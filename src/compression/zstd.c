@@ -6,7 +6,7 @@
  * Reference: https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md
  */
 
-/* #define ZSTD_DEBUG 1 */
+#define ZSTD_DEBUG 1
 
 #include <carquet/error.h>
 #include <stdint.h>
@@ -165,7 +165,7 @@ static inline uint32_t zstd_br_read_bits(zstd_bitreader_t* br, int n) {
  */
 
 typedef struct {
-    uint16_t new_state_base;
+    int16_t new_state_base;  /* Signed: can be negative during FSE table construction */
     uint8_t symbol;
     uint8_t num_bits;
 } fse_entry_t;
@@ -178,10 +178,11 @@ static const int16_t LL_default_norm[36] = {
 };
 
 static const int16_t ML_default_norm[53] = {
-    1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1,
-    -1, -1, -1, -1, -1
+    /* From zstd source lib/common/zstd_internal.h ML_defaultNorm */
+    1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1,  /* 0-15 */
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,  /* 16-31 */
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, /* 32-47 */
+    -1, -1, -1, -1, -1                                /* 48-52 */
 };
 
 static const int16_t OF_default_norm[29] = {
@@ -266,7 +267,7 @@ static void build_fse_decode_table(fse_entry_t* table, int accuracy_log,
         int nb_bits = accuracy_log - highest_bit_set(next_state);
         if (nb_bits < 0) nb_bits = 0;
         table[i].num_bits = (uint8_t)nb_bits;
-        table[i].new_state_base = (uint16_t)((next_state << nb_bits) - table_size);
+        table[i].new_state_base = (int16_t)((next_state << nb_bits) - table_size);
     }
 }
 
@@ -582,17 +583,22 @@ static int decode_literals(zstd_dctx_t* ctx, const uint8_t* data, size_t size,
         int size_fmt = (hdr >> 2) & 3;
         size_t lit_size;
 
-        if (size_fmt == 0 || size_fmt == 1) {
-            /* 1-byte header: size in bits 4-7 (max 15) */
-            lit_size = hdr >> 4;
+        if (size_fmt == 0) {
+            /* Size_Format=0: 1-byte header, size in bits 3-7 (5 bits, max 31) */
+            lit_size = hdr >> 3;
             pos = 1;
-        } else if (size_fmt == 2) {
-            /* 2-byte header: size[3:0] in bits 4-7 of byte0, size[11:4] in byte1 */
+        } else if (size_fmt == 1) {
+            /* Size_Format=1: 2-byte header, size in bits 4-7 of byte0 + byte1 (12 bits) */
             if (size < 2) return -1;
             lit_size = (hdr >> 4) | ((size_t)data[1] << 4);
             pos = 2;
+        } else if (size_fmt == 2) {
+            /* Size_Format=2: 3-byte header (20 bits) */
+            if (size < 3) return -1;
+            lit_size = (hdr >> 4) | ((size_t)data[1] << 4) | ((size_t)data[2] << 12);
+            pos = 3;
         } else {
-            /* 3-byte header */
+            /* Size_Format=3: 3-byte header (20 bits) */
             if (size < 3) return -1;
             lit_size = (hdr >> 4) | ((size_t)data[1] << 4) | ((size_t)data[2] << 12);
             pos = 3;
@@ -608,16 +614,22 @@ static int decode_literals(zstd_dctx_t* ctx, const uint8_t* data, size_t size,
         int size_fmt = (hdr >> 2) & 3;
         size_t lit_size;
 
-        if (size_fmt == 0 || size_fmt == 1) {
-            /* 1-byte header: size in bits 4-7 (max 15) */
-            lit_size = hdr >> 4;
+        if (size_fmt == 0) {
+            /* Size_Format=0: 1-byte header, size in bits 3-7 (5 bits, max 31) */
+            lit_size = hdr >> 3;
             pos = 1;
-        } else if (size_fmt == 2) {
-            /* 2-byte header */
+        } else if (size_fmt == 1) {
+            /* Size_Format=1: 2-byte header (12 bits) */
             if (size < 2) return -1;
             lit_size = (hdr >> 4) | ((size_t)data[1] << 4);
             pos = 2;
+        } else if (size_fmt == 2) {
+            /* Size_Format=2: 3-byte header (20 bits) */
+            if (size < 3) return -1;
+            lit_size = (hdr >> 4) | ((size_t)data[1] << 4) | ((size_t)data[2] << 12);
+            pos = 3;
         } else {
+            /* Size_Format=3: 3-byte header (20 bits) */
             if (size < 3) return -1;
             lit_size = (hdr >> 4) | ((size_t)data[1] << 4) | ((size_t)data[2] << 12);
             pos = 3;
@@ -833,12 +845,7 @@ static int decode_sequences(zstd_dctx_t* ctx, const uint8_t* data, size_t size,
         uint32_t of_code = of_e->symbol;
         uint32_t ml_code = ml_e->symbol;
 
-        /* Read extra bits in order: LL, OF, ML */
-        uint32_t lit_len = LL_baseline[ll_code];
-        if (LL_bits[ll_code] > 0) {
-            lit_len += zstd_br_read_bits(&br, LL_bits[ll_code]);
-        }
-
+        /* Read extra bits in order: OF, ML, LL (per RFC 8878 Section 3.1.1.3.2.1.2) */
         uint32_t offset_val;
         if (of_code > 0) {
             uint32_t extra = zstd_br_read_bits(&br, of_code);
@@ -852,10 +859,19 @@ static int decode_sequences(zstd_dctx_t* ctx, const uint8_t* data, size_t size,
             match_len += zstd_br_read_bits(&br, ML_bits[ml_code]);
         }
 
-        /* Read update bits in order: LL, OF, ML */
-        ll_state = ll_e->new_state_base + zstd_br_read_bits(&br, ll_e->num_bits);
-        of_state = of_e->new_state_base + zstd_br_read_bits(&br, of_e->num_bits);
-        ml_state = ml_e->new_state_base + zstd_br_read_bits(&br, ml_e->num_bits);
+        uint32_t lit_len = LL_baseline[ll_code];
+        if (LL_bits[ll_code] > 0) {
+            lit_len += zstd_br_read_bits(&br, LL_bits[ll_code]);
+        }
+
+        /* Read update bits in order: LL, ML, OF (per RFC 8878)
+         * Update bits are read for all sequences EXCEPT the last.
+         */
+        if (i < num_seq - 1) {
+            ll_state = ll_e->new_state_base + zstd_br_read_bits(&br, ll_e->num_bits);
+            ml_state = ml_e->new_state_base + zstd_br_read_bits(&br, ml_e->num_bits);
+            of_state = of_e->new_state_base + zstd_br_read_bits(&br, of_e->num_bits);
+        }
 
         /* Handle repeat offsets */
         uint32_t offset;
@@ -1062,6 +1078,10 @@ static void zstd_bw_init(zstd_bitwriter_t* bw, uint8_t* data, size_t cap) {
 }
 
 static int zstd_bw_add_bits(zstd_bitwriter_t* bw, uint32_t val, int n) {
+    if (n == 0) return 0;
+    /* Mask value to prevent garbage high bits from corrupting the stream */
+    val &= (1U << n) - 1;
+
     bw->bits |= (uint64_t)val << bw->num_bits;
     bw->num_bits += n;
 
@@ -1184,9 +1204,8 @@ static size_t zstd_find_matches(zstd_cctx_t* cctx, const uint8_t* src, size_t sr
     }
 
     memset(cctx->hash_table, 0, sizeof(cctx->hash_table));
-    cctx->rep[0] = 1;
-    cctx->rep[1] = 4;
-    cctx->rep[2] = 8;
+    /* Note: rep[] is initialized once per frame in carquet_zstd_compress,
+     * not here, to maintain correct state across multiple blocks */
     cctx->num_sequences = 0;
 
     const uint8_t* ip = src;
@@ -1278,9 +1297,10 @@ static int find_states_for_symbol(fse_entry_t* table, int table_size, int symbol
     return count;
 }
 
-/* Find a state that can transition to target_state given table entry constraints */
-static uint32_t find_encoding_state(fse_entry_t* table, int table_size, int symbol,
-                                     uint32_t target_state) {
+/* Find a state that can transition to target_state given table entry constraints.
+ * Returns the state index, or -1 if no valid state exists. */
+static int find_encoding_state(fse_entry_t* table, int table_size, int symbol,
+                                uint32_t target_state) {
     /* We need: target_state = table[state].new_state_base + update_bits
      * where update_bits < (1 << table[state].num_bits)
      * So: state must decode to symbol AND
@@ -1289,21 +1309,18 @@ static uint32_t find_encoding_state(fse_entry_t* table, int table_size, int symb
     for (int state = 0; state < table_size; state++) {
         if (table[state].symbol != symbol) continue;
 
-        uint32_t base = table[state].new_state_base;
+        int32_t base = table[state].new_state_base;  /* Signed base */
         int num_bits = table[state].num_bits;
-        uint32_t max_update = (1U << num_bits);
+        int32_t max_update = (1 << num_bits);
 
-        if (target_state >= base && (target_state - base) < max_update) {
-            return (uint32_t)state;
+        /* Check if target_state can be reached: base <= target < base + max_update */
+        int32_t target = (int32_t)target_state;
+        if (target >= base && (target - base) < max_update) {
+            return state;
         }
     }
-    /* Fallback: return any state with this symbol */
-    for (int state = 0; state < table_size; state++) {
-        if (table[state].symbol == symbol) {
-            return (uint32_t)state;
-        }
-    }
-    return 0;
+    /* No valid state found - FSE encoding not possible for this transition */
+    return -1;
 }
 
 /* Encode sequences using predefined FSE tables
@@ -1401,12 +1418,25 @@ static size_t encode_sequences(zstd_cctx_t* cctx, const uint8_t* src,
         uint32_t next_of = of_states[idx];
 
         /* Find states that can transition to next states */
-        ll_states[i] = find_encoding_state(g_LL_table, 1 << LITERALS_LENGTH_ACC_LOG,
+        int ll_state = find_encoding_state(g_LL_table, 1 << LITERALS_LENGTH_ACC_LOG,
                                            ll_codes[i], next_ll);
-        ml_states[i] = find_encoding_state(g_ML_table, 1 << MATCH_LENGTH_ACC_LOG,
+        int ml_state = find_encoding_state(g_ML_table, 1 << MATCH_LENGTH_ACC_LOG,
                                            ml_codes[i], next_ml);
-        of_states[i] = find_encoding_state(g_OF_table, 1 << OFFSET_ACC_LOG,
+        int of_state = find_encoding_state(g_OF_table, 1 << OFFSET_ACC_LOG,
                                            of_codes[i], next_of);
+
+        /* If any state transition is impossible, FSE encoding fails */
+        if (ll_state < 0 || ml_state < 0 || of_state < 0) {
+#ifdef ZSTD_DEBUG
+            fprintf(stderr, "encode_sequences: FSE encoding failed at seq %zu "
+                    "(ll=%d ml=%d of=%d)\n", i, ll_state, ml_state, of_state);
+#endif
+            return 0;  /* Fall back to raw block */
+        }
+
+        ll_states[i] = (uint32_t)ll_state;
+        ml_states[i] = (uint32_t)ml_state;
+        of_states[i] = (uint32_t)of_state;
     }
 
     /* Build bitstream - written forward, read backward */
@@ -1439,24 +1469,33 @@ static size_t encode_sequences(zstd_cctx_t* cctx, const uint8_t* src,
         fse_entry_t* ml_entry = &g_ML_table[ml_state];
         fse_entry_t* of_entry = &g_OF_table[of_state];
 
-        /* Compute update bits to reach next state (or 0 for last sequence) */
-        uint32_t ll_next = (i + 1 < n) ? ll_states[i + 1] : 0;
-        uint32_t ml_next = (i + 1 < n) ? ml_states[i + 1] : 0;
-        uint32_t of_next = (i + 1 < n) ? of_states[i + 1] : 0;
+        /* Write update bits for all sequences EXCEPT the last decoded one.
+         * The last decoded sequence is the first one we encode (i == n - 1).
+         * Per RFC 8878: "update bits are read for all sequences except the last."
+         */
+        if (i < n - 1) {
+            /* Compute update bits to reach next state
+             * update_bits = next_state - new_state_base (works with signed base)
+             */
+            int32_t ll_next = (int32_t)ll_states[i + 1];
+            int32_t ml_next = (int32_t)ml_states[i + 1];
+            int32_t of_next = (int32_t)of_states[i + 1];
 
-        uint32_t ll_update = (ll_next >= ll_entry->new_state_base) ?
-                             (ll_next - ll_entry->new_state_base) : 0;
-        uint32_t ml_update = (ml_next >= ml_entry->new_state_base) ?
-                             (ml_next - ml_entry->new_state_base) : 0;
-        uint32_t of_update = (of_next >= of_entry->new_state_base) ?
-                             (of_next - of_entry->new_state_base) : 0;
+            uint32_t ll_update = (uint32_t)(ll_next - ll_entry->new_state_base);
+            uint32_t ml_update = (uint32_t)(ml_next - ml_entry->new_state_base);
+            uint32_t of_update = (uint32_t)(of_next - of_entry->new_state_base);
 
-        /* Write update bits in order: ML, OF, LL (read as LL, OF, ML backward) */
-        zstd_bw_add_bits(&bw, ml_update, ml_entry->num_bits);
-        zstd_bw_add_bits(&bw, of_update, of_entry->num_bits);
-        zstd_bw_add_bits(&bw, ll_update, ll_entry->num_bits);
+            /* Write update bits in order: OF, ML, LL (read as LL, ML, OF backward per RFC 8878) */
+            zstd_bw_add_bits(&bw, of_update, of_entry->num_bits);
+            zstd_bw_add_bits(&bw, ml_update, ml_entry->num_bits);
+            zstd_bw_add_bits(&bw, ll_update, ll_entry->num_bits);
+        }
 
-        /* Write extra bits in order: ML, OF, LL (read as LL, OF, ML backward) */
+        /* Write extra bits in order: LL, ML, OF (read as OF, ML, LL backward per RFC 8878) */
+        if (LL_bits[ll_codes[i]] > 0) {
+            uint32_t extra = seq->lit_len - LL_baseline[ll_codes[i]];
+            zstd_bw_add_bits(&bw, extra, LL_bits[ll_codes[i]]);
+        }
         if (ML_bits[ml_codes[i]] > 0) {
             uint32_t extra = seq->match_len - ML_baseline[ml_codes[i]];
             zstd_bw_add_bits(&bw, extra, ML_bits[ml_codes[i]]);
@@ -1465,10 +1504,6 @@ static size_t encode_sequences(zstd_cctx_t* cctx, const uint8_t* src,
             uint32_t offset_val = seq->offset;
             uint32_t extra = offset_val - (1U << of_codes[i]);
             zstd_bw_add_bits(&bw, extra, of_codes[i]);
-        }
-        if (LL_bits[ll_codes[i]] > 0) {
-            uint32_t extra = seq->lit_len - LL_baseline[ll_codes[i]];
-            zstd_bw_add_bits(&bw, extra, LL_bits[ll_codes[i]]);
         }
     }
 
@@ -1522,20 +1557,22 @@ static size_t write_compressed_block(zstd_cctx_t* cctx, uint8_t* dst, size_t cap
     /* Write literals section (raw)
      * Format for Raw/RLE literals:
      * - bits 0-1: Literals_Block_Type (00=Raw)
-     * - bits 2-3: Size_Format
-     *   - 00 or 01: 1-byte header, size in bits 4-7 (max 15)
-     *   - 10: 2-byte header, size in bits 4-7 of byte0 + byte1 (max 4095)
-     *   - 11: 3-byte header (max 1M)
+     * - bit 2: part of Size_Format
+     * Per RFC 8878:
+     *   - Size_Format=0: 1-byte header, size in bits 3-7 (5 bits, max 31)
+     *   - Size_Format=1: 2-byte header, size in bits 4-7 of byte0 + byte1 (12 bits)
+     *   - Size_Format=2: 3-byte header (20 bits)
+     *   - Size_Format=3: 3-byte header (20 bits)
      */
-    if (total_lit <= 15) {
-        /* 1-byte header: Size_Format=00, size in bits 4-7 */
-        block_data[block_pos++] = (uint8_t)(ZSTD_LITBLOCK_RAW | ((total_lit) << 4));
+    if (total_lit <= 31) {
+        /* Size_Format=0: 1-byte header, size in bits 3-7 */
+        block_data[block_pos++] = (uint8_t)(ZSTD_LITBLOCK_RAW | (total_lit << 3));
     } else if (total_lit < 4096) {
-        /* 2-byte header: Size_Format=10 (0x08), size[3:0] in bits 4-7, size[11:4] in byte1 */
-        block_data[block_pos++] = (uint8_t)(ZSTD_LITBLOCK_RAW | 0x08 | ((total_lit & 0x0F) << 4));
+        /* Size_Format=1: 2-byte header (bit 2 set = 0x04) */
+        block_data[block_pos++] = (uint8_t)(ZSTD_LITBLOCK_RAW | 0x04 | ((total_lit & 0x0F) << 4));
         block_data[block_pos++] = (uint8_t)(total_lit >> 4);
     } else {
-        /* 3-byte header: Size_Format=11 (0x0C) */
+        /* Size_Format=2: 3-byte header (bits 2-3 = 0x08) */
         block_data[block_pos++] = (uint8_t)(ZSTD_LITBLOCK_RAW | 0x0C | ((total_lit & 0x0F) << 4));
         block_data[block_pos++] = (uint8_t)(total_lit >> 4);
         block_data[block_pos++] = (uint8_t)(total_lit >> 12);
@@ -1567,6 +1604,11 @@ static size_t write_compressed_block(zstd_cctx_t* cctx, uint8_t* dst, size_t cap
     /* Encode sequences */
     size_t seq_size = encode_sequences(cctx, src, block_data + block_pos,
                                         sizeof(block_data) - block_pos);
+
+    /* If sequence encoding failed (FSE encoding impossible), fall back to raw */
+    if (seq_size == 0 && cctx->num_sequences > 0) {
+        return 0;
+    }
     block_pos += seq_size;
 
     /* Check if compressed is smaller than raw */
@@ -1675,6 +1717,11 @@ int carquet_zstd_compress(
     zstd_cctx_t cctx_stack;
     zstd_cctx_t* cctx = &cctx_stack;
 
+    /* Initialize ZSTD Repeated Offsets once per frame */
+    cctx->rep[0] = 1;
+    cctx->rep[1] = 4;
+    cctx->rep[2] = 8;
+
     /* Compress blocks */
     size_t src_pos = 0;
     while (src_pos < src_size) {
@@ -1691,7 +1738,14 @@ int carquet_zstd_compress(
         if (check_rle(block_src, block_size)) {
             written = write_rle_block(dst + pos, dst_capacity - pos,
                                       block_src[0], block_size, is_last);
+            /* RLE blocks do not update rep history */
         } else if (level > 0 && block_size >= 64) {
+            /* Save rep state before attempting compression.
+             * If compression fails and we fall back to raw block,
+             * we must restore rep state since raw blocks don't update it. */
+            uint32_t saved_rep[3];
+            memcpy(saved_rep, cctx->rep, sizeof(saved_rep));
+
             /* Try LZ77 compression for level > 0 and blocks >= 64 bytes */
             zstd_find_matches(cctx, block_src, block_size);
 
@@ -1699,12 +1753,18 @@ int carquet_zstd_compress(
                 written = write_compressed_block(cctx, dst + pos, dst_capacity - pos,
                                                  block_src, block_size, is_last);
             }
+
+            /* If compression failed or wasn't beneficial, restore rep state */
+            if (written == 0) {
+                memcpy(cctx->rep, saved_rep, sizeof(saved_rep));
+            }
         }
 
         /* Fall back to raw block if compression didn't help */
         if (written == 0) {
             written = write_raw_block(dst + pos, dst_capacity - pos,
                                       block_src, block_size, is_last);
+            /* Raw blocks do not update rep history */
         }
 
         if (written == 0) return CARQUET_ERROR_COMPRESSION;
