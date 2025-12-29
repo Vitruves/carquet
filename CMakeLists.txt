@@ -248,6 +248,7 @@ if(CARQUET_BUILD_TESTS)
     add_carquet_test(test_utils tests/test_utils.c)
     add_carquet_test(test_production tests/test_production.c)
     add_carquet_test(test_maturity tests/test_maturity.c)
+    add_carquet_test(test_large_schema tests/test_large_schema.c)
 endif()
 
 # Examples

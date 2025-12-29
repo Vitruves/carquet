@@ -27,6 +27,7 @@ struct carquet_schema {
     carquet_arena_t arena;
     parquet_schema_element_t* elements;
     int32_t num_elements;
+    int32_t capacity;           /* Capacity of elements/leaf arrays */
 
     /* Computed fields */
     int32_t* leaf_indices;      /* Map leaf index -> schema element index */

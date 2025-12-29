@@ -175,6 +175,7 @@ carquet_schema_t* build_schema(
 
     schema->elements = metadata->schema;
     schema->num_elements = metadata->num_schema_elements;
+    schema->capacity = metadata->num_schema_elements;  /* Fixed size from file */
     schema->num_leaves = count_leaves(metadata->schema, metadata->num_schema_elements);
 
     schema->leaf_indices = carquet_arena_calloc(arena, schema->num_leaves, sizeof(int32_t));
