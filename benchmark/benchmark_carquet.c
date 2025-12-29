@@ -23,8 +23,8 @@ static void benchmark_write(const char* filename, carquet_compression_t codec) {
     carquet_error_t err = CARQUET_ERROR_INIT;
 
     carquet_schema_t* schema = carquet_schema_create(&err);
-    carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT64, NULL, CARQUET_REPETITION_REQUIRED, 0);
-    carquet_schema_add_column(schema, "value", CARQUET_PHYSICAL_DOUBLE, NULL, CARQUET_REPETITION_REQUIRED, 0);
+(void)carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT64, NULL, CARQUET_REPETITION_REQUIRED, 0);
+(void)carquet_schema_add_column(schema, "value", CARQUET_PHYSICAL_DOUBLE, NULL, CARQUET_REPETITION_REQUIRED, 0);
 
     carquet_writer_options_t opts;
     carquet_writer_options_init(&opts);
@@ -42,9 +42,9 @@ static void benchmark_write(const char* filename, carquet_compression_t codec) {
         double start = get_time_ms();
 
         carquet_writer_t* writer = carquet_writer_create(filename, schema, &opts, &err);
-        carquet_writer_write_batch(writer, 0, ids, BENCH_ROWS, NULL, NULL);
-        carquet_writer_write_batch(writer, 1, values, BENCH_ROWS, NULL, NULL);
-        carquet_writer_close(writer);
+(void)carquet_writer_write_batch(writer, 0, ids, BENCH_ROWS, NULL, NULL);
+(void)carquet_writer_write_batch(writer, 1, values, BENCH_ROWS, NULL, NULL);
+(void)carquet_writer_close(writer);
 
         double elapsed = get_time_ms() - start;
         total_time += elapsed;
@@ -83,6 +83,7 @@ static void benchmark_read(const char* filename) {
                 carquet_row_batch_free(batch);
                 batch = NULL;
             }
+            (void)total_rows;
             carquet_batch_reader_free(batch_reader);
         }
 

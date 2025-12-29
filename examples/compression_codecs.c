@@ -54,11 +54,11 @@ static carquet_schema_t* create_schema(void) {
 
     carquet_logical_type_t string_type = { .id = CARQUET_LOGICAL_STRING };
 
-    carquet_schema_add_column(schema, "id",
+(void)carquet_schema_add_column(schema, "id",
         CARQUET_PHYSICAL_INT64, NULL, CARQUET_REPETITION_REQUIRED, 0);
-    carquet_schema_add_column(schema, "value",
+(void)carquet_schema_add_column(schema, "value",
         CARQUET_PHYSICAL_DOUBLE, NULL, CARQUET_REPETITION_REQUIRED, 0);
-    carquet_schema_add_column(schema, "category",
+(void)carquet_schema_add_column(schema, "category",
         CARQUET_PHYSICAL_BYTE_ARRAY, &string_type, CARQUET_REPETITION_REQUIRED, 0);
 
     return schema;
@@ -254,7 +254,7 @@ int main(int argc, char* argv[]) {
     printf("Library version: %s\n\n", carquet_version());
 
     /* Initialize */
-    carquet_init();
+(void)carquet_init();
 
     /* Create schema */
     carquet_schema_t* schema = create_schema();

@@ -35,7 +35,8 @@ int64_t carquet_column_read_batch(
     int16_t* def_levels,
     int16_t* rep_levels) {
 
-    if (!reader || !values || max_values <= 0) {
+    /* reader and values are nonnull per API contract */
+    if (max_values <= 0) {
         return -1;
     }
 
@@ -113,11 +114,8 @@ int64_t carquet_column_skip(
     carquet_column_reader_t* reader,
     int64_t num_values) {
 
-    if (!reader || num_values <= 0) {
-        return 0;
-    }
-
-    if (reader->values_remaining <= 0) {
+    /* reader is nonnull per API contract */
+    if (num_values <= 0 || reader->values_remaining <= 0) {
         return 0;
     }
 

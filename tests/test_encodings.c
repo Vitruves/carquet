@@ -36,6 +36,7 @@ static int test_plain_int32(void) {
     int64_t bytes = carquet_decode_plain_int32(
         carquet_buffer_data_const(&buf), carquet_buffer_size(&buf),
         output, count);
+    (void)bytes;
 
     assert(bytes == count * 4);
     for (int i = 0; i < count; i++) {
@@ -60,6 +61,7 @@ static int test_plain_int64(void) {
     int64_t bytes = carquet_decode_plain_int64(
         carquet_buffer_data_const(&buf), carquet_buffer_size(&buf),
         output, count);
+    (void)bytes;
 
     assert(bytes == count * 8);
     for (int i = 0; i < count; i++) {
@@ -85,6 +87,7 @@ static int test_plain_boolean(void) {
     int64_t bytes = carquet_decode_plain_boolean(
         carquet_buffer_data_const(&buf), carquet_buffer_size(&buf),
         output, count);
+    (void)bytes;
 
     assert(bytes == 2);
     for (int i = 0; i < count; i++) {
@@ -109,6 +112,7 @@ static int test_plain_double(void) {
     int64_t bytes = carquet_decode_plain_double(
         carquet_buffer_data_const(&buf), carquet_buffer_size(&buf),
         output, count);
+    (void)bytes;
 
     assert(bytes == count * 8);
     for (int i = 0; i < count; i++) {
@@ -142,6 +146,7 @@ static int test_rle_repeated_values(void) {
     int64_t count = carquet_rle_decode_all(
         carquet_buffer_data_const(&buf), carquet_buffer_size(&buf),
         1, output, 100);
+    (void)count;
 
     assert(count == 100);
     for (int i = 0; i < 100; i++) {
@@ -169,6 +174,7 @@ static int test_rle_alternating(void) {
     int64_t count = carquet_rle_decode_all(
         carquet_buffer_data_const(&buf), carquet_buffer_size(&buf),
         1, output, 16);
+    (void)count;
 
     assert(count == 16);
     for (int i = 0; i < 16; i++) {
@@ -198,11 +204,13 @@ static int test_rle_decoder_skip(void) {
 
     /* Skip first 25 values */
     int64_t skipped = carquet_rle_decoder_skip(&dec, 25);
+    (void)skipped;
     assert(skipped == 25);
 
     /* Read next 10 values (should be 2s and 3s) */
     uint32_t output[10];
     int64_t read = carquet_rle_decoder_get_batch(&dec, output, 10);
+    (void)read;
     assert(read == 10);
 
     for (int i = 0; i < 5; i++) {
@@ -230,6 +238,7 @@ static int test_rle_levels(void) {
     int64_t decoded = carquet_rle_decode_levels(
         carquet_buffer_data_const(&buf), carquet_buffer_size(&buf),
         1, output, count);
+    (void)decoded;
 
     assert(decoded == count);
     for (int i = 0; i < count; i++) {

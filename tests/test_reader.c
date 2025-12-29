@@ -15,6 +15,7 @@
 
 static int test_version(void) {
     const char* ver = carquet_version();
+    (void)ver;
     assert(ver != NULL);
     assert(strcmp(ver, "0.1.0") == 0);
 
@@ -85,6 +86,7 @@ static int test_open_nonexistent(void) {
     carquet_error_t err = CARQUET_ERROR_INIT;
     carquet_reader_t* reader = carquet_reader_open(
         "/nonexistent/path/file.parquet", NULL, &err);
+    (void)reader;
 
     assert(reader == NULL);
     assert(err.code == CARQUET_ERROR_FILE_OPEN);
@@ -164,6 +166,7 @@ static int test_nested_schema_levels(void) {
     /* Add optional group "address" */
     int32_t address_idx = carquet_schema_add_group(
         schema, "address", CARQUET_REPETITION_OPTIONAL, -1);
+    (void)address_idx;
     assert(address_idx >= 0);
 
     /* Add columns inside address group */
@@ -180,6 +183,7 @@ static int test_nested_schema_levels(void) {
     /* Add repeated group "phones" */
     int32_t phones_idx = carquet_schema_add_group(
         schema, "phones", CARQUET_REPETITION_REPEATED, -1);
+    (void)phones_idx;
     assert(phones_idx >= 0);
 
     /* Add columns inside phones group */
@@ -238,6 +242,7 @@ static int test_nested_schema_levels(void) {
     }
 
     const carquet_schema_t* read_schema = carquet_reader_schema(reader);
+    (void)read_schema;
     assert(read_schema != NULL);
 
     int32_t read_cols = carquet_reader_num_columns(reader);
@@ -339,6 +344,7 @@ static int test_write_simple_file(void) {
 
     /* Check PAR1 header */
     char magic[4];
+    (void)magic;
     assert(fread(magic, 1, 4, f) == 4);
     assert(memcmp(magic, "PAR1", 4) == 0);
 

@@ -42,23 +42,23 @@ static carquet_schema_t* create_schema_with_nullables(void) {
     carquet_logical_type_t string_type = { .id = CARQUET_LOGICAL_STRING };
 
     /* Required column (always has a value) */
-    carquet_schema_add_column(schema, "id",
+(void)carquet_schema_add_column(schema, "id",
         CARQUET_PHYSICAL_INT64, NULL, CARQUET_REPETITION_REQUIRED, 0);
 
     /* Required string column */
-    carquet_schema_add_column(schema, "name",
+(void)carquet_schema_add_column(schema, "name",
         CARQUET_PHYSICAL_BYTE_ARRAY, &string_type, CARQUET_REPETITION_REQUIRED, 0);
 
     /* Optional integer column (can be NULL) */
-    carquet_schema_add_column(schema, "age",
+(void)carquet_schema_add_column(schema, "age",
         CARQUET_PHYSICAL_INT32, NULL, CARQUET_REPETITION_OPTIONAL, 0);
 
     /* Optional double column (can be NULL) */
-    carquet_schema_add_column(schema, "score",
+(void)carquet_schema_add_column(schema, "score",
         CARQUET_PHYSICAL_DOUBLE, NULL, CARQUET_REPETITION_OPTIONAL, 0);
 
     /* Optional string column (can be NULL) */
-    carquet_schema_add_column(schema, "email",
+(void)carquet_schema_add_column(schema, "email",
         CARQUET_PHYSICAL_BYTE_ARRAY, &string_type, CARQUET_REPETITION_OPTIONAL, 0);
 
     printf("Schema created:\n");

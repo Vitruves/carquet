@@ -37,13 +37,13 @@ static int create_test_file(void) {
     carquet_schema_t* schema = carquet_schema_create(&err);
     if (!schema) return -1;
 
-    carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT32, NULL,
+    (void)carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT32, NULL,
         CARQUET_REPETITION_REQUIRED, 0);
-    carquet_schema_add_column(schema, "value", CARQUET_PHYSICAL_DOUBLE, NULL,
+    (void)carquet_schema_add_column(schema, "value", CARQUET_PHYSICAL_DOUBLE, NULL,
         CARQUET_REPETITION_REQUIRED, 0);
-    carquet_schema_add_column(schema, "category", CARQUET_PHYSICAL_INT32, NULL,
+    (void)carquet_schema_add_column(schema, "category", CARQUET_PHYSICAL_INT32, NULL,
         CARQUET_REPETITION_REQUIRED, 0);
-    carquet_schema_add_column(schema, "score", CARQUET_PHYSICAL_FLOAT, NULL,
+    (void)carquet_schema_add_column(schema, "score", CARQUET_PHYSICAL_FLOAT, NULL,
         CARQUET_REPETITION_REQUIRED, 0);
 
     /* Writer options - small row groups for testing */
@@ -76,13 +76,13 @@ static int create_test_file(void) {
     for (int g = 0; g < NUM_ROW_GROUPS; g++) {
         int offset = g * rows_per_group;
 
-        carquet_writer_write_batch(writer, 0, ids + offset, rows_per_group, NULL, NULL);
-        carquet_writer_write_batch(writer, 1, values + offset, rows_per_group, NULL, NULL);
-        carquet_writer_write_batch(writer, 2, categories + offset, rows_per_group, NULL, NULL);
-        carquet_writer_write_batch(writer, 3, scores + offset, rows_per_group, NULL, NULL);
+        (void)carquet_writer_write_batch(writer, 0, ids + offset, rows_per_group, NULL, NULL);
+        (void)carquet_writer_write_batch(writer, 1, values + offset, rows_per_group, NULL, NULL);
+        (void)carquet_writer_write_batch(writer, 2, categories + offset, rows_per_group, NULL, NULL);
+        (void)carquet_writer_write_batch(writer, 3, scores + offset, rows_per_group, NULL, NULL);
 
         if (g < NUM_ROW_GROUPS - 1) {
-            carquet_writer_new_row_group(writer);
+            (void)carquet_writer_new_row_group(writer);
         }
     }
 
@@ -113,8 +113,7 @@ static int test_column_projection(void) {
     }
 
     /* Verify file has expected columns */
-    int32_t num_cols = carquet_reader_num_columns(reader);
-    assert(num_cols == 4);
+    assert(carquet_reader_num_columns(reader) == 4);
 
     /* Test 1: Project only 2 columns by index */
     carquet_batch_reader_config_t config;
@@ -148,13 +147,13 @@ static int test_column_projection(void) {
         const uint8_t* null_bitmap;
         int64_t num_values;
 
-        carquet_status_t status = carquet_row_batch_column(batch, 0, &data, &null_bitmap, &num_values);
-        assert(status == CARQUET_OK);
+        assert(carquet_row_batch_column(batch, 0, &data, &null_bitmap, &num_values) == CARQUET_OK);
         assert(data != NULL);
         assert(num_values == batch_rows);
 
-        status = carquet_row_batch_column(batch, 1, &data, &null_bitmap, &num_values);
+        carquet_status_t status = carquet_row_batch_column(batch, 1, &data, &null_bitmap, &num_values);
         assert(status == CARQUET_OK);
+        (void)status;
         assert(data != NULL);
 
         carquet_row_batch_free(batch);
@@ -401,8 +400,10 @@ static int test_full_pipeline(void) {
         carquet_row_batch_t* batch = NULL;
         while (carquet_batch_reader_next(batch_reader, &batch) == CARQUET_OK && batch) {
             const void* cat_data;
+            const uint8_t* null_bitmap;
             int64_t num_values;
-            carquet_row_batch_column(batch, 1, &cat_data, NULL, &num_values);
+            (void)carquet_row_batch_column(batch, 1, &cat_data, &null_bitmap, &num_values);
+            (void)null_bitmap;
 
             const int32_t* categories = (const int32_t*)cat_data;
             for (int64_t i = 0; i < num_values; i++) {

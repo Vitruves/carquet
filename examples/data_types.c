@@ -36,16 +36,16 @@ static carquet_schema_t* create_typed_schema(void) {
     }
 
     /* INT32 column (plain) */
-    carquet_schema_add_column(schema, "count",
+(void)carquet_schema_add_column(schema, "count",
         CARQUET_PHYSICAL_INT32, NULL, CARQUET_REPETITION_REQUIRED, 0);
 
     /* INT32 with DATE logical type */
     carquet_logical_type_t date_type = { .id = CARQUET_LOGICAL_DATE };
-    carquet_schema_add_column(schema, "created_date",
+(void)carquet_schema_add_column(schema, "created_date",
         CARQUET_PHYSICAL_INT32, &date_type, CARQUET_REPETITION_REQUIRED, 0);
 
     /* INT64 column (plain) */
-    carquet_schema_add_column(schema, "big_number",
+(void)carquet_schema_add_column(schema, "big_number",
         CARQUET_PHYSICAL_INT64, NULL, CARQUET_REPETITION_REQUIRED, 0);
 
     /* INT64 with TIMESTAMP logical type (microseconds, UTC) */
@@ -56,20 +56,20 @@ static carquet_schema_t* create_typed_schema(void) {
             .is_adjusted_to_utc = true
         }
     };
-    carquet_schema_add_column(schema, "event_time",
+(void)carquet_schema_add_column(schema, "event_time",
         CARQUET_PHYSICAL_INT64, &timestamp_type, CARQUET_REPETITION_REQUIRED, 0);
 
     /* FLOAT column */
-    carquet_schema_add_column(schema, "temperature",
+(void)carquet_schema_add_column(schema, "temperature",
         CARQUET_PHYSICAL_FLOAT, NULL, CARQUET_REPETITION_REQUIRED, 0);
 
     /* DOUBLE column */
-    carquet_schema_add_column(schema, "precise_value",
+(void)carquet_schema_add_column(schema, "precise_value",
         CARQUET_PHYSICAL_DOUBLE, NULL, CARQUET_REPETITION_REQUIRED, 0);
 
     /* BYTE_ARRAY with STRING logical type */
     carquet_logical_type_t string_type = { .id = CARQUET_LOGICAL_STRING };
-    carquet_schema_add_column(schema, "description",
+(void)carquet_schema_add_column(schema, "description",
         CARQUET_PHYSICAL_BYTE_ARRAY, &string_type, CARQUET_REPETITION_REQUIRED, 0);
 
     printf("Schema created with %d columns:\n", carquet_schema_num_columns(schema));

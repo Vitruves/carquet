@@ -199,7 +199,7 @@ carquet_schema_t* build_schema(
  */
 
 void carquet_reader_options_init(carquet_reader_options_t* options) {
-    if (!options) return;
+    /* Parameter is nonnull per API contract */
     memset(options, 0, sizeof(*options));
     options->use_mmap = false;
     options->verify_checksums = true;
@@ -296,11 +296,7 @@ carquet_reader_t* carquet_reader_open(
     const carquet_reader_options_t* options,
     carquet_error_t* error) {
 
-    if (!path) {
-        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT, "NULL path");
-        return NULL;
-    }
-
+    /* path is nonnull per API contract */
     FILE* file = fopen(path, "rb");
     if (!file) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_OPEN, "Failed to open file: %s", path);
@@ -356,19 +352,23 @@ void carquet_reader_close(carquet_reader_t* reader) {
 }
 
 const carquet_schema_t* carquet_reader_schema(const carquet_reader_t* reader) {
-    return reader ? reader->schema : NULL;
+    /* reader is nonnull per API contract */
+    return reader->schema;
 }
 
 int64_t carquet_reader_num_rows(const carquet_reader_t* reader) {
-    return reader ? reader->metadata.num_rows : 0;
+    /* reader is nonnull per API contract */
+    return reader->metadata.num_rows;
 }
 
 int32_t carquet_reader_num_row_groups(const carquet_reader_t* reader) {
-    return reader ? reader->metadata.num_row_groups : 0;
+    /* reader is nonnull per API contract */
+    return reader->metadata.num_row_groups;
 }
 
 int32_t carquet_reader_num_columns(const carquet_reader_t* reader) {
-    return reader ? reader->schema->num_leaves : 0;
+    /* reader is nonnull per API contract */
+    return reader->schema->num_leaves;
 }
 
 carquet_status_t carquet_reader_row_group_metadata(
@@ -376,10 +376,7 @@ carquet_status_t carquet_reader_row_group_metadata(
     int32_t row_group_index,
     carquet_row_group_metadata_t* metadata) {
 
-    if (!reader || !metadata) {
-        return CARQUET_ERROR_INVALID_ARGUMENT;
-    }
-
+    /* reader and metadata are nonnull per API contract */
     if (row_group_index < 0 || row_group_index >= reader->metadata.num_row_groups) {
         return CARQUET_ERROR_ROW_GROUP_NOT_FOUND;
     }
@@ -404,11 +401,7 @@ carquet_column_reader_t* carquet_reader_get_column(
     int32_t column_index,
     carquet_error_t* error) {
 
-    if (!reader) {
-        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT, "NULL reader");
-        return NULL;
-    }
-
+    /* reader is nonnull per API contract */
     if (row_group_index < 0 || row_group_index >= reader->metadata.num_row_groups) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_ROW_GROUP_NOT_FOUND,
             "Row group %d not found", row_group_index);
@@ -474,11 +467,13 @@ void carquet_column_reader_free(carquet_column_reader_t* reader) {
 }
 
 bool carquet_column_has_next(const carquet_column_reader_t* reader) {
-    return reader && reader->values_remaining > 0;
+    /* reader is nonnull per API contract */
+    return reader->values_remaining > 0;
 }
 
 int64_t carquet_column_remaining(const carquet_column_reader_t* reader) {
-    return reader ? reader->values_remaining : 0;
+    /* reader is nonnull per API contract */
+    return reader->values_remaining;
 }
 
 /* ============================================================================

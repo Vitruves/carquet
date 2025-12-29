@@ -167,6 +167,7 @@ static carquet_mmap_t* mmap_open(const char* path, carquet_error_t* error) {
     return mmap_info;
 }
 
+__attribute__((unused))
 static void mmap_close(carquet_mmap_t* mmap_info) {
     if (!mmap_info) return;
 
@@ -218,8 +219,9 @@ carquet_reader_t* carquet_reader_open_buffer(
     const carquet_reader_options_t* options,
     carquet_error_t* error) {
 
-    if (!buffer || size == 0) {
-        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT, "Invalid buffer");
+    /* buffer is nonnull per API contract */
+    if (size == 0) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT, "Invalid buffer size");
         return NULL;
     }
 

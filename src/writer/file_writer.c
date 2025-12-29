@@ -142,7 +142,7 @@ struct carquet_writer {
  */
 
 void carquet_writer_options_init(carquet_writer_options_t* options) {
-    if (!options) return;
+    /* options is nonnull per API contract */
     memset(options, 0, sizeof(*options));
     options->compression = CARQUET_COMPRESSION_UNCOMPRESSED;
     options->compression_level = 0;
@@ -453,16 +453,7 @@ carquet_writer_t* carquet_writer_create(
     const carquet_writer_options_t* options,
     carquet_error_t* error) {
 
-    if (!path) {
-        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT, "NULL path");
-        return NULL;
-    }
-
-    if (!schema) {
-        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT, "NULL schema");
-        return NULL;
-    }
-
+    /* path and schema are nonnull per API contract */
     carquet_writer_t* writer = calloc(1, sizeof(carquet_writer_t));
     if (!writer) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate writer");
@@ -502,27 +493,25 @@ carquet_writer_t* carquet_writer_create(
         carquet_writer_options_init(&writer->options);
     }
 
-    /* If schema provided, add columns from it */
-    if (schema) {
-        for (int32_t i = 0; i < schema->num_leaves; i++) {
-            int32_t elem_idx = schema->leaf_indices[i];
-            parquet_schema_element_t* elem = &schema->elements[elem_idx];
+    /* Add columns from schema (schema is nonnull per API contract) */
+    for (int32_t i = 0; i < schema->num_leaves; i++) {
+        int32_t elem_idx = schema->leaf_indices[i];
+        parquet_schema_element_t* elem = &schema->elements[elem_idx];
 
-            carquet_logical_type_t* lt = elem->has_logical_type ? &elem->logical_type : NULL;
+        carquet_logical_type_t* lt = elem->has_logical_type ? &elem->logical_type : NULL;
 
-            carquet_status_t status = add_column_internal(
-                writer,
-                elem->name,
-                elem->type,
-                lt,
-                elem->repetition_type,
-                elem->type_length);
+        carquet_status_t status = add_column_internal(
+            writer,
+            elem->name,
+            elem->type,
+            lt,
+            elem->repetition_type,
+            elem->type_length);
 
-            if (status != CARQUET_OK) {
-                carquet_writer_abort(writer);
-                CARQUET_SET_ERROR(error, status, "Failed to add column from schema");
-                return NULL;
-            }
+        if (status != CARQUET_OK) {
+            carquet_writer_abort(writer);
+            CARQUET_SET_ERROR(error, status, "Failed to add column from schema");
+            return NULL;
         }
     }
 
@@ -535,11 +524,7 @@ carquet_writer_t* carquet_writer_create_file(
     const carquet_writer_options_t* options,
     carquet_error_t* error) {
 
-    if (!file) {
-        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT, "NULL file handle");
-        return NULL;
-    }
-
+    /* file and schema are nonnull per API contract */
     carquet_writer_t* writer = calloc(1, sizeof(carquet_writer_t));
     if (!writer) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate writer");
@@ -563,27 +548,25 @@ carquet_writer_t* carquet_writer_create_file(
         carquet_writer_options_init(&writer->options);
     }
 
-    /* If schema provided, add columns from it */
-    if (schema) {
-        for (int32_t i = 0; i < schema->num_leaves; i++) {
-            int32_t elem_idx = schema->leaf_indices[i];
-            parquet_schema_element_t* elem = &schema->elements[elem_idx];
+    /* Add columns from schema (schema is nonnull per API contract) */
+    for (int32_t i = 0; i < schema->num_leaves; i++) {
+        int32_t elem_idx = schema->leaf_indices[i];
+        parquet_schema_element_t* elem = &schema->elements[elem_idx];
 
-            carquet_logical_type_t* lt = elem->has_logical_type ? &elem->logical_type : NULL;
+        carquet_logical_type_t* lt = elem->has_logical_type ? &elem->logical_type : NULL;
 
-            carquet_status_t status = add_column_internal(
-                writer,
-                elem->name,
-                elem->type,
-                lt,
-                elem->repetition_type,
-                elem->type_length);
+        carquet_status_t status = add_column_internal(
+            writer,
+            elem->name,
+            elem->type,
+            lt,
+            elem->repetition_type,
+            elem->type_length);
 
-            if (status != CARQUET_OK) {
-                carquet_writer_abort(writer);
-                CARQUET_SET_ERROR(error, status, "Failed to add column from schema");
-                return NULL;
-            }
+        if (status != CARQUET_OK) {
+            carquet_writer_abort(writer);
+            CARQUET_SET_ERROR(error, status, "Failed to add column from schema");
+            return NULL;
         }
     }
 
@@ -598,10 +581,7 @@ carquet_status_t carquet_writer_write_batch(
     const int16_t* def_levels,
     const int16_t* rep_levels) {
 
-    if (!writer || !values) {
-        return CARQUET_ERROR_INVALID_ARGUMENT;
-    }
-
+    /* writer and values are nonnull per API contract */
     if (column_index < 0 || column_index >= writer->num_columns) {
         return CARQUET_ERROR_INVALID_ARGUMENT;
     }
@@ -642,10 +622,7 @@ carquet_status_t carquet_writer_write_batch(
 }
 
 carquet_status_t carquet_writer_new_row_group(carquet_writer_t* writer) {
-    if (!writer) {
-        return CARQUET_ERROR_INVALID_ARGUMENT;
-    }
-
+    /* writer is nonnull per API contract */
     /* Ensure header is written */
     carquet_status_t status = ensure_header_written(writer);
     if (status != CARQUET_OK) {
@@ -657,10 +634,7 @@ carquet_status_t carquet_writer_new_row_group(carquet_writer_t* writer) {
 }
 
 carquet_status_t carquet_writer_close(carquet_writer_t* writer) {
-    if (!writer) {
-        return CARQUET_ERROR_INVALID_ARGUMENT;
-    }
-
+    /* writer is nonnull per API contract */
     carquet_status_t status = CARQUET_OK;
 
     /* Ensure header is written */

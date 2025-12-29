@@ -69,7 +69,8 @@ static int test_thrift_string_roundtrip(void) {
     thrift_decoder_init(&dec, carquet_buffer_data_const(&buf), carquet_buffer_size(&buf));
 
     int32_t len;
-    const uint8_t* data;
+    const uint8_t* data = NULL;
+    (void)data;
 
     data = thrift_read_binary(&dec, &len);
     assert(len == 13);
@@ -109,7 +110,9 @@ static int test_thrift_struct(void) {
     thrift_read_struct_begin(&dec);
 
     thrift_type_t type;
+    (void)type;
     int16_t field_id;
+    (void)field_id;
 
     assert(thrift_read_field_begin(&dec, &type, &field_id));
     assert(field_id == 1);
@@ -121,6 +124,7 @@ static int test_thrift_struct(void) {
     assert(type == THRIFT_TYPE_BINARY);
     int32_t len;
     const uint8_t* data = thrift_read_binary(&dec, &len);
+    (void)data;
     assert(len == 4 && memcmp(data, "test", 4) == 0);
 
     assert(thrift_read_field_begin(&dec, &type, &field_id));

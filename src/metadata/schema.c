@@ -71,10 +71,7 @@ carquet_status_t carquet_schema_add_column(
     carquet_field_repetition_t repetition,
     int32_t type_length) {
 
-    if (!schema || !name) {
-        return CARQUET_ERROR_INVALID_ARGUMENT;
-    }
-
+    /* schema and name are nonnull per API contract */
     /* Add element to schema */
     int32_t elem_idx = schema->num_elements;
     parquet_schema_element_t* elem = &schema->elements[elem_idx];
@@ -110,10 +107,7 @@ int32_t carquet_schema_add_group(
     carquet_field_repetition_t repetition,
     int32_t parent_index) {
 
-    if (!schema || !name) {
-        return -1;
-    }
-
+    /* schema and name are nonnull per API contract */
     /* For now, only support adding to root */
     if (parent_index != -1 && parent_index != 0) {
         return -1;
@@ -144,8 +138,7 @@ int32_t carquet_schema_find_column(
     const carquet_schema_t* schema,
     const char* name) {
 
-    if (!schema || !name) return -1;
-
+    /* schema and name are nonnull per API contract */
     /* Simple linear search */
     for (int32_t i = 0; i < schema->num_leaves; i++) {
         int32_t elem_idx = schema->leaf_indices[i];
@@ -159,18 +152,21 @@ int32_t carquet_schema_find_column(
 }
 
 int32_t carquet_schema_num_columns(const carquet_schema_t* schema) {
-    return schema ? schema->num_leaves : 0;
+    /* schema is nonnull per API contract */
+    return schema->num_leaves;
 }
 
 int32_t carquet_schema_num_elements(const carquet_schema_t* schema) {
-    return schema ? schema->num_elements : 0;
+    /* schema is nonnull per API contract */
+    return schema->num_elements;
 }
 
 const carquet_schema_node_t* carquet_schema_get_element(
     const carquet_schema_t* schema,
     int32_t index) {
 
-    if (!schema || index < 0 || index >= schema->num_elements) {
+    /* schema is nonnull per API contract */
+    if (index < 0 || index >= schema->num_elements) {
         return NULL;
     }
 
@@ -184,43 +180,43 @@ const carquet_schema_node_t* carquet_schema_get_element(
  */
 
 const char* carquet_schema_node_name(const carquet_schema_node_t* node) {
-    if (!node) return NULL;
+    /* node is nonnull per API contract */
     const parquet_schema_element_t* elem = (const parquet_schema_element_t*)node;
     return elem->name;
 }
 
 bool carquet_schema_node_is_leaf(const carquet_schema_node_t* node) {
-    if (!node) return false;
+    /* node is nonnull per API contract */
     const parquet_schema_element_t* elem = (const parquet_schema_element_t*)node;
     return elem->has_type;
 }
 
 carquet_physical_type_t carquet_schema_node_physical_type(const carquet_schema_node_t* node) {
-    if (!node) return CARQUET_PHYSICAL_BOOLEAN;
+    /* node is nonnull per API contract */
     const parquet_schema_element_t* elem = (const parquet_schema_element_t*)node;
     return elem->type;
 }
 
 const carquet_logical_type_t* carquet_schema_node_logical_type(const carquet_schema_node_t* node) {
-    if (!node) return NULL;
+    /* node is nonnull per API contract */
     const parquet_schema_element_t* elem = (const parquet_schema_element_t*)node;
     return elem->has_logical_type ? &elem->logical_type : NULL;
 }
 
 carquet_field_repetition_t carquet_schema_node_repetition(const carquet_schema_node_t* node) {
-    if (!node) return CARQUET_REPETITION_REQUIRED;
+    /* node is nonnull per API contract */
     const parquet_schema_element_t* elem = (const parquet_schema_element_t*)node;
     return elem->repetition_type;
 }
 
 int16_t carquet_schema_node_max_def_level(const carquet_schema_node_t* node) {
-    if (!node) return 0;
+    /* node is nonnull per API contract */
     const parquet_schema_element_t* elem = (const parquet_schema_element_t*)node;
     return (elem->repetition_type == CARQUET_REPETITION_OPTIONAL) ? 1 : 0;
 }
 
 int16_t carquet_schema_node_max_rep_level(const carquet_schema_node_t* node) {
-    if (!node) return 0;
+    /* node is nonnull per API contract */
     const parquet_schema_element_t* elem = (const parquet_schema_element_t*)node;
     return (elem->repetition_type == CARQUET_REPETITION_REPEATED) ? 1 : 0;
 }

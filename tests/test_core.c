@@ -35,11 +35,13 @@ static int test_arena_basic(void) {
     }
 
     void* p2 = carquet_arena_alloc(&arena, 200);
+    (void)p2;
     assert(p2 != NULL);
     assert(p2 != p1);
 
     /* Test calloc */
     int* arr = carquet_arena_calloc(&arena, 10, sizeof(int));
+    (void)arr;
     assert(arr != NULL);
     for (int i = 0; i < 10; i++) {
         assert(arr[i] == 0);
@@ -47,11 +49,13 @@ static int test_arena_basic(void) {
 
     /* Test strdup */
     char* s = carquet_arena_strdup(&arena, "Hello, World!");
+    (void)s;
     assert(s != NULL);
     assert(strcmp(s, "Hello, World!") == 0);
 
     /* Test reset */
     size_t allocated_before = carquet_arena_allocated(&arena);
+    (void)allocated_before;
     assert(allocated_before > 0);
 
     carquet_arena_reset(&arena);
@@ -59,6 +63,7 @@ static int test_arena_basic(void) {
 
     /* Can still allocate after reset */
     void* p3 = carquet_arena_alloc(&arena, 50);
+    (void)p3;
     assert(p3 != NULL);
 
     carquet_arena_destroy(&arena);
@@ -97,9 +102,12 @@ static int test_arena_save_restore(void) {
     }
 
     carquet_arena_mark_t mark = carquet_arena_save(&arena);
+    (void)mark;
     size_t allocated_at_mark = carquet_arena_allocated(&arena);
+    (void)allocated_at_mark;
 
     void* p2 = carquet_arena_alloc(&arena, 200);
+    (void)p2;
     assert(p2 != NULL);
 
     carquet_arena_restore(&arena, mark);
@@ -135,6 +143,7 @@ static int test_buffer_basic(void) {
 
     /* Verify contents */
     const uint8_t* ptr = carquet_buffer_data_const(&buf);
+    (void)ptr;
     assert(ptr[0] == 1 && ptr[5] == 6);
 
     carquet_buffer_destroy(&buf);
@@ -156,6 +165,7 @@ static int test_buffer_integers(void) {
     assert(carquet_buffer_append_u64_le(&buf, 0x123456789ABCDEF0ULL) == CARQUET_OK);
 
     const uint8_t* ptr = carquet_buffer_data_const(&buf);
+    (void)ptr;
 
     /* Verify u16 */
     assert(ptr[0] == 0x34 && ptr[1] == 0x12);
@@ -177,10 +187,12 @@ static int test_buffer_reader(void) {
     carquet_buffer_reader_init_data(&reader, data, sizeof(data));
 
     uint16_t u16;
+    (void)u16;
     assert(carquet_buffer_reader_read_u16_le(&reader, &u16) == CARQUET_OK);
     assert(u16 == 0x1234);
 
     uint32_t u32;
+    (void)u32;
     assert(carquet_buffer_reader_read_u32_le(&reader, &u32) == CARQUET_OK);
     assert(u32 == 0x12345678);
 
@@ -221,8 +233,10 @@ static int test_varint(void) {
 
     /* Test small value */
     int len = carquet_encode_varint32(buf, 127);
+    (void)len;
     assert(len == 1);
     int consumed = carquet_decode_varint32(buf, 10, &val32);
+    (void)consumed;
     assert(consumed == 1 && val32 == 127);
 
     /* Test larger value */
@@ -253,7 +267,9 @@ static int test_zigzag(void) {
     /* Roundtrip */
     for (int32_t i = -1000; i <= 1000; i++) {
         uint32_t encoded = carquet_zigzag_encode32(i);
+        (void)encoded;
         int32_t decoded = carquet_zigzag_decode32(encoded);
+        (void)decoded;
         assert(decoded == i);
     }
 
@@ -322,6 +338,7 @@ static int test_bitpack_roundtrip(void) {
 
         /* Verify */
         uint32_t mask = (1U << bit_width) - 1;
+        (void)mask;
         for (int i = 0; i < 8; i++) {
             assert((original[i] & mask) == unpacked[i]);
         }
@@ -344,6 +361,7 @@ static int test_bit_reader(void) {
 
     /* Read 4 bits */
     uint32_t nibble = carquet_bit_reader_read_bits(&reader, 4);
+    (void)nibble;
     assert(nibble == 0xD);  /* bits 4-7 of first byte: 0b1101 = 13 */
 
     TEST_PASS("bit_reader");

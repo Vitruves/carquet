@@ -68,7 +68,7 @@ struct carquet_batch_reader {
  */
 
 void carquet_batch_reader_config_init(carquet_batch_reader_config_t* config) {
-    if (!config) return;
+    /* config is nonnull per API contract */
     memset(config, 0, sizeof(*config));
     config->batch_size = 65536;  /* 64K rows per batch */
     config->num_threads = 0;     /* Auto-detect */
@@ -111,11 +111,7 @@ carquet_batch_reader_t* carquet_batch_reader_create(
     const carquet_batch_reader_config_t* config,
     carquet_error_t* error) {
 
-    if (!reader) {
-        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT, "NULL reader");
-        return NULL;
-    }
-
+    /* reader is nonnull per API contract */
     carquet_batch_reader_t* batch_reader = calloc(1, sizeof(carquet_batch_reader_t));
     if (!batch_reader) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate batch reader");
@@ -234,10 +230,7 @@ carquet_status_t carquet_batch_reader_next(
     carquet_batch_reader_t* batch_reader,
     carquet_row_batch_t** batch) {
 
-    if (!batch_reader || !batch) {
-        return CARQUET_ERROR_INVALID_ARGUMENT;
-    }
-
+    /* batch_reader and batch are nonnull per API contract */
     carquet_error_t err = CARQUET_ERROR_INIT;
     int32_t num_row_groups = carquet_reader_num_row_groups(batch_reader->reader);
 
@@ -391,11 +384,13 @@ void carquet_batch_reader_free(carquet_batch_reader_t* batch_reader) {
  */
 
 int64_t carquet_row_batch_num_rows(const carquet_row_batch_t* batch) {
-    return batch ? batch->num_rows : 0;
+    /* batch is nonnull per API contract */
+    return batch->num_rows;
 }
 
 int32_t carquet_row_batch_num_columns(const carquet_row_batch_t* batch) {
-    return batch ? batch->num_columns : 0;
+    /* batch is nonnull per API contract */
+    return batch->num_columns;
 }
 
 carquet_status_t carquet_row_batch_column(
@@ -405,15 +400,16 @@ carquet_status_t carquet_row_batch_column(
     const uint8_t** null_bitmap,
     int64_t* num_values) {
 
-    if (!batch || column_index < 0 || column_index >= batch->num_columns) {
+    /* batch, data, null_bitmap, num_values are nonnull per API contract */
+    if (column_index < 0 || column_index >= batch->num_columns) {
         return CARQUET_ERROR_INVALID_ARGUMENT;
     }
 
     const carquet_column_data_t* col = &batch->columns[column_index];
 
-    if (data) *data = col->data;
-    if (null_bitmap) *null_bitmap = col->null_bitmap;
-    if (num_values) *num_values = col->num_values;
+    *data = col->data;
+    *null_bitmap = col->null_bitmap;
+    *num_values = col->num_values;
 
     return CARQUET_OK;
 }

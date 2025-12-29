@@ -220,7 +220,7 @@ static int read_parquet_file(const char* filename) {
         printf("  Row group %d:\n", rg);
 
         carquet_row_group_metadata_t rg_meta;
-        carquet_reader_row_group_metadata(reader, rg, &rg_meta);
+(void)carquet_reader_row_group_metadata(reader, rg, &rg_meta);
         printf("    Rows: %lld\n", (long long)rg_meta.num_rows);
 
         /* Read first column (id) */

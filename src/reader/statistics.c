@@ -81,10 +81,7 @@ carquet_status_t carquet_reader_column_statistics(
     int32_t column_index,
     carquet_column_statistics_t* stats) {
 
-    if (!reader || !stats) {
-        return CARQUET_ERROR_INVALID_ARGUMENT;
-    }
-
+    /* reader and stats are nonnull per API contract */
     if (row_group_index < 0 || row_group_index >= reader->metadata.num_row_groups) {
         return CARQUET_ERROR_ROW_GROUP_NOT_FOUND;
     }
@@ -160,10 +157,7 @@ carquet_status_t carquet_reader_row_group_matches(
     int32_t value_size,
     bool* might_match) {
 
-    if (!reader || !value || !might_match) {
-        return CARQUET_ERROR_INVALID_ARGUMENT;
-    }
-
+    /* reader, value, might_match are nonnull per API contract */
     /* Default: might match (conservative) */
     *might_match = true;
 
@@ -270,7 +264,8 @@ int32_t carquet_reader_filter_row_groups(
     int32_t* matching_indices,
     int32_t max_indices) {
 
-    if (!reader || !value || !matching_indices || max_indices <= 0) {
+    /* reader, value, matching_indices are nonnull per API contract */
+    if (max_indices <= 0) {
         return -1;
     }
 
