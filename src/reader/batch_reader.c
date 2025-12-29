@@ -152,12 +152,13 @@ carquet_batch_reader_t* carquet_batch_reader_create(
         }
 
         for (int32_t i = 0; i < batch_reader->num_projected; i++) {
-            int32_t idx = resolve_column_name(reader, batch_reader->config.column_names[i]);
+            const char* col_name = batch_reader->config.column_names[i];
+            int32_t idx = resolve_column_name(reader, col_name);
             if (idx < 0) {
                 free(batch_reader->projected_columns);
                 free(batch_reader);
                 CARQUET_SET_ERROR(error, CARQUET_ERROR_COLUMN_NOT_FOUND,
-                    "Column not found: %s", batch_reader->config.column_names[i]);
+                    "Column not found: %s", col_name);
                 return NULL;
             }
             batch_reader->projected_columns[i] = idx;

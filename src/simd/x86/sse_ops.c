@@ -240,8 +240,6 @@ void carquet_sse_byte_stream_split_encode_double(
 
     /* Process 2 doubles (16 bytes) at a time */
     for (; i + 2 <= count; i += 2) {
-        __m128i v = _mm_loadu_si128((const __m128i*)(src + i * 8));
-
         /* Transpose using shuffles for 8 byte streams */
         for (int b = 0; b < 8; b++) {
             output[b * count + i + 0] = ((const uint8_t*)(src + i * 8))[0 + b];

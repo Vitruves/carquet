@@ -138,7 +138,8 @@ carquet_status_t carquet_init(void) {
 
 const carquet_cpu_info_t* carquet_get_cpu_info(void) {
     if (!g_initialized) {
-        (void)carquet_init();
+        carquet_status_t status = carquet_init();
+        (void)status; /* Ignore - we'll return info regardless */
     }
     return &g_cpu_info;
 }

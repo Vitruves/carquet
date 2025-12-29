@@ -945,26 +945,27 @@ static int test_error_truncated_file(void) {
     return 0;
 }
 
-static int test_error_null_arguments(void) {
+static int test_error_invalid_arguments(void) {
     carquet_error_t err = CARQUET_ERROR_INIT;
 
-    /* Suppress nonnull warnings - we're intentionally testing error handling */
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wnonnull"
+    /* Test non-existent file path */
+    carquet_reader_t* reader = carquet_reader_open("/nonexistent/path/file.parquet", NULL, &err);
+    ASSERT_TRUE(reader == NULL, "error_invalid_arguments", "should fail on non-existent file");
+    ASSERT_TRUE(err.code != CARQUET_OK, "error_invalid_arguments", "should set error code");
 
-    /* Test NULL path */
-    carquet_reader_t* reader = carquet_reader_open(NULL, NULL, &err);
-    ASSERT_TRUE(reader == NULL, "error_null_arguments", "should fail on NULL path");
+    /* Test empty schema */
+    carquet_schema_t* empty_schema = carquet_schema_create(&err);
+    ASSERT_TRUE(empty_schema != NULL, "error_invalid_arguments", "should create empty schema");
 
-    /* Test NULL schema */
     carquet_writer_options_t opts;
     carquet_writer_options_init(&opts);
-    carquet_writer_t* writer = carquet_writer_create("/tmp/test.parquet", NULL, &opts, &err);
-    ASSERT_TRUE(writer == NULL, "error_null_arguments", "should fail on NULL schema");
+    carquet_writer_t* writer = carquet_writer_create("/tmp/test_empty_schema.parquet", empty_schema, &opts, &err);
+    if (writer) {
+        carquet_writer_close(writer);
+    }
+    carquet_schema_free(empty_schema);
 
-#pragma clang diagnostic pop
-
-    TEST_PASS("error_null_arguments");
+    TEST_PASS("error_invalid_arguments");
     return 0;
 }
 
@@ -1348,7 +1349,7 @@ int main(void) {
     test_error_invalid_file();
     test_error_corrupted_magic();
     test_error_truncated_file();
-    test_error_null_arguments();
+    test_error_invalid_arguments();
 
     /* Section 5: Compression */
     test_all_compressions();

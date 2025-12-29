@@ -453,7 +453,6 @@ carquet_writer_t* carquet_writer_create(
     const carquet_writer_options_t* options,
     carquet_error_t* error) {
 
-    /* path and schema are nonnull per API contract */
     carquet_writer_t* writer = calloc(1, sizeof(carquet_writer_t));
     if (!writer) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate writer");

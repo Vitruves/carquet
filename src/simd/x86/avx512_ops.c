@@ -30,12 +30,16 @@
  * Unpack 32 8-bit values to 32-bit using AVX-512.
  */
 void carquet_avx512_bitunpack32_8bit(const uint8_t* input, uint32_t* values) {
-    /* Load 32 bytes */
-    __m256i bytes = _mm256_loadu_si256((const __m256i*)input);
+    /* Load 32 bytes as two 128-bit halves */
+    __m128i bytes_lo = _mm_loadu_si128((const __m128i*)input);
+    __m128i bytes_hi = _mm_loadu_si128((const __m128i*)(input + 16));
 
-    /* Expand to 32-bit using AVX-512 */
-    __m512i result = _mm512_cvtepu8_epi32(bytes);
-    _mm512_storeu_si512((__m512i*)values, result);
+    /* Expand each half to 32-bit using AVX-512 (16 x 8-bit -> 16 x 32-bit) */
+    __m512i result_lo = _mm512_cvtepu8_epi32(bytes_lo);
+    __m512i result_hi = _mm512_cvtepu8_epi32(bytes_hi);
+
+    _mm512_storeu_si512((__m512i*)values, result_lo);
+    _mm512_storeu_si512((__m512i*)(values + 16), result_hi);
 }
 
 /**
@@ -59,16 +63,16 @@ void carquet_avx512_bitunpack32_4bit(const uint8_t* input, uint32_t* values) {
     __m128i hi_nibbles = _mm_srli_epi16(bytes, 4);
     hi_nibbles = _mm_and_si128(hi_nibbles, _mm_set1_epi8(0x0F));
 
-    /* Interleave to get correct order */
+    /* Interleave to get correct order - produces two 128-bit results */
     __m128i interleaved_lo = _mm_unpacklo_epi8(lo_nibbles, hi_nibbles);
     __m128i interleaved_hi = _mm_unpackhi_epi8(lo_nibbles, hi_nibbles);
 
-    /* Combine into 256-bit */
-    __m256i combined = _mm256_set_m128i(interleaved_hi, interleaved_lo);
+    /* Expand each half to 32-bit using AVX-512 (16 x 8-bit -> 16 x 32-bit) */
+    __m512i result_lo = _mm512_cvtepu8_epi32(interleaved_lo);
+    __m512i result_hi = _mm512_cvtepu8_epi32(interleaved_hi);
 
-    /* Expand to 32-bit using AVX-512 */
-    __m512i result = _mm512_cvtepu8_epi32(combined);
-    _mm512_storeu_si512((__m512i*)values, result);
+    _mm512_storeu_si512((__m512i*)values, result_lo);
+    _mm512_storeu_si512((__m512i*)(values + 16), result_hi);
 }
 
 /* ============================================================================

@@ -215,9 +215,11 @@ static uint32_t scalar_crc32c(uint32_t crc, const uint8_t* data, size_t len) {
  * ============================================================================
  */
 
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+/* Use CMake defines instead of compiler intrinsic macros, since dispatch.c
+ * is not compiled with -msse4.2/-mavx2/-mavx512f flags */
+#if defined(CARQUET_ARCH_X86)
 
-#ifdef __SSE4_2__
+#ifdef CARQUET_ENABLE_SSE
 extern void carquet_sse_prefix_sum_i32(int32_t* values, int64_t count, int32_t initial);
 extern void carquet_sse_prefix_sum_i64(int64_t* values, int64_t count, int64_t initial);
 extern void carquet_sse_gather_i32(const int32_t* dict, const uint32_t* indices,
@@ -237,7 +239,7 @@ extern void carquet_sse_pack_bools(const uint8_t* input, uint8_t* output, int64_
 extern uint32_t carquet_sse_crc32c(uint32_t crc, const uint8_t* data, size_t len);
 #endif
 
-#ifdef __AVX2__
+#ifdef CARQUET_ENABLE_AVX2
 extern void carquet_avx2_prefix_sum_i32(int32_t* values, int64_t count, int32_t initial);
 extern void carquet_avx2_prefix_sum_i64(int64_t* values, int64_t count, int64_t initial);
 extern void carquet_avx2_gather_i32(const int32_t* dict, const uint32_t* indices,
@@ -257,7 +259,7 @@ extern void carquet_avx2_pack_bools(const uint8_t* input, uint8_t* output, int64
 extern int64_t carquet_avx2_find_run_length_i32(const int32_t* values, int64_t count);
 #endif
 
-#ifdef __AVX512F__
+#ifdef CARQUET_ENABLE_AVX512
 extern void carquet_avx512_prefix_sum_i32(int32_t* values, int64_t count, int32_t initial);
 extern void carquet_avx512_prefix_sum_i64(int64_t* values, int64_t count, int64_t initial);
 extern void carquet_avx512_gather_i32(const int32_t* dict, const uint32_t* indices,
@@ -273,7 +275,7 @@ extern void carquet_avx512_pack_bools(const uint8_t* input, uint8_t* output, int
 extern int64_t carquet_avx512_find_run_length_i32(const int32_t* values, int64_t count);
 #endif
 
-#endif /* x86 */
+#endif /* CARQUET_ARCH_X86 */
 
 #if defined(__aarch64__)
 
@@ -346,9 +348,9 @@ void carquet_simd_dispatch_init(void) {
     g_dispatch.find_run_length_i32 = scalar_find_run_length_i32;
     g_dispatch.crc32c = scalar_crc32c;
 
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+#if defined(CARQUET_ARCH_X86)
 
-#ifdef __SSE4_2__
+#ifdef CARQUET_ENABLE_SSE
     if (cpu->has_sse42) {
         g_dispatch.prefix_sum_i32 = carquet_sse_prefix_sum_i32;
         g_dispatch.prefix_sum_i64 = carquet_sse_prefix_sum_i64;
@@ -364,7 +366,7 @@ void carquet_simd_dispatch_init(void) {
     }
 #endif
 
-#ifdef __AVX2__
+#ifdef CARQUET_ENABLE_AVX2
     if (cpu->has_avx2) {
         g_dispatch.prefix_sum_i32 = carquet_avx2_prefix_sum_i32;
         g_dispatch.prefix_sum_i64 = carquet_avx2_prefix_sum_i64;
@@ -380,7 +382,7 @@ void carquet_simd_dispatch_init(void) {
     }
 #endif
 
-#ifdef __AVX512F__
+#ifdef CARQUET_ENABLE_AVX512
     if (cpu->has_avx512f) {
         g_dispatch.prefix_sum_i32 = carquet_avx512_prefix_sum_i32;
         g_dispatch.prefix_sum_i64 = carquet_avx512_prefix_sum_i64;
@@ -394,7 +396,7 @@ void carquet_simd_dispatch_init(void) {
     }
 #endif
 
-#endif /* x86 */
+#endif /* CARQUET_ARCH_X86 */
 
 #if defined(__aarch64__)
 

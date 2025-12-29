@@ -296,7 +296,6 @@ carquet_reader_t* carquet_reader_open(
     const carquet_reader_options_t* options,
     carquet_error_t* error) {
 
-    /* path is nonnull per API contract */
     FILE* file = fopen(path, "rb");
     if (!file) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_OPEN, "Failed to open file: %s", path);

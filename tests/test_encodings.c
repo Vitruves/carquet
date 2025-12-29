@@ -168,7 +168,10 @@ static int test_rle_alternating(void) {
     carquet_buffer_t buf;
     carquet_buffer_init(&buf);
 
-    assert(carquet_rle_encode_all(input, 16, 1, &buf) == CARQUET_OK);
+    carquet_status_t status = carquet_rle_encode_all(input, 16, 1, &buf);
+    assert(status == CARQUET_OK);
+    (void)status;
+    (void)input[0];  /* Silence false -Wunused-but-set-variable warning */
 
     uint32_t output[16];
     int64_t count = carquet_rle_decode_all(
@@ -196,7 +199,10 @@ static int test_rle_decoder_skip(void) {
     carquet_buffer_t buf;
     carquet_buffer_init(&buf);
 
-    assert(carquet_rle_encode_all(input, 100, 4, &buf) == CARQUET_OK);
+    carquet_status_t status = carquet_rle_encode_all(input, 100, 4, &buf);
+    assert(status == CARQUET_OK);
+    (void)status;
+    (void)input[0];  /* Silence false -Wunused-but-set-variable warning */
 
     carquet_rle_decoder_t dec;
     carquet_rle_decoder_init(&dec,

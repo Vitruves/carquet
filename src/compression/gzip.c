@@ -780,7 +780,7 @@ int carquet_gzip_compress(
 
         if (match_len >= DEFLATE_MIN_MATCH) {
             /* Emit length/distance pair */
-            int extra_bits, extra_value;
+            int extra_bits = 0, extra_value = 0;
             int length_code = get_length_code(match_len, &extra_bits, &extra_value);
 
             huffman_code_t* lc = &g_fixed_litlen_codes[length_code];

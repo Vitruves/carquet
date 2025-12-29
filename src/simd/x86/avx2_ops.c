@@ -30,10 +30,6 @@
  * Input: 8 bytes, Output: 64 x uint32_t
  */
 void carquet_avx2_bitunpack64_1bit(const uint8_t* input, uint32_t* values) {
-    /* Load 8 bytes */
-    __m128i bytes = _mm_loadl_epi64((const __m128i*)input);
-    __m256i wide_bytes = _mm256_cvtepu8_epi32(bytes);
-
     /* For each byte, extract bits */
     for (int b = 0; b < 8; b++) {
         uint8_t byte_val = input[b];
@@ -223,8 +219,6 @@ void carquet_avx2_byte_stream_split_encode_double(
 
     /* Process 4 doubles (32 bytes) at a time */
     for (; i + 4 <= count; i += 4) {
-        __m256i v = _mm256_loadu_si256((const __m256i*)(src + i * 8));
-
         /* Transpose - extract each byte position */
         for (int b = 0; b < 8; b++) {
             output[b * count + i + 0] = src[i * 8 + 0 + b];
@@ -585,13 +579,6 @@ void carquet_avx2_pack_bools(const uint8_t* input, uint8_t* output, int64_t coun
     /* Process 8 bools at a time using movemask */
     for (; i + 8 <= count; i += 8) {
         __m128i bools = _mm_loadl_epi64((const __m128i*)(input + i));
-
-        /* Compare with zero - gives 0xFF for non-zero, 0x00 for zero */
-        __m128i cmp = _mm_cmpgt_epi8(bools, _mm_setzero_si128());
-
-        /* Use movemask to pack - gets MSB of each byte */
-        /* But we need LSB order, so shift each byte left by 7 first */
-        __m128i shifted = _mm_slli_epi16(cmp, 7);  /* Move comparison bit to MSB position */
 
         /* Actually simpler: multiply by bit positions */
         __m128i mult = _mm_set_epi8(0, 0, 0, 0, 0, 0, 0, 0,
