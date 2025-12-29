@@ -3,7 +3,7 @@
  * @brief Carquet - High-Performance Pure C Parquet Library
  * @version 0.1.0
  *
- * @copyright Copyright (c) 2024. All rights reserved.
+ * @copyright Copyright (c) 2025. All rights reserved.
  * @license MIT License
  *
  * Carquet is a production-ready, zero-dependency pure C11 library for reading

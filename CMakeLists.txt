@@ -249,6 +249,13 @@ if(CARQUET_BUILD_TESTS)
     add_carquet_test(test_production tests/test_production.c)
     add_carquet_test(test_maturity tests/test_maturity.c)
     add_carquet_test(test_large_schema tests/test_large_schema.c)
+
+    # Edge case tests
+    add_carquet_test(test_edge_encodings tests/test_edge_encodings.c)
+    add_carquet_test(test_edge_compression tests/test_edge_compression.c)
+    add_carquet_test(test_edge_malformed tests/test_edge_malformed.c)
+    add_carquet_test(test_edge_boundaries tests/test_edge_boundaries.c)
+    add_carquet_test(test_edge_io tests/test_edge_io.c)
 endif()
 
 # Examples

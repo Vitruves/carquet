@@ -605,6 +605,7 @@ static int decode_literals(zstd_dctx_t* ctx, const uint8_t* data, size_t size,
         }
 
         if (pos + lit_size > size) return -1;
+        if (lit_size > ZSTD_MAX_LITERALS) return -1;
         memcpy(out, data + pos, lit_size);
         *out_size = lit_size;
         *consumed = pos + lit_size;
@@ -636,6 +637,7 @@ static int decode_literals(zstd_dctx_t* ctx, const uint8_t* data, size_t size,
         }
 
         if (pos >= size) return -1;
+        if (lit_size > ZSTD_MAX_LITERALS) return -1;
         memset(out, data[pos], lit_size);
         *out_size = lit_size;
         *consumed = pos + 1;
@@ -1783,4 +1785,13 @@ int carquet_zstd_compress(
 
 size_t carquet_zstd_compress_bound(size_t src_size) {
     return src_size + (src_size / ZSTD_BLOCK_SIZE_MAX + 1) * 3 + 32;
+}
+
+/* ============================================================================
+ * Thread-safe Initialization
+ * ============================================================================
+ */
+
+void carquet_zstd_init_tables(void) {
+    init_default_tables();
 }

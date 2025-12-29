@@ -161,8 +161,8 @@ static carquet_status_t delta_decoder_read_mini_block(delta_decoder_t* dec) {
         for (int i = 0; i < mini_block_size; i++) {
             dec->mini_block_values[i] = dec->min_delta;
         }
-    } else {
-        /* Unpack bit-packed deltas */
+    } else if (bit_width <= 32) {
+        /* Unpack bit-packed deltas (32-bit) */
         size_t packed_size = (mini_block_size * bit_width + 7) / 8;
         if (dec->pos + packed_size > dec->size) {
             return CARQUET_ERROR_DECODE;
@@ -176,6 +176,21 @@ static carquet_status_t delta_decoder_read_mini_block(delta_decoder_t* dec) {
         }
 
         dec->pos += packed_size;
+    } else {
+        /* Unpack 64-bit values (stored as little-endian bytes) */
+        int bytes_per_value = (bit_width + 7) / 8;
+        size_t packed_size = mini_block_size * bytes_per_value;
+        if (dec->pos + packed_size > dec->size) {
+            return CARQUET_ERROR_DECODE;
+        }
+
+        for (int i = 0; i < mini_block_size; i++) {
+            uint64_t val = 0;
+            for (int b = 0; b < bytes_per_value; b++) {
+                val |= (uint64_t)dec->data[dec->pos++] << (b * 8);
+            }
+            dec->mini_block_values[i] = dec->min_delta + (int64_t)val;
+        }
     }
 
     dec->current_mini_block++;
@@ -305,7 +320,7 @@ static size_t write_uleb128(uint8_t* data, uint64_t value) {
 }
 
 static uint64_t zigzag_encode64(int64_t n) {
-    return (uint64_t)((n << 1) ^ (n >> 63));
+    return ((uint64_t)n << 1) ^ (n >> 63);
 }
 
 static int bit_width_required(uint64_t value) {
@@ -372,18 +387,34 @@ static carquet_status_t delta_encoder_flush_block(delta_encoder_t* enc) {
 
         if (bit_widths[mb] == 0) continue;
 
-        /* Pack values */
-        uint32_t to_pack[DELTA_MINI_BLOCK_SIZE];
-        for (int i = start; i < end; i++) {
-            to_pack[i - start] = (uint32_t)(enc->deltas[i] - min_delta);
+        /* Pack values - use 64-bit packing for large bit widths */
+        if (bit_widths[mb] <= 32) {
+            uint32_t to_pack[DELTA_MINI_BLOCK_SIZE];
+            for (int i = start; i < end; i++) {
+                to_pack[i - start] = (uint32_t)(enc->deltas[i] - min_delta);
+            }
+            /* Pad with zeros */
+            for (int i = end - start; i < mini_block_size; i++) {
+                to_pack[i] = 0;
+            }
+            enc->pos += carquet_bitpack_32(to_pack, mini_block_size,
+                                            bit_widths[mb], enc->data + enc->pos);
+        } else {
+            /* For bit widths > 32, pack directly as bytes (little-endian) */
+            int bytes_per_value = (bit_widths[mb] + 7) / 8;
+            for (int i = start; i < end; i++) {
+                uint64_t adjusted = (uint64_t)(enc->deltas[i] - min_delta);
+                for (int b = 0; b < bytes_per_value; b++) {
+                    enc->data[enc->pos++] = (uint8_t)(adjusted >> (b * 8));
+                }
+            }
+            /* Pad with zeros */
+            for (int i = end - start; i < mini_block_size; i++) {
+                for (int b = 0; b < bytes_per_value; b++) {
+                    enc->data[enc->pos++] = 0;
+                }
+            }
         }
-        /* Pad with zeros */
-        for (int i = end - start; i < mini_block_size; i++) {
-            to_pack[i] = 0;
-        }
-
-        enc->pos += carquet_bitpack_32(to_pack, mini_block_size,
-                                        bit_widths[mb], enc->data + enc->pos);
     }
 
     enc->delta_count = 0;

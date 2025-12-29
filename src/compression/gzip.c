@@ -415,7 +415,10 @@ int carquet_gzip_decompress(
 
         if (btype == DEFLATE_BLOCK_STORED) {
             /* Stored (uncompressed) block */
-            /* Skip to byte boundary */
+            /* Skip to byte boundary - need to calculate actual position
+             * since bit reader loads bytes greedily ahead */
+            size_t bits_consumed = br.pos * 8 - (size_t)br.num_bits;
+            br.pos = (bits_consumed + 7) / 8;  /* Round up to next byte */
             br.bits = 0;
             br.num_bits = 0;
 
@@ -665,7 +668,7 @@ static int find_match(const match_finder_t* mf,
 
     int cur = mf->head[h];
     while (cur >= limit && chain_len-- > 0) {
-        if (src[cur + best_len] == src[pos + best_len]) {
+        if (pos < src_size - best_len && src[cur + best_len] == src[pos + best_len]) {
             /* Check full match */
             int len = 0;
             int max_len = src_size - pos;
@@ -806,9 +809,12 @@ int carquet_gzip_compress(
                 }
             }
 
-            /* Insert all positions of the match into hash table */
+            /* Insert all positions of the match into hash table.
+             * hash3() reads 3 bytes, so stop 2 positions before the end
+             * to avoid reading past the match boundary. */
             if (mf) {
-                for (int i = 0; i < match_len; i++) {
+                int insert_count = match_len - 2;
+                for (int i = 0; i < insert_count; i++) {
                     match_finder_insert(mf, src, pos + i);
                 }
             }
@@ -851,4 +857,13 @@ int carquet_gzip_compress(
 size_t carquet_gzip_compress_bound(size_t src_size) {
     /* Worst case: stored blocks with headers */
     return src_size + (src_size / 65535 + 1) * 5 + 10;
+}
+
+/* ============================================================================
+ * Thread-safe Initialization
+ * ============================================================================
+ */
+
+void carquet_gzip_init_tables(void) {
+    build_fixed_tables();
 }

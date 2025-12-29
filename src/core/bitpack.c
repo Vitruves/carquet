@@ -139,7 +139,8 @@ void carquet_bitunpack8_32(const uint8_t* input, int bit_width, uint32_t* values
     }
 
     /* General case for 9-32 bits */
-    uint32_t mask = (1U << bit_width) - 1;
+    /* Use 64-bit shift to avoid UB when bit_width=32 */
+    uint32_t mask = (uint32_t)((1ULL << bit_width) - 1);
     int bit_pos = 0;
     int byte_pos = 0;
 
@@ -222,7 +223,8 @@ void carquet_bitpack8_32(const uint32_t* values, int bit_width, uint8_t* output)
     /* General packing */
     memset(output, 0, bit_width);
 
-    uint32_t mask = (1U << bit_width) - 1;
+    /* Use 64-bit shift to avoid UB when bit_width=32 */
+    uint32_t mask = (uint32_t)((1ULL << bit_width) - 1);
     int bit_pos = 0;
 
     for (int i = 0; i < 8; i++) {

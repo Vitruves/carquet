@@ -29,7 +29,11 @@
 #endif
 
 static carquet_cpu_info_t g_cpu_info = {0};
-static int g_initialized = 0;
+static volatile int g_initialized = 0;
+
+/* External initialization functions for compression tables */
+extern void carquet_gzip_init_tables(void);
+extern void carquet_zstd_init_tables(void);
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 
@@ -120,10 +124,12 @@ static void detect_arm_features(void) {
 #endif
 
 carquet_status_t carquet_init(void) {
+    /* Fast path: already initialized */
     if (g_initialized) {
         return CARQUET_OK;
     }
 
+    /* Initialize CPU feature detection */
     memset(&g_cpu_info, 0, sizeof(g_cpu_info));
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
@@ -132,7 +138,23 @@ carquet_status_t carquet_init(void) {
     detect_arm_features();
 #endif
 
+    /* Initialize compression lookup tables.
+     * This ensures tables are built before any multi-threaded use,
+     * making compression/decompression thread-safe. */
+    carquet_gzip_init_tables();
+    carquet_zstd_init_tables();
+
+    /* Use memory barrier to ensure all writes are visible before flag is set.
+     * Note: For full thread safety, callers should ensure carquet_init()
+     * is called once before spawning threads that use carquet. */
+#if defined(__GNUC__) || defined(__clang__)
+    __atomic_store_n(&g_initialized, 1, __ATOMIC_RELEASE);
+#elif defined(_MSC_VER)
+    _InterlockedExchange((volatile long*)&g_initialized, 1);
+#else
     g_initialized = 1;
+#endif
+
     return CARQUET_OK;
 }
 
