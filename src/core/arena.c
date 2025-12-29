@@ -1,0 +1,258 @@
+/**
+ * @file arena.c
+ * @brief Arena (bump) memory allocator implementation
+ */
+
+#include "arena.h"
+#include <stdlib.h>
+#include <string.h>
+
+/* ============================================================================
+ * Internal Helpers
+ * ============================================================================
+ */
+
+static inline size_t align_up(size_t value, size_t alignment) {
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
+static carquet_arena_block_t* arena_new_block(size_t min_size) {
+    size_t block_size = min_size < CARQUET_ARENA_DEFAULT_BLOCK_SIZE
+                            ? CARQUET_ARENA_DEFAULT_BLOCK_SIZE
+                            : align_up(min_size, CARQUET_ARENA_DEFAULT_BLOCK_SIZE);
+
+    carquet_arena_block_t* block = (carquet_arena_block_t*)malloc(
+        sizeof(carquet_arena_block_t) + block_size);
+
+    if (!block) {
+        return NULL;
+    }
+
+    block->next = NULL;
+    block->size = block_size;
+    block->used = 0;
+
+    return block;
+}
+
+/* ============================================================================
+ * Arena Operations
+ * ============================================================================
+ */
+
+carquet_status_t carquet_arena_init(carquet_arena_t* arena) {
+    return carquet_arena_init_size(arena, CARQUET_ARENA_DEFAULT_BLOCK_SIZE);
+}
+
+carquet_status_t carquet_arena_init_size(carquet_arena_t* arena, size_t block_size) {
+    if (!arena) {
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    /* Zero-initialize the arena structure first */
+    arena->head = NULL;
+    arena->current = NULL;
+    arena->default_block_size = block_size;
+    arena->total_allocated = 0;
+    arena->total_capacity = 0;
+
+    arena->head = arena_new_block(block_size);
+    if (!arena->head) {
+        return CARQUET_ERROR_OUT_OF_MEMORY;
+    }
+
+    arena->current = arena->head;
+    arena->total_capacity = arena->head->size;
+
+    return CARQUET_OK;
+}
+
+void carquet_arena_destroy(carquet_arena_t* arena) {
+    if (!arena) {
+        return;
+    }
+
+    carquet_arena_block_t* block = arena->head;
+    while (block) {
+        carquet_arena_block_t* next = block->next;
+        free(block);
+        block = next;
+    }
+
+    arena->head = NULL;
+    arena->current = NULL;
+    arena->total_allocated = 0;
+    arena->total_capacity = 0;
+}
+
+void carquet_arena_reset(carquet_arena_t* arena) {
+    if (!arena) {
+        return;
+    }
+
+    /* Reset all blocks to empty */
+    carquet_arena_block_t* block = arena->head;
+    while (block) {
+        block->used = 0;
+        block = block->next;
+    }
+
+    arena->current = arena->head;
+    arena->total_allocated = 0;
+}
+
+void* carquet_arena_alloc(carquet_arena_t* arena, size_t size) {
+    return carquet_arena_alloc_aligned(arena, size, CARQUET_ARENA_ALIGNMENT);
+}
+
+void* carquet_arena_alloc_aligned(carquet_arena_t* arena, size_t size, size_t alignment) {
+    if (!arena || size == 0) {
+        return NULL;
+    }
+
+    /* Ensure alignment is power of 2 and at least 1 */
+    if (alignment == 0) {
+        alignment = 1;
+    }
+
+    carquet_arena_block_t* block = arena->current;
+
+    /* Safety check - current block must exist */
+    if (!block) {
+        return NULL;
+    }
+
+    /* Calculate aligned offset */
+    size_t aligned_offset = align_up(block->used, alignment);
+    size_t new_used = aligned_offset + size;
+
+    /* Check if current block has space */
+    if (new_used <= block->size) {
+        void* ptr = block->data + aligned_offset;
+        block->used = new_used;
+        arena->total_allocated += size;
+        return ptr;
+    }
+
+    /* Try next blocks */
+    while (block->next) {
+        block = block->next;
+        aligned_offset = align_up(block->used, alignment);
+        new_used = aligned_offset + size;
+
+        if (new_used <= block->size) {
+            arena->current = block;
+            void* ptr = block->data + aligned_offset;
+            block->used = new_used;
+            arena->total_allocated += size;
+            return ptr;
+        }
+    }
+
+    /* Need new block */
+    size_t needed = size + alignment;  /* Worst case alignment overhead */
+    size_t block_size = needed > arena->default_block_size
+                            ? needed
+                            : arena->default_block_size;
+
+    carquet_arena_block_t* new_block = arena_new_block(block_size);
+    if (!new_block) {
+        return NULL;
+    }
+
+    /* Link new block */
+    block->next = new_block;
+    arena->current = new_block;
+    arena->total_capacity += new_block->size;
+
+    /* Allocate from new block */
+    aligned_offset = align_up(new_block->used, alignment);
+    new_block->used = aligned_offset + size;
+    arena->total_allocated += size;
+
+    return new_block->data + aligned_offset;
+}
+
+void* carquet_arena_calloc(carquet_arena_t* arena, size_t count, size_t size) {
+    size_t total = count * size;
+
+    /* Check for overflow */
+    if (count != 0 && total / count != size) {
+        return NULL;
+    }
+
+    void* ptr = carquet_arena_alloc(arena, total);
+    if (ptr) {
+        memset(ptr, 0, total);
+    }
+    return ptr;
+}
+
+char* carquet_arena_strdup(carquet_arena_t* arena, const char* str) {
+    if (!str) {
+        return NULL;
+    }
+    return carquet_arena_strndup(arena, str, strlen(str));
+}
+
+char* carquet_arena_strndup(carquet_arena_t* arena, const char* str, size_t max_len) {
+    if (!str) {
+        return NULL;
+    }
+
+    size_t len = 0;
+    while (len < max_len && str[len]) {
+        len++;
+    }
+
+    char* copy = (char*)carquet_arena_alloc_aligned(arena, len + 1, 1);
+    if (copy) {
+        memcpy(copy, str, len);
+        copy[len] = '\0';
+    }
+    return copy;
+}
+
+void* carquet_arena_memdup(carquet_arena_t* arena, const void* src, size_t size) {
+    if (!src || size == 0) {
+        return NULL;
+    }
+
+    void* copy = carquet_arena_alloc(arena, size);
+    if (copy) {
+        memcpy(copy, src, size);
+    }
+    return copy;
+}
+
+/* ============================================================================
+ * Save/Restore
+ * ============================================================================
+ */
+
+carquet_arena_mark_t carquet_arena_save(const carquet_arena_t* arena) {
+    carquet_arena_mark_t mark = {
+        .block = arena->current,
+        .used = arena->current ? arena->current->used : 0,
+        .total_allocated = arena->total_allocated,
+    };
+    return mark;
+}
+
+void carquet_arena_restore(carquet_arena_t* arena, carquet_arena_mark_t mark) {
+    if (!arena || !mark.block) {
+        return;
+    }
+
+    /* Reset blocks after the marked block */
+    carquet_arena_block_t* block = mark.block->next;
+    while (block) {
+        block->used = 0;
+        block = block->next;
+    }
+
+    /* Restore marked block state */
+    mark.block->used = mark.used;
+    arena->current = mark.block;
+    arena->total_allocated = mark.total_allocated;
+}
