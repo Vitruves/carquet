@@ -1,10 +1,10 @@
 # Carquet
 
-A high-performance, zero-dependency pure C library for reading and writing Apache Parquet files.
+A high-performance pure C library for reading and writing Apache Parquet files.
 
 ## Features
 
-- **Pure C11** - No external dependencies, easy to embed in any project
+- **Pure C11** - Minimal dependencies (zstd, zlib for compression), easy to embed
 - **SIMD Optimized** - Automatic CPU detection and dispatch for SSE4.2, AVX2, AVX-512, NEON, and SVE
 - **Complete Parquet Support**:
   - All physical types (BOOLEAN, INT32, INT64, INT96, FLOAT, DOUBLE, BYTE_ARRAY, FIXED_LEN_BYTE_ARRAY)
@@ -41,6 +41,7 @@ A high-performance, zero-dependency pure C library for reading and writing Apach
 
 - C11-compatible compiler (GCC 4.9+, Clang 3.4+, MSVC 2015+)
 - CMake 3.16+
+- zstd and zlib (automatically fetched if not found)
 
 ### Basic Build
 
@@ -777,16 +778,14 @@ carquet/
 
 ## Performance
 
-Benchmark results on Apple M1 (ARM64 with NEON):
+Benchmark results on Apple M1 (ARM64 with NEON), 1M rows:
 
-| Operation | Throughput |
-|-----------|------------|
-| Write (uncompressed) | ~45M rows/sec |
-| Write (SNAPPY) | ~35M rows/sec |
-| Write (ZSTD) | ~25M rows/sec |
-| Read (uncompressed) | ~280M rows/sec |
-| Read (SNAPPY) | ~180M rows/sec |
-| Read (ZSTD) | ~150M rows/sec |
+| Codec | Write | Read |
+|-------|-------|------|
+| UNCOMPRESSED | 18.8 M rows/sec | 18.5 M rows/sec |
+| SNAPPY | 18.1 M rows/sec | 18.4 M rows/sec |
+| LZ4 | 14.8 M rows/sec | 18.5 M rows/sec |
+| ZSTD | 31.3 M rows/sec | 39.9 M rows/sec |
 
 Run benchmarks:
 

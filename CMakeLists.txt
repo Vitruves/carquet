@@ -31,6 +31,51 @@ option(CARQUET_ENABLE_AVX512 "Enable AVX-512 optimizations" ON)
 option(CARQUET_ENABLE_NEON "Enable NEON optimizations" ON)
 option(CARQUET_ENABLE_SVE "Enable SVE optimizations" OFF)
 
+# External compression libraries
+include(FetchContent)
+
+# Try to find system zstd first, fetch if not found
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(ZSTD QUIET libzstd)
+endif()
+
+if(ZSTD_FOUND)
+    message(STATUS "Found system libzstd: ${ZSTD_VERSION}")
+else()
+    message(STATUS "Fetching zstd...")
+    FetchContent_Declare(
+        zstd
+        GIT_REPOSITORY https://github.com/facebook/zstd.git
+        GIT_TAG        v1.5.6
+        SOURCE_SUBDIR  build/cmake
+    )
+    set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+    set(ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+    set(ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(zstd)
+    set(ZSTD_LIBRARIES libzstd_static)
+    set(ZSTD_INCLUDE_DIRS ${zstd_SOURCE_DIR}/lib)
+endif()
+
+# Try to find system zlib first, fetch if not found
+find_package(ZLIB QUIET)
+if(ZLIB_FOUND)
+    message(STATUS "Found system zlib: ${ZLIB_VERSION_STRING}")
+else()
+    message(STATUS "Fetching zlib...")
+    FetchContent_Declare(
+        zlib
+        GIT_REPOSITORY https://github.com/madler/zlib.git
+        GIT_TAG        v1.3.1
+    )
+    set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(zlib)
+    set(ZLIB_LIBRARIES zlibstatic)
+    set(ZLIB_INCLUDE_DIRS ${zlib_SOURCE_DIR} ${zlib_BINARY_DIR})
+endif()
+
 # Compiler detection
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     set(CARQUET_COMPILER_GCC_LIKE TRUE)
@@ -198,7 +243,17 @@ target_include_directories(carquet
         $<INSTALL_INTERFACE:include>
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${ZSTD_INCLUDE_DIRS}
+        ${ZLIB_INCLUDE_DIRS}
 )
+
+# Link external compression libraries
+if(ZLIB_FOUND)
+    target_link_libraries(carquet PRIVATE ${ZSTD_LIBRARIES} ZLIB::ZLIB)
+else()
+    target_link_libraries(carquet PRIVATE ${ZSTD_LIBRARIES} ${ZLIB_LIBRARIES})
+endif()
+
 
 # Architecture definitions
 if(CARQUET_ARCH_X86)
