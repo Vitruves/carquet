@@ -348,6 +348,15 @@ carquet_status_t carquet_dictionary_decode_int32(
     int32_t* output,
     int64_t output_count) {
 
+    /* Early validation */
+    if (output_count <= 0) {
+        return CARQUET_OK;
+    }
+
+    if (dict_count <= 0 || dict_data == NULL) {
+        return CARQUET_ERROR_DECODE;
+    }
+
     if (dict_size < (size_t)dict_count * sizeof(int32_t)) {
         return CARQUET_ERROR_DECODE;
     }
@@ -367,14 +376,14 @@ carquet_status_t carquet_dictionary_decode_int32(
     int64_t decoded = carquet_rle_decode_all(
         indices_data + 1, indices_size - 1, bit_width, indices, output_count);
 
-    if (decoded < 0) {
+    if (decoded < 0 || decoded < output_count) {
         free(indices);
         return CARQUET_ERROR_DECODE;
     }
 
     /* Look up values */
     const int32_t* dict = (const int32_t*)dict_data;
-    for (int64_t i = 0; i < output_count; i++) {
+    for (int64_t i = 0; i < decoded; i++) {
         if ((int32_t)indices[i] >= dict_count) {
             free(indices);
             return CARQUET_ERROR_DECODE;
@@ -395,6 +404,15 @@ carquet_status_t carquet_dictionary_decode_int64(
     int64_t* output,
     int64_t output_count) {
 
+    /* Early validation */
+    if (output_count <= 0) {
+        return CARQUET_OK;
+    }
+
+    if (dict_count <= 0 || dict_data == NULL) {
+        return CARQUET_ERROR_DECODE;
+    }
+
     if (dict_size < (size_t)dict_count * sizeof(int64_t)) {
         return CARQUET_ERROR_DECODE;
     }
@@ -412,13 +430,13 @@ carquet_status_t carquet_dictionary_decode_int64(
     int64_t decoded = carquet_rle_decode_all(
         indices_data + 1, indices_size - 1, bit_width, indices, output_count);
 
-    if (decoded < 0) {
+    if (decoded < 0 || decoded < output_count) {
         free(indices);
         return CARQUET_ERROR_DECODE;
     }
 
     const int64_t* dict = (const int64_t*)dict_data;
-    for (int64_t i = 0; i < output_count; i++) {
+    for (int64_t i = 0; i < decoded; i++) {
         if ((int32_t)indices[i] >= dict_count) {
             free(indices);
             return CARQUET_ERROR_DECODE;
@@ -439,6 +457,15 @@ carquet_status_t carquet_dictionary_decode_float(
     float* output,
     int64_t output_count) {
 
+    /* Early validation */
+    if (output_count <= 0) {
+        return CARQUET_OK;
+    }
+
+    if (dict_count <= 0 || dict_data == NULL) {
+        return CARQUET_ERROR_DECODE;
+    }
+
     if (dict_size < (size_t)dict_count * sizeof(float)) {
         return CARQUET_ERROR_DECODE;
     }
@@ -456,13 +483,13 @@ carquet_status_t carquet_dictionary_decode_float(
     int64_t decoded = carquet_rle_decode_all(
         indices_data + 1, indices_size - 1, bit_width, indices, output_count);
 
-    if (decoded < 0) {
+    if (decoded < 0 || decoded < output_count) {
         free(indices);
         return CARQUET_ERROR_DECODE;
     }
 
     const float* dict = (const float*)dict_data;
-    for (int64_t i = 0; i < output_count; i++) {
+    for (int64_t i = 0; i < decoded; i++) {
         if ((int32_t)indices[i] >= dict_count) {
             free(indices);
             return CARQUET_ERROR_DECODE;
@@ -483,6 +510,15 @@ carquet_status_t carquet_dictionary_decode_double(
     double* output,
     int64_t output_count) {
 
+    /* Early validation */
+    if (output_count <= 0) {
+        return CARQUET_OK;
+    }
+
+    if (dict_count <= 0 || dict_data == NULL) {
+        return CARQUET_ERROR_DECODE;
+    }
+
     if (dict_size < (size_t)dict_count * sizeof(double)) {
         return CARQUET_ERROR_DECODE;
     }
@@ -500,13 +536,13 @@ carquet_status_t carquet_dictionary_decode_double(
     int64_t decoded = carquet_rle_decode_all(
         indices_data + 1, indices_size - 1, bit_width, indices, output_count);
 
-    if (decoded < 0) {
+    if (decoded < 0 || decoded < output_count) {
         free(indices);
         return CARQUET_ERROR_DECODE;
     }
 
     const double* dict = (const double*)dict_data;
-    for (int64_t i = 0; i < output_count; i++) {
+    for (int64_t i = 0; i < decoded; i++) {
         if ((int32_t)indices[i] >= dict_count) {
             free(indices);
             return CARQUET_ERROR_DECODE;
