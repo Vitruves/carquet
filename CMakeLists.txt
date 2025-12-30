@@ -286,6 +286,12 @@ if(CARQUET_BUILD_BENCHMARKS)
     endif()
 endif()
 
+# Fuzzing
+option(CARQUET_BUILD_FUZZ "Build fuzz targets" OFF)
+if(CARQUET_BUILD_FUZZ)
+    add_subdirectory(fuzz)
+endif()
+
 # Installation
 include(GNUInstallDirs)
 install(TARGETS carquet

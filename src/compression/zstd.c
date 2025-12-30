@@ -6,7 +6,7 @@
  * Reference: https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md
  */
 
-#define ZSTD_DEBUG 1
+/* #define ZSTD_DEBUG 1 */
 
 #include <carquet/error.h>
 #include <stdint.h>
@@ -280,6 +280,222 @@ static void init_default_tables(void) {
 
     g_tables_initialized = 1;
 }
+
+/* ============================================================================
+ * FSE Table Decoding from Compressed Bitstream
+ * ============================================================================
+ */
+
+/* Forward bit reader for FSE table decoding */
+typedef struct {
+    const uint8_t* data;
+    size_t size;
+    size_t byte_pos;
+    uint32_t bits;
+    int bits_avail;
+} fse_bitreader_t;
+
+static void fse_br_init(fse_bitreader_t* br, const uint8_t* data, size_t size) {
+    br->data = data;
+    br->size = size;
+    br->byte_pos = 0;
+    br->bits = 0;
+    br->bits_avail = 0;
+    /* Pre-load some bits */
+    while (br->bits_avail < 24 && br->byte_pos < br->size) {
+        br->bits |= (uint32_t)br->data[br->byte_pos++] << br->bits_avail;
+        br->bits_avail += 8;
+    }
+}
+
+static inline uint32_t fse_br_read(fse_bitreader_t* br, int n) {
+    if (n == 0) return 0;
+    uint32_t val = br->bits & ((1U << n) - 1);
+    br->bits >>= n;
+    br->bits_avail -= n;
+    /* Refill */
+    while (br->bits_avail < 24 && br->byte_pos < br->size) {
+        br->bits |= (uint32_t)br->data[br->byte_pos++] << br->bits_avail;
+        br->bits_avail += 8;
+    }
+    return val;
+}
+
+static inline uint32_t fse_br_peek(fse_bitreader_t* br, int n) {
+    /* Refill if needed before peeking */
+    while (br->bits_avail < n && br->byte_pos < br->size) {
+        br->bits |= (uint32_t)br->data[br->byte_pos++] << br->bits_avail;
+        br->bits_avail += 8;
+    }
+    return br->bits & ((1U << n) - 1);
+}
+
+static inline void fse_br_consume(fse_bitreader_t* br, int n) {
+    br->bits >>= n;
+    br->bits_avail -= n;
+    while (br->bits_avail < 24 && br->byte_pos < br->size) {
+        br->bits |= (uint32_t)br->data[br->byte_pos++] << br->bits_avail;
+        br->bits_avail += 8;
+    }
+}
+
+static size_t fse_br_bytes_consumed(fse_bitreader_t* br) {
+    /* Bytes consumed = byte_pos minus any bits we loaded but didn't use */
+    int unused_bytes = br->bits_avail / 8;
+    return br->byte_pos - (size_t)unused_bytes;
+}
+
+/**
+ * Decode FSE table header and normalized frequencies from bitstream.
+ * Returns: bytes consumed on success, 0 on error
+ *
+ * The format follows RFC 8878 section 4.1.1:
+ * - 4 bits: accuracy log (actual AL = value + 5, so 0-4 means AL 5-9)
+ * - Variable length: normalized frequencies for each symbol
+ */
+static size_t decode_fse_table_header(const uint8_t* data, size_t size,
+                                       int16_t* norm, int* accuracy_log_out,
+                                       int max_symbol) {
+    if (size < 1) return 0;
+
+    fse_bitreader_t br;
+    fse_br_init(&br, data, size);
+
+    /* Read accuracy log (4 bits) */
+#ifdef ZSTD_DEBUG
+    fprintf(stderr, "decode_fse_table_header: first bytes = %02x %02x %02x %02x\n",
+            data[0], data[1], size > 2 ? data[2] : 0, size > 3 ? data[3] : 0);
+#endif
+    int al = (int)fse_br_read(&br, 4) + 5;
+    if (al > 9) al = 9;  /* Cap at max */
+    *accuracy_log_out = al;
+
+#ifdef ZSTD_DEBUG
+    fprintf(stderr, "decode_fse_table_header: accuracy_log=%d table_size=%d max_symbol=%d\n",
+            al, 1 << al, max_symbol);
+#endif
+
+    int table_size = 1 << al;
+
+    /*
+     * Follows the exact algorithm from zstd reference:
+     * FSE_readNCount_body in entropy_common.c
+     */
+    int nbBits = al;
+    int threshold = 1 << nbBits;
+    nbBits++;
+    int remaining = (1 << nbBits) + 1;
+    int symbol = 0;
+
+    while (remaining > 1 && symbol <= max_symbol) {
+        /* Adjust nbBits when remaining shrinks */
+        while (remaining < threshold) {
+            nbBits--;
+            threshold >>= 1;
+        }
+
+        /*
+         * Variable-length decoding:
+         * max = (2*threshold - 1) - remaining
+         * If low bits < max: use nbBits-1 bits
+         * Else: use nbBits bits and adjust
+         */
+        int max_val = (2 * threshold - 1) - remaining;
+        uint32_t bits = fse_br_peek(&br, nbBits);
+
+#ifdef ZSTD_DEBUG
+        if (symbol < 5) {
+            fprintf(stderr, "  sym=%d: nbBits=%d threshold=%d remaining=%d max=%d bits=0x%x\n",
+                    symbol, nbBits, threshold, remaining, max_val, bits);
+        }
+#endif
+
+        int count;
+        if (max_val < 0 || (int)(bits & (threshold - 1)) < max_val) {
+            /* Short form: use nbBits-1 bits */
+            count = (int)(bits & (threshold - 1));
+            fse_br_consume(&br, nbBits - 1);
+        } else {
+            /* Long form: use nbBits bits */
+            count = (int)(bits & ((2 * threshold) - 1));
+            if (count >= threshold) {
+                count -= max_val;
+            }
+            fse_br_consume(&br, nbBits);
+        }
+
+        /* Decode: count=0 means prob=-1, count=1 means prob=0, etc. */
+        count--;
+
+        if (count < 0) {
+            /* Probability -1 (less than 1) */
+            norm[symbol] = -1;
+            remaining += count;  /* count is -1, so remaining -= 1 */
+            symbol++;
+        } else if (count == 0) {
+            /* Probability 0: symbol not present, read repeat zeros */
+            norm[symbol] = 0;
+            symbol++;
+            /* Read 2-bit repeat count */
+            int repeat = (int)fse_br_read(&br, 2);
+            while (repeat == 3 && symbol <= max_symbol) {
+                for (int r = 0; r < 3 && symbol <= max_symbol; r++) {
+                    norm[symbol++] = 0;
+                }
+                repeat = (int)fse_br_read(&br, 2);
+            }
+            while (repeat > 0 && symbol <= max_symbol) {
+                norm[symbol++] = 0;
+                repeat--;
+            }
+        } else {
+            /* Normal probability */
+            norm[symbol] = (int16_t)count;
+            remaining -= count;
+            symbol++;
+        }
+    }
+
+    /* Verify we distributed exactly table_size probability */
+    int total = 0;
+    for (int i = 0; i <= max_symbol; i++) {
+        if (norm[i] == -1) total += 1;
+        else if (norm[i] > 0) total += norm[i];
+    }
+
+    /* Fill remaining symbols with 0 */
+    while (symbol <= max_symbol) {
+        norm[symbol++] = 0;
+    }
+
+#ifdef ZSTD_DEBUG
+    fprintf(stderr, "decode_fse_table_header: total=%d (should be %d), remaining=%d (should be 1)\n",
+            total, table_size, remaining);
+    if (total != table_size) {
+        fprintf(stderr, "decode_fse_table_header: norm = [");
+        for (int i = 0; i <= max_symbol; i++) {
+            if (norm[i] != 0) fprintf(stderr, "%d:%d, ", i, norm[i]);
+        }
+        fprintf(stderr, "]\n");
+    }
+#endif
+    (void)total;
+
+    return fse_br_bytes_consumed(&br);
+}
+
+/* Per-block FSE tables for custom sequences encoding */
+typedef struct {
+    fse_entry_t ll_table[1 << FSE_MAX_ACCURACY_LOG];
+    fse_entry_t ml_table[1 << FSE_MAX_ACCURACY_LOG];
+    fse_entry_t of_table[1 << FSE_MAX_ACCURACY_LOG];
+    int ll_accuracy_log;
+    int ml_accuracy_log;
+    int of_accuracy_log;
+    bool ll_valid;
+    bool ml_valid;
+    bool of_valid;
+} seq_tables_t;
 
 /* ============================================================================
  * Huffman Decoding for Compressed Literals
@@ -564,6 +780,7 @@ typedef struct {
     uint32_t rep[3];
     huf_dtable_t huf_table;
     bool huf_table_valid;
+    seq_tables_t seq_tables;
 } zstd_dctx_t;
 
 /* ============================================================================
@@ -752,6 +969,12 @@ static int decode_literals(zstd_dctx_t* ctx, const uint8_t* data, size_t size,
  * ============================================================================
  */
 
+/* FSE mode constants */
+#define FSE_MODE_PREDEFINED 0
+#define FSE_MODE_RLE        1
+#define FSE_MODE_FSE        2
+#define FSE_MODE_REPEAT     3
+
 static int decode_sequences(zstd_dctx_t* ctx, const uint8_t* data, size_t size,
                             const uint8_t* literals, size_t lit_size,
                             uint8_t* out, size_t* out_size, size_t out_cap) {
@@ -792,42 +1015,167 @@ static int decode_sequences(zstd_dctx_t* ctx, const uint8_t* data, size_t size,
     int of_mode = (modes >> 2) & 3;
     int ml_mode = (modes >> 4) & 3;
 
-    /* Only predefined tables (mode 0) supported */
-    if (ll_mode != 0 || of_mode != 0 || ml_mode != 0) {
+    /* Tables to use for decoding */
+    fse_entry_t* ll_table;
+    fse_entry_t* of_table;
+    fse_entry_t* ml_table;
+    int ll_al, of_al, ml_al;  /* accuracy logs */
+
+    /* RLE symbols (for mode 1) */
+    uint8_t ll_rle_sym = 0, of_rle_sym = 0, ml_rle_sym = 0;
+
+    /* Initialize with defaults */
+    init_default_tables();
+    ll_table = g_LL_table;
+    of_table = g_OF_table;
+    ml_table = g_ML_table;
+    ll_al = LITERALS_LENGTH_ACC_LOG;
+    of_al = OFFSET_ACC_LOG;
+    ml_al = MATCH_LENGTH_ACC_LOG;
+
+    /* Process Literals_Lengths FSE table */
+    if (ll_mode == FSE_MODE_PREDEFINED) {
+        /* Use default table - already set */
+    } else if (ll_mode == FSE_MODE_RLE) {
+        if (pos >= size) return -1;
+        ll_rle_sym = data[pos++];
+    } else if (ll_mode == FSE_MODE_FSE) {
+        int16_t norm[64];
+        int al;
+        size_t consumed = decode_fse_table_header(data + pos, size - pos, norm, &al, 35);
+        if (consumed == 0) {
 #ifdef ZSTD_DEBUG
-        fprintf(stderr, "decode_sequences: unsupported modes ll=%d of=%d ml=%d\n", ll_mode, of_mode, ml_mode);
+            fprintf(stderr, "decode_sequences: failed to decode LL FSE table\n");
 #endif
-        return -1;
+            return -1;
+        }
+        pos += consumed;
+        build_fse_decode_table(ctx->seq_tables.ll_table, al, norm, 35);
+        ctx->seq_tables.ll_accuracy_log = al;
+        ctx->seq_tables.ll_valid = true;
+        ll_table = ctx->seq_tables.ll_table;
+        ll_al = al;
+    } else if (ll_mode == FSE_MODE_REPEAT) {
+        if (!ctx->seq_tables.ll_valid) {
+#ifdef ZSTD_DEBUG
+            fprintf(stderr, "decode_sequences: LL repeat mode but no previous table\n");
+#endif
+            return -1;
+        }
+        ll_table = ctx->seq_tables.ll_table;
+        ll_al = ctx->seq_tables.ll_accuracy_log;
     }
 
-    init_default_tables();
+    /* Process Offsets FSE table */
+    if (of_mode == FSE_MODE_PREDEFINED) {
+        /* Use default table - already set */
+    } else if (of_mode == FSE_MODE_RLE) {
+        if (pos >= size) return -1;
+        of_rle_sym = data[pos++];
+    } else if (of_mode == FSE_MODE_FSE) {
+        int16_t norm[64];
+        int al;
+        size_t consumed = decode_fse_table_header(data + pos, size - pos, norm, &al, 31);
+        if (consumed == 0) {
+#ifdef ZSTD_DEBUG
+            fprintf(stderr, "decode_sequences: failed to decode OF FSE table\n");
+#endif
+            return -1;
+        }
+        pos += consumed;
+        build_fse_decode_table(ctx->seq_tables.of_table, al, norm, 31);
+        ctx->seq_tables.of_accuracy_log = al;
+        ctx->seq_tables.of_valid = true;
+        of_table = ctx->seq_tables.of_table;
+        of_al = al;
+    } else if (of_mode == FSE_MODE_REPEAT) {
+        if (!ctx->seq_tables.of_valid) {
+#ifdef ZSTD_DEBUG
+            fprintf(stderr, "decode_sequences: OF repeat mode but no previous table\n");
+#endif
+            return -1;
+        }
+        of_table = ctx->seq_tables.of_table;
+        of_al = ctx->seq_tables.of_accuracy_log;
+    }
+
+    /* Process Match_Lengths FSE table */
+    if (ml_mode == FSE_MODE_PREDEFINED) {
+        /* Use default table - already set */
+    } else if (ml_mode == FSE_MODE_RLE) {
+        if (pos >= size) return -1;
+        ml_rle_sym = data[pos++];
+    } else if (ml_mode == FSE_MODE_FSE) {
+        int16_t norm[64];
+        int al;
+        size_t consumed = decode_fse_table_header(data + pos, size - pos, norm, &al, 52);
+        if (consumed == 0) {
+#ifdef ZSTD_DEBUG
+            fprintf(stderr, "decode_sequences: failed to decode ML FSE table\n");
+#endif
+            return -1;
+        }
+        pos += consumed;
+        build_fse_decode_table(ctx->seq_tables.ml_table, al, norm, 52);
+        ctx->seq_tables.ml_accuracy_log = al;
+        ctx->seq_tables.ml_valid = true;
+        ml_table = ctx->seq_tables.ml_table;
+        ml_al = al;
+    } else if (ml_mode == FSE_MODE_REPEAT) {
+        if (!ctx->seq_tables.ml_valid) {
+#ifdef ZSTD_DEBUG
+            fprintf(stderr, "decode_sequences: ML repeat mode but no previous table\n");
+#endif
+            return -1;
+        }
+        ml_table = ctx->seq_tables.ml_table;
+        ml_al = ctx->seq_tables.ml_accuracy_log;
+    }
 
     /* Init backward bitreader */
     zstd_bitreader_t br;
     zstd_br_init_backward(&br, data + pos, size - pos);
 
-    /* Read initial states - order is LL, OF, ML when encoded forward,
-       so when reading backward we get them in order: LL, OF, ML */
-    uint32_t ll_state = zstd_br_read_bits(&br, LITERALS_LENGTH_ACC_LOG);
-    uint32_t of_state = zstd_br_read_bits(&br, OFFSET_ACC_LOG);
-    uint32_t ml_state = zstd_br_read_bits(&br, MATCH_LENGTH_ACC_LOG);
+    /* Read initial states - use actual accuracy logs for each table */
+    uint32_t ll_state = 0, of_state = 0, ml_state = 0;
+    if (ll_mode != FSE_MODE_RLE) {
+        ll_state = zstd_br_read_bits(&br, ll_al);
+    }
+    if (of_mode != FSE_MODE_RLE) {
+        of_state = zstd_br_read_bits(&br, of_al);
+    }
+    if (ml_mode != FSE_MODE_RLE) {
+        ml_state = zstd_br_read_bits(&br, ml_al);
+    }
 
 #ifdef ZSTD_DEBUG
-    fprintf(stderr, "decode_sequences: num_seq=%zu init_states ll=%u of=%u ml=%u\n",
-            num_seq, ll_state, of_state, ml_state);
+    fprintf(stderr, "decode_sequences: num_seq=%zu modes ll=%d of=%d ml=%d al ll=%d of=%d ml=%d init_states ll=%u of=%u ml=%u\n",
+            num_seq, ll_mode, of_mode, ml_mode, ll_al, of_al, ml_al, ll_state, of_state, ml_state);
 #endif
 
     size_t lit_pos = 0;
     size_t out_pos = 0;
 
     for (size_t i = 0; i < num_seq; i++) {
-        /* Check state bounds */
-        if (of_state >= (1U << OFFSET_ACC_LOG) ||
-            ml_state >= (1U << MATCH_LENGTH_ACC_LOG) ||
-            ll_state >= (1U << LITERALS_LENGTH_ACC_LOG)) {
+        /* Check state bounds (only for non-RLE modes) */
+        if (ll_mode != FSE_MODE_RLE && ll_state >= (1U << ll_al)) {
 #ifdef ZSTD_DEBUG
-            fprintf(stderr, "decode_sequences[%zu]: state out of bounds of=%u ml=%u ll=%u\n",
-                    i, of_state, ml_state, ll_state);
+            fprintf(stderr, "decode_sequences[%zu]: ll_state out of bounds %u >= %u\n",
+                    i, ll_state, 1U << ll_al);
+#endif
+            return -1;
+        }
+        if (of_mode != FSE_MODE_RLE && of_state >= (1U << of_al)) {
+#ifdef ZSTD_DEBUG
+            fprintf(stderr, "decode_sequences[%zu]: of_state out of bounds %u >= %u\n",
+                    i, of_state, 1U << of_al);
+#endif
+            return -1;
+        }
+        if (ml_mode != FSE_MODE_RLE && ml_state >= (1U << ml_al)) {
+#ifdef ZSTD_DEBUG
+            fprintf(stderr, "decode_sequences[%zu]: ml_state out of bounds %u >= %u\n",
+                    i, ml_state, 1U << ml_al);
 #endif
             return -1;
         }
@@ -839,13 +1187,13 @@ static int decode_sequences(zstd_dctx_t* ctx, const uint8_t* data, size_t size,
          */
 
         /* Get FSE table entries and symbols */
-        fse_entry_t* ll_e = &g_LL_table[ll_state];
-        fse_entry_t* of_e = &g_OF_table[of_state];
-        fse_entry_t* ml_e = &g_ML_table[ml_state];
+        fse_entry_t* ll_e = (ll_mode != FSE_MODE_RLE) ? &ll_table[ll_state] : NULL;
+        fse_entry_t* of_e = (of_mode != FSE_MODE_RLE) ? &of_table[of_state] : NULL;
+        fse_entry_t* ml_e = (ml_mode != FSE_MODE_RLE) ? &ml_table[ml_state] : NULL;
 
-        uint32_t ll_code = ll_e->symbol;
-        uint32_t of_code = of_e->symbol;
-        uint32_t ml_code = ml_e->symbol;
+        uint32_t ll_code = (ll_mode == FSE_MODE_RLE) ? ll_rle_sym : ll_e->symbol;
+        uint32_t of_code = (of_mode == FSE_MODE_RLE) ? of_rle_sym : of_e->symbol;
+        uint32_t ml_code = (ml_mode == FSE_MODE_RLE) ? ml_rle_sym : ml_e->symbol;
 
         /* Read extra bits in order: OF, ML, LL (per RFC 8878 Section 3.1.1.3.2.1.2) */
         uint32_t offset_val;
@@ -868,11 +1216,18 @@ static int decode_sequences(zstd_dctx_t* ctx, const uint8_t* data, size_t size,
 
         /* Read update bits in order: LL, ML, OF (per RFC 8878)
          * Update bits are read for all sequences EXCEPT the last.
+         * RLE mode doesn't have state updates.
          */
         if (i < num_seq - 1) {
-            ll_state = ll_e->new_state_base + zstd_br_read_bits(&br, ll_e->num_bits);
-            ml_state = ml_e->new_state_base + zstd_br_read_bits(&br, ml_e->num_bits);
-            of_state = of_e->new_state_base + zstd_br_read_bits(&br, of_e->num_bits);
+            if (ll_mode != FSE_MODE_RLE) {
+                ll_state = ll_e->new_state_base + zstd_br_read_bits(&br, ll_e->num_bits);
+            }
+            if (ml_mode != FSE_MODE_RLE) {
+                ml_state = ml_e->new_state_base + zstd_br_read_bits(&br, ml_e->num_bits);
+            }
+            if (of_mode != FSE_MODE_RLE) {
+                of_state = of_e->new_state_base + zstd_br_read_bits(&br, of_e->num_bits);
+            }
         }
 
         /* Handle repeat offsets */
@@ -1039,6 +1394,9 @@ int carquet_zstd_decompress(
     ctx.rep[1] = 4;
     ctx.rep[2] = 8;
     ctx.huf_table_valid = false;
+    ctx.seq_tables.ll_valid = false;
+    ctx.seq_tables.of_valid = false;
+    ctx.seq_tables.ml_valid = false;
 
     size_t pos = hdr_size;
     size_t out_pos = 0;
