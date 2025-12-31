@@ -109,11 +109,7 @@ carquet_column_writer_internal_t* carquet_column_writer_create(
         return NULL;
     }
 
-    if (carquet_buffer_init(&writer->column_buffer) != CARQUET_OK) {
-        carquet_page_writer_destroy(writer->page_writer);
-        free(writer);
-        return NULL;
-    }
+    carquet_buffer_init(&writer->column_buffer);
 
     writer->type = type;
     writer->encoding = encoding;

@@ -24,6 +24,9 @@
 #define LZ4_MIN_LENGTH       13
 #define LZ4_LAST_LITERALS    5
 
+/* Forward declaration */
+size_t carquet_lz4_compress_bound(size_t src_size);
+
 /* ============================================================================
  * LZ4 Decompression
  * ============================================================================
@@ -184,6 +187,12 @@ carquet_status_t carquet_lz4_compress(
 
     if (!dst || !dst_size) {
         return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    /* Check if output buffer is large enough for worst case */
+    size_t max_output = carquet_lz4_compress_bound(src_size);
+    if (dst_capacity < max_output) {
+        return CARQUET_ERROR_COMPRESSION;
     }
 
     /* Handle empty input */

@@ -93,13 +93,10 @@ carquet_page_writer_t* carquet_page_writer_create(
     carquet_page_writer_t* writer = calloc(1, sizeof(carquet_page_writer_t));
     if (!writer) return NULL;
 
-    if (carquet_buffer_init(&writer->values_buffer) != CARQUET_OK ||
-        carquet_buffer_init(&writer->def_levels_buffer) != CARQUET_OK ||
-        carquet_buffer_init(&writer->rep_levels_buffer) != CARQUET_OK ||
-        carquet_buffer_init(&writer->page_buffer) != CARQUET_OK) {
-        carquet_page_writer_destroy(writer);
-        return NULL;
-    }
+    carquet_buffer_init(&writer->values_buffer);
+    carquet_buffer_init(&writer->def_levels_buffer);
+    carquet_buffer_init(&writer->rep_levels_buffer);
+    carquet_buffer_init(&writer->page_buffer);
 
     writer->type = type;
     writer->encoding = encoding;

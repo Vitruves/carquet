@@ -25,6 +25,9 @@
 #define SNAPPY_MAX_OFFSET      (1 << 15)
 #define SNAPPY_BLOCK_SIZE      (1 << 16)
 
+/* Forward declaration */
+size_t carquet_snappy_compress_bound(size_t src_size);
+
 /* ============================================================================
  * Varint Encoding
  * ============================================================================
@@ -282,6 +285,12 @@ carquet_status_t carquet_snappy_compress(
 
     if (!dst || !dst_size) {
         return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    /* Check if output buffer is large enough for worst case */
+    size_t max_output = carquet_snappy_compress_bound(src_size);
+    if (dst_capacity < max_output) {
+        return CARQUET_ERROR_COMPRESSION;
     }
 
     uint8_t* op = dst;

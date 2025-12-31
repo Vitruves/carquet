@@ -5,6 +5,7 @@
 
 #include "buffer.h"
 #include "endian.h"
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -59,27 +60,21 @@ static carquet_status_t ensure_capacity(carquet_buffer_t* buf, size_t needed) {
  * ============================================================================
  */
 
-carquet_status_t carquet_buffer_init(carquet_buffer_t* buf) {
-    if (!buf) {
-        return CARQUET_ERROR_INVALID_ARGUMENT;
-    }
+void carquet_buffer_init(carquet_buffer_t* buf) {
+    assert(buf != NULL);
 
     buf->data = NULL;
     buf->size = 0;
     buf->capacity = 0;
     buf->owns_data = true;
-
-    return CARQUET_OK;
 }
 
 carquet_status_t carquet_buffer_init_capacity(carquet_buffer_t* buf, size_t capacity) {
-    carquet_status_t status = carquet_buffer_init(buf);
-    if (CARQUET_FAILED(status)) {
-        return status;
-    }
+    assert(buf != NULL);
+    carquet_buffer_init(buf);
 
     if (capacity > 0) {
-        status = carquet_buffer_reserve(buf, capacity);
+        carquet_status_t status = carquet_buffer_reserve(buf, capacity);
         if (CARQUET_FAILED(status)) {
             return status;
         }
@@ -89,7 +84,7 @@ carquet_status_t carquet_buffer_init_capacity(carquet_buffer_t* buf, size_t capa
 }
 
 void carquet_buffer_init_wrap(carquet_buffer_t* buf, uint8_t* data, size_t size) {
-    if (!buf) return;
+    assert(buf != NULL);
 
     buf->data = data;
     buf->size = size;
@@ -113,7 +108,7 @@ carquet_status_t carquet_buffer_init_copy(carquet_buffer_t* buf,
 }
 
 void carquet_buffer_destroy(carquet_buffer_t* buf) {
-    if (!buf) return;
+    assert(buf != NULL);
 
     if (buf->owns_data && buf->data) {
         free(buf->data);
@@ -126,22 +121,17 @@ void carquet_buffer_destroy(carquet_buffer_t* buf) {
 }
 
 void carquet_buffer_clear(carquet_buffer_t* buf) {
-    if (buf) {
-        buf->size = 0;
-    }
+    assert(buf != NULL);
+    buf->size = 0;
 }
 
 carquet_status_t carquet_buffer_reserve(carquet_buffer_t* buf, size_t capacity) {
-    if (!buf) {
-        return CARQUET_ERROR_INVALID_ARGUMENT;
-    }
+    assert(buf != NULL);
     return ensure_capacity(buf, capacity);
 }
 
 carquet_status_t carquet_buffer_resize(carquet_buffer_t* buf, size_t size) {
-    if (!buf) {
-        return CARQUET_ERROR_INVALID_ARGUMENT;
-    }
+    assert(buf != NULL);
 
     carquet_status_t status = ensure_capacity(buf, size);
     if (CARQUET_FAILED(status)) {
@@ -158,9 +148,8 @@ carquet_status_t carquet_buffer_resize(carquet_buffer_t* buf, size_t size) {
 }
 
 carquet_status_t carquet_buffer_shrink_to_fit(carquet_buffer_t* buf) {
-    if (!buf || !buf->owns_data) {
-        return CARQUET_ERROR_INVALID_ARGUMENT;
-    }
+    assert(buf != NULL);
+    assert(buf->owns_data);
 
     if (buf->size == 0) {
         free(buf->data);
@@ -188,15 +177,11 @@ carquet_status_t carquet_buffer_shrink_to_fit(carquet_buffer_t* buf) {
 
 carquet_status_t carquet_buffer_append(carquet_buffer_t* buf,
                                         const void* data, size_t size) {
-    if (!buf) {
-        return CARQUET_ERROR_INVALID_ARGUMENT;
-    }
+    assert(buf != NULL);
     if (size == 0) {
         return CARQUET_OK;
     }
-    if (!data) {
-        return CARQUET_ERROR_INVALID_ARGUMENT;
-    }
+    assert(data != NULL);
 
     carquet_status_t status = ensure_capacity(buf, buf->size + size);
     if (CARQUET_FAILED(status)) {
@@ -215,9 +200,7 @@ carquet_status_t carquet_buffer_append_byte(carquet_buffer_t* buf, uint8_t byte)
 
 carquet_status_t carquet_buffer_append_fill(carquet_buffer_t* buf,
                                              uint8_t value, size_t count) {
-    if (!buf) {
-        return CARQUET_ERROR_INVALID_ARGUMENT;
-    }
+    assert(buf != NULL);
     if (count == 0) {
         return CARQUET_OK;
     }
@@ -264,7 +247,8 @@ carquet_status_t carquet_buffer_append_f64_le(carquet_buffer_t* buf, double valu
 }
 
 uint8_t* carquet_buffer_advance(carquet_buffer_t* buf, size_t size) {
-    if (!buf || size == 0) {
+    assert(buf != NULL);
+    if (size == 0) {
         return NULL;
     }
 
@@ -285,7 +269,7 @@ uint8_t* carquet_buffer_advance(carquet_buffer_t* buf, size_t size) {
 
 void carquet_buffer_reader_init(carquet_buffer_reader_t* reader,
                                  const carquet_buffer_t* buf) {
-    if (!reader) return;
+    assert(reader != NULL);
 
     reader->data = buf ? buf->data : NULL;
     reader->size = buf ? buf->size : 0;
@@ -294,7 +278,7 @@ void carquet_buffer_reader_init(carquet_buffer_reader_t* reader,
 
 void carquet_buffer_reader_init_data(carquet_buffer_reader_t* reader,
                                       const uint8_t* data, size_t size) {
-    if (!reader) return;
+    assert(reader != NULL);
 
     reader->data = data;
     reader->size = size;
@@ -303,9 +287,8 @@ void carquet_buffer_reader_init_data(carquet_buffer_reader_t* reader,
 
 carquet_status_t carquet_buffer_reader_read(carquet_buffer_reader_t* reader,
                                              void* dest, size_t size) {
-    if (!reader || !dest) {
-        return CARQUET_ERROR_INVALID_ARGUMENT;
-    }
+    assert(reader != NULL);
+    assert(dest != NULL);
     if (!carquet_buffer_reader_has(reader, size)) {
         return CARQUET_ERROR_FILE_TRUNCATED;
     }
@@ -316,9 +299,7 @@ carquet_status_t carquet_buffer_reader_read(carquet_buffer_reader_t* reader,
 }
 
 carquet_status_t carquet_buffer_reader_skip(carquet_buffer_reader_t* reader, size_t size) {
-    if (!reader) {
-        return CARQUET_ERROR_INVALID_ARGUMENT;
-    }
+    assert(reader != NULL);
     if (!carquet_buffer_reader_has(reader, size)) {
         return CARQUET_ERROR_FILE_TRUNCATED;
     }
@@ -392,7 +373,7 @@ carquet_status_t carquet_buffer_reader_read_f64_le(carquet_buffer_reader_t* read
  */
 
 uint8_t* carquet_buffer_detach(carquet_buffer_t* buf, size_t* size_out) {
-    if (!buf) return NULL;
+    assert(buf != NULL);
 
     uint8_t* data = buf->data;
     if (size_out) {
@@ -408,7 +389,8 @@ uint8_t* carquet_buffer_detach(carquet_buffer_t* buf, size_t* size_out) {
 }
 
 void carquet_buffer_swap(carquet_buffer_t* a, carquet_buffer_t* b) {
-    if (!a || !b) return;
+    assert(a != NULL);
+    assert(b != NULL);
 
     carquet_buffer_t tmp = *a;
     *a = *b;

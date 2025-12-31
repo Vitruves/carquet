@@ -100,10 +100,7 @@ carquet_row_group_writer_t* carquet_row_group_writer_create(
     carquet_row_group_writer_t* writer = calloc(1, sizeof(*writer));
     if (!writer) return NULL;
 
-    if (carquet_buffer_init(&writer->row_group_buffer) != CARQUET_OK) {
-        free(writer);
-        return NULL;
-    }
+    carquet_buffer_init(&writer->row_group_buffer);
 
     writer->compression = compression;
     writer->target_page_size = target_page_size > 0 ? target_page_size : (1024 * 1024);

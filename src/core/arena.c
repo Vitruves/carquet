@@ -4,6 +4,7 @@
  */
 
 #include "arena.h"
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -45,9 +46,7 @@ carquet_status_t carquet_arena_init(carquet_arena_t* arena) {
 }
 
 carquet_status_t carquet_arena_init_size(carquet_arena_t* arena, size_t block_size) {
-    if (!arena) {
-        return CARQUET_ERROR_INVALID_ARGUMENT;
-    }
+    assert(arena != NULL);
 
     /* Zero-initialize the arena structure first */
     arena->head = NULL;
@@ -68,9 +67,7 @@ carquet_status_t carquet_arena_init_size(carquet_arena_t* arena, size_t block_si
 }
 
 void carquet_arena_destroy(carquet_arena_t* arena) {
-    if (!arena) {
-        return;
-    }
+    assert(arena != NULL);
 
     carquet_arena_block_t* block = arena->head;
     while (block) {
@@ -86,9 +83,7 @@ void carquet_arena_destroy(carquet_arena_t* arena) {
 }
 
 void carquet_arena_reset(carquet_arena_t* arena) {
-    if (!arena) {
-        return;
-    }
+    assert(arena != NULL);
 
     /* Reset all blocks to empty */
     carquet_arena_block_t* block = arena->head;
@@ -106,7 +101,8 @@ void* carquet_arena_alloc(carquet_arena_t* arena, size_t size) {
 }
 
 void* carquet_arena_alloc_aligned(carquet_arena_t* arena, size_t size, size_t alignment) {
-    if (!arena || size == 0) {
+    assert(arena != NULL);
+    if (size == 0) {
         return NULL;
     }
 
@@ -116,11 +112,7 @@ void* carquet_arena_alloc_aligned(carquet_arena_t* arena, size_t size, size_t al
     }
 
     carquet_arena_block_t* block = arena->current;
-
-    /* Safety check - current block must exist */
-    if (!block) {
-        return NULL;
-    }
+    assert(block != NULL);  /* Arena must be properly initialized */
 
     /* Calculate aligned offset */
     size_t aligned_offset = align_up(block->used, alignment);
@@ -231,18 +223,20 @@ void* carquet_arena_memdup(carquet_arena_t* arena, const void* src, size_t size)
  */
 
 carquet_arena_mark_t carquet_arena_save(const carquet_arena_t* arena) {
+    assert(arena != NULL);
+    assert(arena->current != NULL);
+
     carquet_arena_mark_t mark = {
         .block = arena->current,
-        .used = arena->current ? arena->current->used : 0,
+        .used = arena->current->used,
         .total_allocated = arena->total_allocated,
     };
     return mark;
 }
 
 void carquet_arena_restore(carquet_arena_t* arena, carquet_arena_mark_t mark) {
-    if (!arena || !mark.block) {
-        return;
-    }
+    assert(arena != NULL);
+    assert(mark.block != NULL);
 
     /* Reset blocks after the marked block */
     carquet_arena_block_t* block = mark.block->next;

@@ -125,9 +125,7 @@ static int test_arena_save_restore(void) {
 
 static int test_buffer_basic(void) {
     carquet_buffer_t buf;
-    if (carquet_buffer_init(&buf) != CARQUET_OK) {
-        TEST_FAIL("buffer_basic", "failed to initialize buffer");
-    }
+    carquet_buffer_init(&buf);
 
     /* Test append */
     uint8_t data[] = {1, 2, 3, 4, 5};
@@ -153,9 +151,7 @@ static int test_buffer_basic(void) {
 
 static int test_buffer_integers(void) {
     carquet_buffer_t buf;
-    if (carquet_buffer_init(&buf) != CARQUET_OK) {
-        TEST_FAIL("buffer_integers", "failed to initialize buffer");
-    }
+    carquet_buffer_init(&buf);
 
     if (carquet_buffer_append_u16_le(&buf, 0x1234) != CARQUET_OK) {
         carquet_buffer_destroy(&buf);

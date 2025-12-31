@@ -657,10 +657,7 @@ carquet_status_t carquet_writer_close(carquet_writer_t* writer) {
 
     /* Serialize metadata to buffer */
     carquet_buffer_t metadata_buffer;
-    if (carquet_buffer_init(&metadata_buffer) != CARQUET_OK) {
-        status = CARQUET_ERROR_OUT_OF_MEMORY;
-        goto cleanup;
-    }
+    carquet_buffer_init(&metadata_buffer);
 
     status = parquet_write_file_metadata(&metadata, &metadata_buffer, NULL);
     if (status != CARQUET_OK) {

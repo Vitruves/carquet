@@ -47,8 +47,9 @@ typedef struct carquet_buffer {
 
 /**
  * Initialize an empty buffer.
+ * @pre buf != NULL (asserts on violation)
  */
-carquet_status_t carquet_buffer_init(carquet_buffer_t* buf);
+void carquet_buffer_init(carquet_buffer_t* buf);
 
 /**
  * Initialize a buffer with a specific capacity.
