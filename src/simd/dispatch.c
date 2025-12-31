@@ -279,6 +279,32 @@ extern int64_t carquet_avx512_find_run_length_i32(const int32_t* values, int64_t
 
 #if defined(__aarch64__)
 
+/* NEON declarations - always available on AArch64 */
+#ifdef __ARM_NEON
+extern void carquet_neon_prefix_sum_i32(int32_t* values, int64_t count, int32_t initial);
+extern void carquet_neon_prefix_sum_i64(int64_t* values, int64_t count, int64_t initial);
+extern void carquet_neon_gather_i32(const int32_t* dict, const uint32_t* indices,
+                                     int64_t count, int32_t* output);
+extern void carquet_neon_gather_i64(const int64_t* dict, const uint32_t* indices,
+                                     int64_t count, int64_t* output);
+extern void carquet_neon_gather_float(const float* dict, const uint32_t* indices,
+                                       int64_t count, float* output);
+extern void carquet_neon_gather_double(const double* dict, const uint32_t* indices,
+                                        int64_t count, double* output);
+extern void carquet_neon_byte_stream_split_encode_float(const float* values, int64_t count,
+                                                         uint8_t* output);
+extern void carquet_neon_byte_stream_split_decode_float(const uint8_t* data, int64_t count,
+                                                         float* values);
+extern void carquet_neon_byte_stream_split_encode_double(const double* values, int64_t count,
+                                                          uint8_t* output);
+extern void carquet_neon_byte_stream_split_decode_double(const uint8_t* data, int64_t count,
+                                                          double* values);
+extern void carquet_neon_unpack_bools(const uint8_t* input, uint8_t* output, int64_t count);
+extern void carquet_neon_pack_bools(const uint8_t* input, uint8_t* output, int64_t count);
+extern int64_t carquet_neon_find_run_length_i32(const int32_t* values, int64_t count);
+extern uint32_t carquet_neon_crc32c(uint32_t crc, const uint8_t* data, size_t len);
+#endif
+
 #ifdef __ARM_FEATURE_SVE
 extern void carquet_sve_prefix_sum_i32(int32_t* values, int64_t count, int32_t initial);
 extern void carquet_sve_prefix_sum_i64(int64_t* values, int64_t count, int64_t initial);
@@ -400,6 +426,26 @@ void carquet_simd_dispatch_init(void) {
 
 #if defined(__aarch64__)
 
+    /* NEON is always available on AArch64 - register NEON functions first */
+#ifdef __ARM_NEON
+    /* NEON optimized functions - always enabled on AArch64 */
+    g_dispatch.prefix_sum_i32 = carquet_neon_prefix_sum_i32;
+    g_dispatch.prefix_sum_i64 = carquet_neon_prefix_sum_i64;
+    g_dispatch.gather_i32 = carquet_neon_gather_i32;
+    g_dispatch.gather_i64 = carquet_neon_gather_i64;
+    g_dispatch.gather_float = carquet_neon_gather_float;
+    g_dispatch.gather_double = carquet_neon_gather_double;
+    g_dispatch.byte_split_encode_float = carquet_neon_byte_stream_split_encode_float;
+    g_dispatch.byte_split_decode_float = carquet_neon_byte_stream_split_decode_float;
+    g_dispatch.byte_split_encode_double = carquet_neon_byte_stream_split_encode_double;
+    g_dispatch.byte_split_decode_double = carquet_neon_byte_stream_split_decode_double;
+    g_dispatch.unpack_bools = carquet_neon_unpack_bools;
+    g_dispatch.pack_bools = carquet_neon_pack_bools;
+    g_dispatch.find_run_length_i32 = carquet_neon_find_run_length_i32;
+    g_dispatch.crc32c = carquet_neon_crc32c;
+#endif
+
+    /* SVE overrides NEON if available (better performance on supporting hardware) */
 #ifdef __ARM_FEATURE_SVE
     if (cpu->has_sve) {
         g_dispatch.prefix_sum_i32 = carquet_sve_prefix_sum_i32;
