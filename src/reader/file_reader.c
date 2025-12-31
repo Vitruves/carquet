@@ -292,26 +292,66 @@ static carquet_status_t read_footer(carquet_reader_t* reader, carquet_error_t* e
     return CARQUET_OK;
 }
 
+/**
+ * Read footer from memory-mapped data.
+ */
+static carquet_status_t read_footer_mmap(carquet_reader_t* reader, carquet_error_t* error) {
+    const uint8_t* data = reader->mmap_data;
+    size_t file_size = reader->file_size;
+
+    /* Check minimum size */
+    if (file_size < PARQUET_MAGIC_LEN * 2 + PARQUET_FOOTER_SIZE_LEN) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_FOOTER, "File too small");
+        return CARQUET_ERROR_INVALID_FOOTER;
+    }
+
+    /* Verify magic bytes at start and end */
+    if (memcmp(data, PARQUET_MAGIC, PARQUET_MAGIC_LEN) != 0) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_MAGIC, "Invalid header magic");
+        return CARQUET_ERROR_INVALID_MAGIC;
+    }
+
+    const uint8_t* end = data + file_size;
+    if (memcmp(end - 4, PARQUET_MAGIC, PARQUET_MAGIC_LEN) != 0) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_MAGIC, "Invalid trailing magic");
+        return CARQUET_ERROR_INVALID_MAGIC;
+    }
+
+    /* Get footer size */
+    uint32_t footer_size = carquet_read_u32_le(end - 8);
+    if (footer_size > file_size - 8) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_FOOTER, "Footer size too large");
+        return CARQUET_ERROR_INVALID_FOOTER;
+    }
+
+    /* Parse metadata directly from mmap (zero-copy) */
+    const uint8_t* footer_data = end - 8 - footer_size;
+    carquet_status_t status = parquet_parse_file_metadata(
+        footer_data, footer_size, &reader->arena, &reader->metadata, error);
+
+    if (status != CARQUET_OK) {
+        return status;
+    }
+
+    /* Build schema */
+    reader->schema = build_schema(&reader->arena, &reader->metadata, error);
+    if (!reader->schema) {
+        return CARQUET_ERROR_INVALID_SCHEMA;
+    }
+
+    return CARQUET_OK;
+}
+
 carquet_reader_t* carquet_reader_open(
     const char* path,
     const carquet_reader_options_t* options,
     carquet_error_t* error) {
 
-    FILE* file = fopen(path, "rb");
-    if (!file) {
-        CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_OPEN, "Failed to open file: %s", path);
-        return NULL;
-    }
-
     carquet_reader_t* reader = calloc(1, sizeof(carquet_reader_t));
     if (!reader) {
-        fclose(file);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate reader");
         return NULL;
     }
-
-    reader->file = file;
-    reader->owns_file = true;
 
     if (options) {
         reader->options = *options;
@@ -321,14 +361,51 @@ carquet_reader_t* carquet_reader_open(
 
     /* Initialize arena */
     if (carquet_arena_init(&reader->arena) != CARQUET_OK) {
-        fclose(file);
         free(reader);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to initialize arena");
         return NULL;
     }
 
+    carquet_status_t status;
+
+    /* Try mmap if requested */
+    if (reader->options.use_mmap) {
+        carquet_mmap_info_t* mmap_info = carquet_mmap_open(path, error);
+        if (mmap_info) {
+            reader->mmap_info = mmap_info;
+            reader->mmap_data = mmap_info->data;
+            reader->file_size = mmap_info->size;
+            reader->owns_file = false;  /* mmap handles cleanup */
+
+            /* Parse footer from mmap */
+            status = read_footer_mmap(reader, error);
+            if (status != CARQUET_OK) {
+                carquet_mmap_close(reader->mmap_info);
+                carquet_arena_destroy(&reader->arena);
+                free(reader);
+                return NULL;
+            }
+
+            reader->is_open = true;
+            return reader;
+        }
+        /* mmap failed, fall through to fread path */
+    }
+
+    /* Standard fread path */
+    FILE* file = fopen(path, "rb");
+    if (!file) {
+        carquet_arena_destroy(&reader->arena);
+        free(reader);
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_OPEN, "Failed to open file: %s", path);
+        return NULL;
+    }
+
+    reader->file = file;
+    reader->owns_file = true;
+
     /* Read and parse footer */
-    carquet_status_t status = read_footer(reader, error);
+    status = read_footer(reader, error);
     if (status != CARQUET_OK) {
         carquet_arena_destroy(&reader->arena);
         fclose(file);
@@ -342,6 +419,13 @@ carquet_reader_t* carquet_reader_open(
 
 void carquet_reader_close(carquet_reader_t* reader) {
     if (!reader) return;
+
+    /* Close mmap if active */
+    if (reader->mmap_info) {
+        carquet_mmap_close(reader->mmap_info);
+        reader->mmap_info = NULL;
+        reader->mmap_data = NULL;
+    }
 
     if (reader->owns_file && reader->file) {
         fclose(reader->file);
@@ -464,7 +548,13 @@ void carquet_column_reader_free(carquet_column_reader_t* reader) {
     free(reader->page_buffer);
     free(reader->dictionary_data);
     free(reader->dictionary_offsets);
-    free(reader->decoded_values);
+
+    /* Only free decoded_values if we own the memory (not a mmap view) */
+    if (reader->decoded_ownership == CARQUET_DATA_OWNED) {
+        free(reader->decoded_values);
+    }
+
+    /* Levels are always owned (decoded from RLE) */
     free(reader->decoded_def_levels);
     free(reader->decoded_rep_levels);
     free(reader->indices_buffer);
@@ -479,6 +569,77 @@ bool carquet_column_has_next(const carquet_column_reader_t* reader) {
 int64_t carquet_column_remaining(const carquet_column_reader_t* reader) {
     /* reader is nonnull per API contract */
     return reader->values_remaining;
+}
+
+/* ============================================================================
+ * Memory Mapping API
+ * ============================================================================
+ */
+
+bool carquet_reader_is_mmap(const carquet_reader_t* reader) {
+    /* reader is nonnull per API contract */
+    return reader->mmap_info != NULL && reader->mmap_info->is_valid;
+}
+
+bool carquet_reader_can_zero_copy(
+    const carquet_reader_t* reader,
+    int32_t row_group_index,
+    int32_t column_index) {
+
+    /* reader is nonnull per API contract */
+
+    /* Must have mmap enabled */
+    if (!reader->mmap_info || !reader->mmap_info->is_valid) {
+        return false;
+    }
+
+    /* Validate indices */
+    if (row_group_index < 0 || row_group_index >= reader->metadata.num_row_groups) {
+        return false;
+    }
+    if (column_index < 0 || column_index >= reader->schema->num_leaves) {
+        return false;
+    }
+
+    const parquet_row_group_t* rg = &reader->metadata.row_groups[row_group_index];
+    if (column_index >= rg->num_columns) {
+        return false;
+    }
+
+    const parquet_column_chunk_t* chunk = &rg->columns[column_index];
+    if (!chunk->has_metadata) {
+        return false;
+    }
+
+    const parquet_column_metadata_t* col_meta = &chunk->metadata;
+
+    /* Must be uncompressed */
+    if (col_meta->codec != CARQUET_COMPRESSION_UNCOMPRESSED) {
+        return false;
+    }
+
+    /* Check if column has definition levels (nullable) */
+    int16_t max_def = reader->schema->max_def_levels[column_index];
+    if (max_def > 0) {
+        return false;  /* Nullable columns need level decoding */
+    }
+
+    /* Check physical type - must be fixed-size */
+    carquet_physical_type_t type = col_meta->type;
+    switch (type) {
+        case CARQUET_PHYSICAL_INT32:
+        case CARQUET_PHYSICAL_INT64:
+        case CARQUET_PHYSICAL_FLOAT:
+        case CARQUET_PHYSICAL_DOUBLE:
+        case CARQUET_PHYSICAL_INT96:
+        case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY:
+            return true;
+
+        case CARQUET_PHYSICAL_BOOLEAN:
+        case CARQUET_PHYSICAL_BYTE_ARRAY:
+        default:
+            return false;
+    }
 }
 
 /* ============================================================================

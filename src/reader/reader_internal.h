@@ -14,9 +14,41 @@
 #include "core/arena.h"
 #include <stdio.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* ============================================================================
+ * Memory Mapping Types
+ * ============================================================================
+ */
+
+/**
+ * Indicates whether data is owned (malloc'd) or a view (mmap pointer).
+ */
+typedef enum carquet_data_ownership {
+    CARQUET_DATA_OWNED = 0,    /* Data is malloc'd, caller must free */
+    CARQUET_DATA_VIEW = 1,     /* Data is view into mmap, do NOT free */
+} carquet_data_ownership_t;
+
+/**
+ * Platform-specific memory mapping handle.
+ */
+typedef struct carquet_mmap_info {
+    uint8_t* data;
+    size_t size;
+#ifdef _WIN32
+    HANDLE file_handle;
+    HANDLE mapping_handle;
+#else
+    int fd;
+#endif
+    bool is_valid;
+} carquet_mmap_info_t;
 
 /* ============================================================================
  * Internal Schema Structure
@@ -45,9 +77,10 @@ struct carquet_reader {
     FILE* file;
     bool owns_file;
 
-    /* Memory-mapped or buffered data */
+    /* Memory-mapped data */
     const uint8_t* mmap_data;
     size_t file_size;
+    carquet_mmap_info_t* mmap_info;  /* Platform-specific mmap handle, NULL if not using mmap */
 
     /* Metadata */
     carquet_arena_t arena;
@@ -107,6 +140,7 @@ struct carquet_column_reader {
     int16_t* decoded_def_levels; /* Buffer for decoded definition levels */
     int16_t* decoded_rep_levels; /* Buffer for decoded repetition levels */
     size_t decoded_capacity;    /* Capacity of decoded buffers */
+    carquet_data_ownership_t decoded_ownership; /* OWNED or VIEW (mmap) */
 
     /* Reusable buffers to reduce allocations */
     uint32_t* indices_buffer;   /* Reusable buffer for dictionary indices */
@@ -125,6 +159,26 @@ carquet_schema_t* build_schema(
     carquet_arena_t* arena,
     const parquet_file_metadata_t* metadata,
     carquet_error_t* error);
+
+/**
+ * Open file with memory mapping.
+ * Returns mmap_info on success, NULL on failure (fallback to fread).
+ */
+carquet_mmap_info_t* carquet_mmap_open(const char* path, carquet_error_t* error);
+
+/**
+ * Close memory mapping and release resources.
+ */
+void carquet_mmap_close(carquet_mmap_info_t* mmap_info);
+
+/**
+ * Check if a page is eligible for zero-copy reading.
+ * Requires: uncompressed, PLAIN encoding, fixed-size type.
+ */
+bool carquet_page_is_zero_copy_eligible(
+    carquet_compression_t codec,
+    carquet_encoding_t encoding,
+    carquet_physical_type_t type);
 
 #ifdef __cplusplus
 }

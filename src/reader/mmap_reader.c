@@ -23,30 +23,14 @@
 #endif
 
 /* ============================================================================
- * Memory Mapping Structures
- * ============================================================================
- */
-
-typedef struct carquet_mmap {
-    uint8_t* data;
-    size_t size;
-#ifdef _WIN32
-    HANDLE file_handle;
-    HANDLE mapping_handle;
-#else
-    int fd;
-#endif
-} carquet_mmap_t;
-
-/* ============================================================================
  * Platform-specific Implementation
  * ============================================================================
  */
 
 #ifdef _WIN32
 
-static carquet_mmap_t* mmap_open(const char* path, carquet_error_t* error) {
-    carquet_mmap_t* mmap_info = calloc(1, sizeof(carquet_mmap_t));
+carquet_mmap_info_t* carquet_mmap_open(const char* path, carquet_error_t* error) {
+    carquet_mmap_info_t* mmap_info = calloc(1, sizeof(carquet_mmap_info_t));
     if (!mmap_info) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate mmap info");
         return NULL;
@@ -107,10 +91,11 @@ static carquet_mmap_t* mmap_open(const char* path, carquet_error_t* error) {
         return NULL;
     }
 
+    mmap_info->is_valid = true;
     return mmap_info;
 }
 
-static void mmap_close(carquet_mmap_t* mmap_info) {
+void carquet_mmap_close(carquet_mmap_info_t* mmap_info) {
     if (!mmap_info) return;
 
     if (mmap_info->data) {
@@ -122,13 +107,14 @@ static void mmap_close(carquet_mmap_t* mmap_info) {
     if (mmap_info->file_handle != INVALID_HANDLE_VALUE) {
         CloseHandle(mmap_info->file_handle);
     }
+    mmap_info->is_valid = false;
     free(mmap_info);
 }
 
 #else /* POSIX */
 
-static carquet_mmap_t* mmap_open(const char* path, carquet_error_t* error) {
-    carquet_mmap_t* mmap_info = calloc(1, sizeof(carquet_mmap_t));
+carquet_mmap_info_t* carquet_mmap_open(const char* path, carquet_error_t* error) {
+    carquet_mmap_info_t* mmap_info = calloc(1, sizeof(carquet_mmap_info_t));
     if (!mmap_info) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate mmap info");
         return NULL;
@@ -161,14 +147,15 @@ static carquet_mmap_t* mmap_open(const char* path, carquet_error_t* error) {
         return NULL;
     }
 
-    /* Advise the kernel we'll read sequentially */
-    madvise(mmap_info->data, mmap_info->size, MADV_SEQUENTIAL);
+    /* Advise the kernel about access pattern - use MADV_RANDOM for Parquet
+     * since we typically seek to specific column chunks rather than reading sequentially */
+    madvise(mmap_info->data, mmap_info->size, MADV_RANDOM);
 
+    mmap_info->is_valid = true;
     return mmap_info;
 }
 
-__attribute__((unused))
-static void mmap_close(carquet_mmap_t* mmap_info) {
+void carquet_mmap_close(carquet_mmap_info_t* mmap_info) {
     if (!mmap_info) return;
 
     if (mmap_info->data && mmap_info->data != MAP_FAILED) {
@@ -177,6 +164,7 @@ static void mmap_close(carquet_mmap_t* mmap_info) {
     if (mmap_info->fd >= 0) {
         close(mmap_info->fd);
     }
+    mmap_info->is_valid = false;
     free(mmap_info);
 }
 
@@ -196,18 +184,66 @@ carquet_status_t carquet_reader_open_mmap_internal(
     const char* path,
     carquet_error_t* error) {
 
-    carquet_mmap_t* mmap_info = mmap_open(path, error);
+    carquet_mmap_info_t* mmap_info = carquet_mmap_open(path, error);
     if (!mmap_info) {
         return error ? error->code : CARQUET_ERROR_FILE_OPEN;
     }
 
     reader->mmap_data = mmap_info->data;
     reader->file_size = mmap_info->size;
-
-    /* Store mmap info for cleanup - we'll use a simple approach here */
-    /* In production, you'd want to store the mmap handle properly */
+    reader->mmap_info = mmap_info;  /* Store for cleanup in close() */
 
     return CARQUET_OK;
+}
+
+/* ============================================================================
+ * Zero-Copy Eligibility Check
+ * ============================================================================
+ */
+
+/**
+ * Check if a page is eligible for zero-copy reading.
+ * Zero-copy requires:
+ * - Uncompressed data (no decompression needed)
+ * - PLAIN encoding (no decoding needed)
+ * - Fixed-size type (predictable layout)
+ */
+bool carquet_page_is_zero_copy_eligible(
+    carquet_compression_t codec,
+    carquet_encoding_t encoding,
+    carquet_physical_type_t type) {
+
+    /* Must be uncompressed */
+    if (codec != CARQUET_COMPRESSION_UNCOMPRESSED) {
+        return false;
+    }
+
+    /* Must be PLAIN encoding */
+    if (encoding != CARQUET_ENCODING_PLAIN) {
+        return false;
+    }
+
+    /* Must be fixed-size type */
+    switch (type) {
+        case CARQUET_PHYSICAL_INT32:
+        case CARQUET_PHYSICAL_INT64:
+        case CARQUET_PHYSICAL_FLOAT:
+        case CARQUET_PHYSICAL_DOUBLE:
+        case CARQUET_PHYSICAL_INT96:
+        case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY:
+            return true;
+
+        case CARQUET_PHYSICAL_BOOLEAN:
+            /* Boolean is bit-packed, not directly mappable */
+            return false;
+
+        case CARQUET_PHYSICAL_BYTE_ARRAY:
+            /* Variable length, requires length parsing */
+            return false;
+
+        default:
+            return false;
+    }
 }
 
 /**

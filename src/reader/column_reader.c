@@ -35,9 +35,21 @@ int64_t carquet_column_read_batch(
     int16_t* def_levels,
     int16_t* rep_levels) {
 
-    /* reader and values are nonnull per API contract */
-    if (max_values <= 0) {
+    /* max_values < 0 is invalid; max_values = 0 is a "peek" to trigger page loading */
+    if (max_values < 0) {
         return -1;
+    }
+    if (max_values == 0) {
+        /* Load page if needed, but don't read any values */
+        if (reader->values_remaining > 0 && !reader->page_loaded) {
+            carquet_error_t error = CARQUET_ERROR_INIT;
+            int64_t values_read = 0;
+            uint8_t dummy[16];
+            carquet_status_t status = carquet_read_next_page(
+                reader, dummy, 0, NULL, NULL, &values_read, &error);
+            (void)status;
+        }
+        return 0;
     }
 
     if (reader->values_remaining <= 0) {

@@ -311,6 +311,9 @@ if(CARQUET_BUILD_TESTS)
     add_carquet_test(test_edge_malformed tests/test_edge_malformed.c)
     add_carquet_test(test_edge_boundaries tests/test_edge_boundaries.c)
     add_carquet_test(test_edge_io tests/test_edge_io.c)
+
+    # Memory mapping tests
+    add_carquet_test(test_mmap tests/test_mmap.c)
 endif()
 
 # Examples

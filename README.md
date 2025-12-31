@@ -810,20 +810,44 @@ carquet/
 
 ## Performance
 
-Benchmark results on Apple M3 (ARM64 with NEON), 1M rows, Release build:
+Benchmark comparing Carquet vs PyArrow 20.0 on Apple M3 (ARM64 with NEON), 10M rows, 3 columns (INT64 + DOUBLE + INT32), Release build with mmap enabled:
 
-| Codec | Write | Read |
-|-------|-------|------|
-| UNCOMPRESSED | 18.6 M rows/sec | 27.2 M rows/sec |
-| SNAPPY | 19.9 M rows/sec | 26.8 M rows/sec |
-| LZ4 | 19.5 M rows/sec | 27.4 M rows/sec |
-| ZSTD | 32.3 M rows/sec | 58.5 M rows/sec |
+### Read Performance (10M rows)
 
-Run benchmarks:
+| Codec | Carquet | PyArrow | Speedup |
+|-------|---------|---------|---------|
+| UNCOMPRESSED | **410 M rows/sec** | 308 M rows/sec | 1.33x faster |
+| SNAPPY | **258 M rows/sec** | 240 M rows/sec | 1.08x faster |
+| ZSTD | 73 M rows/sec | **222 M rows/sec** | 0.33x (see note) |
+
+### Write Performance (10M rows)
+
+| Codec | Carquet | PyArrow | Speedup |
+|-------|---------|---------|---------|
+| UNCOMPRESSED | 18.8 M rows/sec | **20.2 M rows/sec** | 0.93x |
+| SNAPPY | **18.7 M rows/sec** | 16.4 M rows/sec | 1.14x faster |
+| ZSTD | **29.9 M rows/sec** | 14.0 M rows/sec | 2.14x faster |
+
+### File Size (10M rows)
+
+| Codec | Carquet | PyArrow | Ratio |
+|-------|---------|---------|-------|
+| UNCOMPRESSED | 191 MB | 202 MB | 0.95x smaller |
+| SNAPPY | 154 MB | 121 MB | 1.27x larger |
+| ZSTD | **20 MB** | 60 MB | **0.34x smaller** |
+
+**Notes:**
+- Carquet uses mmap with zero-copy for uncompressed data, achieving maximum read throughput
+- ZSTD read is slower because PyArrow uses multi-threaded decompression; Carquet is single-threaded
+- ZSTD write is faster and produces smaller files due to better compression ratio
+- Benchmark uses identical data: `id` (INT64), `value` (DOUBLE), `category` (INT32)
+
+### Running Benchmarks
 
 ```bash
 cd build
-./benchmark_carquet
+./benchmark_carquet                    # Carquet only
+../benchmark/run_benchmark.sh          # Full comparison with PyArrow
 ```
 
 ## License

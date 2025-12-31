@@ -32,6 +32,7 @@ typedef struct carquet_column_data {
     size_t data_capacity;       /* Allocated capacity for data */
     carquet_physical_type_t type;
     int32_t type_length;        /* For fixed-length types */
+    carquet_data_ownership_t ownership;  /* OWNED or VIEW (for future zero-copy) */
 } carquet_column_data_t;
 
 struct carquet_row_batch {
@@ -305,67 +306,108 @@ carquet_status_t carquet_batch_reader_next(
         col_data->type_length = elem->type_length;
 
         size_t value_size = get_type_size(col_data->type, col_data->type_length);
-        size_t data_size = value_size * (size_t)rows_to_read;
-
-        /* Allocate column data buffer */
-        col_data->data = malloc(data_size);
-        if (!col_data->data) {
-            read_error = true;
-            continue;
-        }
-        col_data->data_capacity = data_size;
-
-        /* Allocate null bitmap */
-        size_t bitmap_size = ((size_t)rows_to_read + 7) / 8;
-        col_data->null_bitmap = calloc(1, bitmap_size);
-
-        /* Read values - fast path for REQUIRED columns (no nulls) */
         int16_t max_def = schema->max_def_levels[file_col_idx];
-        int16_t* def_levels = NULL;
 
-        if (max_def > 0) {
-            /* Column can have nulls - need to decode levels */
-            def_levels = malloc(sizeof(int16_t) * (size_t)rows_to_read);
+        /* Check if zero-copy is possible:
+         * - mmap is active
+         * - Column is REQUIRED (no nulls, no definition levels)
+         * - Page is zero-copy eligible (uncompressed, PLAIN, fixed-type)
+         * - Entire page fits in batch
+         */
+        bool try_zero_copy = (batch_reader->reader->mmap_info != NULL) &&
+                             (max_def == 0) &&
+                             (!col_reader->page_loaded);
+
+        if (try_zero_copy) {
+            /* Trigger page load to check if it's a zero-copy page */
+            carquet_error_t local_err = CARQUET_ERROR_INIT;
+            int64_t dummy_read = carquet_column_read_batch(
+                col_reader, NULL, 0, NULL, NULL);
+            (void)dummy_read;
+            (void)local_err;
         }
 
-        int64_t values_read = carquet_column_read_batch(
-            col_reader, col_data->data, rows_to_read, def_levels, NULL);
+        /* Check if we got a zero-copy view and can use it directly */
+        bool use_zero_copy = col_reader->page_loaded &&
+                             col_reader->decoded_ownership == CARQUET_DATA_VIEW &&
+                             col_reader->page_values_read == 0 &&
+                             col_reader->page_num_values <= (int32_t)rows_to_read &&
+                             max_def == 0;
 
-        if (values_read < 0) {
-            read_error = true;
-            free(def_levels);
-            continue;
-        }
+        if (use_zero_copy) {
+            /* ====== ZERO-COPY PATH ====== */
+            /* Point directly to mmap data - no allocation or copy! */
+            col_data->data = col_reader->decoded_values;
+            col_data->data_capacity = 0;  /* Not our allocation */
+            col_data->ownership = CARQUET_DATA_VIEW;
+            col_data->num_values = col_reader->page_num_values;
 
-        col_data->num_values = values_read;
+            /* No nulls in REQUIRED columns */
+            size_t bitmap_size = ((size_t)col_data->num_values + 7) / 8;
+            col_data->null_bitmap = calloc(1, bitmap_size);  /* All zeros = no nulls */
 
-        /* Build null bitmap from definition levels */
-        if (def_levels && col_data->null_bitmap) {
-            /* Process 8 values at a time for better performance */
-            int64_t full_bytes = values_read / 8;
-            for (int64_t b = 0; b < full_bytes; b++) {
-                uint8_t null_bits = 0;
-                int64_t base = b * 8;
-                /* Unrolled loop for 8 bits */
-                if (def_levels[base + 0] < max_def) null_bits |= 0x01;
-                if (def_levels[base + 1] < max_def) null_bits |= 0x02;
-                if (def_levels[base + 2] < max_def) null_bits |= 0x04;
-                if (def_levels[base + 3] < max_def) null_bits |= 0x08;
-                if (def_levels[base + 4] < max_def) null_bits |= 0x10;
-                if (def_levels[base + 5] < max_def) null_bits |= 0x20;
-                if (def_levels[base + 6] < max_def) null_bits |= 0x40;
-                if (def_levels[base + 7] < max_def) null_bits |= 0x80;
-                col_data->null_bitmap[b] = null_bits;
+            /* Mark page as consumed */
+            col_reader->page_values_read = col_reader->page_num_values;
+            col_reader->values_remaining -= col_reader->page_num_values;
+        } else {
+            /* ====== STANDARD PATH (with copy) ====== */
+            size_t data_size = value_size * (size_t)rows_to_read;
+
+            /* Allocate column data buffer */
+            col_data->data = malloc(data_size);
+            if (!col_data->data) {
+                read_error = true;
+                continue;
             }
-            /* Handle remaining values */
-            for (int64_t j = full_bytes * 8; j < values_read; j++) {
-                if (def_levels[j] < max_def) {
-                    col_data->null_bitmap[j / 8] |= (1 << (j % 8));
+            col_data->data_capacity = data_size;
+            col_data->ownership = CARQUET_DATA_OWNED;
+
+            /* Allocate null bitmap */
+            size_t bitmap_size = ((size_t)rows_to_read + 7) / 8;
+            col_data->null_bitmap = calloc(1, bitmap_size);
+
+            /* Read values */
+            int16_t* def_levels = NULL;
+            if (max_def > 0) {
+                def_levels = malloc(sizeof(int16_t) * (size_t)rows_to_read);
+            }
+
+            int64_t values_read = carquet_column_read_batch(
+                col_reader, col_data->data, rows_to_read, def_levels, NULL);
+
+            if (values_read < 0) {
+                read_error = true;
+                free(def_levels);
+                continue;
+            }
+
+            col_data->num_values = values_read;
+
+            /* Build null bitmap from definition levels */
+            if (def_levels && col_data->null_bitmap) {
+                int64_t full_bytes = values_read / 8;
+                for (int64_t b = 0; b < full_bytes; b++) {
+                    uint8_t null_bits = 0;
+                    int64_t base = b * 8;
+                    if (def_levels[base + 0] < max_def) null_bits |= 0x01;
+                    if (def_levels[base + 1] < max_def) null_bits |= 0x02;
+                    if (def_levels[base + 2] < max_def) null_bits |= 0x04;
+                    if (def_levels[base + 3] < max_def) null_bits |= 0x08;
+                    if (def_levels[base + 4] < max_def) null_bits |= 0x10;
+                    if (def_levels[base + 5] < max_def) null_bits |= 0x20;
+                    if (def_levels[base + 6] < max_def) null_bits |= 0x40;
+                    if (def_levels[base + 7] < max_def) null_bits |= 0x80;
+                    col_data->null_bitmap[b] = null_bits;
+                }
+                for (int64_t j = full_bytes * 8; j < values_read; j++) {
+                    if (def_levels[j] < max_def) {
+                        col_data->null_bitmap[j / 8] |= (1 << (j % 8));
+                    }
                 }
             }
-        }
 
-        free(def_levels);
+            free(def_levels);
+        }
     }
 
     if (read_error) {
@@ -436,9 +478,12 @@ carquet_status_t carquet_row_batch_column(
 void carquet_row_batch_free(carquet_row_batch_t* batch) {
     if (!batch) return;
 
-    /* Free column data */
+    /* Free column data (only if owned, not views into mmap) */
     for (int32_t i = 0; i < batch->num_columns; i++) {
-        free(batch->columns[i].data);
+        if (batch->columns[i].ownership == CARQUET_DATA_OWNED) {
+            free(batch->columns[i].data);
+        }
+        /* null_bitmap is always owned */
         free(batch->columns[i].null_bitmap);
     }
 

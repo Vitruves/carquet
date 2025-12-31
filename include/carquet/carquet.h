@@ -968,6 +968,43 @@ CARQUET_API CARQUET_PURE CARQUET_NONNULL(1)
 int32_t carquet_reader_num_columns(const carquet_reader_t* reader);
 
 /**
+ * @brief Check if reader is using memory-mapped I/O.
+ *
+ * When mmap is enabled, the reader can provide zero-copy access to data
+ * for uncompressed columns with PLAIN encoding.
+ *
+ * @param[in] reader File reader
+ * @return true if mmap is active, false otherwise
+ *
+ * @note Thread-safe: Yes (read-only)
+ */
+CARQUET_API CARQUET_PURE CARQUET_NONNULL(1)
+bool carquet_reader_is_mmap(const carquet_reader_t* reader);
+
+/**
+ * @brief Check if zero-copy reading is possible for a column.
+ *
+ * Zero-copy requires:
+ * - Memory-mapped I/O enabled
+ * - Uncompressed data (no compression codec)
+ * - PLAIN encoding
+ * - Fixed-size physical type (INT32, INT64, FLOAT, DOUBLE, INT96, FIXED_LEN_BYTE_ARRAY)
+ * - No definition levels (REQUIRED column)
+ *
+ * @param[in] reader File reader
+ * @param[in] row_group_index Row group index
+ * @param[in] column_index Column index
+ * @return true if zero-copy is possible, false otherwise
+ *
+ * @note Thread-safe: Yes (read-only)
+ */
+CARQUET_API CARQUET_PURE CARQUET_NONNULL(1)
+bool carquet_reader_can_zero_copy(
+    const carquet_reader_t* reader,
+    int32_t row_group_index,
+    int32_t column_index);
+
+/**
  * @brief Metadata for a row group.
  */
 typedef struct carquet_row_group_metadata {
@@ -1060,7 +1097,7 @@ carquet_column_reader_t* carquet_reader_get_column(
  * - BYTE_ARRAY: carquet_byte_array_t (pointer + length)
  * - FIXED_LEN_BYTE_ARRAY: uint8_t[type_length]
  */
-CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1, 2)
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1)
 int64_t carquet_column_read_batch(
     carquet_column_reader_t* reader,
     void* values,

@@ -84,12 +84,18 @@ static double benchmark_read(const char* filename, int expected_rows) {
 
     double start = get_time_ms();
 
-    carquet_reader_t* reader = carquet_reader_open(filename, NULL, &err);
+    /* Enable mmap and disable CRC for maximum read performance */
+    carquet_reader_options_t opts;
+    carquet_reader_options_init(&opts);
+    opts.use_mmap = true;
+    opts.verify_checksums = false;  /* Skip for benchmarking */
+
+    carquet_reader_t* reader = carquet_reader_open(filename, &opts, &err);
     if (!reader) return 0;
 
     carquet_batch_reader_config_t config;
     carquet_batch_reader_config_init(&config);
-    config.batch_size = 65536;
+    config.batch_size = 262144;  /* 256K rows per batch - reduces allocation overhead */
 
     carquet_batch_reader_t* batch_reader = carquet_batch_reader_create(reader, &config, &err);
     if (batch_reader) {

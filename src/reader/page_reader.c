@@ -533,11 +533,396 @@ static size_t get_value_size(carquet_physical_type_t type, int32_t type_length) 
 }
 
 /* ============================================================================
- * Helper: Load and decode a new page
+ * Helper: Load dictionary page (mmap path)
  * ============================================================================
  */
 
-static carquet_status_t load_next_page(
+static carquet_status_t load_dictionary_page_mmap(
+    carquet_column_reader_t* reader,
+    carquet_error_t* error) {
+
+    carquet_reader_t* file_reader = reader->file_reader;
+    const uint8_t* mmap_data = file_reader->mmap_data;
+    const parquet_column_metadata_t* col_meta = reader->col_meta;
+
+    /* Parse page header directly from mmap */
+    int64_t dict_offset = col_meta->dictionary_page_offset;
+    const uint8_t* header_ptr = mmap_data + dict_offset;
+
+    parquet_page_header_t page_header;
+    size_t header_size;
+    carquet_status_t status = parquet_parse_page_header(
+        header_ptr, 256, &page_header, &header_size, error);
+    if (status != CARQUET_OK) {
+        return status;
+    }
+
+    if (page_header.type != CARQUET_PAGE_DICTIONARY) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Expected dictionary page");
+        return CARQUET_ERROR_INVALID_PAGE;
+    }
+
+    /* Get pointer to compressed data */
+    const uint8_t* compressed = header_ptr + header_size;
+
+    /* Verify CRC32 if present */
+    if (page_header.has_crc && file_reader->options.verify_checksums) {
+        uint32_t computed_crc = carquet_crc32(compressed, page_header.compressed_page_size);
+        uint32_t expected_crc = (uint32_t)page_header.crc;
+        if (computed_crc != expected_crc) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_CRC_MISMATCH,
+                "Dictionary page CRC mismatch: expected 0x%08X, got 0x%08X",
+                expected_crc, computed_crc);
+            return CARQUET_ERROR_CRC_MISMATCH;
+        }
+    }
+
+    /* Process dictionary data */
+    const uint8_t* page_data;
+    size_t page_size;
+    uint8_t* decompressed = NULL;
+
+    if (col_meta->codec == CARQUET_COMPRESSION_UNCOMPRESSED) {
+        /* Zero-copy: point directly to mmap data */
+        page_data = compressed;
+        page_size = page_header.compressed_page_size;
+    } else {
+        /* Must decompress */
+        decompressed = malloc(page_header.uncompressed_page_size);
+        if (!decompressed) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate decompress buffer");
+            return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
+
+        status = decompress_page(col_meta->codec,
+            compressed, page_header.compressed_page_size,
+            decompressed, page_header.uncompressed_page_size, &page_size);
+
+        if (status != CARQUET_OK) {
+            free(decompressed);
+            CARQUET_SET_ERROR(error, status, "Failed to decompress dictionary");
+            return status;
+        }
+        page_data = decompressed;
+    }
+
+    /* Parse dictionary */
+    status = carquet_read_dictionary_page(
+        reader, page_data, page_size,
+        &page_header.dictionary_page_header, error);
+
+    free(decompressed);  /* Safe to free NULL */
+    return status;
+}
+
+/* ============================================================================
+ * Helper: Load dictionary page (fread path)
+ * ============================================================================
+ */
+
+static carquet_status_t load_dictionary_page_fread(
+    carquet_column_reader_t* reader,
+    carquet_error_t* error) {
+
+    carquet_reader_t* file_reader = reader->file_reader;
+    FILE* file = file_reader->file;
+    const parquet_column_metadata_t* col_meta = reader->col_meta;
+
+    /* Seek to dictionary page */
+    if (fseek(file, col_meta->dictionary_page_offset, SEEK_SET) != 0) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_SEEK, "Failed to seek to dictionary");
+        return CARQUET_ERROR_FILE_SEEK;
+    }
+
+    /* Read page header */
+    uint8_t header_buf[256];
+    size_t header_read = fread(header_buf, 1, sizeof(header_buf), file);
+    if (header_read < 8) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_READ, "Failed to read dictionary header");
+        return CARQUET_ERROR_FILE_READ;
+    }
+
+    parquet_page_header_t page_header;
+    size_t header_size;
+    carquet_status_t status = parquet_parse_page_header(
+        header_buf, header_read, &page_header, &header_size, error);
+    if (status != CARQUET_OK) {
+        return status;
+    }
+
+    if (page_header.type != CARQUET_PAGE_DICTIONARY) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Expected dictionary page");
+        return CARQUET_ERROR_INVALID_PAGE;
+    }
+
+    /* Seek past header and read page data */
+    if (fseek(file, col_meta->dictionary_page_offset + (long)header_size, SEEK_SET) != 0) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_SEEK, "Failed to seek past dict header");
+        return CARQUET_ERROR_FILE_SEEK;
+    }
+
+    /* Allocate and read compressed data */
+    uint8_t* compressed = malloc(page_header.compressed_page_size);
+    if (!compressed) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate compressed buffer");
+        return CARQUET_ERROR_OUT_OF_MEMORY;
+    }
+
+    if (fread(compressed, 1, page_header.compressed_page_size, file) !=
+        (size_t)page_header.compressed_page_size) {
+        free(compressed);
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_READ, "Failed to read dictionary data");
+        return CARQUET_ERROR_FILE_READ;
+    }
+
+    /* Verify CRC32 if present */
+    if (page_header.has_crc && file_reader->options.verify_checksums) {
+        uint32_t computed_crc = carquet_crc32(compressed, page_header.compressed_page_size);
+        uint32_t expected_crc = (uint32_t)page_header.crc;
+        if (computed_crc != expected_crc) {
+            free(compressed);
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_CRC_MISMATCH,
+                "Dictionary page CRC mismatch: expected 0x%08X, got 0x%08X",
+                expected_crc, computed_crc);
+            return CARQUET_ERROR_CRC_MISMATCH;
+        }
+    }
+
+    /* Decompress if needed */
+    uint8_t* page_data;
+    size_t page_size;
+
+    if (col_meta->codec == CARQUET_COMPRESSION_UNCOMPRESSED) {
+        page_data = compressed;
+        page_size = page_header.compressed_page_size;
+    } else {
+        page_data = malloc(page_header.uncompressed_page_size);
+        if (!page_data) {
+            free(compressed);
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate decompress buffer");
+            return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
+
+        status = decompress_page(col_meta->codec,
+            compressed, page_header.compressed_page_size,
+            page_data, page_header.uncompressed_page_size, &page_size);
+        free(compressed);
+
+        if (status != CARQUET_OK) {
+            free(page_data);
+            CARQUET_SET_ERROR(error, status, "Failed to decompress dictionary");
+            return status;
+        }
+    }
+
+    /* Parse dictionary */
+    status = carquet_read_dictionary_page(
+        reader, page_data, page_size,
+        &page_header.dictionary_page_header, error);
+
+    if (page_data != compressed) {
+        free(page_data);
+    } else {
+        free(compressed);
+    }
+
+    return status;
+}
+
+/* ============================================================================
+ * Helper: Load and decode a new page (mmap path with zero-copy support)
+ * ============================================================================
+ */
+
+static carquet_status_t load_next_page_mmap(
+    carquet_column_reader_t* reader,
+    carquet_error_t* error) {
+
+    carquet_reader_t* file_reader = reader->file_reader;
+    const uint8_t* mmap_data = file_reader->mmap_data;
+    const parquet_column_metadata_t* col_meta = reader->col_meta;
+    int64_t data_offset = col_meta->data_page_offset;
+
+    /* Load dictionary if needed */
+    if (col_meta->has_dictionary_page_offset && !reader->has_dictionary) {
+        carquet_status_t status = load_dictionary_page_mmap(reader, error);
+        if (status != CARQUET_OK) {
+            return status;
+        }
+    }
+
+    /* Parse page header directly from mmap */
+    int64_t page_offset = data_offset + reader->current_page;
+    const uint8_t* header_ptr = mmap_data + page_offset;
+
+    parquet_page_header_t page_header;
+    size_t header_size;
+    carquet_status_t status = parquet_parse_page_header(
+        header_ptr, 256, &page_header, &header_size, error);
+    if (status != CARQUET_OK) {
+        return status;
+    }
+
+    if (page_header.type != CARQUET_PAGE_DATA && page_header.type != CARQUET_PAGE_DATA_V2) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Expected data page");
+        return CARQUET_ERROR_INVALID_PAGE;
+    }
+
+    /* Get pointer to page data in mmap */
+    const uint8_t* page_data_ptr = header_ptr + header_size;
+
+    /* Verify CRC32 if present */
+    if (page_header.has_crc && file_reader->options.verify_checksums) {
+        uint32_t computed_crc = carquet_crc32(page_data_ptr, page_header.compressed_page_size);
+        uint32_t expected_crc = (uint32_t)page_header.crc;
+        if (computed_crc != expected_crc) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_CRC_MISMATCH,
+                "Page CRC mismatch: expected 0x%08X, got 0x%08X at offset %ld",
+                expected_crc, computed_crc, (long)page_offset);
+            return CARQUET_ERROR_CRC_MISMATCH;
+        }
+    }
+
+    int32_t num_values = page_header.data_page_header.num_values;
+    size_t value_size = get_value_size(reader->type, reader->type_length);
+
+    /* Check if zero-copy is possible */
+    bool zero_copy_eligible = carquet_page_is_zero_copy_eligible(
+        col_meta->codec,
+        page_header.data_page_header.encoding,
+        reader->type);
+
+    /* Additional constraint: no definition/repetition levels for zero-copy
+     * (levels require RLE decoding which modifies data layout) */
+    bool has_levels = (reader->max_def_level > 0 || reader->max_rep_level > 0);
+
+    if (zero_copy_eligible && !has_levels) {
+        /* ====== ZERO-COPY PATH ====== */
+
+        /* Free previous owned buffer if any */
+        if (reader->decoded_ownership == CARQUET_DATA_OWNED) {
+            free(reader->decoded_values);
+        }
+
+        /* Point directly to mmap data - no copy! */
+        reader->decoded_values = (uint8_t*)page_data_ptr;
+        reader->decoded_ownership = CARQUET_DATA_VIEW;
+
+        /* Ensure level buffers exist (may be empty but API expects them) */
+        if ((size_t)num_values > reader->decoded_capacity) {
+            free(reader->decoded_def_levels);
+            free(reader->decoded_rep_levels);
+            reader->decoded_def_levels = malloc(sizeof(int16_t) * num_values);
+            reader->decoded_rep_levels = malloc(sizeof(int16_t) * num_values);
+            reader->decoded_capacity = num_values;
+        }
+
+        /* Zero-copy only happens when max_def_level == 0, so all levels are 0.
+         * Use memset for O(1) instead of O(n) loop */
+        memset(reader->decoded_def_levels, 0, sizeof(int16_t) * num_values);
+        memset(reader->decoded_rep_levels, 0, sizeof(int16_t) * num_values);
+
+        reader->page_loaded = true;
+        reader->page_num_values = num_values;
+        reader->page_values_read = 0;
+        reader->page_header_size = (int32_t)header_size;
+        reader->page_compressed_size = page_header.compressed_page_size;
+
+        return CARQUET_OK;
+    }
+
+    /* ====== STANDARD PATH (with decompression/decoding) ====== */
+
+    const uint8_t* page_data;
+    size_t page_size;
+    uint8_t* decompressed = NULL;
+
+    if (col_meta->codec == CARQUET_COMPRESSION_UNCOMPRESSED) {
+        page_data = page_data_ptr;
+        page_size = page_header.compressed_page_size;
+    } else {
+        /* Must decompress */
+        decompressed = malloc(page_header.uncompressed_page_size);
+        if (!decompressed) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate decompress buffer");
+            return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
+
+        status = decompress_page(col_meta->codec,
+            page_data_ptr, page_header.compressed_page_size,
+            decompressed, page_header.uncompressed_page_size, &page_size);
+
+        if (status != CARQUET_OK) {
+            free(decompressed);
+            CARQUET_SET_ERROR(error, status, "Failed to decompress page");
+            return status;
+        }
+        page_data = decompressed;
+    }
+
+    /* Ensure we have owned buffers for decoding */
+    if (reader->decoded_ownership == CARQUET_DATA_VIEW) {
+        /* Was a view, need to allocate new buffer */
+        reader->decoded_values = NULL;
+        reader->decoded_capacity = 0;
+    }
+
+    size_t values_buffer_size = value_size * (size_t)num_values;
+    if ((size_t)num_values > reader->decoded_capacity) {
+        free(reader->decoded_values);
+        free(reader->decoded_def_levels);
+        free(reader->decoded_rep_levels);
+
+        reader->decoded_values = malloc(values_buffer_size);
+        reader->decoded_def_levels = malloc(sizeof(int16_t) * num_values);
+        reader->decoded_rep_levels = malloc(sizeof(int16_t) * num_values);
+        reader->decoded_capacity = num_values;
+
+        if (!reader->decoded_values || !reader->decoded_def_levels || !reader->decoded_rep_levels) {
+            free(reader->decoded_values);
+            free(reader->decoded_def_levels);
+            free(reader->decoded_rep_levels);
+            reader->decoded_values = NULL;
+            reader->decoded_def_levels = NULL;
+            reader->decoded_rep_levels = NULL;
+            reader->decoded_capacity = 0;
+            free(decompressed);
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate decode buffers");
+            return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
+    }
+    reader->decoded_ownership = CARQUET_DATA_OWNED;
+
+    /* Decode the page */
+    int64_t decoded_count;
+    status = carquet_read_data_page_v1(
+        reader, page_data, page_size,
+        &page_header.data_page_header,
+        reader->decoded_values, num_values,
+        reader->decoded_def_levels, reader->decoded_rep_levels,
+        &decoded_count, error);
+
+    free(decompressed);
+
+    if (status != CARQUET_OK) {
+        return status;
+    }
+
+    reader->page_loaded = true;
+    reader->page_num_values = (int32_t)decoded_count;
+    reader->page_values_read = 0;
+    reader->page_header_size = (int32_t)header_size;
+    reader->page_compressed_size = page_header.compressed_page_size;
+
+    return CARQUET_OK;
+}
+
+/* ============================================================================
+ * Helper: Load and decode a new page (fread path)
+ * ============================================================================
+ */
+
+static carquet_status_t load_next_page_fread(
     carquet_column_reader_t* reader,
     carquet_error_t* error) {
 
@@ -546,106 +931,9 @@ static carquet_status_t load_next_page(
     const parquet_column_metadata_t* col_meta = reader->col_meta;
     int64_t data_offset = col_meta->data_page_offset;
 
-    /* Check for dictionary page */
+    /* Load dictionary if needed */
     if (col_meta->has_dictionary_page_offset && !reader->has_dictionary) {
-        /* Seek to dictionary page */
-        if (fseek(file, col_meta->dictionary_page_offset, SEEK_SET) != 0) {
-            CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_SEEK, "Failed to seek to dictionary");
-            return CARQUET_ERROR_FILE_SEEK;
-        }
-
-        /* Read page header */
-        uint8_t header_buf[256];
-        size_t header_read = fread(header_buf, 1, sizeof(header_buf), file);
-        if (header_read < 8) {
-            CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_READ, "Failed to read dictionary header");
-            return CARQUET_ERROR_FILE_READ;
-        }
-
-        parquet_page_header_t page_header;
-        size_t header_size;
-        carquet_status_t status = parquet_parse_page_header(
-            header_buf, header_read, &page_header, &header_size, error);
-        if (status != CARQUET_OK) {
-            return status;
-        }
-
-        if (page_header.type != CARQUET_PAGE_DICTIONARY) {
-            CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Expected dictionary page");
-            return CARQUET_ERROR_INVALID_PAGE;
-        }
-
-        /* Seek past header and read page data */
-        if (fseek(file, col_meta->dictionary_page_offset + (long)header_size, SEEK_SET) != 0) {
-            CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_SEEK, "Failed to seek past dict header");
-            return CARQUET_ERROR_FILE_SEEK;
-        }
-
-        /* Allocate and read compressed data */
-        uint8_t* compressed = malloc(page_header.compressed_page_size);
-        if (!compressed) {
-            CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate compressed buffer");
-            return CARQUET_ERROR_OUT_OF_MEMORY;
-        }
-
-        if (fread(compressed, 1, page_header.compressed_page_size, file) !=
-            (size_t)page_header.compressed_page_size) {
-            free(compressed);
-            CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_READ, "Failed to read dictionary data");
-            return CARQUET_ERROR_FILE_READ;
-        }
-
-        /* Verify CRC32 if present */
-        if (page_header.has_crc) {
-            uint32_t computed_crc = carquet_crc32(compressed, page_header.compressed_page_size);
-            uint32_t expected_crc = (uint32_t)page_header.crc;
-            if (computed_crc != expected_crc) {
-                free(compressed);
-                CARQUET_SET_ERROR(error, CARQUET_ERROR_CRC_MISMATCH,
-                    "Dictionary page CRC mismatch: expected 0x%08X, got 0x%08X",
-                    expected_crc, computed_crc);
-                return CARQUET_ERROR_CRC_MISMATCH;
-            }
-        }
-
-        /* Decompress if needed */
-        uint8_t* page_data;
-        size_t page_size;
-
-        if (col_meta->codec == CARQUET_COMPRESSION_UNCOMPRESSED) {
-            page_data = compressed;
-            page_size = page_header.compressed_page_size;
-        } else {
-            page_data = malloc(page_header.uncompressed_page_size);
-            if (!page_data) {
-                free(compressed);
-                CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate decompress buffer");
-                return CARQUET_ERROR_OUT_OF_MEMORY;
-            }
-
-            status = decompress_page(col_meta->codec,
-                compressed, page_header.compressed_page_size,
-                page_data, page_header.uncompressed_page_size, &page_size);
-            free(compressed);
-
-            if (status != CARQUET_OK) {
-                free(page_data);
-                CARQUET_SET_ERROR(error, status, "Failed to decompress dictionary");
-                return status;
-            }
-        }
-
-        /* Parse dictionary */
-        status = carquet_read_dictionary_page(
-            reader, page_data, page_size,
-            &page_header.dictionary_page_header, error);
-
-        if (page_data != compressed) {
-            free(page_data);
-        } else {
-            free(compressed);
-        }
-
+        carquet_status_t status = load_dictionary_page_fread(reader, error);
         if (status != CARQUET_OK) {
             return status;
         }
@@ -699,7 +987,7 @@ static carquet_status_t load_next_page(
     }
 
     /* Verify CRC32 if present */
-    if (page_header.has_crc) {
+    if (page_header.has_crc && file_reader->options.verify_checksums) {
         uint32_t computed_crc = carquet_crc32(compressed, page_header.compressed_page_size);
         uint32_t expected_crc = (uint32_t)page_header.crc;
         if (computed_crc != expected_crc) {
@@ -738,6 +1026,13 @@ static carquet_status_t load_next_page(
             return status;
         }
     }
+
+    /* Ensure we have owned buffers */
+    if (reader->decoded_ownership == CARQUET_DATA_VIEW) {
+        reader->decoded_values = NULL;
+        reader->decoded_capacity = 0;
+    }
+    reader->decoded_ownership = CARQUET_DATA_OWNED;
 
     /* Allocate buffers for decoded page data */
     int32_t num_values = page_header.data_page_header.num_values;
@@ -798,6 +1093,26 @@ static carquet_status_t load_next_page(
     reader->page_compressed_size = page_header.compressed_page_size;
 
     return CARQUET_OK;
+}
+
+/* ============================================================================
+ * Helper: Load and decode a new page (dispatcher)
+ * ============================================================================
+ */
+
+static carquet_status_t load_next_page(
+    carquet_column_reader_t* reader,
+    carquet_error_t* error) {
+
+    carquet_reader_t* file_reader = reader->file_reader;
+
+    /* Use mmap path if available */
+    if (file_reader->mmap_info && file_reader->mmap_info->is_valid) {
+        return load_next_page_mmap(reader, error);
+    }
+
+    /* Fall back to fread path */
+    return load_next_page_fread(reader, error);
 }
 
 /* ============================================================================
