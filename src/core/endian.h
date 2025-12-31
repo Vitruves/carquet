@@ -21,18 +21,33 @@ extern "C" {
  * ============================================================================
  */
 
-#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__)
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && defined(__ORDER_BIG_ENDIAN__)
+    /* GCC/Clang - most reliable detection */
     #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
         #define CARQUET_LITTLE_ENDIAN 1
-    #else
+    #elif __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
         #define CARQUET_LITTLE_ENDIAN 0
+    #else
+        #error "Unknown byte order"
     #endif
-#elif defined(_WIN32) || defined(__x86_64__) || defined(__i386__) || \
-      defined(__aarch64__) || defined(__arm__)
-    /* Most common platforms are little-endian */
+#elif defined(__LITTLE_ENDIAN__) || defined(__ARMEL__) || defined(__THUMBEL__) || \
+      defined(__AARCH64EL__) || defined(_MIPSEL) || defined(__MIPSEL) || \
+      defined(__MIPSEL__) || defined(__XTENSA_EL__) || defined(__RISCV__) || \
+      defined(_WIN32) || defined(__x86_64__) || defined(__i386__) || \
+      defined(__amd64__)
+    /* Explicitly little-endian platforms */
     #define CARQUET_LITTLE_ENDIAN 1
+#elif defined(__BIG_ENDIAN__) || defined(__ARMEB__) || defined(__THUMBEB__) || \
+      defined(__AARCH64EB__) || defined(_MIPSEB) || defined(__MIPSEB) || \
+      defined(__MIPSEB__) || defined(__XTENSA_EB__) || defined(__sparc__) || \
+      defined(__s390__) || defined(__s390x__) || defined(__hppa__) || \
+      defined(__HPPA__) || defined(__powerpc__) || defined(__ppc__) || \
+      defined(__PPC__) || defined(_POWER)
+    /* Explicitly big-endian platforms */
+    #define CARQUET_LITTLE_ENDIAN 0
 #else
-    /* Assume little-endian, can be overridden */
+    /* Fallback: use runtime check or compilation will fail if incorrect */
+    #warning "Unknown endianness - assuming little-endian. Define CARQUET_LITTLE_ENDIAN=0 for big-endian."
     #define CARQUET_LITTLE_ENDIAN 1
 #endif
 
