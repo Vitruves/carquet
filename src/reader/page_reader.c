@@ -18,6 +18,16 @@
 /* CRC32 verification */
 extern uint32_t carquet_crc32(const uint8_t* data, size_t length);
 
+/* SIMD dispatch functions for dictionary gather */
+extern void carquet_dispatch_gather_i32(const int32_t* dict, const uint32_t* indices,
+                                         int64_t count, int32_t* output);
+extern void carquet_dispatch_gather_i64(const int64_t* dict, const uint32_t* indices,
+                                         int64_t count, int64_t* output);
+extern void carquet_dispatch_gather_float(const float* dict, const uint32_t* indices,
+                                           int64_t count, float* output);
+extern void carquet_dispatch_gather_double(const double* dict, const uint32_t* indices,
+                                            int64_t count, double* output);
+
 /* Forward declarations for compression functions */
 extern carquet_status_t carquet_lz4_decompress(
     const uint8_t* src, size_t src_size,
@@ -389,38 +399,53 @@ carquet_status_t carquet_read_data_page_v1(
                         out[i].length = (int32_t)len;
                     }
                 } else {
-                    size_t value_size = 0;
+                    /* Validate all indices first */
+                    for (int32_t i = 0; i < non_null_count; i++) {
+                        if (indices[i] >= (uint32_t)reader->dictionary_count) {
+                            free(indices);
+                            CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Dictionary index out of bounds");
+                            return CARQUET_ERROR_DECODE;
+                        }
+                    }
+
+                    /* Use SIMD-optimized gather for common types */
                     switch (reader->type) {
                         case CARQUET_PHYSICAL_INT32:
-                        case CARQUET_PHYSICAL_FLOAT:
-                            value_size = 4;
+                            carquet_dispatch_gather_i32(
+                                (const int32_t*)reader->dictionary_data,
+                                indices, non_null_count, (int32_t*)values);
                             break;
                         case CARQUET_PHYSICAL_INT64:
+                            carquet_dispatch_gather_i64(
+                                (const int64_t*)reader->dictionary_data,
+                                indices, non_null_count, (int64_t*)values);
+                            break;
+                        case CARQUET_PHYSICAL_FLOAT:
+                            carquet_dispatch_gather_float(
+                                (const float*)reader->dictionary_data,
+                                indices, non_null_count, (float*)values);
+                            break;
                         case CARQUET_PHYSICAL_DOUBLE:
-                            value_size = 8;
+                            carquet_dispatch_gather_double(
+                                (const double*)reader->dictionary_data,
+                                indices, non_null_count, (double*)values);
                             break;
                         case CARQUET_PHYSICAL_INT96:
-                            value_size = 12;
-                            break;
                         case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY:
-                            value_size = reader->type_length;
+                            {
+                                /* Scalar fallback for less common types */
+                                size_t value_size = (reader->type == CARQUET_PHYSICAL_INT96)
+                                    ? 12 : (size_t)reader->type_length;
+                                uint8_t* out = (uint8_t*)values;
+                                for (int32_t i = 0; i < non_null_count; i++) {
+                                    memcpy(out + i * value_size,
+                                           reader->dictionary_data + indices[i] * value_size,
+                                           value_size);
+                                }
+                            }
                             break;
                         default:
                             break;
-                    }
-
-                    if (value_size > 0) {
-                        uint8_t* out = (uint8_t*)values;
-                        for (int32_t i = 0; i < non_null_count; i++) {
-                            int32_t idx = (int32_t)indices[i];
-                            if (idx < 0 || idx >= reader->dictionary_count) {
-                                status = CARQUET_ERROR_DECODE;
-                                break;
-                            }
-                            memcpy(out + i * value_size,
-                                   reader->dictionary_data + idx * value_size,
-                                   value_size);
-                        }
                     }
                 }
 

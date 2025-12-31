@@ -15,6 +15,12 @@
 #include <stddef.h>
 #include <string.h>
 
+/* SIMD dispatch functions */
+extern void carquet_dispatch_byte_split_encode_float(const float* values, int64_t count, uint8_t* output);
+extern void carquet_dispatch_byte_split_decode_float(const uint8_t* data, int64_t count, float* values);
+extern void carquet_dispatch_byte_split_encode_double(const double* values, int64_t count, uint8_t* output);
+extern void carquet_dispatch_byte_split_decode_double(const uint8_t* data, int64_t count, double* values);
+
 /* ============================================================================
  * Float Encoding (32-bit, 4 bytes)
  * ============================================================================
@@ -36,14 +42,8 @@ carquet_status_t carquet_byte_stream_split_encode_float(
         return CARQUET_ERROR_ENCODE;
     }
 
-    const uint8_t* src = (const uint8_t*)values;
-
-    /* Transpose: put byte 0 of all values, then byte 1, etc. */
-    for (int b = 0; b < 4; b++) {
-        for (int64_t i = 0; i < count; i++) {
-            output[b * count + i] = src[i * 4 + b];
-        }
-    }
+    /* Use SIMD-optimized transpose */
+    carquet_dispatch_byte_split_encode_float(values, count, output);
 
     *bytes_written = required_size;
     return CARQUET_OK;
@@ -64,14 +64,8 @@ carquet_status_t carquet_byte_stream_split_decode_float(
         return CARQUET_ERROR_DECODE;
     }
 
-    uint8_t* dst = (uint8_t*)values;
-
-    /* Un-transpose: gather byte streams back into values */
-    for (int64_t i = 0; i < count; i++) {
-        for (int b = 0; b < 4; b++) {
-            dst[i * 4 + b] = data[b * count + i];
-        }
-    }
+    /* Use SIMD-optimized un-transpose */
+    carquet_dispatch_byte_split_decode_float(data, count, values);
 
     return CARQUET_OK;
 }
@@ -97,14 +91,8 @@ carquet_status_t carquet_byte_stream_split_encode_double(
         return CARQUET_ERROR_ENCODE;
     }
 
-    const uint8_t* src = (const uint8_t*)values;
-
-    /* Transpose: put byte 0 of all values, then byte 1, etc. */
-    for (int b = 0; b < 8; b++) {
-        for (int64_t i = 0; i < count; i++) {
-            output[b * count + i] = src[i * 8 + b];
-        }
-    }
+    /* Use SIMD-optimized transpose */
+    carquet_dispatch_byte_split_encode_double(values, count, output);
 
     *bytes_written = required_size;
     return CARQUET_OK;
@@ -125,14 +113,8 @@ carquet_status_t carquet_byte_stream_split_decode_double(
         return CARQUET_ERROR_DECODE;
     }
 
-    uint8_t* dst = (uint8_t*)values;
-
-    /* Un-transpose: gather byte streams back into values */
-    for (int64_t i = 0; i < count; i++) {
-        for (int b = 0; b < 8; b++) {
-            dst[i * 8 + b] = data[b * count + i];
-        }
-    }
+    /* Use SIMD-optimized un-transpose */
+    carquet_dispatch_byte_split_decode_double(data, count, values);
 
     return CARQUET_OK;
 }
