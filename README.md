@@ -814,10 +814,10 @@ Benchmark results on Apple M3 (ARM64 with NEON), 1M rows, Release build:
 
 | Codec | Write | Read |
 |-------|-------|------|
-| UNCOMPRESSED | 17.8 M rows/sec | 18.1 M rows/sec |
-| SNAPPY | 20.0 M rows/sec | 18.3 M rows/sec |
-| LZ4 | 19.4 M rows/sec | 18.4 M rows/sec |
-| ZSTD | 31.7 M rows/sec | 39.5 M rows/sec |
+| UNCOMPRESSED | 18.6 M rows/sec | 27.2 M rows/sec |
+| SNAPPY | 19.9 M rows/sec | 26.8 M rows/sec |
+| LZ4 | 19.5 M rows/sec | 27.4 M rows/sec |
+| ZSTD | 32.3 M rows/sec | 58.5 M rows/sec |
 
 Run benchmarks:
 
