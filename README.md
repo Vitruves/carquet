@@ -4,14 +4,15 @@ A high-performance pure C library for reading and writing Apache Parquet files.
 
 ## Features
 
-- **Pure C11** - Minimal dependencies (zstd, zlib for compression), easy to embed
-- **SIMD Optimized** - Automatic CPU detection and dispatch for SSE4.2, AVX2, AVX-512, NEON, and SVE
+- **Pure C11** - Only external dependencies are zstd and zlib (auto-fetched by CMake if missing). Snappy and LZ4 are internal implementations.
+- **Portable** - Works on any architecture. SIMD optimizations (SSE4.2, AVX2, AVX-512, NEON, SVE) with automatic runtime detection and scalar fallbacks.
+- **Big-Endian Support** - Proper byte-order handling for s390x, SPARC, PowerPC, etc.
 - **Complete Parquet Support**:
   - All physical types (BOOLEAN, INT32, INT64, INT96, FLOAT, DOUBLE, BYTE_ARRAY, FIXED_LEN_BYTE_ARRAY)
   - All encodings (PLAIN, RLE, DICTIONARY, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, BYTE_STREAM_SPLIT)
   - All compression codecs (UNCOMPRESSED, SNAPPY, GZIP, LZ4, ZSTD)
-  - Nested types with full definition/repetition level support
-  - Nullable columns with proper null bitmap handling
+  - Nullable columns with definition levels
+  - Basic nested schema support (groups, definition/repetition levels)
 - **Production Ready**:
   - CRC32 page verification for data integrity
   - Column statistics for predicate pushdown
@@ -20,8 +21,15 @@ A high-performance pure C library for reading and writing Apache Parquet files.
 - **Streaming API** - Read and write large files without loading everything into memory
 - **PyArrow Compatible** - Full interoperability with Python's PyArrow library
 
+### Current Limitations
+
+- Complex nested types (deeply nested lists/maps) are not fully tested
+- No encryption support
+- Bloom filters are read-only
+
 ## Table of Contents
 
+- [Features](#features)
 - [Building](#building)
 - [Quick Start](#quick-start)
 - [Reading Parquet Files](#reading-parquet-files)
@@ -34,6 +42,7 @@ A high-performance pure C library for reading and writing Apache Parquet files.
 - [API Reference](#api-reference)
 - [Examples](#examples)
 - [Interoperability](#interoperability)
+- [Performance](#performance)
 
 ## Building
 
@@ -41,7 +50,9 @@ A high-performance pure C library for reading and writing Apache Parquet files.
 
 - C11-compatible compiler (GCC 4.9+, Clang 3.4+, MSVC 2015+)
 - CMake 3.16+
-- zstd and zlib (automatically fetched if not found)
+- zstd and zlib (automatically fetched via FetchContent if not found on system)
+
+Works on Linux, macOS, Windows, and any POSIX system. Tested on x86_64, ARM64, and should work on RISC-V, MIPS, PowerPC, s390x, etc.
 
 ### Basic Build
 
@@ -549,12 +560,33 @@ printf("%s\n", error_buffer);
 | Category | Codes | Description |
 |----------|-------|-------------|
 | Success | `CARQUET_OK` | Operation succeeded |
-| General | `CARQUET_ERROR_INVALID_ARGUMENT`, `CARQUET_ERROR_OUT_OF_MEMORY` | General errors |
+| General | `CARQUET_ERROR_OUT_OF_MEMORY` | Memory allocation failed |
 | File I/O | `CARQUET_ERROR_FILE_*` | File operation errors |
 | Format | `CARQUET_ERROR_INVALID_MAGIC`, `CARQUET_ERROR_INVALID_FOOTER` | Invalid file format |
 | Encoding | `CARQUET_ERROR_DECODE`, `CARQUET_ERROR_INVALID_ENCODING` | Encoding errors |
-| Compression | `CARQUET_ERROR_DECOMPRESSION`, `CARQUET_ERROR_UNSUPPORTED_CODEC` | Compression errors |
+| Compression | `CARQUET_ERROR_COMPRESSION`, `CARQUET_ERROR_UNSUPPORTED_CODEC` | Compression errors |
 | Integrity | `CARQUET_ERROR_CRC_MISMATCH`, `CARQUET_ERROR_CHECKSUM` | Data corruption |
+
+### API Design: Assertions vs Error Returns
+
+Carquet distinguishes between **programming errors** (bugs) and **runtime errors** (expected failures):
+
+| Error Type | Handling | Example |
+|------------|----------|---------|
+| Programming error | `assert()` | Passing NULL to `carquet_buffer_init()` |
+| Runtime error | Return status | File not found, corrupted data, out of memory |
+
+**Rationale**: If you pass NULL where a valid pointer is required, that's a bug in your code - not something to "handle" at runtime. Assertions catch these during development. Runtime errors (bad files, memory exhaustion) return proper error codes since they can legitimately occur in production.
+
+```c
+// These assert on NULL (programming errors - fix your code!)
+carquet_buffer_init(&buf);      // buf must not be NULL
+carquet_arena_destroy(&arena);  // arena must not be NULL
+
+// These return errors (runtime failures - handle gracefully)
+carquet_reader_t* r = carquet_reader_open("bad.parquet", NULL, &err);
+if (!r) { /* file might not exist or be corrupted */ }
+```
 
 ### Checking Recoverability
 
