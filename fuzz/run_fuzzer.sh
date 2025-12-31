@@ -50,15 +50,39 @@ usage() {
 build_fuzzers() {
     echo -e "${YELLOW}Building fuzz targets...${NC}"
 
-    # Check for clang
-    if ! command -v clang &> /dev/null; then
-        echo -e "${RED}Error: clang not found. libFuzzer requires clang.${NC}"
+    # Find a clang with libFuzzer support
+    # System clang on macOS doesn't have libFuzzer, need LLVM from Homebrew
+    CLANG=""
+
+    # Try Homebrew LLVM first (has libFuzzer)
+    if [ -x "/opt/homebrew/opt/llvm/bin/clang" ]; then
+        CLANG="/opt/homebrew/opt/llvm/bin/clang"
+    elif [ -x "/usr/local/opt/llvm/bin/clang" ]; then
+        CLANG="/usr/local/opt/llvm/bin/clang"
+    elif command -v clang &> /dev/null; then
+        # Check if system clang has libFuzzer
+        if clang --print-runtime-dir 2>/dev/null | grep -q "lib/clang"; then
+            CLANG="clang"
+        fi
+    fi
+
+    if [ -z "$CLANG" ]; then
+        echo -e "${RED}Error: No clang with libFuzzer support found.${NC}"
+        echo ""
+        echo "On macOS, install LLVM via Homebrew:"
+        echo "  brew install llvm"
+        echo ""
+        echo "On Linux, install clang:"
+        echo "  apt install clang  # Debian/Ubuntu"
+        echo "  dnf install clang  # Fedora"
         exit 1
     fi
 
+    echo -e "${GREEN}Using clang: $CLANG${NC}"
+
     # Configure with fuzzing enabled
     cmake -B "$BUILD_DIR" \
-        -DCMAKE_C_COMPILER=clang \
+        -DCMAKE_C_COMPILER="$CLANG" \
         -DCMAKE_BUILD_TYPE=Debug \
         -DCARQUET_BUILD_FUZZ=ON \
         -DCARQUET_BUILD_TESTS=OFF \

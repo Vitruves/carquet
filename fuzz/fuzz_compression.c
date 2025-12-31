@@ -37,7 +37,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         return 0;
     }
 
-    carquet_init();
+    (void)carquet_init();
 
     /* First byte selects codec */
     uint8_t codec = data[0] % 4;

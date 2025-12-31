@@ -6,6 +6,42 @@
 #include "parquet_types.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+
+/* ============================================================================
+ * Security Limits
+ * ============================================================================
+ * These limits prevent OOM attacks from malicious files that claim huge counts.
+ * Real Parquet files rarely exceed these limits.
+ */
+
+#define CARQUET_MAX_SCHEMA_ELEMENTS   10000   /* Max columns/groups in schema */
+#define CARQUET_MAX_ROW_GROUPS        100000  /* Max row groups in file */
+#define CARQUET_MAX_COLUMNS_PER_RG    10000   /* Max columns per row group */
+#define CARQUET_MAX_KEY_VALUE_PAIRS   10000   /* Max metadata key-value pairs */
+#define CARQUET_MAX_ENCODINGS         100     /* Max encodings per column */
+#define CARQUET_MAX_PATH_ELEMENTS     100     /* Max path depth */
+#define CARQUET_MAX_ENCODING_STATS    100     /* Max encoding stats entries */
+
+/* Validate count is within reasonable bounds before allocation */
+#define VALIDATE_COUNT(count, max, dec) \
+    do { \
+        if ((count) < 0 || (count) > (max)) { \
+            (dec)->status = CARQUET_ERROR_THRIFT_DECODE; \
+            snprintf((dec)->error_message, sizeof((dec)->error_message), \
+                "Invalid count %d (max %d)", (int)(count), (int)(max)); \
+            return; \
+        } \
+    } while(0)
+
+#define VALIDATE_COUNT_STATUS(count, max, error) \
+    do { \
+        if ((count) < 0 || (count) > (max)) { \
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_METADATA, \
+                "Invalid count %d exceeds limit %d", (int)(count), (int)(max)); \
+            return CARQUET_ERROR_INVALID_METADATA; \
+        } \
+    } while(0)
 
 /* ============================================================================
  * Internal Helpers
@@ -293,6 +329,7 @@ static void parse_column_metadata(thrift_decoder_t* dec, carquet_arena_t* arena,
                 thrift_type_t elem_type;
                 int32_t count;
                 thrift_read_list_begin(dec, &elem_type, &count);
+                VALIDATE_COUNT(count, CARQUET_MAX_ENCODINGS, dec);
                 meta->num_encodings = count;
                 meta->encodings = carquet_arena_calloc(arena, count, sizeof(carquet_encoding_t));
                 for (int32_t i = 0; i < count; i++) {
@@ -304,6 +341,7 @@ static void parse_column_metadata(thrift_decoder_t* dec, carquet_arena_t* arena,
                 thrift_type_t elem_type;
                 int32_t count;
                 thrift_read_list_begin(dec, &elem_type, &count);
+                VALIDATE_COUNT(count, CARQUET_MAX_PATH_ELEMENTS, dec);
                 meta->path_len = count;
                 meta->path_in_schema = carquet_arena_calloc(arena, count, sizeof(char*));
                 for (int32_t i = 0; i < count; i++) {
@@ -327,6 +365,7 @@ static void parse_column_metadata(thrift_decoder_t* dec, carquet_arena_t* arena,
                 thrift_type_t elem_type;
                 int32_t count;
                 thrift_read_list_begin(dec, &elem_type, &count);
+                VALIDATE_COUNT(count, CARQUET_MAX_KEY_VALUE_PAIRS, dec);
                 meta->num_key_value = count;
                 meta->key_value_metadata = carquet_arena_calloc(arena, count,
                     sizeof(parquet_key_value_t));
@@ -362,6 +401,7 @@ static void parse_column_metadata(thrift_decoder_t* dec, carquet_arena_t* arena,
                 thrift_type_t elem_type;
                 int32_t count;
                 thrift_read_list_begin(dec, &elem_type, &count);
+                VALIDATE_COUNT(count, CARQUET_MAX_ENCODING_STATS, dec);
                 meta->num_encoding_stats = count;
                 meta->encoding_stats = carquet_arena_calloc(arena, count,
                     sizeof(parquet_page_encoding_stats_t));
@@ -467,6 +507,7 @@ static void parse_row_group(thrift_decoder_t* dec, carquet_arena_t* arena,
                 thrift_type_t elem_type;
                 int32_t count;
                 thrift_read_list_begin(dec, &elem_type, &count);
+                VALIDATE_COUNT(count, CARQUET_MAX_COLUMNS_PER_RG, dec);
                 rg->num_columns = count;
                 rg->columns = carquet_arena_calloc(arena, count,
                     sizeof(parquet_column_chunk_t));
@@ -546,6 +587,7 @@ carquet_status_t parquet_parse_file_metadata(
                 thrift_type_t elem_type;
                 int32_t count;
                 thrift_read_list_begin(&dec, &elem_type, &count);
+                VALIDATE_COUNT_STATUS(count, CARQUET_MAX_SCHEMA_ELEMENTS, error);
                 metadata->num_schema_elements = count;
                 metadata->schema = carquet_arena_calloc(arena, count,
                     sizeof(parquet_schema_element_t));
@@ -561,6 +603,7 @@ carquet_status_t parquet_parse_file_metadata(
                 thrift_type_t elem_type;
                 int32_t count;
                 thrift_read_list_begin(&dec, &elem_type, &count);
+                VALIDATE_COUNT_STATUS(count, CARQUET_MAX_ROW_GROUPS, error);
                 metadata->num_row_groups = count;
                 metadata->row_groups = carquet_arena_calloc(arena, count,
                     sizeof(parquet_row_group_t));
@@ -573,6 +616,7 @@ carquet_status_t parquet_parse_file_metadata(
                 thrift_type_t elem_type;
                 int32_t count;
                 thrift_read_list_begin(&dec, &elem_type, &count);
+                VALIDATE_COUNT_STATUS(count, CARQUET_MAX_KEY_VALUE_PAIRS, error);
                 metadata->num_key_value = count;
                 metadata->key_value_metadata = carquet_arena_calloc(arena, count,
                     sizeof(parquet_key_value_t));
