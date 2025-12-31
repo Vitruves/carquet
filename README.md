@@ -810,14 +810,14 @@ carquet/
 
 ## Performance
 
-Benchmark results on Apple M1 (ARM64 with NEON), 1M rows:
+Benchmark results on Apple M3 (ARM64 with NEON), 1M rows, Release build:
 
 | Codec | Write | Read |
 |-------|-------|------|
-| UNCOMPRESSED | 18.8 M rows/sec | 18.5 M rows/sec |
-| SNAPPY | 18.1 M rows/sec | 18.4 M rows/sec |
-| LZ4 | 14.8 M rows/sec | 18.5 M rows/sec |
-| ZSTD | 31.3 M rows/sec | 39.9 M rows/sec |
+| UNCOMPRESSED | 17.8 M rows/sec | 18.1 M rows/sec |
+| SNAPPY | 20.0 M rows/sec | 18.3 M rows/sec |
+| LZ4 | 19.4 M rows/sec | 18.4 M rows/sec |
+| ZSTD | 31.7 M rows/sec | 39.5 M rows/sec |
 
 Run benchmarks:
 
