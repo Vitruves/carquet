@@ -83,7 +83,8 @@ build_test() {
     gcc -O2 -I"$PROJECT_DIR/include" -I"$PROJECT_DIR/src" \
         -o "$SCRIPT_DIR/test_interop" \
         "$SCRIPT_DIR/test_interop.c" \
-        "$BUILD_DIR/libcarquet.a"
+        "$BUILD_DIR/libcarquet.a" \
+        -lzstd -lz
 
     echo -e "${GREEN}Built: $SCRIPT_DIR/test_interop${NC}"
 }
