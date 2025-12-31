@@ -467,6 +467,7 @@ void carquet_column_reader_free(carquet_column_reader_t* reader) {
     free(reader->decoded_values);
     free(reader->decoded_def_levels);
     free(reader->decoded_rep_levels);
+    free(reader->indices_buffer);
     free(reader);
 }
 

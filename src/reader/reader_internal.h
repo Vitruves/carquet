@@ -107,6 +107,10 @@ struct carquet_column_reader {
     int16_t* decoded_def_levels; /* Buffer for decoded definition levels */
     int16_t* decoded_rep_levels; /* Buffer for decoded repetition levels */
     size_t decoded_capacity;    /* Capacity of decoded buffers */
+
+    /* Reusable buffers to reduce allocations */
+    uint32_t* indices_buffer;   /* Reusable buffer for dictionary indices */
+    size_t indices_capacity;    /* Capacity of indices buffer */
 };
 
 /* ============================================================================

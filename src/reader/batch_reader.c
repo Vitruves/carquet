@@ -319,9 +319,12 @@ carquet_status_t carquet_batch_reader_next(
         size_t bitmap_size = ((size_t)rows_to_read + 7) / 8;
         col_data->null_bitmap = calloc(1, bitmap_size);
 
-        /* Read values */
+        /* Read values - fast path for REQUIRED columns (no nulls) */
+        int16_t max_def = schema->max_def_levels[file_col_idx];
         int16_t* def_levels = NULL;
-        if (schema->max_def_levels[file_col_idx] > 0) {
+
+        if (max_def > 0) {
+            /* Column can have nulls - need to decode levels */
             def_levels = malloc(sizeof(int16_t) * (size_t)rows_to_read);
         }
 
@@ -338,10 +341,25 @@ carquet_status_t carquet_batch_reader_next(
 
         /* Build null bitmap from definition levels */
         if (def_levels && col_data->null_bitmap) {
-            int16_t max_def = schema->max_def_levels[file_col_idx];
-            for (int64_t j = 0; j < values_read; j++) {
+            /* Process 8 values at a time for better performance */
+            int64_t full_bytes = values_read / 8;
+            for (int64_t b = 0; b < full_bytes; b++) {
+                uint8_t null_bits = 0;
+                int64_t base = b * 8;
+                /* Unrolled loop for 8 bits */
+                if (def_levels[base + 0] < max_def) null_bits |= 0x01;
+                if (def_levels[base + 1] < max_def) null_bits |= 0x02;
+                if (def_levels[base + 2] < max_def) null_bits |= 0x04;
+                if (def_levels[base + 3] < max_def) null_bits |= 0x08;
+                if (def_levels[base + 4] < max_def) null_bits |= 0x10;
+                if (def_levels[base + 5] < max_def) null_bits |= 0x20;
+                if (def_levels[base + 6] < max_def) null_bits |= 0x40;
+                if (def_levels[base + 7] < max_def) null_bits |= 0x80;
+                col_data->null_bitmap[b] = null_bits;
+            }
+            /* Handle remaining values */
+            for (int64_t j = full_bytes * 8; j < values_read; j++) {
                 if (def_levels[j] < max_def) {
-                    /* Value is null - set bit */
                     col_data->null_bitmap[j / 8] |= (1 << (j % 8));
                 }
             }

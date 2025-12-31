@@ -373,18 +373,27 @@ carquet_status_t carquet_read_data_page_v1(
                 ptr++;
                 remaining--;
 
-                /* Decode indices using RLE */
-                uint32_t* indices = malloc(non_null_count * sizeof(uint32_t));
-                if (!indices) {
-                    CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate indices");
-                    return CARQUET_ERROR_OUT_OF_MEMORY;
+                /* Use reusable indices buffer to avoid per-page allocation */
+                uint32_t* indices;
+                if ((size_t)non_null_count <= reader->indices_capacity) {
+                    indices = reader->indices_buffer;
+                } else {
+                    /* Need larger buffer - reallocate */
+                    free(reader->indices_buffer);
+                    reader->indices_buffer = malloc(non_null_count * sizeof(uint32_t));
+                    if (!reader->indices_buffer) {
+                        reader->indices_capacity = 0;
+                        CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate indices");
+                        return CARQUET_ERROR_OUT_OF_MEMORY;
+                    }
+                    reader->indices_capacity = non_null_count;
+                    indices = reader->indices_buffer;
                 }
 
                 int64_t decoded = carquet_rle_decode_all(
                     ptr, remaining, bit_width, indices, non_null_count);
 
                 if (decoded < 0) {
-                    free(indices);
                     CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Failed to decode dictionary indices");
                     return CARQUET_ERROR_DECODE;
                 }
@@ -433,7 +442,6 @@ carquet_status_t carquet_read_data_page_v1(
                     /* Validate all indices first */
                     for (int32_t i = 0; i < non_null_count; i++) {
                         if (indices[i] >= (uint32_t)reader->dictionary_count) {
-                            free(indices);
                             CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Dictionary index out of bounds");
                             return CARQUET_ERROR_DECODE;
                         }
@@ -479,8 +487,7 @@ carquet_status_t carquet_read_data_page_v1(
                             break;
                     }
                 }
-
-                free(indices);
+                /* indices buffer is reused, don't free */
             }
             break;
 
