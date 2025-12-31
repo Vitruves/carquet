@@ -463,6 +463,7 @@ void carquet_column_reader_free(carquet_column_reader_t* reader) {
 
     free(reader->page_buffer);
     free(reader->dictionary_data);
+    free(reader->dictionary_offsets);
     free(reader->decoded_values);
     free(reader->decoded_def_levels);
     free(reader->decoded_rep_levels);

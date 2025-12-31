@@ -190,6 +190,42 @@ carquet_status_t carquet_read_dictionary_page(
         }
         memcpy(reader->dictionary_data, page_data, page_size);
         reader->dictionary_size = page_size;
+
+        /* Build offset table for O(1) BYTE_ARRAY lookup */
+        reader->dictionary_offsets = malloc((size_t)header->num_values * sizeof(uint32_t));
+        if (!reader->dictionary_offsets) {
+            free(reader->dictionary_data);
+            reader->dictionary_data = NULL;
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate offset table");
+            return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
+
+        /* Scan dictionary once to build offset table */
+        const uint8_t* dict_ptr = page_data;
+        size_t dict_remaining = page_size;
+        for (int32_t i = 0; i < header->num_values; i++) {
+            if (dict_remaining < 4) {
+                free(reader->dictionary_data);
+                free(reader->dictionary_offsets);
+                reader->dictionary_data = NULL;
+                reader->dictionary_offsets = NULL;
+                CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Truncated dictionary");
+                return CARQUET_ERROR_DECODE;
+            }
+            reader->dictionary_offsets[i] = (uint32_t)(dict_ptr - page_data);
+            uint32_t len = carquet_read_u32_le(dict_ptr);
+            size_t entry_size = 4 + len;
+            if (dict_remaining < entry_size) {
+                free(reader->dictionary_data);
+                free(reader->dictionary_offsets);
+                reader->dictionary_data = NULL;
+                reader->dictionary_offsets = NULL;
+                CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Invalid dictionary entry");
+                return CARQUET_ERROR_DECODE;
+            }
+            dict_ptr += entry_size;
+            dict_remaining -= entry_size;
+        }
     } else {
         /* Fixed size values */
         size_t dict_size = value_size * header->num_values;
@@ -358,45 +394,40 @@ carquet_status_t carquet_read_data_page_v1(
                     /* BYTE_ARRAY: dictionary is stored as length-prefixed values */
                     carquet_byte_array_t* out = (carquet_byte_array_t*)values;
 
-                    /* Build offset table for dictionary entries (cached on first use) */
-                    /* For now, scan each time (can be optimized later) */
-                    for (int32_t i = 0; i < non_null_count; i++) {
-                        int32_t idx = (int32_t)indices[i];
-                        if (idx < 0 || idx >= reader->dictionary_count) {
-                            status = CARQUET_ERROR_DECODE;
-                            break;
-                        }
-
-                        /* Scan to find the idx-th entry */
-                        const uint8_t* dict_ptr = reader->dictionary_data;
-                        size_t dict_remaining = reader->dictionary_size;
-                        for (int32_t j = 0; j < idx; j++) {
-                            if (dict_remaining < 4) {
+                    /* Use O(1) offset table lookup (built when dictionary was read) */
+                    if (reader->dictionary_offsets) {
+                        for (int32_t i = 0; i < non_null_count; i++) {
+                            int32_t idx = (int32_t)indices[i];
+                            if (idx < 0 || idx >= reader->dictionary_count) {
                                 status = CARQUET_ERROR_DECODE;
                                 break;
+                            }
+
+                            /* Direct O(1) lookup using offset table */
+                            uint32_t offset = reader->dictionary_offsets[idx];
+                            const uint8_t* dict_ptr = reader->dictionary_data + offset;
+                            uint32_t len = carquet_read_u32_le(dict_ptr);
+                            out[i].data = (uint8_t*)(dict_ptr + 4);
+                            out[i].length = (int32_t)len;
+                        }
+                    } else {
+                        /* Fallback: scan each time (shouldn't happen for new readers) */
+                        for (int32_t i = 0; i < non_null_count; i++) {
+                            int32_t idx = (int32_t)indices[i];
+                            if (idx < 0 || idx >= reader->dictionary_count) {
+                                status = CARQUET_ERROR_DECODE;
+                                break;
+                            }
+
+                            const uint8_t* dict_ptr = reader->dictionary_data;
+                            for (int32_t j = 0; j < idx; j++) {
+                                uint32_t len = carquet_read_u32_le(dict_ptr);
+                                dict_ptr += 4 + len;
                             }
                             uint32_t len = carquet_read_u32_le(dict_ptr);
-                            dict_ptr += 4 + len;
-                            if (dict_remaining < 4 + len) {
-                                status = CARQUET_ERROR_DECODE;
-                                break;
-                            }
-                            dict_remaining -= 4 + len;
+                            out[i].data = (uint8_t*)(dict_ptr + 4);
+                            out[i].length = (int32_t)len;
                         }
-                        if (status != CARQUET_OK) break;
-
-                        if (dict_remaining < 4) {
-                            status = CARQUET_ERROR_DECODE;
-                            break;
-                        }
-                        uint32_t len = carquet_read_u32_le(dict_ptr);
-                        if (dict_remaining < 4 + len) {
-                            status = CARQUET_ERROR_DECODE;
-                            break;
-                        }
-
-                        out[i].data = (uint8_t*)(dict_ptr + 4);
-                        out[i].length = (int32_t)len;
                     }
                 } else {
                     /* Validate all indices first */
