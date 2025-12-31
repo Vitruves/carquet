@@ -344,31 +344,83 @@ carquet_status_t carquet_read_data_page_v1(
                 }
 
                 /* Look up values from dictionary */
-                size_t value_size = 0;
-                switch (reader->type) {
-                    case CARQUET_PHYSICAL_INT32:
-                    case CARQUET_PHYSICAL_FLOAT:
-                        value_size = 4;
-                        break;
-                    case CARQUET_PHYSICAL_INT64:
-                    case CARQUET_PHYSICAL_DOUBLE:
-                        value_size = 8;
-                        break;
-                    default:
-                        break;
-                }
+                if (reader->type == CARQUET_PHYSICAL_BYTE_ARRAY) {
+                    /* BYTE_ARRAY: dictionary is stored as length-prefixed values */
+                    carquet_byte_array_t* out = (carquet_byte_array_t*)values;
 
-                if (value_size > 0) {
-                    uint8_t* out = (uint8_t*)values;
+                    /* Build offset table for dictionary entries (cached on first use) */
+                    /* For now, scan each time (can be optimized later) */
                     for (int32_t i = 0; i < non_null_count; i++) {
                         int32_t idx = (int32_t)indices[i];
                         if (idx < 0 || idx >= reader->dictionary_count) {
                             status = CARQUET_ERROR_DECODE;
                             break;
                         }
-                        memcpy(out + i * value_size,
-                               reader->dictionary_data + idx * value_size,
-                               value_size);
+
+                        /* Scan to find the idx-th entry */
+                        const uint8_t* dict_ptr = reader->dictionary_data;
+                        size_t dict_remaining = reader->dictionary_size;
+                        for (int32_t j = 0; j < idx; j++) {
+                            if (dict_remaining < 4) {
+                                status = CARQUET_ERROR_DECODE;
+                                break;
+                            }
+                            uint32_t len = carquet_read_u32_le(dict_ptr);
+                            dict_ptr += 4 + len;
+                            if (dict_remaining < 4 + len) {
+                                status = CARQUET_ERROR_DECODE;
+                                break;
+                            }
+                            dict_remaining -= 4 + len;
+                        }
+                        if (status != CARQUET_OK) break;
+
+                        if (dict_remaining < 4) {
+                            status = CARQUET_ERROR_DECODE;
+                            break;
+                        }
+                        uint32_t len = carquet_read_u32_le(dict_ptr);
+                        if (dict_remaining < 4 + len) {
+                            status = CARQUET_ERROR_DECODE;
+                            break;
+                        }
+
+                        out[i].data = (uint8_t*)(dict_ptr + 4);
+                        out[i].length = (int32_t)len;
+                    }
+                } else {
+                    size_t value_size = 0;
+                    switch (reader->type) {
+                        case CARQUET_PHYSICAL_INT32:
+                        case CARQUET_PHYSICAL_FLOAT:
+                            value_size = 4;
+                            break;
+                        case CARQUET_PHYSICAL_INT64:
+                        case CARQUET_PHYSICAL_DOUBLE:
+                            value_size = 8;
+                            break;
+                        case CARQUET_PHYSICAL_INT96:
+                            value_size = 12;
+                            break;
+                        case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY:
+                            value_size = reader->type_length;
+                            break;
+                        default:
+                            break;
+                    }
+
+                    if (value_size > 0) {
+                        uint8_t* out = (uint8_t*)values;
+                        for (int32_t i = 0; i < non_null_count; i++) {
+                            int32_t idx = (int32_t)indices[i];
+                            if (idx < 0 || idx >= reader->dictionary_count) {
+                                status = CARQUET_ERROR_DECODE;
+                                break;
+                            }
+                            memcpy(out + i * value_size,
+                                   reader->dictionary_data + idx * value_size,
+                                   value_size);
+                        }
                     }
                 }
 
@@ -392,28 +444,42 @@ carquet_status_t carquet_read_data_page_v1(
 }
 
 /* ============================================================================
- * Page Reading Entry Point
+ * Helper: Get value size for a physical type
  * ============================================================================
  */
 
-carquet_status_t carquet_read_next_page(
-    carquet_column_reader_t* reader,
-    void* values,
-    int64_t max_values,
-    int16_t* def_levels,
-    int16_t* rep_levels,
-    int64_t* values_read,
-    carquet_error_t* error) {
-
-    if (!reader || !values || !values_read) {
-        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT, "NULL argument");
-        return CARQUET_ERROR_INVALID_ARGUMENT;
+static size_t get_value_size(carquet_physical_type_t type, int32_t type_length) {
+    switch (type) {
+        case CARQUET_PHYSICAL_BOOLEAN:
+            return 1;
+        case CARQUET_PHYSICAL_INT32:
+        case CARQUET_PHYSICAL_FLOAT:
+            return 4;
+        case CARQUET_PHYSICAL_INT64:
+        case CARQUET_PHYSICAL_DOUBLE:
+            return 8;
+        case CARQUET_PHYSICAL_INT96:
+            return 12;
+        case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY:
+            return type_length;
+        case CARQUET_PHYSICAL_BYTE_ARRAY:
+            return sizeof(carquet_byte_array_t);
+        default:
+            return 0;
     }
+}
+
+/* ============================================================================
+ * Helper: Load and decode a new page
+ * ============================================================================
+ */
+
+static carquet_status_t load_next_page(
+    carquet_column_reader_t* reader,
+    carquet_error_t* error) {
 
     carquet_reader_t* file_reader = reader->file_reader;
     FILE* file = file_reader->file;
-
-    /* Get column chunk info */
     const parquet_column_metadata_t* col_meta = reader->col_meta;
     int64_t data_offset = col_meta->data_page_offset;
 
@@ -610,12 +676,45 @@ carquet_status_t carquet_read_next_page(
         }
     }
 
-    /* Decode page */
+    /* Allocate buffers for decoded page data */
+    int32_t num_values = page_header.data_page_header.num_values;
+    size_t value_size = get_value_size(reader->type, reader->type_length);
+    size_t values_buffer_size = value_size * (size_t)num_values;
+
+    /* Ensure we have enough buffer capacity */
+    if ((size_t)num_values > reader->decoded_capacity) {
+        free(reader->decoded_values);
+        free(reader->decoded_def_levels);
+        free(reader->decoded_rep_levels);
+
+        reader->decoded_values = malloc(values_buffer_size);
+        reader->decoded_def_levels = malloc(sizeof(int16_t) * num_values);
+        reader->decoded_rep_levels = malloc(sizeof(int16_t) * num_values);
+        reader->decoded_capacity = num_values;
+
+        if (!reader->decoded_values || !reader->decoded_def_levels || !reader->decoded_rep_levels) {
+            free(reader->decoded_values);
+            free(reader->decoded_def_levels);
+            free(reader->decoded_rep_levels);
+            reader->decoded_values = NULL;
+            reader->decoded_def_levels = NULL;
+            reader->decoded_rep_levels = NULL;
+            reader->decoded_capacity = 0;
+            if (page_data != compressed) free(page_data);
+            if (compressed) free(compressed);
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate decode buffers");
+            return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
+    }
+
+    /* Decode the entire page into our buffers */
+    int64_t decoded_count;
     status = carquet_read_data_page_v1(
         reader, page_data, page_size,
         &page_header.data_page_header,
-        values, max_values, def_levels, rep_levels,
-        values_read, error);
+        reader->decoded_values, num_values,
+        reader->decoded_def_levels, reader->decoded_rep_levels,
+        &decoded_count, error);
 
     if (page_data != compressed) {
         free(page_data);
@@ -624,11 +723,79 @@ carquet_status_t carquet_read_next_page(
         free(compressed);
     }
 
-    if (status == CARQUET_OK) {
-        /* Update position */
-        reader->current_page += header_size + page_header.compressed_page_size;
-        reader->values_remaining -= *values_read;
+    if (status != CARQUET_OK) {
+        return status;
     }
 
-    return status;
+    /* Update page tracking state */
+    reader->page_loaded = true;
+    reader->page_num_values = (int32_t)decoded_count;
+    reader->page_values_read = 0;
+    reader->page_header_size = (int32_t)header_size;
+    reader->page_compressed_size = page_header.compressed_page_size;
+
+    return CARQUET_OK;
+}
+
+/* ============================================================================
+ * Page Reading Entry Point
+ * ============================================================================
+ */
+
+carquet_status_t carquet_read_next_page(
+    carquet_column_reader_t* reader,
+    void* values,
+    int64_t max_values,
+    int16_t* def_levels,
+    int16_t* rep_levels,
+    int64_t* values_read,
+    carquet_error_t* error) {
+
+    if (!reader || !values || !values_read) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT, "NULL argument");
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    /* Load a new page if needed */
+    if (!reader->page_loaded || reader->page_values_read >= reader->page_num_values) {
+        /* If we had a previous page, advance past it */
+        if (reader->page_loaded) {
+            reader->current_page += reader->page_header_size + reader->page_compressed_size;
+            reader->page_loaded = false;
+        }
+
+        carquet_status_t status = load_next_page(reader, error);
+        if (status != CARQUET_OK) {
+            return status;
+        }
+    }
+
+    /* Calculate how many values to return from the current page */
+    int32_t available = reader->page_num_values - reader->page_values_read;
+    int32_t to_copy = (int32_t)max_values;
+    if (to_copy > available) {
+        to_copy = available;
+    }
+
+    /* Copy values from decoded buffers */
+    size_t value_size = get_value_size(reader->type, reader->type_length);
+    size_t offset = (size_t)reader->page_values_read * value_size;
+
+    memcpy(values, (uint8_t*)reader->decoded_values + offset, (size_t)to_copy * value_size);
+
+    if (def_levels) {
+        memcpy(def_levels, reader->decoded_def_levels + reader->page_values_read,
+               (size_t)to_copy * sizeof(int16_t));
+    }
+    if (rep_levels) {
+        memcpy(rep_levels, reader->decoded_rep_levels + reader->page_values_read,
+               (size_t)to_copy * sizeof(int16_t));
+    }
+
+    /* Update state */
+    reader->page_values_read += to_copy;
+    reader->values_remaining -= to_copy;
+    *values_read = to_copy;
+
+    return CARQUET_OK;
 }

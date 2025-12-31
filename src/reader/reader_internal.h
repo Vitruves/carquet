@@ -96,9 +96,16 @@ struct carquet_column_reader {
     size_t dictionary_size;
     int32_t dictionary_count;
 
-    /* Current page position */
-    const uint8_t* data_ptr;
-    size_t data_remaining;
+    /* Current page state for partial reads */
+    bool page_loaded;           /* Is a page currently loaded? */
+    int32_t page_num_values;    /* Total values in current page */
+    int32_t page_values_read;   /* Values already read from current page */
+    int32_t page_header_size;   /* Size of current page header */
+    int32_t page_compressed_size; /* Size of current page compressed data */
+    uint8_t* decoded_values;    /* Buffer for decoded values from current page */
+    int16_t* decoded_def_levels; /* Buffer for decoded definition levels */
+    int16_t* decoded_rep_levels; /* Buffer for decoded repetition levels */
+    size_t decoded_capacity;    /* Capacity of decoded buffers */
 };
 
 /* ============================================================================
