@@ -221,7 +221,7 @@ static int read_typed_data(const char* filename) {
            (long long)num_rows, num_cols);
 
     /* Read sample values from first row group */
-    const int SAMPLE_SIZE = 5;
+    enum { SAMPLE_SIZE = 5 };
     carquet_column_reader_t* col_reader;
     int64_t count;
 

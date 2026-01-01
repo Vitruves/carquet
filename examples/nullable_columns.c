@@ -234,7 +234,7 @@ static int read_nullable_data(const char* filename) {
     printf("File contains %lld rows\n\n", (long long)num_rows);
 
     /* Read from first row group */
-    const int BATCH_SIZE = 10;
+    enum { BATCH_SIZE = 10 };
 
     printf("First %d rows:\n", BATCH_SIZE);
     printf("%-4s %-12s %-6s %-8s %-25s\n", "ID", "Name", "Age", "Score", "Email");
