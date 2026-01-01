@@ -287,6 +287,13 @@ carquet_status_t carquet_batch_reader_next(
         rows_to_read = batch_size;
     }
 
+    /* Handle empty row group - return empty batch, not an error */
+    if (rows_to_read == 0) {
+        new_batch->num_rows = 0;
+        *batch = new_batch;
+        return CARQUET_OK;
+    }
+
     /* Read each column - potentially in parallel */
     bool read_error = false;
 
