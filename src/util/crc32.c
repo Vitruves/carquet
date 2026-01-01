@@ -7,6 +7,7 @@
 #include <stddef.h>
 
 /* ARM hardware CRC32 (when available) */
+#if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64) || defined(_M_ARM)
 extern uint32_t carquet_crc32_arm(const uint8_t* data, size_t length);
 extern int carquet_has_arm_crc32(void);
 
@@ -19,6 +20,7 @@ static int check_arm_crc32(void) {
     }
     return use_arm_crc32;
 }
+#endif
 
 /* CRC32 lookup table (polynomial 0x04C11DB7, reflected) */
 static const uint32_t crc32_table[256] = {
@@ -78,11 +80,15 @@ static uint32_t carquet_crc32_table(const uint8_t* data, size_t length) {
 }
 
 uint32_t carquet_crc32(const uint8_t* data, size_t length) {
+#if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64) || defined(_M_ARM)
     /* Use hardware CRC32 if available (ARM) */
     if (check_arm_crc32()) {
         return carquet_crc32_arm(data, length);
     }
     return carquet_crc32_table(data, length);
+#else
+    return carquet_crc32_table(data, length);
+#endif
 }
 
 uint32_t carquet_crc32_update(uint32_t crc, const uint8_t* data, size_t length) {
