@@ -844,11 +844,13 @@ carquet/
 
 ## Performance
 
-Carquet's performance varies by use case. These benchmarks show where Carquet excels and where Arrow is faster.
+Carquet's performance varies by platform and use case. These benchmarks show where Carquet excels and where Arrow is faster.
 
-**Test setup:** Apple M3 (ARM64), 10M rows, 3 columns (INT64 + DOUBLE + INT32), fair comparison with both libraries reading actual data values and verifying CRC checksums.
+**Test configuration:** 10M rows, 3 columns (INT64 + DOUBLE + INT32), fair comparison with both libraries reading actual data values and verifying CRC checksums.
 
-### Where Carquet Excels: Writing
+### Apple M3 (ARM64, macOS)
+
+#### Writing (Carquet Excels)
 
 | Codec | Carquet | PyArrow | Speedup |
 |-------|---------|---------|---------|
@@ -856,23 +858,45 @@ Carquet's performance varies by use case. These benchmarks show where Carquet ex
 | SNAPPY | 50 M rows/sec | 17 M rows/sec | **3x faster** |
 | ZSTD | 35 M rows/sec | 14 M rows/sec | **2.5x faster** |
 
-Carquet's write path has less abstraction overhead, resulting in consistently faster writes.
-
-### Where Arrow Excels: ZSTD Reads
+#### Reading
 
 | Codec | Carquet | PyArrow | Ratio |
 |-------|---------|---------|-------|
 | UNCOMPRESSED | 463 M rows/sec | 364 M rows/sec | 1.3x faster |
 | SNAPPY | 334 M rows/sec | 268 M rows/sec | 1.2x faster |
-| ZSTD | 134 M rows/sec | 238 M rows/sec | **0.6x slower** |
+| ZSTD | 134 M rows/sec | 238 M rows/sec | 0.6x slower |
 
-Arrow uses multi-threaded ZSTD decompression internally. Carquet's ZSTD is currently single-threaded per page.
+### Intel Xeon E5-2680 (x86_64, Linux)
 
-### Why the Difference?
+#### Writing (Carquet Faster)
 
-- **Writes**: Carquet has a simpler code path with less abstraction
-- **Uncompressed reads**: Carquet uses zero-copy mmap, skipping memcpy
-- **ZSTD reads**: Arrow's libzstd is configured for multi-threaded decompression
+| Codec | Carquet | PyArrow | Speedup |
+|-------|---------|---------|---------|
+| UNCOMPRESSED | 4.1 M rows/sec | 3.6 M rows/sec | **1.2x faster** |
+| SNAPPY | 3.5 M rows/sec | 3.0 M rows/sec | **1.2x faster** |
+| ZSTD | 5.0 M rows/sec | 3.1 M rows/sec | **1.6x faster** |
+
+#### Reading (PyArrow Faster)
+
+| Codec | Carquet | PyArrow | Ratio |
+|-------|---------|---------|-------|
+| UNCOMPRESSED | 27 M rows/sec | 87 M rows/sec | 0.3x slower |
+| SNAPPY | 18 M rows/sec | 90 M rows/sec | 0.2x slower |
+| ZSTD | 15 M rows/sec | 111 M rows/sec | 0.1x slower |
+
+#### Compression Ratio (Carquet Better)
+
+| Codec | Carquet | PyArrow | Ratio |
+|-------|---------|---------|-------|
+| ZSTD | 20 MB | 60 MB | **3x smaller** |
+| SNAPPY | 154 MB | 127 MB | 1.2x larger |
+
+### Analysis
+
+- **Writes**: Carquet consistently faster across platforms due to simpler code path
+- **ARM reads**: Carquet competitive or faster with hardware CRC32 and NEON optimizations
+- **x86 reads**: PyArrow significantly faster due to highly optimized Arrow columnar format and multi-threaded decompression
+- **ZSTD compression**: Carquet achieves better compression ratios (using system libzstd)
 
 ### Running Benchmarks
 

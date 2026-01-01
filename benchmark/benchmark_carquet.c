@@ -202,6 +202,9 @@ static void run_benchmark(const char* dataset_name, int num_rows,
 }
 
 int main(void) {
+    /* Disable stdout buffering for progress visibility */
+    setvbuf(stdout, NULL, _IONBF, 0);
+
     printf("Carquet Benchmark\n");
     printf("=================\n");
 
