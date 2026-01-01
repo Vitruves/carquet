@@ -108,6 +108,23 @@ run_fuzzer() {
         exit 1
     fi
 
+    # Set library path for Homebrew/Linuxbrew OpenMP
+    # Find libomp.so location dynamically
+    local omp_lib=""
+    if [ -f "/home/linuxbrew/.linuxbrew/lib/libomp.so" ]; then
+        omp_lib="/home/linuxbrew/.linuxbrew/lib"
+    elif omp_lib=$(dirname "$(find /home/linuxbrew -name 'libomp.so' 2>/dev/null | head -1)" 2>/dev/null) && [ -n "$omp_lib" ]; then
+        : # Found via find
+    fi
+
+    if [ -n "$omp_lib" ]; then
+        export LD_LIBRARY_PATH="$omp_lib:${LD_LIBRARY_PATH:-}"
+    elif [ -d "/opt/homebrew/lib" ]; then
+        export DYLD_LIBRARY_PATH="/opt/homebrew/lib:${DYLD_LIBRARY_PATH:-}"
+    elif [ -d "/usr/local/opt/llvm/lib" ]; then
+        export DYLD_LIBRARY_PATH="/usr/local/opt/llvm/lib:${DYLD_LIBRARY_PATH:-}"
+    fi
+
     # Create corpus directory
     mkdir -p "$corpus"
 
