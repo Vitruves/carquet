@@ -47,8 +47,8 @@ endfunction()
 # fuzz_compression and fuzz_thrift test internal decoders directly
 add_fuzz_target(fuzz_reader fuzz_reader.c)
 add_fuzz_target(fuzz_compression fuzz_compression.c)
-# Note: fuzz_encodings requires internal headers
-# add_fuzz_target(fuzz_encodings fuzz_encodings.c)
+# Encodings fuzzer tests RLE, delta, and dictionary decoders
+add_fuzz_target(fuzz_encodings fuzz_encodings.c)
 
 # Thrift fuzzer tests the Thrift compact protocol decoder
 add_fuzz_target(fuzz_thrift fuzz_thrift.c)

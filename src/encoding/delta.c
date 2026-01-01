@@ -105,6 +105,18 @@ static carquet_status_t delta_decoder_init(delta_decoder_t* dec,
     dec->mini_blocks_per_block = (int32_t)val;
     dec->pos += bytes;
 
+    /* Validate header values to prevent buffer overflows */
+    if (dec->mini_blocks_per_block <= 0 || dec->mini_blocks_per_block > DELTA_MINI_BLOCKS) {
+        return CARQUET_ERROR_DECODE;
+    }
+    if (dec->block_size <= 0 || dec->block_size > DELTA_BLOCK_SIZE) {
+        return CARQUET_ERROR_DECODE;
+    }
+    /* mini_block_size = block_size / mini_blocks_per_block must fit in buffer */
+    if (dec->block_size / dec->mini_blocks_per_block > DELTA_MINI_BLOCK_SIZE) {
+        return CARQUET_ERROR_DECODE;
+    }
+
     /* Total value count */
     bytes = read_uleb128(data + dec->pos, size - dec->pos, &val);
     if (bytes == 0) return CARQUET_ERROR_DECODE;

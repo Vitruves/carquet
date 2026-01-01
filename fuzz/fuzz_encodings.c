@@ -12,37 +12,27 @@
 #include <stdlib.h>
 #include <carquet/carquet.h>
 
-/* Encoding function declarations */
-int64_t carquet_rle_decode_all(
-    const uint8_t* input, size_t input_size, int bit_width,
-    uint32_t* output, int64_t max_values);
+/* Internal encoding headers */
+#include "encoding/rle.h"
+#include "encoding/plain.h"
 
+/* Delta decode declarations (internal) */
 carquet_status_t carquet_delta_decode_int32(
-    const uint8_t* data, size_t data_size,
-    int32_t* values, int32_t num_values, size_t* bytes_consumed);
+    const uint8_t* data, size_t size,
+    int32_t* output, int32_t num_values,
+    size_t* bytes_consumed);
 
 carquet_status_t carquet_delta_decode_int64(
-    const uint8_t* data, size_t data_size,
-    int64_t* values, int32_t num_values, size_t* bytes_consumed);
-
-carquet_status_t carquet_plain_decode_int32(
-    const uint8_t* data, size_t size, int32_t count, int32_t* values);
-
-carquet_status_t carquet_plain_decode_int64(
-    const uint8_t* data, size_t size, int32_t count, int64_t* values);
-
-carquet_status_t carquet_plain_decode_float(
-    const uint8_t* data, size_t size, int32_t count, float* values);
-
-carquet_status_t carquet_plain_decode_double(
-    const uint8_t* data, size_t size, int32_t count, double* values);
+    const uint8_t* data, size_t size,
+    int64_t* output, int32_t num_values,
+    size_t* bytes_consumed);
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (size < 3) {
         return 0;
     }
 
-    carquet_init();
+    (void)carquet_init();
 
     /* First byte: encoding type, second byte: parameters */
     uint8_t encoding = data[0] % 6;
@@ -51,8 +41,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     size_t payload_size = size - 2;
 
     /* Output buffer - limit size to avoid OOM */
-    size_t max_values = 10000;
-    void* output = malloc(max_values * 8);  /* 8 bytes per value max */
+    int64_t max_values = 10000;
+    void* output = malloc((size_t)max_values * 8);  /* 8 bytes per value max */
     if (!output) {
         return 0;
     }
@@ -61,53 +51,53 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         case 0: {
             /* RLE - bit_width from param (1-32) */
             int bit_width = (param % 32) + 1;
-            carquet_rle_decode_all(payload, payload_size, bit_width,
-                                   (uint32_t*)output, max_values);
+            (void)carquet_rle_decode_all(payload, payload_size, bit_width,
+                                         (uint32_t*)output, max_values);
             break;
         }
 
         case 1: {
             /* Delta INT32 */
             int32_t num_values = (param % 100) + 1;
-            size_t consumed;
-            carquet_delta_decode_int32(payload, payload_size,
-                                       (int32_t*)output, num_values, &consumed);
+            size_t consumed = 0;
+            (void)carquet_delta_decode_int32(payload, payload_size,
+                                             (int32_t*)output, num_values, &consumed);
             break;
         }
 
         case 2: {
             /* Delta INT64 */
             int32_t num_values = (param % 100) + 1;
-            size_t consumed;
-            carquet_delta_decode_int64(payload, payload_size,
-                                       (int64_t*)output, num_values, &consumed);
+            size_t consumed = 0;
+            (void)carquet_delta_decode_int64(payload, payload_size,
+                                             (int64_t*)output, num_values, &consumed);
             break;
         }
 
         case 3: {
             /* Plain INT32 */
-            int32_t count = payload_size / 4;
-            if (count > (int32_t)max_values) count = max_values;
-            carquet_plain_decode_int32(payload, payload_size,
-                                       count, (int32_t*)output);
+            int64_t count = payload_size / 4;
+            if (count > max_values) count = max_values;
+            (void)carquet_decode_plain_int32(payload, payload_size,
+                                             (int32_t*)output, count);
             break;
         }
 
         case 4: {
             /* Plain INT64 */
-            int32_t count = payload_size / 8;
-            if (count > (int32_t)max_values) count = max_values;
-            carquet_plain_decode_int64(payload, payload_size,
-                                       count, (int64_t*)output);
+            int64_t count = payload_size / 8;
+            if (count > max_values) count = max_values;
+            (void)carquet_decode_plain_int64(payload, payload_size,
+                                             (int64_t*)output, count);
             break;
         }
 
         case 5: {
             /* Plain DOUBLE */
-            int32_t count = payload_size / 8;
-            if (count > (int32_t)max_values) count = max_values;
-            carquet_plain_decode_double(payload, payload_size,
-                                        count, (double*)output);
+            int64_t count = payload_size / 8;
+            if (count > max_values) count = max_values;
+            (void)carquet_decode_plain_double(payload, payload_size,
+                                              (double*)output, count);
             break;
         }
     }
@@ -134,19 +124,19 @@ int main(int argc, char** argv) {
 
     struct stat st;
     fstat(fileno(f), &st);
-    size_t size = st.st_size;
+    size_t file_size = (size_t)st.st_size;
 
-    uint8_t* data = malloc(size);
-    if (!data) {
+    uint8_t* file_data = malloc(file_size);
+    if (!file_data) {
         fclose(f);
         return 1;
     }
 
-    fread(data, 1, size, f);
+    fread(file_data, 1, file_size, f);
     fclose(f);
 
-    int result = LLVMFuzzerTestOneInput(data, size);
-    free(data);
+    int result = LLVMFuzzerTestOneInput(file_data, file_size);
+    free(file_data);
     return result;
 }
 #endif
