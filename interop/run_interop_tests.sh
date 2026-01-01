@@ -122,55 +122,8 @@ run_tests() {
 run_roundtrip() {
     echo -e "${YELLOW}Step 4: Running write roundtrip test...${NC}"
 
-    # Build roundtrip_writer
-    if [ -f "$SCRIPT_DIR/roundtrip_writer.c" ]; then
-        OMP_FLAGS=""
-        OMP_LIBS=""
-        if [ -d "/opt/homebrew/opt/llvm" ]; then
-            OMP_FLAGS="-I/opt/homebrew/opt/llvm/include"
-            OMP_LIBS="-L/opt/homebrew/opt/llvm/lib -lomp"
-        elif [[ "$(uname)" == "Linux" ]]; then
-            OMP_LIBS="-fopenmp"
-        fi
-
-        gcc -O2 -I"$PROJECT_DIR/include" $OMP_FLAGS \
-            -o "$SCRIPT_DIR/roundtrip_writer" \
-            "$SCRIPT_DIR/roundtrip_writer.c" \
-            "$BUILD_DIR/libcarquet.a" \
-            -lzstd -lz $OMP_LIBS 2>/dev/null
-
-        if [ $? -eq 0 ]; then
-            echo -e "${GREEN}Built: roundtrip_writer${NC}"
-        else
-            echo -e "${RED}Failed to build roundtrip_writer${NC}"
-            return 1
-        fi
-    fi
-
-    # Run roundtrip test with Python
-    if [ -f "$SCRIPT_DIR/roundtrip_test.py" ]; then
-        python3 "$SCRIPT_DIR/roundtrip_test.py"
-    else
-        # Fallback: manual test
-        TEMP_FILE=$(mktemp).parquet
-        "$SCRIPT_DIR/roundtrip_writer" "$TEMP_FILE"
-
-        python3 -c "
-import pyarrow.parquet as pq
-t = pq.read_table('$TEMP_FILE')
-assert t.num_rows == 1000, f'Expected 1000 rows, got {t.num_rows}'
-print('PyArrow: OK')
-
-import duckdb
-conn = duckdb.connect()
-r = conn.execute(\"SELECT COUNT(*) FROM read_parquet('$TEMP_FILE')\").fetchone()[0]
-assert r == 1000, f'Expected 1000 rows, got {r}'
-print('DuckDB: OK')
-conn.close()
-print('Roundtrip test PASSED')
-"
-        rm -f "$TEMP_FILE"
-    fi
+    # roundtrip_test.py builds and runs the comprehensive test
+    python3 "$SCRIPT_DIR/roundtrip_test.py"
 }
 
 # Cleanup compiled binaries

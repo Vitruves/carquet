@@ -1,61 +1,41 @@
 #!/usr/bin/env python3
 """
-Full round-trip interoperability test for carquet.
+Comprehensive verification of carquet output files.
 
-This test:
-1. Generates known test data
-2. Writes it using carquet (via C test program)
-3. Reads it back with PyArrow and DuckDB
-4. Verifies values match EXACTLY
-
-This is the GOLD STANDARD for semantic correctness.
-
-Usage:
-    python roundtrip_test.py
-
-Requirements:
-    pip install pyarrow pandas duckdb numpy
+Tests all physical types, all compression codecs, null handling,
+and verifies exact values with PyArrow and DuckDB.
 """
 
 import subprocess
 import tempfile
-import os
-import sys
 import json
+import sys
+import os
 from pathlib import Path
-import struct
 
 try:
     import pyarrow.parquet as pq
     import numpy as np
     import duckdb
 except ImportError as e:
-    print(f"Missing dependency: {e}")
-    print("Install with: pip install pyarrow numpy duckdb")
+    print(f"Missing: {e}. Install: pip install pyarrow numpy duckdb")
     sys.exit(1)
-
 
 SCRIPT_DIR = Path(__file__).parent
 PROJECT_DIR = SCRIPT_DIR.parent
-
-# Find build directory (could be build or build-fuzz)
-if (PROJECT_DIR / "build" / "libcarquet.a").exists():
-    BUILD_DIR = PROJECT_DIR / "build"
-elif (PROJECT_DIR / "build-fuzz" / "libcarquet.a").exists():
-    BUILD_DIR = PROJECT_DIR / "build-fuzz"
-else:
-    BUILD_DIR = PROJECT_DIR / "build"
+BUILD_DIR = PROJECT_DIR / "build"
 
 
-def build_roundtrip_writer():
-    """Compile the C roundtrip test program."""
+def build_comprehensive_writer():
+    """Build the comprehensive test writer."""
     source = SCRIPT_DIR / "roundtrip_writer.c"
     binary = SCRIPT_DIR / "roundtrip_writer"
 
     if not source.exists():
-        create_roundtrip_writer_source(source)
+        print(f"ERROR: {source} not found")
+        return None
 
-    # Detect OpenMP flags
+    # Detect OpenMP
     omp_flags = ""
     omp_libs = ""
     if Path("/opt/homebrew/opt/llvm").exists():
@@ -68,274 +48,214 @@ def build_roundtrip_writer():
 
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"Compilation failed: {result.stderr}")
+        print(f"Compile failed: {result.stderr}")
         return None
 
     return binary
 
 
-def create_roundtrip_writer_source(path: Path):
-    """Create the C source for roundtrip testing."""
-    source = '''
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
-#include <carquet/carquet.h>
+def verify_with_pyarrow(path, expected, file_info):
+    """Verify file with PyArrow."""
+    errors = []
 
-/*
- * Write test data with known values for roundtrip verification.
- * Output format is JSON with expected values.
- */
+    try:
+        table = pq.read_table(path)
+    except Exception as e:
+        return [f"PyArrow failed to read: {e}"]
 
-#define NUM_ROWS 1000
+    # Check row count
+    if table.num_rows != expected["num_rows"]:
+        errors.append(f"Row count: {table.num_rows} != {expected['num_rows']}")
 
-int main(int argc, char** argv) {
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <output.parquet>\\n", argv[0]);
-        return 1;
-    }
+    cols = file_info["columns"]
 
-    const char* output_path = argv[1];
-    carquet_error_t err = CARQUET_ERROR_INIT;
+    # bool_col
+    bools = table.column("bool_col").to_pylist()[:5]
+    exp_bools = cols["bool_col"]["first"]
+    if bools != exp_bools:
+        errors.append(f"bool_col: {bools} != {exp_bools}")
 
-    if (carquet_init() != CARQUET_OK) {
-        fprintf(stderr, "Failed to init carquet\\n");
-        return 1;
-    }
+    # int32_col
+    int32s = table.column("int32_col").to_pylist()[:5]
+    exp_int32s = cols["int32_col"]["first"]
+    if int32s != exp_int32s:
+        errors.append(f"int32_col: {int32s} != {exp_int32s}")
 
-    /* Create schema */
-    carquet_schema_t* schema = carquet_schema_create(&err);
-    if (!schema) {
-        fprintf(stderr, "Failed to create schema: %s\\n", err.message);
-        return 1;
-    }
+    # int64_col
+    int64s = table.column("int64_col").to_pylist()[:5]
+    exp_int64s = cols["int64_col"]["first"]
+    if int64s != exp_int64s:
+        errors.append(f"int64_col: {int64s} != {exp_int64s}")
 
-    /* Add columns - various types */
-    carquet_schema_add_column(schema, "int32_col", CARQUET_PHYSICAL_INT32,
-                              NULL, CARQUET_REPETITION_REQUIRED, 0);
-    carquet_schema_add_column(schema, "int64_col", CARQUET_PHYSICAL_INT64,
-                              NULL, CARQUET_REPETITION_REQUIRED, 0);
-    carquet_schema_add_column(schema, "float_col", CARQUET_PHYSICAL_FLOAT,
-                              NULL, CARQUET_REPETITION_REQUIRED, 0);
-    carquet_schema_add_column(schema, "double_col", CARQUET_PHYSICAL_DOUBLE,
-                              NULL, CARQUET_REPETITION_REQUIRED, 0);
-    carquet_schema_add_column(schema, "nullable_int", CARQUET_PHYSICAL_INT32,
-                              NULL, CARQUET_REPETITION_OPTIONAL, 0);
+    # float_col (with tolerance)
+    floats = table.column("float_col").to_pylist()[:5]
+    exp_floats = cols["float_col"]["first"]
+    for i, (a, b) in enumerate(zip(floats, exp_floats)):
+        if abs(a - b) > 1e-4:
+            errors.append(f"float_col[{i}]: {a} != {b}")
+            break
 
-    /* Create writer */
-    carquet_writer_options_t opts;
-    carquet_writer_options_init(&opts);
-    opts.compression = CARQUET_COMPRESSION_ZSTD;
+    # double_col
+    doubles = table.column("double_col").to_pylist()[:5]
+    exp_doubles = cols["double_col"]["first"]
+    for i, (a, b) in enumerate(zip(doubles, exp_doubles)):
+        if abs(a - b) > 1e-10:
+            errors.append(f"double_col[{i}]: {a} != {b}")
+            break
 
-    carquet_writer_t* writer = carquet_writer_create(output_path, schema, &opts, &err);
-    if (!writer) {
-        fprintf(stderr, "Failed to create writer: %s\\n", err.message);
-        carquet_schema_free(schema);
-        return 1;
-    }
+    # string_col (with nulls) - PyArrow returns bytes, decode to str
+    strings_raw = table.column("string_col").to_pylist()[:5]
+    strings = [s.decode('utf-8') if s is not None else None for s in strings_raw]
+    exp_strings = cols["string_col"]["first"]
+    if strings != exp_strings:
+        errors.append(f"string_col: {strings} != {exp_strings}")
 
-    /* Generate test data with predictable values */
-    int32_t* int32_data = malloc(NUM_ROWS * sizeof(int32_t));
-    int64_t* int64_data = malloc(NUM_ROWS * sizeof(int64_t));
-    float* float_data = malloc(NUM_ROWS * sizeof(float));
-    double* double_data = malloc(NUM_ROWS * sizeof(double));
-    int32_t* nullable_data = malloc(NUM_ROWS * sizeof(int32_t));
-    int16_t* def_levels = malloc(NUM_ROWS * sizeof(int16_t));
+    # nullable_int
+    nullable = table.column("nullable_int").to_pylist()[:5]
+    exp_nullable = cols["nullable_int"]["first"]
+    if nullable != exp_nullable:
+        errors.append(f"nullable_int: {nullable} != {exp_nullable}")
 
-    for (int i = 0; i < NUM_ROWS; i++) {
-        int32_data[i] = i * 10;
-        int64_data[i] = (int64_t)i * 1000000LL;
-        float_data[i] = (float)i * 0.5f;
-        double_data[i] = (double)i * 0.125;
-        nullable_data[i] = i * 100;
-        def_levels[i] = (i % 5 == 0) ? 0 : 1;  /* Every 5th value is NULL */
-    }
+    # Verify null counts
+    string_nulls = sum(1 for v in table.column("string_col").to_pylist() if v is None)
+    exp_string_nulls = expected["verification"]["null_count_string_col"]
+    if string_nulls != exp_string_nulls:
+        errors.append(f"string null count: {string_nulls} != {exp_string_nulls}")
 
-    /* Write columns */
-    carquet_writer_write_batch(writer, 0, int32_data, NUM_ROWS, NULL, NULL);
-    carquet_writer_write_batch(writer, 1, int64_data, NUM_ROWS, NULL, NULL);
-    carquet_writer_write_batch(writer, 2, float_data, NUM_ROWS, NULL, NULL);
-    carquet_writer_write_batch(writer, 3, double_data, NUM_ROWS, NULL, NULL);
-    carquet_writer_write_batch(writer, 4, nullable_data, NUM_ROWS, def_levels, NULL);
+    nullable_nulls = sum(1 for v in table.column("nullable_int").to_pylist() if v is None)
+    exp_nullable_nulls = expected["verification"]["null_count_nullable_int"]
+    if nullable_nulls != exp_nullable_nulls:
+        errors.append(f"nullable_int null count: {nullable_nulls} != {exp_nullable_nulls}")
 
-    /* Close and finalize */
-    carquet_status_t status = carquet_writer_close(writer);
-    if (status != CARQUET_OK) {
-        fprintf(stderr, "Failed to close writer\\n");
-    }
+    # Verify aggregates
+    int32_sum = sum(table.column("int32_col").to_pylist())
+    exp_sum = expected["verification"]["int32_sum"]
+    if int32_sum != exp_sum:
+        errors.append(f"int32 sum: {int32_sum} != {exp_sum}")
 
-    /* Output expected values as JSON for verification */
-    printf("{\\n");
-    printf("  \\"num_rows\\": %d,\\n", NUM_ROWS);
-    printf("  \\"columns\\": {\\n");
-    printf("    \\"int32_col\\": { \\"first\\": [0, 10, 20, 30, 40], \\"type\\": \\"int32\\" },\\n");
-    printf("    \\"int64_col\\": { \\"first\\": [0, 1000000, 2000000, 3000000, 4000000], \\"type\\": \\"int64\\" },\\n");
-    printf("    \\"float_col\\": { \\"first\\": [0.0, 0.5, 1.0, 1.5, 2.0], \\"type\\": \\"float\\" },\\n");
-    printf("    \\"double_col\\": { \\"first\\": [0.0, 0.125, 0.25, 0.375, 0.5], \\"type\\": \\"double\\" },\\n");
-    printf("    \\"nullable_int\\": { \\"first\\": [null, 100, 200, 300, 400], \\"null_indices\\": [0, 5, 10, 15, 20], \\"type\\": \\"int32\\" }\\n");
-    printf("  }\\n");
-    printf("}\\n");
+    last_int32 = table.column("int32_col").to_pylist()[-1]
+    exp_last = expected["verification"]["last_int32"]
+    if last_int32 != exp_last:
+        errors.append(f"last int32: {last_int32} != {exp_last}")
 
-    free(int32_data);
-    free(int64_data);
-    free(float_data);
-    free(double_data);
-    free(nullable_data);
-    free(def_levels);
-    carquet_schema_free(schema);
-
-    return status == CARQUET_OK ? 0 : 1;
-}
-'''
-    path.write_text(source)
+    return errors
 
 
-def run_roundtrip_test():
-    """Run the full roundtrip test."""
-    print("=" * 60)
-    print("  Carquet Round-Trip Interoperability Test")
-    print("=" * 60)
+def verify_with_duckdb(path, expected):
+    """Verify file with DuckDB."""
+    errors = []
+
+    try:
+        conn = duckdb.connect()
+        df = conn.execute(f"SELECT * FROM read_parquet('{path}')").fetchdf()
+        conn.close()
+    except Exception as e:
+        return [f"DuckDB failed to read: {e}"]
+
+    if len(df) != expected["num_rows"]:
+        errors.append(f"DuckDB row count: {len(df)} != {expected['num_rows']}")
+
+    # Check sum
+    int32_sum = int(df["int32_col"].sum())
+    exp_sum = expected["verification"]["int32_sum"]
+    if int32_sum != exp_sum:
+        errors.append(f"DuckDB int32 sum: {int32_sum} != {exp_sum}")
+
+    return errors
+
+
+def run_comprehensive_test():
+    """Run the full comprehensive test."""
+    print("=" * 70)
+    print("  Comprehensive Carquet Interoperability Test")
+    print("=" * 70)
     print()
 
-    # Check if library exists
-    lib_path = BUILD_DIR / "libcarquet.a"
-    if not lib_path.exists():
-        print(f"ERROR: Library not found: {lib_path}")
-        print("Build with: cmake -B build && cmake --build build")
+    # Check library
+    if not (BUILD_DIR / "libcarquet.a").exists():
+        print(f"ERROR: Library not found. Build first.")
         return 1
 
-    # Build the test writer
-    print("Step 1: Building roundtrip test writer...")
-    binary = build_roundtrip_writer()
+    # Build writer
+    print("Building comprehensive test writer...")
+    binary = build_comprehensive_writer()
     if not binary:
         return 1
     print(f"  Built: {binary}")
     print()
 
-    # Create temp file for output
-    with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as f:
-        parquet_path = f.name
-
-    try:
-        # Run carquet writer
-        print("Step 2: Writing test data with carquet...")
+    # Create temp dir for test files
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Run writer
+        print("Generating test files (all compressions)...")
         result = subprocess.run(
-            [str(binary), parquet_path],
+            [str(binary), tmpdir],
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=60
         )
 
         if result.returncode != 0:
             print(f"  FAILED: {result.stderr}")
             return 1
 
-        # Parse expected values from stdout
         expected = json.loads(result.stdout)
-        print(f"  Wrote {expected['num_rows']} rows")
+        print(f"  Generated {len(expected['files'])} files with {expected['num_rows']} rows each")
         print()
 
-        # Read with PyArrow
-        print("Step 3: Reading with PyArrow...")
-        try:
-            table = pq.read_table(parquet_path)
-            print(f"  Read {table.num_rows} rows, {table.num_columns} columns")
+        # Test each file
+        total_errors = 0
+        for file_info in expected["files"]:
+            path = file_info["path"]
+            compression = file_info["compression"]
+            print(f"Testing {compression}...")
 
-            # Verify values
-            errors = []
-
-            # Check int32_col
-            int32_vals = table.column('int32_col').to_pylist()[:5]
-            expected_int32 = expected['columns']['int32_col']['first']
-            if int32_vals != expected_int32:
-                errors.append(f"int32_col mismatch: {int32_vals} != {expected_int32}")
+            # PyArrow
+            pa_errors = verify_with_pyarrow(path, expected, file_info)
+            if pa_errors:
+                print(f"  PyArrow ERRORS:")
+                for e in pa_errors:
+                    print(f"    - {e}")
+                total_errors += len(pa_errors)
             else:
-                print(f"  ✓ int32_col values correct")
+                print(f"  PyArrow: OK (all types, nulls, values)")
 
-            # Check int64_col
-            int64_vals = table.column('int64_col').to_pylist()[:5]
-            expected_int64 = expected['columns']['int64_col']['first']
-            if int64_vals != expected_int64:
-                errors.append(f"int64_col mismatch: {int64_vals} != {expected_int64}")
+            # DuckDB
+            db_errors = verify_with_duckdb(path, expected)
+            if db_errors:
+                print(f"  DuckDB ERRORS:")
+                for e in db_errors:
+                    print(f"    - {e}")
+                total_errors += len(db_errors)
             else:
-                print(f"  ✓ int64_col values correct")
+                print(f"  DuckDB: OK")
 
-            # Check float_col (with tolerance)
-            float_vals = table.column('float_col').to_pylist()[:5]
-            expected_float = expected['columns']['float_col']['first']
-            float_ok = all(abs(a - b) < 1e-5 for a, b in zip(float_vals, expected_float))
-            if not float_ok:
-                errors.append(f"float_col mismatch: {float_vals} != {expected_float}")
-            else:
-                print(f"  ✓ float_col values correct")
+            print()
 
-            # Check double_col
-            double_vals = table.column('double_col').to_pylist()[:5]
-            expected_double = expected['columns']['double_col']['first']
-            double_ok = all(abs(a - b) < 1e-10 for a, b in zip(double_vals, expected_double))
-            if not double_ok:
-                errors.append(f"double_col mismatch: {double_vals} != {expected_double}")
-            else:
-                print(f"  ✓ double_col values correct")
+    # Cleanup binary
+    if binary and Path(binary).exists():
+        os.unlink(binary)
+        dsym = Path(str(binary) + ".dSYM")
+        if dsym.exists():
+            import shutil
+            shutil.rmtree(dsym)
 
-            # Check nullable column
-            nullable_vals = table.column('nullable_int').to_pylist()[:5]
-            expected_nullable = expected['columns']['nullable_int']['first']
-            if nullable_vals != expected_nullable:
-                errors.append(f"nullable_int mismatch: {nullable_vals} != {expected_nullable}")
-            else:
-                print(f"  ✓ nullable_int values correct (including NULLs)")
-
-            if errors:
-                print()
-                print("ERRORS:")
-                for e in errors:
-                    print(f"  ✗ {e}")
-                return 1
-
-        except Exception as e:
-            print(f"  FAILED: {e}")
-            return 1
-        print()
-
-        # Read with DuckDB
-        print("Step 4: Reading with DuckDB...")
-        try:
-            conn = duckdb.connect()
-            df = conn.execute(f"SELECT * FROM read_parquet('{parquet_path}')").fetchdf()
-            print(f"  Read {len(df)} rows")
-
-            # Quick value check
-            if df['int32_col'].iloc[1] == 10 and df['int64_col'].iloc[1] == 1000000:
-                print(f"  ✓ DuckDB values correct")
-            else:
-                print(f"  ✗ DuckDB value mismatch")
-                return 1
-
-            conn.close()
-        except Exception as e:
-            print(f"  FAILED: {e}")
-            return 1
-        print()
-
-        # Summary
-        print("=" * 60)
-        print("✓ ROUND-TRIP TEST PASSED")
+    # Summary
+    print("=" * 70)
+    if total_errors == 0:
+        print("COMPREHENSIVE TEST PASSED")
         print()
         print("Verified:")
-        print("  - carquet writes valid Parquet files")
-        print("  - PyArrow can read carquet output")
-        print("  - DuckDB can read carquet output")
-        print("  - Values are semantically correct")
-        print("  - NULL handling is correct")
+        print("  - All physical types: BOOLEAN, INT32, INT64, FLOAT, DOUBLE, BYTE_ARRAY")
+        print("  - All compressions: UNCOMPRESSED, SNAPPY, GZIP, LZ4, ZSTD")
+        print("  - Null handling: string nulls (every 7th), int nulls (every 5th)")
+        print("  - Value correctness: first values, last values, sums, null counts")
+        print("  - Readers: PyArrow and DuckDB")
         return 0
-
-    finally:
-        # Cleanup
-        if os.path.exists(parquet_path):
-            os.unlink(parquet_path)
+    else:
+        print(f"FAILED: {total_errors} errors")
+        return 1
 
 
-if __name__ == '__main__':
-    sys.exit(run_roundtrip_test())
+if __name__ == "__main__":
+    sys.exit(run_comprehensive_test())
