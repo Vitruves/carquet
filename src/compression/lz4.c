@@ -22,7 +22,7 @@
 #define LZ4_HASH_SIZE        (1 << LZ4_HASH_LOG)
 #define LZ4_SKIP_TRIGGER     6
 #define LZ4_MIN_LENGTH       13
-#define LZ4_LAST_LITERALS    5
+#define LZ4_LAST_LITERALS    12  /* Extra margin for decoder compatibility */
 
 /* Forward declaration */
 size_t carquet_lz4_compress_bound(size_t src_size);
@@ -258,6 +258,12 @@ carquet_status_t carquet_lz4_compress(
         size_t lit_len = (size_t)(ip - anchor);
         size_t match_len = lz4_count(ip + LZ4_MIN_MATCH, ref + LZ4_MIN_MATCH,
                                       matchlimit) + LZ4_MIN_MATCH;
+
+        /* Don't encode match if it would leave < LZ4_LAST_LITERALS trailing bytes */
+        if (ip + match_len > iend - LZ4_LAST_LITERALS) {
+            ip++;
+            continue;
+        }
 
         /* Check output space */
         size_t max_out = 1 + (lit_len / 255) + lit_len + 2 + (match_len / 255);
