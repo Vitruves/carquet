@@ -33,6 +33,7 @@ usage() {
     echo "  encodings    - Fuzz encoding decoders"
     echo "  thrift       - Fuzz Thrift protocol decoder"
     echo "  roundtrip    - Fuzz encode->decode roundtrips"
+    echo "  writer       - Fuzz the Parquet file writer"
     echo "  all          - Run all fuzzers sequentially"
     echo "  build        - Just build the fuzzers"
     echo ""
@@ -179,6 +180,15 @@ run_fuzzer() {
                 printf '\x03\x00\x00\x80\x3f\x00\x00\x00\x40\x00\x00\x40\x40' > "$corpus/seed_bss_float"
                 printf '\x04\x00\x00\x00\x00\x00\x00\xf0\x3f\x00\x00\x00\x00\x00\x00\x00\x40' > "$corpus/seed_bss_double"
                 ;;
+            writer)
+                # Seeds for writer: num_cols, num_rows(u16), codec, nullable_mask, type_bytes, data...
+                # 1 col, 10 rows, uncompressed, non-nullable, INT32 type
+                printf '\x01\x0a\x00\x00\x00\x01' > "$corpus/seed_simple"
+                # 3 cols, 5 rows, zstd, some nullable, mixed types
+                printf '\x03\x05\x00\x04\x55\x01\x02\x03' > "$corpus/seed_multi"
+                # 2 cols, 100 rows, snappy
+                printf '\x02\x64\x00\x01\x00\x01\x04' > "$corpus/seed_snappy"
+                ;;
         esac
     fi
 
@@ -209,7 +219,7 @@ case $TARGET in
     build)
         build_fuzzers
         ;;
-    reader|compression|encodings|thrift|roundtrip)
+    reader|compression|encodings|thrift|roundtrip|writer)
         if [ ! -d "$BUILD_DIR" ]; then
             build_fuzzers
         fi
@@ -221,7 +231,7 @@ case $TARGET in
         fi
         # Default: 5 minutes per target
         TIME=${1:--max_total_time=300}
-        for t in reader compression encodings thrift roundtrip; do
+        for t in reader compression encodings thrift roundtrip writer; do
             echo ""
             echo -e "${YELLOW}========== Fuzzing: $t ==========${NC}"
             run_fuzzer "$t" "$TIME" || true
