@@ -817,17 +817,17 @@ Benchmark comparing Carquet vs PyArrow 20.0 on Apple M3 (ARM64 with NEON), 10M r
 
 | Codec | Carquet | PyArrow | Speedup |
 |-------|---------|---------|---------|
-| UNCOMPRESSED | **83.5 M rows/sec** | 20.4 M rows/sec | **4.09x faster** |
-| SNAPPY | **50.0 M rows/sec** | 16.7 M rows/sec | **3.00x faster** |
-| ZSTD | **34.6 M rows/sec** | 13.8 M rows/sec | **2.51x faster** |
+| UNCOMPRESSED | **84.2 M rows/sec** | 20.8 M rows/sec | **4.05x faster** |
+| SNAPPY | **49.7 M rows/sec** | 16.8 M rows/sec | **2.96x faster** |
+| ZSTD | **34.9 M rows/sec** | 14.1 M rows/sec | **2.48x faster** |
 
 ### Read Performance (10M rows)
 
 | Codec | Carquet | PyArrow | Speedup |
 |-------|---------|---------|---------|
-| UNCOMPRESSED | **427 M rows/sec** | 336 M rows/sec | **1.27x faster** |
-| SNAPPY | **316 M rows/sec** | 254 M rows/sec | **1.25x faster** |
-| ZSTD | 133 M rows/sec | **234 M rows/sec** | 0.57x (see note) |
+| UNCOMPRESSED | **463 M rows/sec** | 364 M rows/sec | **1.27x faster** |
+| SNAPPY | **334 M rows/sec** | 268 M rows/sec | **1.25x faster** |
+| ZSTD | 134 M rows/sec | **238 M rows/sec** | 0.56x (see note) |
 
 ### File Size (10M rows)
 

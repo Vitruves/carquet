@@ -79,12 +79,24 @@ build_test() {
         cmake --build "$BUILD_DIR"
     fi
 
+    # Detect OpenMP flags
+    OMP_FLAGS=""
+    OMP_LIBS=""
+    if [ -d "/opt/homebrew/opt/llvm" ]; then
+        # macOS with Homebrew LLVM
+        OMP_FLAGS="-I/opt/homebrew/opt/llvm/include"
+        OMP_LIBS="-L/opt/homebrew/opt/llvm/lib -lomp"
+    elif [ -f "/usr/lib/libomp.so" ] || [ -f "/usr/lib/libgomp.so" ]; then
+        # Linux
+        OMP_LIBS="-fopenmp"
+    fi
+
     # Compile test program
-    gcc -O2 -I"$PROJECT_DIR/include" -I"$PROJECT_DIR/src" \
+    gcc -O2 -I"$PROJECT_DIR/include" -I"$PROJECT_DIR/src" $OMP_FLAGS \
         -o "$SCRIPT_DIR/test_interop" \
         "$SCRIPT_DIR/test_interop.c" \
         "$BUILD_DIR/libcarquet.a" \
-        -lzstd -lz
+        -lzstd -lz $OMP_LIBS
 
     echo -e "${GREEN}Built: $SCRIPT_DIR/test_interop${NC}"
 }

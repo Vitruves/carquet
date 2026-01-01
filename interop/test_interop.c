@@ -55,8 +55,12 @@ static int test_file(const char* path, int verbose) {
         printf("\n=== Testing: %s ===\n", path);
     }
 
-    /* Open file */
-    carquet_reader_t* reader = carquet_reader_open(path, NULL, &err);
+    /* Open file with mmap for thread-safe parallel reading with OpenMP */
+    carquet_reader_options_t opts;
+    carquet_reader_options_init(&opts);
+    opts.use_mmap = true;
+
+    carquet_reader_t* reader = carquet_reader_open(path, &opts, &err);
     if (!reader) {
         printf("  FAIL: Could not open file: %s\n", err.message);
         return 1;
