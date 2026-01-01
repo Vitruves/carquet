@@ -777,8 +777,8 @@ static carquet_status_t load_next_page_mmap(
         uint32_t expected_crc = (uint32_t)page_header.crc;
         if (computed_crc != expected_crc) {
             CARQUET_SET_ERROR(error, CARQUET_ERROR_CRC_MISMATCH,
-                "Page CRC mismatch: expected 0x%08X, got 0x%08X at offset %ld",
-                expected_crc, computed_crc, (long)page_offset);
+                "Page CRC mismatch: expected 0x%08X, got 0x%08X at offset %lld",
+                expected_crc, computed_crc, (long long)page_offset);
             return CARQUET_ERROR_CRC_MISMATCH;
         }
     }
@@ -993,8 +993,8 @@ static carquet_status_t load_next_page_fread(
         if (computed_crc != expected_crc) {
             free(compressed);
             CARQUET_SET_ERROR(error, CARQUET_ERROR_CRC_MISMATCH,
-                "Page CRC mismatch: expected 0x%08X, got 0x%08X at offset %ld",
-                expected_crc, computed_crc, data_offset + reader->current_page);
+                "Page CRC mismatch: expected 0x%08X, got 0x%08X at offset %lld",
+                expected_crc, computed_crc, (long long)(data_offset + reader->current_page));
             return CARQUET_ERROR_CRC_MISMATCH;
         }
     }

@@ -174,6 +174,9 @@ void carquet_error_clear(carquet_error_t* error);
 /**
  * Set error information.
  */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((format(printf, 6, 7)))
+#endif
 void carquet_error_set(carquet_error_t* error,
                        carquet_status_t code,
                        const char* file,
