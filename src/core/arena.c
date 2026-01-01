@@ -5,6 +5,7 @@
 
 #include "arena.h"
 #include <assert.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -22,8 +23,10 @@ static carquet_arena_block_t* arena_new_block(size_t min_size) {
                             ? CARQUET_ARENA_DEFAULT_BLOCK_SIZE
                             : align_up(min_size, CARQUET_ARENA_DEFAULT_BLOCK_SIZE);
 
-    carquet_arena_block_t* block = (carquet_arena_block_t*)malloc(
-        sizeof(carquet_arena_block_t) + block_size);
+    /* Allocate the header plus the data block.
+     * Note: offsetof accounts for the union's alignment padding */
+    size_t header_size = offsetof(carquet_arena_block_t, u);
+    carquet_arena_block_t* block = (carquet_arena_block_t*)malloc(header_size + block_size);
 
     if (!block) {
         return NULL;
@@ -120,7 +123,7 @@ void* carquet_arena_alloc_aligned(carquet_arena_t* arena, size_t size, size_t al
 
     /* Check if current block has space */
     if (new_used <= block->size) {
-        void* ptr = block->data + aligned_offset;
+        void* ptr = CARQUET_ARENA_BLOCK_DATA(block) + aligned_offset;
         block->used = new_used;
         arena->total_allocated += size;
         return ptr;
@@ -134,7 +137,7 @@ void* carquet_arena_alloc_aligned(carquet_arena_t* arena, size_t size, size_t al
 
         if (new_used <= block->size) {
             arena->current = block;
-            void* ptr = block->data + aligned_offset;
+            void* ptr = CARQUET_ARENA_BLOCK_DATA(block) + aligned_offset;
             block->used = new_used;
             arena->total_allocated += size;
             return ptr;
@@ -162,7 +165,7 @@ void* carquet_arena_alloc_aligned(carquet_arena_t* arena, size_t size, size_t al
     new_block->used = aligned_offset + size;
     arena->total_allocated += size;
 
-    return new_block->data + aligned_offset;
+    return CARQUET_ARENA_BLOCK_DATA(new_block) + aligned_offset;
 }
 
 void* carquet_arena_calloc(carquet_arena_t* arena, size_t count, size_t size) {

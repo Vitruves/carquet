@@ -35,13 +35,25 @@ extern "C" {
 
 /**
  * A single block in the arena.
+ * Note: The union ensures data[] is properly aligned for all platforms,
+ * including 32-bit systems where the struct fields alone would leave
+ * data[] at an offset that's not 8-byte aligned.
  */
 typedef struct carquet_arena_block {
     struct carquet_arena_block* next;
     size_t size;
     size_t used;
-    uint8_t data[];  /* Flexible array member */
+    union {
+        uint8_t data[1];  /* Flexible array member (C89 compat) */
+        /* Force alignment to match CARQUET_ARENA_ALIGNMENT (16) */
+        double _align_double;
+        void* _align_ptr;
+        long long _align_ll;
+    } u;
 } carquet_arena_block_t;
+
+/* Access data via u.data */
+#define CARQUET_ARENA_BLOCK_DATA(block) ((block)->u.data)
 
 /**
  * Arena allocator.

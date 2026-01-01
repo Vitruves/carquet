@@ -153,24 +153,25 @@ static inline uint32_t lz4_read32(const uint8_t* p) {
 static inline size_t lz4_count(const uint8_t* p, const uint8_t* match,
                                 const uint8_t* limit) {
     const uint8_t* start = p;
+
+    /* Fast path: compare 8 bytes at a time */
     while (p < limit - 7) {
-        uint64_t diff;
         uint64_t a, b;
         memcpy(&a, p, 8);
         memcpy(&b, match, 8);
-        diff = a ^ b;
-        if (diff) {
-            /* Count trailing zeros to find first difference */
-            int tz = 0;
-            while ((diff & 0xFF) == 0) {
-                tz++;
-                diff >>= 8;
+        if (a != b) {
+            /* Find first differing byte (endian-independent) */
+            while (*p == *match) {
+                p++;
+                match++;
             }
-            return (size_t)(p - start) + tz;
+            return (size_t)(p - start);
         }
         p += 8;
         match += 8;
     }
+
+    /* Byte-by-byte for remaining */
     while (p < limit && *p == *match) {
         p++;
         match++;

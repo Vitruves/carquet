@@ -10,6 +10,7 @@
 #include <carquet/types.h>
 #include "rle.h"
 #include "core/buffer.h"
+#include "core/endian.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -381,14 +382,13 @@ carquet_status_t carquet_dictionary_decode_int32(
         return CARQUET_ERROR_DECODE;
     }
 
-    /* Look up values */
-    const int32_t* dict = (const int32_t*)dict_data;
+    /* Look up values (read as little-endian for big-endian compatibility) */
     for (int64_t i = 0; i < decoded; i++) {
         if ((int32_t)indices[i] >= dict_count) {
             free(indices);
             return CARQUET_ERROR_DECODE;
         }
-        output[i] = dict[indices[i]];
+        output[i] = carquet_read_i32_le(dict_data + indices[i] * sizeof(int32_t));
     }
 
     free(indices);
@@ -435,13 +435,13 @@ carquet_status_t carquet_dictionary_decode_int64(
         return CARQUET_ERROR_DECODE;
     }
 
-    const int64_t* dict = (const int64_t*)dict_data;
+    /* Look up values (read as little-endian for big-endian compatibility) */
     for (int64_t i = 0; i < decoded; i++) {
         if ((int32_t)indices[i] >= dict_count) {
             free(indices);
             return CARQUET_ERROR_DECODE;
         }
-        output[i] = dict[indices[i]];
+        output[i] = carquet_read_i64_le(dict_data + indices[i] * sizeof(int64_t));
     }
 
     free(indices);
@@ -488,13 +488,13 @@ carquet_status_t carquet_dictionary_decode_float(
         return CARQUET_ERROR_DECODE;
     }
 
-    const float* dict = (const float*)dict_data;
+    /* Look up values (read as little-endian for big-endian compatibility) */
     for (int64_t i = 0; i < decoded; i++) {
         if ((int32_t)indices[i] >= dict_count) {
             free(indices);
             return CARQUET_ERROR_DECODE;
         }
-        output[i] = dict[indices[i]];
+        output[i] = carquet_read_f32_le(dict_data + indices[i] * sizeof(float));
     }
 
     free(indices);
@@ -541,13 +541,13 @@ carquet_status_t carquet_dictionary_decode_double(
         return CARQUET_ERROR_DECODE;
     }
 
-    const double* dict = (const double*)dict_data;
+    /* Look up values (read as little-endian for big-endian compatibility) */
     for (int64_t i = 0; i < decoded; i++) {
         if ((int32_t)indices[i] >= dict_count) {
             free(indices);
             return CARQUET_ERROR_DECODE;
         }
-        output[i] = dict[indices[i]];
+        output[i] = carquet_read_f64_le(dict_data + indices[i] * sizeof(double));
     }
 
     free(indices);

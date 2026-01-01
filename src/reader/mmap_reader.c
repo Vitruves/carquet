@@ -204,6 +204,7 @@ carquet_status_t carquet_reader_open_mmap_internal(
 /**
  * Check if a page is eligible for zero-copy reading.
  * Zero-copy requires:
+ * - Little-endian system (Parquet stores values in little-endian)
  * - Uncompressed data (no decompression needed)
  * - PLAIN encoding (no decoding needed)
  * - Fixed-size type (predictable layout)
@@ -213,6 +214,14 @@ bool carquet_page_is_zero_copy_eligible(
     carquet_encoding_t encoding,
     carquet_physical_type_t type) {
 
+#if !CARQUET_LITTLE_ENDIAN
+    /* Big-endian systems cannot use zero-copy for numeric types
+     * because Parquet stores values in little-endian format */
+    (void)codec;
+    (void)encoding;
+    (void)type;
+    return false;
+#else
     /* Must be uncompressed */
     if (codec != CARQUET_COMPRESSION_UNCOMPRESSED) {
         return false;
@@ -244,6 +253,7 @@ bool carquet_page_is_zero_copy_eligible(
         default:
             return false;
     }
+#endif
 }
 
 /**
