@@ -5,17 +5,25 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# macOS deployment target - use current system version to avoid library version mismatch
+# macOS deployment target - respect user-specified value, only set default if not provided
 if(APPLE)
-    # Get the current macOS version and use it as deployment target
-    execute_process(
-        COMMAND sw_vers -productVersion
-        OUTPUT_VARIABLE MACOS_VERSION
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-    )
-    # Extract major version (e.g., "15" from "15.2")
-    string(REGEX MATCH "^[0-9]+" MACOS_MAJOR_VERSION "${MACOS_VERSION}")
-    set(CMAKE_OSX_DEPLOYMENT_TARGET "${MACOS_MAJOR_VERSION}.0" CACHE STRING "Minimum macOS version" FORCE)
+    # Only set a default deployment target if one wasn't already specified
+    if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+        # Get the current macOS version and use it as deployment target
+        execute_process(
+            COMMAND sw_vers -productVersion
+            OUTPUT_VARIABLE MACOS_VERSION
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE SW_VERS_RESULT
+        )
+        if(SW_VERS_RESULT EQUAL 0 AND MACOS_VERSION)
+            # Extract major version (e.g., "15" from "15.2")
+            string(REGEX MATCH "^[0-9]+" MACOS_MAJOR_VERSION "${MACOS_VERSION}")
+            if(MACOS_MAJOR_VERSION)
+                set(CMAKE_OSX_DEPLOYMENT_TARGET "${MACOS_MAJOR_VERSION}.0" CACHE STRING "Minimum macOS version")
+            endif()
+        endif()
+    endif()
 
     # Suppress linker warnings about library version mismatches from Homebrew LLVM
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -w")
