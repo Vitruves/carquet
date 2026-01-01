@@ -1106,12 +1106,16 @@ static carquet_status_t load_next_page(
 
     carquet_reader_t* file_reader = reader->file_reader;
 
-    /* Use mmap path if available */
-    if (file_reader->mmap_info && file_reader->mmap_info->is_valid) {
+    /* Use mmap/buffer path if memory-mapped or buffer-based reader */
+    if (file_reader->mmap_data != NULL) {
         return load_next_page_mmap(reader, error);
     }
 
-    /* Fall back to fread path */
+    /* Fall back to fread path (requires valid file handle) */
+    if (file_reader->file == NULL) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_STATE, "No data source available");
+        return CARQUET_ERROR_INVALID_STATE;
+    }
     return load_next_page_fread(reader, error);
 }
 
