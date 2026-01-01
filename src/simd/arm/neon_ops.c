@@ -304,11 +304,15 @@ void carquet_neon_byte_stream_split_encode_float(
         uint8x16_t out2 = vqtbl1q_u8(v, idx2);
         uint8x16_t out3 = vqtbl1q_u8(v, idx3);
 
-        /* Store to transposed positions */
-        vst1_lane_u32((uint32_t*)(output + 0 * count + i), vreinterpret_u32_u8(vget_low_u8(out0)), 0);
-        vst1_lane_u32((uint32_t*)(output + 1 * count + i), vreinterpret_u32_u8(vget_low_u8(out1)), 0);
-        vst1_lane_u32((uint32_t*)(output + 2 * count + i), vreinterpret_u32_u8(vget_low_u8(out2)), 0);
-        vst1_lane_u32((uint32_t*)(output + 3 * count + i), vreinterpret_u32_u8(vget_low_u8(out3)), 0);
+        /* Store to transposed positions (use memcpy for unaligned access) */
+        uint32_t t0 = vgetq_lane_u32(vreinterpretq_u32_u8(out0), 0);
+        uint32_t t1 = vgetq_lane_u32(vreinterpretq_u32_u8(out1), 0);
+        uint32_t t2 = vgetq_lane_u32(vreinterpretq_u32_u8(out2), 0);
+        uint32_t t3 = vgetq_lane_u32(vreinterpretq_u32_u8(out3), 0);
+        memcpy(output + 0 * count + i, &t0, sizeof(uint32_t));
+        memcpy(output + 1 * count + i, &t1, sizeof(uint32_t));
+        memcpy(output + 2 * count + i, &t2, sizeof(uint32_t));
+        memcpy(output + 3 * count + i, &t3, sizeof(uint32_t));
     }
 
     /* Handle remaining values */
@@ -332,11 +336,12 @@ void carquet_neon_byte_stream_split_decode_float(
 
     /* Process 4 floats at a time */
     for (; i + 4 <= count; i += 4) {
-        /* Load 4 bytes from each stream */
-        uint32_t b0 = *(const uint32_t*)(data + 0 * count + i);
-        uint32_t b1 = *(const uint32_t*)(data + 1 * count + i);
-        uint32_t b2 = *(const uint32_t*)(data + 2 * count + i);
-        uint32_t b3 = *(const uint32_t*)(data + 3 * count + i);
+        /* Load 4 bytes from each stream (use memcpy for unaligned access) */
+        uint32_t b0, b1, b2, b3;
+        memcpy(&b0, data + 0 * count + i, sizeof(uint32_t));
+        memcpy(&b1, data + 1 * count + i, sizeof(uint32_t));
+        memcpy(&b2, data + 2 * count + i, sizeof(uint32_t));
+        memcpy(&b3, data + 3 * count + i, sizeof(uint32_t));
 
         uint8x8_t bytes0 = vreinterpret_u8_u32(vdup_n_u32(b0));
         uint8x8_t bytes1 = vreinterpret_u8_u32(vdup_n_u32(b1));

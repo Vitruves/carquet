@@ -184,7 +184,8 @@ static carquet_status_t delta_decoder_read_mini_block(delta_decoder_t* dec) {
         carquet_bitunpack_32(dec->data + dec->pos, mini_block_size, bit_width, unpacked);
 
         for (int i = 0; i < mini_block_size; i++) {
-            dec->mini_block_values[i] = dec->min_delta + (int64_t)unpacked[i];
+            /* Use unsigned addition to avoid overflow UB */
+            dec->mini_block_values[i] = (int64_t)((uint64_t)dec->min_delta + (uint64_t)unpacked[i]);
         }
 
         dec->pos += packed_size;
@@ -201,7 +202,8 @@ static carquet_status_t delta_decoder_read_mini_block(delta_decoder_t* dec) {
             for (int b = 0; b < bytes_per_value; b++) {
                 val |= (uint64_t)dec->data[dec->pos++] << (b * 8);
             }
-            dec->mini_block_values[i] = dec->min_delta + (int64_t)val;
+            /* Use unsigned addition to avoid overflow UB */
+            dec->mini_block_values[i] = (int64_t)((uint64_t)dec->min_delta + val);
         }
     }
 
@@ -231,7 +233,8 @@ static carquet_status_t delta_decoder_next(delta_decoder_t* dec, int64_t* value)
     }
 
     int64_t delta = dec->mini_block_values[dec->mini_block_pos++];
-    dec->last_value += delta;
+    /* Use unsigned addition to avoid overflow UB, then reinterpret as signed */
+    dec->last_value = (int64_t)((uint64_t)dec->last_value + (uint64_t)delta);
     *value = dec->last_value;
     dec->values_decoded++;
 
@@ -366,12 +369,10 @@ static carquet_status_t delta_encoder_flush_block(delta_encoder_t* enc) {
         }
     }
 
-    /* Write min delta */
-    enc->pos += write_uleb128(enc->data + enc->pos, zigzag_encode64(min_delta));
-
-    /* Calculate bit widths for each mini-block */
+    /* Calculate bit widths for each mini-block first to determine space needed */
     int mini_block_size = enc->block_size / enc->mini_blocks_per_block;
     uint8_t bit_widths[DELTA_MINI_BLOCKS];
+    size_t packed_bytes_needed = 0;
 
     for (int mb = 0; mb < enc->mini_blocks_per_block; mb++) {
         uint64_t max_val = 0;
@@ -380,12 +381,32 @@ static carquet_status_t delta_encoder_flush_block(delta_encoder_t* enc) {
         if (end > enc->delta_count) end = enc->delta_count;
 
         for (int i = start; i < end; i++) {
-            uint64_t adjusted = (uint64_t)(enc->deltas[i] - min_delta);
+            /* Use unsigned subtraction to avoid overflow UB */
+            uint64_t adjusted = (uint64_t)enc->deltas[i] - (uint64_t)min_delta;
             if (adjusted > max_val) max_val = adjusted;
         }
 
         bit_widths[mb] = (uint8_t)bit_width_required(max_val);
+        if (bit_widths[mb] > 0) {
+            /* Calculate bytes needed for this mini-block */
+            if (bit_widths[mb] <= 32) {
+                /* Bitpacked: mini_block_size values * bit_width / 8 */
+                packed_bytes_needed += (size_t)mini_block_size * bit_widths[mb] / 8;
+            } else {
+                /* Byte-by-byte: mini_block_size values * bytes_per_value */
+                packed_bytes_needed += (size_t)mini_block_size * ((bit_widths[mb] + 7) / 8);
+            }
+        }
     }
+
+    /* Check capacity: min_delta varint (max 10) + bit_widths + packed data */
+    size_t bytes_needed = 10 + (size_t)enc->mini_blocks_per_block + packed_bytes_needed;
+    if (enc->pos + bytes_needed > enc->capacity) {
+        return CARQUET_ERROR_ENCODE;
+    }
+
+    /* Write min delta */
+    enc->pos += write_uleb128(enc->data + enc->pos, zigzag_encode64(min_delta));
 
     /* Write bit widths */
     memcpy(enc->data + enc->pos, bit_widths, enc->mini_blocks_per_block);
@@ -403,7 +424,8 @@ static carquet_status_t delta_encoder_flush_block(delta_encoder_t* enc) {
         if (bit_widths[mb] <= 32) {
             uint32_t to_pack[DELTA_MINI_BLOCK_SIZE];
             for (int i = start; i < end; i++) {
-                to_pack[i - start] = (uint32_t)(enc->deltas[i] - min_delta);
+                /* Use unsigned subtraction to avoid overflow UB */
+                to_pack[i - start] = (uint32_t)((uint64_t)enc->deltas[i] - (uint64_t)min_delta);
             }
             /* Pad with zeros */
             for (int i = end - start; i < mini_block_size; i++) {
@@ -415,7 +437,8 @@ static carquet_status_t delta_encoder_flush_block(delta_encoder_t* enc) {
             /* For bit widths > 32, pack directly as bytes (little-endian) */
             int bytes_per_value = (bit_widths[mb] + 7) / 8;
             for (int i = start; i < end; i++) {
-                uint64_t adjusted = (uint64_t)(enc->deltas[i] - min_delta);
+                /* Use unsigned subtraction to avoid overflow UB */
+                uint64_t adjusted = (uint64_t)enc->deltas[i] - (uint64_t)min_delta;
                 for (int b = 0; b < bytes_per_value; b++) {
                     enc->data[enc->pos++] = (uint8_t)(adjusted >> (b * 8));
                 }
@@ -448,6 +471,11 @@ carquet_status_t carquet_delta_encode_int32(
     delta_encoder_t enc;
     delta_encoder_init(&enc, data, data_capacity);
 
+    /* Check capacity for header (max 40 bytes for 4 varints) */
+    if (data_capacity < 40) {
+        return CARQUET_ERROR_ENCODE;
+    }
+
     /* Write header */
     enc.pos += write_uleb128(data + enc.pos, DELTA_BLOCK_SIZE);
     enc.pos += write_uleb128(data + enc.pos, DELTA_MINI_BLOCKS);
@@ -460,7 +488,8 @@ carquet_status_t carquet_delta_encode_int32(
 
     /* Encode remaining values */
     for (int32_t i = 1; i < num_values; i++) {
-        int64_t delta = (int64_t)values[i] - enc.last_value;
+        /* Use unsigned subtraction to avoid overflow UB, then reinterpret as signed */
+        int64_t delta = (int64_t)((uint64_t)(int64_t)values[i] - (uint64_t)enc.last_value);
         enc.deltas[enc.delta_count++] = delta;
         enc.last_value = values[i];
 
@@ -471,7 +500,8 @@ carquet_status_t carquet_delta_encode_int32(
     }
 
     /* Flush remaining */
-    delta_encoder_flush_block(&enc);
+    carquet_status_t status = delta_encoder_flush_block(&enc);
+    if (status != CARQUET_OK) return status;
 
     *bytes_written = enc.pos;
     return CARQUET_OK;
@@ -492,6 +522,11 @@ carquet_status_t carquet_delta_encode_int64(
     delta_encoder_t enc;
     delta_encoder_init(&enc, data, data_capacity);
 
+    /* Check capacity for header (max 40 bytes for 4 varints) */
+    if (data_capacity < 40) {
+        return CARQUET_ERROR_ENCODE;
+    }
+
     /* Write header */
     enc.pos += write_uleb128(data + enc.pos, DELTA_BLOCK_SIZE);
     enc.pos += write_uleb128(data + enc.pos, DELTA_MINI_BLOCKS);
@@ -504,7 +539,8 @@ carquet_status_t carquet_delta_encode_int64(
 
     /* Encode remaining values */
     for (int32_t i = 1; i < num_values; i++) {
-        int64_t delta = values[i] - enc.last_value;
+        /* Use unsigned subtraction to avoid overflow UB, then reinterpret as signed */
+        int64_t delta = (int64_t)((uint64_t)values[i] - (uint64_t)enc.last_value);
         enc.deltas[enc.delta_count++] = delta;
         enc.last_value = values[i];
 
@@ -515,7 +551,8 @@ carquet_status_t carquet_delta_encode_int64(
     }
 
     /* Flush remaining */
-    delta_encoder_flush_block(&enc);
+    carquet_status_t status = delta_encoder_flush_block(&enc);
+    if (status != CARQUET_OK) return status;
 
     *bytes_written = enc.pos;
     return CARQUET_OK;

@@ -2,8 +2,8 @@
  * @file fuzz_encodings.c
  * @brief Fuzz target for carquet encoding decoders
  *
- * Tests RLE, Delta, and other encoding decoders with arbitrary input.
- * The first byte selects the encoding type.
+ * Tests RLE, Delta, Dictionary, Byte Stream Split, and other encoding
+ * decoders with arbitrary input. The first byte selects the encoding type.
  */
 
 #include <stdint.h>
@@ -27,6 +27,36 @@ carquet_status_t carquet_delta_decode_int64(
     int64_t* output, int32_t num_values,
     size_t* bytes_consumed);
 
+/* Dictionary decode declarations */
+carquet_status_t carquet_dictionary_decode_int32(
+    const uint8_t* dict_data, size_t dict_size,
+    const uint8_t* indices_data, size_t indices_size,
+    int32_t* output, int64_t num_values);
+
+carquet_status_t carquet_dictionary_decode_int64(
+    const uint8_t* dict_data, size_t dict_size,
+    const uint8_t* indices_data, size_t indices_size,
+    int64_t* output, int64_t num_values);
+
+carquet_status_t carquet_dictionary_decode_float(
+    const uint8_t* dict_data, size_t dict_size,
+    const uint8_t* indices_data, size_t indices_size,
+    float* output, int64_t num_values);
+
+carquet_status_t carquet_dictionary_decode_double(
+    const uint8_t* dict_data, size_t dict_size,
+    const uint8_t* indices_data, size_t indices_size,
+    double* output, int64_t num_values);
+
+/* Byte stream split decode declarations */
+carquet_status_t carquet_byte_stream_split_decode_float(
+    const uint8_t* input, size_t input_size,
+    float* output, int64_t num_values);
+
+carquet_status_t carquet_byte_stream_split_decode_double(
+    const uint8_t* input, size_t input_size,
+    double* output, int64_t num_values);
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (size < 3) {
         return 0;
@@ -35,7 +65,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     (void)carquet_init();
 
     /* First byte: encoding type, second byte: parameters */
-    uint8_t encoding = data[0] % 6;
+    uint8_t encoding = data[0] % 12;  /* 12 test modes */
     uint8_t param = data[1];
     const uint8_t* payload = data + 2;
     size_t payload_size = size - 2;
@@ -98,6 +128,90 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             if (count > max_values) count = max_values;
             (void)carquet_decode_plain_double(payload, payload_size,
                                               (double*)output, count);
+            break;
+        }
+
+        case 6: {
+            /* Dictionary INT32 - split payload into dict and indices */
+            if (payload_size < 4) break;
+            size_t dict_size = (param % 64 + 1) * 4;  /* 4-256 bytes dict */
+            if (dict_size >= payload_size) dict_size = payload_size / 2;
+            size_t indices_size = payload_size - dict_size;
+            int64_t num_values = (param % 100) + 1;
+            if (num_values > max_values) num_values = max_values;
+            (void)carquet_dictionary_decode_int32(
+                payload, dict_size,
+                payload + dict_size, indices_size,
+                (int32_t*)output, num_values);
+            break;
+        }
+
+        case 7: {
+            /* Dictionary INT64 */
+            if (payload_size < 8) break;
+            size_t dict_size = (param % 32 + 1) * 8;  /* 8-256 bytes dict */
+            if (dict_size >= payload_size) dict_size = payload_size / 2;
+            size_t indices_size = payload_size - dict_size;
+            int64_t num_values = (param % 100) + 1;
+            if (num_values > max_values) num_values = max_values;
+            (void)carquet_dictionary_decode_int64(
+                payload, dict_size,
+                payload + dict_size, indices_size,
+                (int64_t*)output, num_values);
+            break;
+        }
+
+        case 8: {
+            /* Dictionary FLOAT */
+            if (payload_size < 4) break;
+            size_t dict_size = (param % 64 + 1) * 4;
+            if (dict_size >= payload_size) dict_size = payload_size / 2;
+            size_t indices_size = payload_size - dict_size;
+            int64_t num_values = (param % 100) + 1;
+            if (num_values > max_values) num_values = max_values;
+            (void)carquet_dictionary_decode_float(
+                payload, dict_size,
+                payload + dict_size, indices_size,
+                (float*)output, num_values);
+            break;
+        }
+
+        case 9: {
+            /* Dictionary DOUBLE */
+            if (payload_size < 8) break;
+            size_t dict_size = (param % 32 + 1) * 8;
+            if (dict_size >= payload_size) dict_size = payload_size / 2;
+            size_t indices_size = payload_size - dict_size;
+            int64_t num_values = (param % 100) + 1;
+            if (num_values > max_values) num_values = max_values;
+            (void)carquet_dictionary_decode_double(
+                payload, dict_size,
+                payload + dict_size, indices_size,
+                (double*)output, num_values);
+            break;
+        }
+
+        case 10: {
+            /* Byte stream split FLOAT */
+            int64_t num_values = payload_size / 4;
+            if (num_values > max_values) num_values = max_values;
+            if (num_values > 0) {
+                (void)carquet_byte_stream_split_decode_float(
+                    payload, (size_t)num_values * 4,
+                    (float*)output, num_values);
+            }
+            break;
+        }
+
+        case 11: {
+            /* Byte stream split DOUBLE */
+            int64_t num_values = payload_size / 8;
+            if (num_values > max_values) num_values = max_values;
+            if (num_values > 0) {
+                (void)carquet_byte_stream_split_decode_double(
+                    payload, (size_t)num_values * 8,
+                    (double*)output, num_values);
+            }
             break;
         }
     }

@@ -53,8 +53,12 @@ add_fuzz_target(fuzz_encodings fuzz_encodings.c)
 # Thrift fuzzer tests the Thrift compact protocol decoder
 add_fuzz_target(fuzz_thrift fuzz_thrift.c)
 
+# Roundtrip fuzzer tests encode->decode consistency
+add_fuzz_target(fuzz_roundtrip fuzz_roundtrip.c)
+
 # Create corpus directories
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/corpus_reader)
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/corpus_compression)
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/corpus_encodings)
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/corpus_thrift)
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/corpus_roundtrip)

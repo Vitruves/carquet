@@ -172,11 +172,15 @@ void carquet_sse_byte_stream_split_encode_float(
         __m128i out2 = _mm_shuffle_epi8(v, s2);
         __m128i out3 = _mm_shuffle_epi8(v, s3);
 
-        /* Store to transposed positions */
-        *(uint32_t*)(output + 0 * count + i) = _mm_cvtsi128_si32(out0);
-        *(uint32_t*)(output + 1 * count + i) = _mm_cvtsi128_si32(out1);
-        *(uint32_t*)(output + 2 * count + i) = _mm_cvtsi128_si32(out2);
-        *(uint32_t*)(output + 3 * count + i) = _mm_cvtsi128_si32(out3);
+        /* Store to transposed positions (use memcpy for unaligned access) */
+        uint32_t t0 = (uint32_t)_mm_cvtsi128_si32(out0);
+        uint32_t t1 = (uint32_t)_mm_cvtsi128_si32(out1);
+        uint32_t t2 = (uint32_t)_mm_cvtsi128_si32(out2);
+        uint32_t t3 = (uint32_t)_mm_cvtsi128_si32(out3);
+        memcpy(output + 0 * count + i, &t0, sizeof(uint32_t));
+        memcpy(output + 1 * count + i, &t1, sizeof(uint32_t));
+        memcpy(output + 2 * count + i, &t2, sizeof(uint32_t));
+        memcpy(output + 3 * count + i, &t3, sizeof(uint32_t));
     }
 
     /* Handle remaining values */
@@ -200,16 +204,17 @@ void carquet_sse_byte_stream_split_decode_float(
 
     /* Process 4 floats at a time */
     for (; i + 4 <= count; i += 4) {
-        /* Load 4 bytes from each stream */
-        uint32_t b0 = *(const uint32_t*)(data + 0 * count + i);
-        uint32_t b1 = *(const uint32_t*)(data + 1 * count + i);
-        uint32_t b2 = *(const uint32_t*)(data + 2 * count + i);
-        uint32_t b3 = *(const uint32_t*)(data + 3 * count + i);
+        /* Load 4 bytes from each stream (use memcpy for unaligned access) */
+        uint32_t b0, b1, b2, b3;
+        memcpy(&b0, data + 0 * count + i, sizeof(uint32_t));
+        memcpy(&b1, data + 1 * count + i, sizeof(uint32_t));
+        memcpy(&b2, data + 2 * count + i, sizeof(uint32_t));
+        memcpy(&b3, data + 3 * count + i, sizeof(uint32_t));
 
-        __m128i v0 = _mm_cvtsi32_si128(b0);
-        __m128i v1 = _mm_cvtsi32_si128(b1);
-        __m128i v2 = _mm_cvtsi32_si128(b2);
-        __m128i v3 = _mm_cvtsi32_si128(b3);
+        __m128i v0 = _mm_cvtsi32_si128((int)b0);
+        __m128i v1 = _mm_cvtsi32_si128((int)b1);
+        __m128i v2 = _mm_cvtsi32_si128((int)b2);
+        __m128i v3 = _mm_cvtsi32_si128((int)b3);
 
         /* Interleave bytes back into floats */
         __m128i lo01 = _mm_unpacklo_epi8(v0, v1);  /* a0b0 a1b1 a2b2 a3b3 ... */

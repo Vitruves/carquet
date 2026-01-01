@@ -32,6 +32,7 @@ usage() {
     echo "  compression  - Fuzz compression decoders"
     echo "  encodings    - Fuzz encoding decoders"
     echo "  thrift       - Fuzz Thrift protocol decoder"
+    echo "  roundtrip    - Fuzz encode->decode roundtrips"
     echo "  all          - Run all fuzzers sequentially"
     echo "  build        - Just build the fuzzers"
     echo ""
@@ -80,10 +81,15 @@ build_fuzzers() {
 
     echo -e "${GREEN}Using clang: $CLANG${NC}"
 
-    # Configure with fuzzing enabled
+    # Configure with fuzzing enabled and sanitizers
+    # ASan: memory errors (buffer overflows, use-after-free)
+    # UBSan: undefined behavior (signed overflow, null deref, etc.)
+    SANITIZER_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all"
+
     cmake -B "$BUILD_DIR" \
         -DCMAKE_C_COMPILER="$CLANG" \
         -DCMAKE_BUILD_TYPE=Debug \
+        -DCMAKE_C_FLAGS="$SANITIZER_FLAGS" \
         -DCARQUET_BUILD_FUZZ=ON \
         -DCARQUET_BUILD_TESTS=OFF \
         -DCARQUET_BUILD_EXAMPLES=OFF \
@@ -145,24 +151,51 @@ run_fuzzer() {
                 printf '\x03\x00' > "$corpus/seed_zstd"
                 ;;
             encodings)
-                # Seeds for each encoding
+                # Seeds for each encoding (12 modes)
                 printf '\x00\x08\x00' > "$corpus/seed_rle"
                 printf '\x01\x10\x00' > "$corpus/seed_delta32"
                 printf '\x02\x10\x00' > "$corpus/seed_delta64"
+                printf '\x03\x10\x00\x00\x00\x00' > "$corpus/seed_plain32"
+                printf '\x04\x10\x00\x00\x00\x00\x00\x00\x00\x00' > "$corpus/seed_plain64"
+                printf '\x05\x10\x00\x00\x00\x00\x00\x00\x00\x00' > "$corpus/seed_plain_double"
+                printf '\x06\x10\x01\x00\x00\x00\x02\x00' > "$corpus/seed_dict32"
+                printf '\x07\x10\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00' > "$corpus/seed_dict64"
+                printf '\x08\x10\x00\x00\x80\x3f\x02\x00' > "$corpus/seed_dict_float"
+                printf '\x09\x10\x00\x00\x00\x00\x00\x00\xf0\x3f\x02\x00' > "$corpus/seed_dict_double"
+                printf '\x0a\x10\x00\x00\x00\x00\x00\x00\x00\x00' > "$corpus/seed_bss_float"
+                printf '\x0b\x10\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' > "$corpus/seed_bss_double"
                 ;;
             thrift)
                 # Minimal Thrift structures
                 printf '\x00\x00' > "$corpus/seed_empty"
+                printf '\x15\x00\x00' > "$corpus/seed_struct"
+                printf '\x19\x00\x00\x00' > "$corpus/seed_list"
+                ;;
+            roundtrip)
+                # Seeds for roundtrip testing (mode byte + data)
+                printf '\x00\x01\x00\x00\x00\x02\x00\x00\x00\x03\x00\x00\x00' > "$corpus/seed_delta32"
+                printf '\x01\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00' > "$corpus/seed_delta64"
+                printf '\x02hello world test data' > "$corpus/seed_lz4"
+                printf '\x03\x00\x00\x80\x3f\x00\x00\x00\x40\x00\x00\x40\x40' > "$corpus/seed_bss_float"
+                printf '\x04\x00\x00\x00\x00\x00\x00\xf0\x3f\x00\x00\x00\x00\x00\x00\x00\x40' > "$corpus/seed_bss_double"
                 ;;
         esac
     fi
 
+    # Use dictionary file if available
+    DICT_FILE="$SCRIPT_DIR/parquet.dict"
+    DICT_OPT=""
+    if [ -f "$DICT_FILE" ]; then
+        DICT_OPT="-dict=$DICT_FILE"
+        echo "Using dictionary: $DICT_FILE"
+    fi
+
     echo -e "${GREEN}Running fuzzer: $target${NC}"
     echo "Corpus: $corpus"
-    echo "Options: $@"
+    echo "Options: $DICT_OPT $@"
     echo ""
 
-    "$fuzzer" "$corpus" "$@"
+    "$fuzzer" "$corpus" $DICT_OPT "$@"
 }
 
 # Parse arguments
@@ -176,7 +209,7 @@ case $TARGET in
     build)
         build_fuzzers
         ;;
-    reader|compression|encodings|thrift)
+    reader|compression|encodings|thrift|roundtrip)
         if [ ! -d "$BUILD_DIR" ]; then
             build_fuzzers
         fi
@@ -188,7 +221,7 @@ case $TARGET in
         fi
         # Default: 5 minutes per target
         TIME=${1:--max_total_time=300}
-        for t in reader compression encodings thrift; do
+        for t in reader compression encodings thrift roundtrip; do
             echo ""
             echo -e "${YELLOW}========== Fuzzing: $t ==========${NC}"
             run_fuzzer "$t" "$TIME" || true

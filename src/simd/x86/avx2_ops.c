@@ -149,15 +149,15 @@ void carquet_avx2_byte_stream_split_encode_float(
         uint32_t b3_lo = _mm256_extract_epi32(out3, 0);
         uint32_t b3_hi = _mm256_extract_epi32(out3, 4);
 
-        /* Store to transposed positions */
-        *(uint32_t*)(output + 0 * count + i) = b0_lo;
-        *(uint32_t*)(output + 0 * count + i + 4) = b0_hi;
-        *(uint32_t*)(output + 1 * count + i) = b1_lo;
-        *(uint32_t*)(output + 1 * count + i + 4) = b1_hi;
-        *(uint32_t*)(output + 2 * count + i) = b2_lo;
-        *(uint32_t*)(output + 2 * count + i + 4) = b2_hi;
-        *(uint32_t*)(output + 3 * count + i) = b3_lo;
-        *(uint32_t*)(output + 3 * count + i + 4) = b3_hi;
+        /* Store to transposed positions (use memcpy for unaligned access) */
+        memcpy(output + 0 * count + i, &b0_lo, sizeof(uint32_t));
+        memcpy(output + 0 * count + i + 4, &b0_hi, sizeof(uint32_t));
+        memcpy(output + 1 * count + i, &b1_lo, sizeof(uint32_t));
+        memcpy(output + 1 * count + i + 4, &b1_hi, sizeof(uint32_t));
+        memcpy(output + 2 * count + i, &b2_lo, sizeof(uint32_t));
+        memcpy(output + 2 * count + i + 4, &b2_hi, sizeof(uint32_t));
+        memcpy(output + 3 * count + i, &b3_lo, sizeof(uint32_t));
+        memcpy(output + 3 * count + i + 4, &b3_hi, sizeof(uint32_t));
     }
 
     /* Handle remaining values */
@@ -181,11 +181,16 @@ void carquet_avx2_byte_stream_split_decode_float(
 
     /* Process 8 floats at a time */
     for (; i + 8 <= count; i += 8) {
-        /* Load 8 bytes from each of the 4 streams */
-        __m128i b0 = _mm_loadl_epi64((const __m128i*)(data + 0 * count + i));
-        __m128i b1 = _mm_loadl_epi64((const __m128i*)(data + 1 * count + i));
-        __m128i b2 = _mm_loadl_epi64((const __m128i*)(data + 2 * count + i));
-        __m128i b3 = _mm_loadl_epi64((const __m128i*)(data + 3 * count + i));
+        /* Load 8 bytes from each of the 4 streams (use memcpy for unaligned access) */
+        uint64_t t0, t1, t2, t3;
+        memcpy(&t0, data + 0 * count + i, sizeof(uint64_t));
+        memcpy(&t1, data + 1 * count + i, sizeof(uint64_t));
+        memcpy(&t2, data + 2 * count + i, sizeof(uint64_t));
+        memcpy(&t3, data + 3 * count + i, sizeof(uint64_t));
+        __m128i b0 = _mm_cvtsi64_si128((long long)t0);
+        __m128i b1 = _mm_cvtsi64_si128((long long)t1);
+        __m128i b2 = _mm_cvtsi64_si128((long long)t2);
+        __m128i b3 = _mm_cvtsi64_si128((long long)t3);
 
         /* Interleave bytes to reconstruct floats */
         __m128i lo01 = _mm_unpacklo_epi8(b0, b1);  /* a0b0 a1b1 a2b2 ... */
