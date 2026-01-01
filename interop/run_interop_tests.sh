@@ -86,8 +86,8 @@ build_test() {
         # macOS with Homebrew LLVM
         OMP_FLAGS="-I/opt/homebrew/opt/llvm/include"
         OMP_LIBS="-L/opt/homebrew/opt/llvm/lib -lomp"
-    elif [ -f "/usr/lib/libomp.so" ] || [ -f "/usr/lib/libgomp.so" ]; then
-        # Linux
+    elif [[ "$(uname)" == "Linux" ]]; then
+        # Linux - use -fopenmp which links libgomp
         OMP_LIBS="-fopenmp"
     fi
 

@@ -210,7 +210,10 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    (void)carquet_init();
+    if (carquet_init() != CARQUET_OK) {
+        fprintf(stderr, "Failed to initialize carquet\n");
+        return 1;
+    }
 
     int verbose = 0;
     for (int i = 1; i < argc; i++) {
