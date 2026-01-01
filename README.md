@@ -787,6 +787,8 @@ cd build
 
 ## Interoperability
 
+Carquet is tested bidirectionally with PyArrow, DuckDB, and fastparquet. Run `./interop/run_interop_tests.sh` to verify both directions (carquet reads others' files, others read carquet's files).
+
 ### PyArrow Compatibility
 
 Files written by Carquet can be read by PyArrow and vice versa:
