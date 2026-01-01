@@ -1,22 +1,54 @@
 # Carquet
 
-A high-performance pure C library for reading and writing Apache Parquet files.
+A pure C library for reading and writing Apache Parquet files.
+
+## Why Carquet?
+
+**The primary goal of Carquet is to provide Parquet support in pure C.** Before Carquet, there was no production-ready C library for Parquet - only C++ (Arrow), Rust, Java, and Python implementations.
+
+### Use Cases
+
+- **Embedded systems** - No C++ runtime, no exceptions, minimal dependencies
+- **C codebases** - Native integration without FFI or language bridges
+- **Minimal binaries** - ~200KB vs ~50MB+ for Arrow
+- **Constrained environments** - IoT, microcontrollers, legacy systems
+
+### Carquet vs Apache Arrow
+
+Carquet is **not** a replacement for Apache Arrow. Arrow is the industry standard with years of production use, full feature support, and a large community.
+
+| Aspect | Carquet | Arrow Parquet |
+|--------|---------|---------------|
+| Language | Pure C11 | C++ |
+| Dependencies | zstd + zlib only | Many (Boost, etc.) |
+| Binary size | ~200KB | ~50MB+ |
+| Write speed | 2-4x faster | Baseline |
+| Read (uncompressed) | ~1.3x faster | Baseline |
+| Read (ZSTD) | ~0.5x slower | Baseline |
+| Nested types | Basic | Full support |
+| Encryption | No | Yes |
+| Community | New | Large, mature |
+| Production tested | Limited | Extensive |
+
+**Choose Carquet if:** You need Parquet in a C-only environment, want minimal dependencies, or are building for embedded/constrained systems.
+
+**Choose Arrow if:** You need full feature support, battle-tested reliability, or are in a C++/Python/Java environment.
 
 ## Features
 
 - **Pure C11** - Only external dependencies are zstd and zlib (auto-fetched by CMake if missing). Snappy and LZ4 are internal implementations.
 - **Portable** - Works on any architecture. SIMD optimizations (SSE4.2, AVX2, AVX-512, NEON, SVE) with automatic runtime detection and scalar fallbacks. ARM CRC32 hardware acceleration.
 - **Big-Endian Support** - Proper byte-order handling for s390x, SPARC, PowerPC, etc.
-- **Complete Parquet Support**:
+- **Parquet Support**:
   - All physical types (BOOLEAN, INT32, INT64, INT96, FLOAT, DOUBLE, BYTE_ARRAY, FIXED_LEN_BYTE_ARRAY)
   - All encodings (PLAIN, RLE, DICTIONARY, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, BYTE_STREAM_SPLIT)
   - All compression codecs (UNCOMPRESSED, SNAPPY, GZIP, LZ4, ZSTD)
   - Nullable columns with definition levels
   - Basic nested schema support (groups, definition/repetition levels)
-- **Production Ready**:
+- **Production Features**:
   - CRC32 page verification for data integrity (hardware-accelerated on ARM)
   - Column statistics for predicate pushdown
-  - Memory-mapped I/O for large files
+  - Memory-mapped I/O with zero-copy reads
   - Column projection for efficient reads
   - OpenMP parallel column reading (when available)
 - **Streaming API** - Read and write large files without loading everything into memory
@@ -24,9 +56,10 @@ A high-performance pure C library for reading and writing Apache Parquet files.
 
 ### Current Limitations
 
-- Complex nested types (deeply nested lists/maps) are not fully tested
+- Complex nested types (deeply nested lists/maps) are not fully supported
 - No encryption support
 - Bloom filters are read-only
+- ZSTD decompression is single-threaded (Arrow uses multi-threaded)
 
 ## Table of Contents
 
@@ -811,40 +844,35 @@ carquet/
 
 ## Performance
 
-Benchmark comparing Carquet vs PyArrow 20.0 on Apple M3 (ARM64 with NEON), 10M rows, 3 columns (INT64 + DOUBLE + INT32), Release build with mmap and OpenMP enabled. Fair comparison: both read actual data values with CRC verification.
+Carquet's performance varies by use case. These benchmarks show where Carquet excels and where Arrow is faster.
 
-### Write Performance (10M rows)
+**Test setup:** Apple M3 (ARM64), 10M rows, 3 columns (INT64 + DOUBLE + INT32), fair comparison with both libraries reading actual data values and verifying CRC checksums.
 
-| Codec | Carquet | PyArrow | Speedup |
-|-------|---------|---------|---------|
-| UNCOMPRESSED | **84.2 M rows/sec** | 20.8 M rows/sec | **4.05x faster** |
-| SNAPPY | **49.7 M rows/sec** | 16.8 M rows/sec | **2.96x faster** |
-| ZSTD | **34.9 M rows/sec** | 14.1 M rows/sec | **2.48x faster** |
-
-### Read Performance (10M rows)
+### Where Carquet Excels: Writing
 
 | Codec | Carquet | PyArrow | Speedup |
 |-------|---------|---------|---------|
-| UNCOMPRESSED | **463 M rows/sec** | 364 M rows/sec | **1.27x faster** |
-| SNAPPY | **334 M rows/sec** | 268 M rows/sec | **1.25x faster** |
-| ZSTD | 134 M rows/sec | **238 M rows/sec** | 0.56x (see note) |
+| UNCOMPRESSED | 84 M rows/sec | 21 M rows/sec | **4x faster** |
+| SNAPPY | 50 M rows/sec | 17 M rows/sec | **3x faster** |
+| ZSTD | 35 M rows/sec | 14 M rows/sec | **2.5x faster** |
 
-### File Size (10M rows)
+Carquet's write path has less abstraction overhead, resulting in consistently faster writes.
+
+### Where Arrow Excels: ZSTD Reads
 
 | Codec | Carquet | PyArrow | Ratio |
 |-------|---------|---------|-------|
-| UNCOMPRESSED | 191 MB | 202 MB | 0.95x smaller |
-| SNAPPY | 154 MB | 121 MB | 1.27x larger |
-| ZSTD | **20 MB** | 60 MB | **0.34x smaller** |
+| UNCOMPRESSED | 463 M rows/sec | 364 M rows/sec | 1.3x faster |
+| SNAPPY | 334 M rows/sec | 268 M rows/sec | 1.2x faster |
+| ZSTD | 134 M rows/sec | 238 M rows/sec | **0.6x slower** |
 
-**Notes:**
-- Write performance is 2.5-4x faster across all compression types
-- Carquet uses mmap with zero-copy for uncompressed reads
-- OpenMP enables parallel column reading when available
-- ARM CRC32 hardware acceleration for fast checksum verification
-- ZSTD read is slower because PyArrow uses multi-threaded decompression internally
-- ZSTD produces significantly smaller files (3x better compression ratio)
-- Benchmark data: `id` (INT64), `value` (DOUBLE), `category` (INT32)
+Arrow uses multi-threaded ZSTD decompression internally. Carquet's ZSTD is currently single-threaded per page.
+
+### Why the Difference?
+
+- **Writes**: Carquet has a simpler code path with less abstraction
+- **Uncompressed reads**: Carquet uses zero-copy mmap, skipping memcpy
+- **ZSTD reads**: Arrow's libzstd is configured for multi-threaded decompression
 
 ### Running Benchmarks
 
