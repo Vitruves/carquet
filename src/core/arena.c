@@ -6,6 +6,7 @@
 #include "arena.h"
 #include <assert.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -103,6 +104,21 @@ void* carquet_arena_alloc(carquet_arena_t* arena, size_t size) {
     return carquet_arena_alloc_aligned(arena, size, CARQUET_ARENA_ALIGNMENT);
 }
 
+/**
+ * Helper to calculate aligned offset within a block.
+ * This calculates alignment based on absolute addresses, not just offsets,
+ * which is necessary on 32-bit systems where malloc may not provide
+ * sufficient alignment.
+ */
+static inline size_t arena_aligned_offset(carquet_arena_block_t* block,
+                                           size_t current_used,
+                                           size_t alignment) {
+    uintptr_t base = (uintptr_t)CARQUET_ARENA_BLOCK_DATA(block);
+    uintptr_t current_addr = base + current_used;
+    uintptr_t aligned_addr = (current_addr + alignment - 1) & ~(alignment - 1);
+    return (size_t)(aligned_addr - base);
+}
+
 void* carquet_arena_alloc_aligned(carquet_arena_t* arena, size_t size, size_t alignment) {
     assert(arena != NULL);
     if (size == 0) {
@@ -117,8 +133,8 @@ void* carquet_arena_alloc_aligned(carquet_arena_t* arena, size_t size, size_t al
     carquet_arena_block_t* block = arena->current;
     assert(block != NULL);  /* Arena must be properly initialized */
 
-    /* Calculate aligned offset */
-    size_t aligned_offset = align_up(block->used, alignment);
+    /* Calculate aligned offset based on absolute address */
+    size_t aligned_offset = arena_aligned_offset(block, block->used, alignment);
     size_t new_used = aligned_offset + size;
 
     /* Check if current block has space */
@@ -132,7 +148,7 @@ void* carquet_arena_alloc_aligned(carquet_arena_t* arena, size_t size, size_t al
     /* Try next blocks */
     while (block->next) {
         block = block->next;
-        aligned_offset = align_up(block->used, alignment);
+        aligned_offset = arena_aligned_offset(block, block->used, alignment);
         new_used = aligned_offset + size;
 
         if (new_used <= block->size) {
@@ -161,7 +177,7 @@ void* carquet_arena_alloc_aligned(carquet_arena_t* arena, size_t size, size_t al
     arena->total_capacity += new_block->size;
 
     /* Allocate from new block */
-    aligned_offset = align_up(new_block->used, alignment);
+    aligned_offset = arena_aligned_offset(new_block, new_block->used, alignment);
     new_block->used = aligned_offset + size;
     arena->total_allocated += size;
 

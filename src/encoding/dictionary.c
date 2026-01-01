@@ -185,9 +185,11 @@ carquet_status_t carquet_dictionary_encode_int32(
         return status;
     }
 
-    /* Build dictionary */
+    /* Build dictionary - convert each value to little-endian for Parquet format */
     for (int64_t i = 0; i < count; i++) {
-        status = dict_builder_add(&builder, (const uint8_t*)&values[i], sizeof(int32_t));
+        uint8_t le_bytes[sizeof(int32_t)];
+        carquet_write_i32_le(le_bytes, values[i]);
+        status = dict_builder_add(&builder, le_bytes, sizeof(int32_t));
         if (status != CARQUET_OK) {
             dict_builder_destroy(&builder);
             return status;
@@ -223,8 +225,11 @@ carquet_status_t carquet_dictionary_encode_int64(
         return status;
     }
 
+    /* Convert each value to little-endian for Parquet format */
     for (int64_t i = 0; i < count; i++) {
-        status = dict_builder_add(&builder, (const uint8_t*)&values[i], sizeof(int64_t));
+        uint8_t le_bytes[sizeof(int64_t)];
+        carquet_write_i64_le(le_bytes, values[i]);
+        status = dict_builder_add(&builder, le_bytes, sizeof(int64_t));
         if (status != CARQUET_OK) {
             dict_builder_destroy(&builder);
             return status;
@@ -254,8 +259,11 @@ carquet_status_t carquet_dictionary_encode_float(
         return status;
     }
 
+    /* Convert each value to little-endian for Parquet format */
     for (int64_t i = 0; i < count; i++) {
-        status = dict_builder_add(&builder, (const uint8_t*)&values[i], sizeof(float));
+        uint8_t le_bytes[sizeof(float)];
+        carquet_write_f32_le(le_bytes, values[i]);
+        status = dict_builder_add(&builder, le_bytes, sizeof(float));
         if (status != CARQUET_OK) {
             dict_builder_destroy(&builder);
             return status;
@@ -285,8 +293,11 @@ carquet_status_t carquet_dictionary_encode_double(
         return status;
     }
 
+    /* Convert each value to little-endian for Parquet format */
     for (int64_t i = 0; i < count; i++) {
-        status = dict_builder_add(&builder, (const uint8_t*)&values[i], sizeof(double));
+        uint8_t le_bytes[sizeof(double)];
+        carquet_write_f64_le(le_bytes, values[i]);
+        status = dict_builder_add(&builder, le_bytes, sizeof(double));
         if (status != CARQUET_OK) {
             dict_builder_destroy(&builder);
             return status;

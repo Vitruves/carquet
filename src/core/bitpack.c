@@ -4,10 +4,55 @@
  *
  * This file contains scalar implementations of bit packing operations.
  * SIMD-optimized versions are in src/simd/
+ *
+ * IMPORTANT: Parquet bit-packing uses little-endian byte order.
+ * We must read bytes explicitly as little-endian to work correctly
+ * on big-endian systems like PowerPC.
  */
 
 #include "bitpack.h"
 #include <string.h>
+
+/* Read bytes as little-endian integers for bit unpacking */
+static inline uint16_t read_le16(const uint8_t* p) {
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static inline uint32_t read_le32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static inline uint64_t read_le64(const uint8_t* p) {
+    return (uint64_t)p[0] | ((uint64_t)p[1] << 8) |
+           ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24) |
+           ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40) |
+           ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
+}
+
+/* Read partial little-endian integers */
+static inline uint32_t read_le24(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
+}
+
+static inline uint64_t read_le40(const uint8_t* p) {
+    return (uint64_t)p[0] | ((uint64_t)p[1] << 8) |
+           ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24) |
+           ((uint64_t)p[4] << 32);
+}
+
+static inline uint64_t read_le48(const uint8_t* p) {
+    return (uint64_t)p[0] | ((uint64_t)p[1] << 8) |
+           ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24) |
+           ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40);
+}
+
+static inline uint64_t read_le56(const uint8_t* p) {
+    return (uint64_t)p[0] | ((uint64_t)p[1] << 8) |
+           ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24) |
+           ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40) |
+           ((uint64_t)p[6] << 48);
+}
 
 /* ============================================================================
  * Bit Unpacking - Specialized Functions (1-8 bits)
@@ -27,8 +72,7 @@ void carquet_bitunpack8_1bit(const uint8_t* input, uint32_t* values) {
 }
 
 void carquet_bitunpack8_2bit(const uint8_t* input, uint32_t* values) {
-    uint16_t v;
-    memcpy(&v, input, 2);
+    uint16_t v = read_le16(input);
     values[0] = (v >> 0) & 0x3;
     values[1] = (v >> 2) & 0x3;
     values[2] = (v >> 4) & 0x3;
@@ -40,8 +84,7 @@ void carquet_bitunpack8_2bit(const uint8_t* input, uint32_t* values) {
 }
 
 void carquet_bitunpack8_3bit(const uint8_t* input, uint32_t* values) {
-    uint32_t v;
-    memcpy(&v, input, 3);
+    uint32_t v = read_le24(input);
     values[0] = (v >> 0) & 0x7;
     values[1] = (v >> 3) & 0x7;
     values[2] = (v >> 6) & 0x7;
@@ -53,8 +96,7 @@ void carquet_bitunpack8_3bit(const uint8_t* input, uint32_t* values) {
 }
 
 void carquet_bitunpack8_4bit(const uint8_t* input, uint32_t* values) {
-    uint32_t v;
-    memcpy(&v, input, 4);
+    uint32_t v = read_le32(input);
     values[0] = (v >> 0) & 0xF;
     values[1] = (v >> 4) & 0xF;
     values[2] = (v >> 8) & 0xF;
@@ -66,8 +108,7 @@ void carquet_bitunpack8_4bit(const uint8_t* input, uint32_t* values) {
 }
 
 void carquet_bitunpack8_5bit(const uint8_t* input, uint32_t* values) {
-    uint64_t v;
-    memcpy(&v, input, 5);
+    uint64_t v = read_le40(input);
     values[0] = (v >> 0) & 0x1F;
     values[1] = (v >> 5) & 0x1F;
     values[2] = (v >> 10) & 0x1F;
@@ -79,8 +120,7 @@ void carquet_bitunpack8_5bit(const uint8_t* input, uint32_t* values) {
 }
 
 void carquet_bitunpack8_6bit(const uint8_t* input, uint32_t* values) {
-    uint64_t v;
-    memcpy(&v, input, 6);
+    uint64_t v = read_le48(input);
     values[0] = (v >> 0) & 0x3F;
     values[1] = (v >> 6) & 0x3F;
     values[2] = (v >> 12) & 0x3F;
@@ -92,8 +132,7 @@ void carquet_bitunpack8_6bit(const uint8_t* input, uint32_t* values) {
 }
 
 void carquet_bitunpack8_7bit(const uint8_t* input, uint32_t* values) {
-    uint64_t v;
-    memcpy(&v, input, 7);
+    uint64_t v = read_le56(input);
     values[0] = (v >> 0) & 0x7F;
     values[1] = (v >> 7) & 0x7F;
     values[2] = (v >> 14) & 0x7F;
