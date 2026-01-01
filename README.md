@@ -85,6 +85,7 @@ Carquet is **not** a replacement for Apache Arrow. Arrow is the industry standar
 - C11-compatible compiler (GCC 4.9+, Clang 3.4+, MSVC 2015+)
 - CMake 3.16+
 - zstd and zlib (automatically fetched via FetchContent if not found on system)
+- OpenMP (optional, for parallel column reading)
 
 Works on Linux, macOS, Windows, and any POSIX system. Tested on x86_64, ARM64, and should work on RISC-V, MIPS, PowerPC, s390x, etc.
 
