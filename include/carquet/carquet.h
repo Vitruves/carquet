@@ -6,14 +6,14 @@
  * @copyright Copyright (c) 2025. All rights reserved.
  * @license MIT License
  *
- * Carquet is a production-ready, zero-dependency pure C11 library for reading
+ * Carquet is a production-ready, minimal-dependency pure C11 library for reading
  * and writing Apache Parquet files. It features automatic SIMD optimization
  * for maximum performance across x86-64 (SSE4.2, AVX2, AVX-512) and ARM
  * (NEON, SVE) architectures.
  *
  * @section features Key Features
  *
- * - **Zero Dependencies**: Pure C11 implementation, no external libraries required
+ * - **Minimal Dependencies**: Pure C11 with optional zstd/zlib for compression
  * - **SIMD Optimized**: Automatic CPU feature detection and optimal code dispatch
  * - **Complete Parquet Support**: All physical types, encodings, and compression codecs
  * - **Production Ready**: CRC32 verification, statistics, predicate pushdown
