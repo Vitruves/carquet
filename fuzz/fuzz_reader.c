@@ -89,7 +89,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         }
 
         int64_t rg_rows = rg_meta.num_rows;
-        if (rg_rows > 10000) rg_rows = 10000;
+        /* Clamp to reasonable bounds (negative or huge values from malicious files) */
+        if (rg_rows <= 0 || rg_rows > 10000) rg_rows = 10000;
 
         for (int32_t col = 0; col < num_cols && col < 50; col++) {
             carquet_column_reader_t* col_reader =
