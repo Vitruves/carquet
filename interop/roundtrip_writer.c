@@ -105,6 +105,17 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    printf("Wrote %d rows to %s\n", NUM_ROWS, output_path);
+    /* Output expected values as JSON for verification by roundtrip_test.py */
+    printf("{\n");
+    printf("  \"num_rows\": %d,\n", NUM_ROWS);
+    printf("  \"columns\": {\n");
+    printf("    \"int32_col\": { \"first\": [0, 10, 20, 30, 40], \"type\": \"int32\" },\n");
+    printf("    \"int64_col\": { \"first\": [0, 1000000, 2000000, 3000000, 4000000], \"type\": \"int64\" },\n");
+    printf("    \"float_col\": { \"first\": [0.0, 0.5, 1.0, 1.5, 2.0], \"type\": \"float\" },\n");
+    printf("    \"double_col\": { \"first\": [0.0, 0.125, 0.25, 0.375, 0.5], \"type\": \"double\" },\n");
+    printf("    \"nullable_int\": { \"first\": [null, 100, 200, 300, 400], \"null_indices\": [0, 5, 10, 15, 20], \"type\": \"int32\" }\n");
+    printf("  }\n");
+    printf("}\n");
+
     return 0;
 }
