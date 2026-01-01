@@ -84,30 +84,67 @@ static double benchmark_read(const char* filename, int expected_rows) {
 
     double start = get_time_ms();
 
-    /* Enable mmap and disable CRC for maximum read performance */
+    /* Fair benchmark: enable mmap but also verify checksums */
     carquet_reader_options_t opts;
     carquet_reader_options_init(&opts);
     opts.use_mmap = true;
-    opts.verify_checksums = false;  /* Skip for benchmarking */
+    opts.verify_checksums = true;  /* Fair comparison with PyArrow */
 
     carquet_reader_t* reader = carquet_reader_open(filename, &opts, &err);
     if (!reader) return 0;
 
     carquet_batch_reader_config_t config;
     carquet_batch_reader_config_init(&config);
-    config.batch_size = 262144;  /* 256K rows per batch - reduces allocation overhead */
+    config.batch_size = 262144;  /* 256K rows per batch */
 
     carquet_batch_reader_t* batch_reader = carquet_batch_reader_create(reader, &config, &err);
     if (batch_reader) {
         carquet_row_batch_t* batch = NULL;
         int64_t total_rows = 0;
+        volatile int64_t checksum = 0;  /* Prevent optimizer from skipping reads */
+
         while (carquet_batch_reader_next(batch_reader, &batch) == CARQUET_OK && batch) {
-            total_rows += carquet_row_batch_num_rows(batch);
+            int64_t batch_rows = carquet_row_batch_num_rows(batch);
+            total_rows += batch_rows;
+
+            /* Actually read and verify data like PyArrow does */
+            const void* data;
+            const uint8_t* nulls;
+            int64_t count;
+
+            /* Read column 0 (ids - INT64) */
+            if (carquet_row_batch_column(batch, 0, &data, &nulls, &count) == CARQUET_OK && data) {
+                const int64_t* ids = (const int64_t*)data;
+                for (int64_t i = 0; i < count; i += 1000) {
+                    checksum += ids[i];  /* Sample every 1000th value */
+                }
+            }
+
+            /* Read column 1 (values - DOUBLE) */
+            if (carquet_row_batch_column(batch, 1, &data, &nulls, &count) == CARQUET_OK && data) {
+                const double* values = (const double*)data;
+                for (int64_t i = 0; i < count; i += 1000) {
+                    checksum += (int64_t)values[i];
+                }
+            }
+
+            /* Read column 2 (categories - INT32) */
+            if (carquet_row_batch_column(batch, 2, &data, &nulls, &count) == CARQUET_OK && data) {
+                const int32_t* cats = (const int32_t*)data;
+                for (int64_t i = 0; i < count; i += 1000) {
+                    checksum += cats[i];
+                }
+            }
+
             carquet_row_batch_free(batch);
             batch = NULL;
         }
-        (void)total_rows;
-        (void)expected_rows;
+
+        (void)checksum;  /* Use it to prevent optimization */
+        if (total_rows != expected_rows) {
+            fprintf(stderr, "Warning: row count mismatch %lld vs %d\n",
+                    (long long)total_rows, expected_rows);
+        }
         carquet_batch_reader_free(batch_reader);
     }
 

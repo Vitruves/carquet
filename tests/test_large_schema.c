@@ -158,7 +158,12 @@ static int test_large_schema_read(void) {
 
     printf("Opening file for reading...\n");
 
-    carquet_reader_t* reader = carquet_reader_open(TEST_FILE, NULL, &err);
+    /* Use mmap for thread-safe parallel reading with OpenMP */
+    carquet_reader_options_t read_opts;
+    carquet_reader_options_init(&read_opts);
+    read_opts.use_mmap = true;
+
+    carquet_reader_t* reader = carquet_reader_open(TEST_FILE, &read_opts, &err);
     if (!reader) {
         printf("  Failed to open file: %s\n", err.message);
         TEST_FAIL("large_schema_read", "failed to open file");
@@ -217,8 +222,9 @@ static int test_large_schema_read(void) {
 
     carquet_row_batch_t* batch = NULL;
     int64_t total_rows = 0;
+    carquet_status_t read_status;
 
-    while (carquet_batch_reader_next(batch_reader, &batch) == CARQUET_OK && batch) {
+    while ((read_status = carquet_batch_reader_next(batch_reader, &batch)) == CARQUET_OK && batch) {
         int64_t batch_rows = carquet_row_batch_num_rows(batch);
         int32_t batch_cols = carquet_row_batch_num_columns(batch);
 
@@ -242,6 +248,9 @@ static int test_large_schema_read(void) {
     }
 
     printf("  Total rows read: %lld\n", (long long)total_rows);
+    if (read_status != CARQUET_OK && read_status != CARQUET_ERROR_END_OF_DATA) {
+        printf("  batch_reader_next returned status: %d\n", read_status);
+    }
 
     carquet_batch_reader_free(batch_reader);
     carquet_reader_close(reader);

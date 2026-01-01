@@ -201,12 +201,25 @@ if(CARQUET_ARCH_ARM)
     set(CARQUET_SIMD_ARM_SOURCES
         src/simd/arm/neon_ops.c
         src/simd/arm/sve_ops.c
+        src/simd/arm/crc32_arm.c
     )
 
     if(CARQUET_COMPILER_GCC_LIKE AND CARQUET_ENABLE_SVE)
         set_source_files_properties(src/simd/arm/sve_ops.c PROPERTIES
             COMPILE_FLAGS "-march=armv8-a+sve")
     endif()
+
+    # Enable ARM CRC32 instructions
+    if(CARQUET_COMPILER_GCC_LIKE)
+        set_source_files_properties(src/simd/arm/crc32_arm.c PROPERTIES
+            COMPILE_FLAGS "-march=armv8-a+crc")
+    endif()
+endif()
+
+# OpenMP support for parallel column reading
+find_package(OpenMP)
+if(OpenMP_C_FOUND)
+    message(STATUS "OpenMP found - enabling parallel column reading")
 endif()
 
 # Combine all sources
@@ -254,6 +267,10 @@ else()
     target_link_libraries(carquet PRIVATE ${ZSTD_LIBRARIES} ${ZLIB_LIBRARIES})
 endif()
 
+# Link OpenMP for parallel column reading
+if(OpenMP_C_FOUND)
+    target_link_libraries(carquet PRIVATE OpenMP::OpenMP_C)
+endif()
 
 # Architecture definitions
 if(CARQUET_ARCH_X86)

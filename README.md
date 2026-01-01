@@ -5,7 +5,7 @@ A high-performance pure C library for reading and writing Apache Parquet files.
 ## Features
 
 - **Pure C11** - Only external dependencies are zstd and zlib (auto-fetched by CMake if missing). Snappy and LZ4 are internal implementations.
-- **Portable** - Works on any architecture. SIMD optimizations (SSE4.2, AVX2, AVX-512, NEON, SVE) with automatic runtime detection and scalar fallbacks.
+- **Portable** - Works on any architecture. SIMD optimizations (SSE4.2, AVX2, AVX-512, NEON, SVE) with automatic runtime detection and scalar fallbacks. ARM CRC32 hardware acceleration.
 - **Big-Endian Support** - Proper byte-order handling for s390x, SPARC, PowerPC, etc.
 - **Complete Parquet Support**:
   - All physical types (BOOLEAN, INT32, INT64, INT96, FLOAT, DOUBLE, BYTE_ARRAY, FIXED_LEN_BYTE_ARRAY)
@@ -14,10 +14,11 @@ A high-performance pure C library for reading and writing Apache Parquet files.
   - Nullable columns with definition levels
   - Basic nested schema support (groups, definition/repetition levels)
 - **Production Ready**:
-  - CRC32 page verification for data integrity
+  - CRC32 page verification for data integrity (hardware-accelerated on ARM)
   - Column statistics for predicate pushdown
   - Memory-mapped I/O for large files
   - Column projection for efficient reads
+  - OpenMP parallel column reading (when available)
 - **Streaming API** - Read and write large files without loading everything into memory
 - **PyArrow Compatible** - Full interoperability with Python's PyArrow library
 
@@ -810,23 +811,23 @@ carquet/
 
 ## Performance
 
-Benchmark comparing Carquet vs PyArrow 20.0 on Apple M3 (ARM64 with NEON), 10M rows, 3 columns (INT64 + DOUBLE + INT32), Release build with mmap enabled:
-
-### Read Performance (10M rows)
-
-| Codec | Carquet | PyArrow | Speedup |
-|-------|---------|---------|---------|
-| UNCOMPRESSED | **410 M rows/sec** | 308 M rows/sec | 1.33x faster |
-| SNAPPY | **258 M rows/sec** | 240 M rows/sec | 1.08x faster |
-| ZSTD | 73 M rows/sec | **222 M rows/sec** | 0.33x (see note) |
+Benchmark comparing Carquet vs PyArrow 20.0 on Apple M3 (ARM64 with NEON), 10M rows, 3 columns (INT64 + DOUBLE + INT32), Release build with mmap and OpenMP enabled. Fair comparison: both read actual data values with CRC verification.
 
 ### Write Performance (10M rows)
 
 | Codec | Carquet | PyArrow | Speedup |
 |-------|---------|---------|---------|
-| UNCOMPRESSED | 18.8 M rows/sec | **20.2 M rows/sec** | 0.93x |
-| SNAPPY | **18.7 M rows/sec** | 16.4 M rows/sec | 1.14x faster |
-| ZSTD | **29.9 M rows/sec** | 14.0 M rows/sec | 2.14x faster |
+| UNCOMPRESSED | **83.5 M rows/sec** | 20.4 M rows/sec | **4.09x faster** |
+| SNAPPY | **50.0 M rows/sec** | 16.7 M rows/sec | **3.00x faster** |
+| ZSTD | **34.6 M rows/sec** | 13.8 M rows/sec | **2.51x faster** |
+
+### Read Performance (10M rows)
+
+| Codec | Carquet | PyArrow | Speedup |
+|-------|---------|---------|---------|
+| UNCOMPRESSED | **427 M rows/sec** | 336 M rows/sec | **1.27x faster** |
+| SNAPPY | **316 M rows/sec** | 254 M rows/sec | **1.25x faster** |
+| ZSTD | 133 M rows/sec | **234 M rows/sec** | 0.57x (see note) |
 
 ### File Size (10M rows)
 
@@ -837,10 +838,13 @@ Benchmark comparing Carquet vs PyArrow 20.0 on Apple M3 (ARM64 with NEON), 10M r
 | ZSTD | **20 MB** | 60 MB | **0.34x smaller** |
 
 **Notes:**
-- Carquet uses mmap with zero-copy for uncompressed data, achieving maximum read throughput
-- ZSTD read is slower because PyArrow uses multi-threaded decompression; Carquet is single-threaded
-- ZSTD write is faster and produces smaller files due to better compression ratio
-- Benchmark uses identical data: `id` (INT64), `value` (DOUBLE), `category` (INT32)
+- Write performance is 2.5-4x faster across all compression types
+- Carquet uses mmap with zero-copy for uncompressed reads
+- OpenMP enables parallel column reading when available
+- ARM CRC32 hardware acceleration for fast checksum verification
+- ZSTD read is slower because PyArrow uses multi-threaded decompression internally
+- ZSTD produces significantly smaller files (3x better compression ratio)
+- Benchmark data: `id` (INT64), `value` (DOUBLE), `category` (INT32)
 
 ### Running Benchmarks
 

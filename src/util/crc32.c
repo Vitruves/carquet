@@ -1,10 +1,24 @@
 /**
  * @file crc32.c
- * @brief CRC32 checksum implementation
+ * @brief CRC32 checksum implementation with hardware acceleration
  */
 
 #include <stdint.h>
 #include <stddef.h>
+
+/* ARM hardware CRC32 (when available) */
+extern uint32_t carquet_crc32_arm(const uint8_t* data, size_t length);
+extern int carquet_has_arm_crc32(void);
+
+/* Runtime check for ARM CRC32 support */
+static int use_arm_crc32 = -1;  /* -1 = not checked yet */
+
+static int check_arm_crc32(void) {
+    if (use_arm_crc32 < 0) {
+        use_arm_crc32 = carquet_has_arm_crc32();
+    }
+    return use_arm_crc32;
+}
 
 /* CRC32 lookup table (polynomial 0x04C11DB7, reflected) */
 static const uint32_t crc32_table[256] = {
@@ -53,7 +67,7 @@ static const uint32_t crc32_table[256] = {
     0xb40bbe37, 0xc30c8ea1, 0x5a05df1b, 0x2d02ef8d
 };
 
-uint32_t carquet_crc32(const uint8_t* data, size_t length) {
+static uint32_t carquet_crc32_table(const uint8_t* data, size_t length) {
     uint32_t crc = 0xFFFFFFFF;
 
     for (size_t i = 0; i < length; i++) {
@@ -61,6 +75,14 @@ uint32_t carquet_crc32(const uint8_t* data, size_t length) {
     }
 
     return crc ^ 0xFFFFFFFF;
+}
+
+uint32_t carquet_crc32(const uint8_t* data, size_t length) {
+    /* Use hardware CRC32 if available (ARM) */
+    if (check_arm_crc32()) {
+        return carquet_crc32_arm(data, length);
+    }
+    return carquet_crc32_table(data, length);
 }
 
 uint32_t carquet_crc32_update(uint32_t crc, const uint8_t* data, size_t length) {
