@@ -81,6 +81,9 @@ void carquet_batch_reader_config_init(carquet_batch_reader_config_t* config) {
  * ============================================================================
  */
 
+/* Maximum reasonable type_length for FIXED_LEN_BYTE_ARRAY (16 MB) */
+#define CARQUET_MAX_TYPE_LENGTH (16 * 1024 * 1024)
+
 static size_t get_type_size(carquet_physical_type_t type, int32_t type_length) {
     switch (type) {
         case CARQUET_PHYSICAL_BOOLEAN: return 1;
@@ -89,7 +92,12 @@ static size_t get_type_size(carquet_physical_type_t type, int32_t type_length) {
         case CARQUET_PHYSICAL_INT96: return 12;
         case CARQUET_PHYSICAL_FLOAT: return 4;
         case CARQUET_PHYSICAL_DOUBLE: return 8;
-        case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY: return (size_t)type_length;
+        case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY:
+            /* Validate type_length to prevent overflow attacks */
+            if (type_length <= 0 || type_length > CARQUET_MAX_TYPE_LENGTH) {
+                return 0;  /* Invalid - will cause allocation to fail safely */
+            }
+            return (size_t)type_length;
         case CARQUET_PHYSICAL_BYTE_ARRAY: return sizeof(carquet_byte_array_t);
         default: return 0;
     }
@@ -351,6 +359,20 @@ carquet_status_t carquet_batch_reader_next(
             col_reader->values_remaining -= col_reader->page_num_values;
         } else {
             /* ====== STANDARD PATH (with copy) ====== */
+
+            /* Validate value_size and check for overflow */
+            if (value_size == 0 || rows_to_read <= 0) {
+                read_error = true;
+                continue;
+            }
+
+            /* Check for multiplication overflow (max 1GB allocation) */
+            #define CARQUET_MAX_BATCH_ALLOC (1024ULL * 1024 * 1024)
+            if (value_size > CARQUET_MAX_BATCH_ALLOC / (size_t)rows_to_read) {
+                read_error = true;
+                continue;
+            }
+
             size_t data_size = value_size * (size_t)rows_to_read;
 
             /* Allocate column data buffer */
