@@ -7,7 +7,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#ifdef _WIN32
+#include <windows.h>
 #include <sys/stat.h>
+#else
+#include <sys/stat.h>
+#endif
 
 #include <carquet/carquet.h>
 
@@ -25,17 +31,42 @@ typedef struct {
 } compression_config_t;
 
 static double get_time_ms(void) {
+#ifdef _WIN32
+    static LARGE_INTEGER freq = {0};
+    LARGE_INTEGER counter;
+    if (freq.QuadPart == 0) {
+        QueryPerformanceFrequency(&freq);
+    }
+    QueryPerformanceCounter(&counter);
+    return (double)counter.QuadPart * 1000.0 / (double)freq.QuadPart;
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
+#endif
 }
 
 static long get_file_size(const char* filename) {
     struct stat st;
     if (stat(filename, &st) == 0) {
-        return st.st_size;
+        return (long)st.st_size;
     }
     return 0;
+}
+
+static const char* get_temp_dir(void) {
+#ifdef _WIN32
+    static char temp_dir[512] = {0};
+    if (temp_dir[0] == 0) {
+        const char* tmp = getenv("TEMP");
+        if (!tmp) tmp = getenv("TMP");
+        if (!tmp) tmp = ".";
+        snprintf(temp_dir, sizeof(temp_dir), "%s", tmp);
+    }
+    return temp_dir;
+#else
+    return "/tmp";
+#endif
 }
 
 static double benchmark_write(const char* filename, int num_rows, carquet_compression_t codec) {
@@ -156,8 +187,8 @@ static double benchmark_read(const char* filename, int expected_rows) {
 static void run_benchmark(const char* dataset_name, int num_rows,
                           carquet_compression_t codec, const char* compression_name) {
     char filename[256];
-    snprintf(filename, sizeof(filename), "/tmp/benchmark_%s_%s_carquet.parquet",
-             dataset_name, compression_name);
+    snprintf(filename, sizeof(filename), "%s/benchmark_%s_%s_carquet.parquet",
+             get_temp_dir(), dataset_name, compression_name);
 
     printf("\n=== %s (%d rows, %s) ===\n", dataset_name, num_rows, compression_name);
 
