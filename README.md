@@ -1,5 +1,10 @@
 # Carquet
 
+[![Build](https://github.com/Vitruves/carquet/actions/workflows/cpp.yml/badge.svg)](https://github.com/Vitruves/carquet/actions/workflows/cpp.yml)
+![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue)
+![C Standard](https://img.shields.io/badge/C-C11-blue)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 A pure C library for reading and writing Apache Parquet files.
 
 ## Why Carquet?
