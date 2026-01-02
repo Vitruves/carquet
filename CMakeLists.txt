@@ -43,14 +43,29 @@ option(CARQUET_ENABLE_SVE "Enable SVE optimizations" OFF)
 include(FetchContent)
 
 # Try to find system zstd first, fetch if not found
-find_package(PkgConfig QUIET)
-if(PkgConfig_FOUND)
-    pkg_check_modules(ZSTD QUIET libzstd)
+# Method 1: Try modern CMake config (works best on Windows/vcpkg/conda)
+find_package(zstd CONFIG QUIET)
+if(zstd_FOUND)
+    message(STATUS "Found zstd via CMake config")
+    # zstd provides imported targets: zstd::libzstd_static or zstd::libzstd_shared
+    if(TARGET zstd::libzstd_static)
+        set(ZSTD_LIBRARIES zstd::libzstd_static)
+    elseif(TARGET zstd::libzstd_shared)
+        set(ZSTD_LIBRARIES zstd::libzstd_shared)
+    endif()
+    set(ZSTD_FOUND TRUE)
+else()
+    # Method 2: Try pkg-config (Linux/macOS)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(ZSTD QUIET libzstd)
+    endif()
 endif()
 
 if(ZSTD_FOUND)
-    message(STATUS "Found system libzstd: ${ZSTD_VERSION}")
+    message(STATUS "Found system libzstd")
 else()
+    # Method 3: Fetch from source
     message(STATUS "Fetching zstd...")
     FetchContent_Declare(
         zstd
