@@ -16,8 +16,12 @@
 #include <string.h>
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
-#ifdef __AVX2__
+/* Check for AVX2 support - MSVC defines __AVX2__ when /arch:AVX2 is used */
+#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
 
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 #include <immintrin.h>
 
 /* ============================================================================

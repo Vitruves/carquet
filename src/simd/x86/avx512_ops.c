@@ -17,9 +17,32 @@
 #include <string.h>
 
 #if defined(__x86_64__) || defined(_M_X64)
-#ifdef __AVX512F__
+/* Check for AVX-512 support */
+#if defined(__AVX512F__) || (defined(_MSC_VER) && defined(__AVX512F__))
 
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 #include <immintrin.h>
+
+/* Portable count trailing zeros */
+static inline int portable_ctz(unsigned int v) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_ctz(v);
+#elif defined(_MSC_VER)
+    unsigned long index;
+    _BitScanForward(&index, v);
+    return (int)index;
+#else
+    int n = 0;
+    if (!(v & 0xFFFF)) { n += 16; v >>= 16; }
+    if (!(v & 0xFF)) { n += 8; v >>= 8; }
+    if (!(v & 0xF)) { n += 4; v >>= 4; }
+    if (!(v & 0x3)) { n += 2; v >>= 2; }
+    if (!(v & 0x1)) { n += 1; }
+    return n;
+#endif
+}
 
 /* ============================================================================
  * Bit Unpacking - AVX-512 Optimized
@@ -606,7 +629,7 @@ int64_t carquet_avx512_find_run_length_i32(const int32_t* values, int64_t count)
 
         if (cmp != 0xFFFF) {  /* Not all equal */
             /* Find first mismatch using trailing zeros */
-            int tz = __builtin_ctz(~cmp);
+            int tz = portable_ctz(~cmp);
             return i + tz;
         }
     }

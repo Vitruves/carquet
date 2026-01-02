@@ -16,8 +16,12 @@
 #include <string.h>
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
-#ifdef __SSE4_2__
+/* SSE4.2 is always available on x64 MSVC, check __SSE4_2__ for GCC/Clang */
+#if defined(__SSE4_2__) || defined(_M_X64) || defined(_M_IX86)
 
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 #include <smmintrin.h>
 #include <nmmintrin.h>
 
