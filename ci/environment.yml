@@ -8,4 +8,9 @@ dependencies:
   - ninja
   - cmake
   - ccache
+  - pkgconfig
+  - zstd-static
+  - zstd
+  - zlib
+  - zlib-ng
 
