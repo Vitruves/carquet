@@ -8,5 +8,4 @@ dependencies:
   - ninja
   - cmake
   - ccache
-  - zlib-ng
 
