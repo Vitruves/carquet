@@ -59,8 +59,12 @@ static ZSTD_DCtx* get_dctx(void) {
 }
 
 #else
-/* Use __thread for modern systems */
+/* Use thread-local storage for modern systems */
+#ifdef _MSC_VER
+static __declspec(thread) ZSTD_DCtx* tls_dctx = NULL;
+#else
 static __thread ZSTD_DCtx* tls_dctx = NULL;
+#endif
 
 static ZSTD_DCtx* get_dctx(void) {
     if (!tls_dctx) {
