@@ -312,9 +312,10 @@ carquet_status_t carquet_batch_reader_next(
      * simultaneously. For a file with 30 pages across 3 columns, this gives
      * up to 30-way parallelism instead of 3-way.
      */
+    int32_t omp_i;  /* Declared outside for MSVC OpenMP compatibility */
     #pragma omp parallel for num_threads(num_threads) schedule(dynamic)
-    for (int32_t i = 0; i < batch_reader->num_projected; i++) {
-        carquet_column_reader_t* col_reader = batch_reader->col_readers[i];
+    for (omp_i = 0; omp_i < batch_reader->num_projected; omp_i++) {
+        carquet_column_reader_t* col_reader = batch_reader->col_readers[omp_i];
         if (col_reader && !col_reader->page_loaded && col_reader->values_remaining > 0) {
             /* Trigger page load (including decompression) without consuming values.
              * The page will be decompressed into col_reader->decoded_values. */
@@ -328,16 +329,17 @@ carquet_status_t carquet_batch_reader_next(
      * Now read from pre-loaded pages. Since pages are already decompressed,
      * this phase is mostly memory copies which are fast.
      */
+    int32_t col_i;  /* Declared outside for MSVC OpenMP compatibility */
     #pragma omp parallel for num_threads(num_threads) schedule(dynamic)
 #endif
-    for (int32_t i = 0; i < batch_reader->num_projected; i++) {
+    for (col_i = 0; col_i < batch_reader->num_projected; col_i++) {
         if (read_error) continue;
 
-        carquet_column_reader_t* col_reader = batch_reader->col_readers[i];
-        carquet_column_data_t* col_data = &new_batch->columns[i];
+        carquet_column_reader_t* col_reader = batch_reader->col_readers[col_i];
+        carquet_column_data_t* col_data = &new_batch->columns[col_i];
 
         /* Get column type info */
-        int32_t file_col_idx = batch_reader->projected_columns[i];
+        int32_t file_col_idx = batch_reader->projected_columns[col_i];
         const carquet_schema_t* schema = carquet_reader_schema(batch_reader->reader);
         int32_t schema_idx = schema->leaf_indices[file_col_idx];
         const parquet_schema_element_t* elem = &schema->elements[schema_idx];
