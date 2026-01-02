@@ -11,17 +11,38 @@
 #include <string.h>
 #include <stdint.h>
 #include <limits.h>
+
+#ifdef _WIN32
+#include <process.h>
+#define getpid _getpid
+#else
 #include <unistd.h>
+#endif
 
 #include <carquet/carquet.h>
 
 #define TEST_PASS(name) printf("[PASS] %s\n", name)
 #define TEST_FAIL(name, msg) do { printf("[FAIL] %s: %s\n", name, msg); return 1; } while(0)
 
-/* Temporary file helper */
+/* Temporary file helper - portable across platforms */
+static const char* get_temp_dir(void) {
+#ifdef _WIN32
+    static char temp_dir[256] = {0};
+    if (temp_dir[0] == 0) {
+        const char* tmp = getenv("TEMP");
+        if (!tmp) tmp = getenv("TMP");
+        if (!tmp) tmp = ".";
+        snprintf(temp_dir, sizeof(temp_dir), "%s", tmp);
+    }
+    return temp_dir;
+#else
+    return "/tmp";
+#endif
+}
+
 static const char* get_temp_file(const char* suffix) {
-    static char path[256];
-    snprintf(path, sizeof(path), "/tmp/carquet_test_%d_%s.parquet", getpid(), suffix);
+    static char path[512];
+    snprintf(path, sizeof(path), "%s/carquet_test_%d_%s.parquet", get_temp_dir(), getpid(), suffix);
     return path;
 }
 

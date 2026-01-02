@@ -12,14 +12,12 @@
 #include <assert.h>
 
 #include <carquet/carquet.h>
-
-#define TEST_PASS(name) printf("[PASS] %s\n", name)
-#define TEST_FAIL(name, msg) do { printf("[FAIL] %s: %s\n", name, msg); return 1; } while(0)
+#include "test_helpers.h"
 
 #define NUM_COLUMNS 1600
 #define NUM_ROWS 100
 
-static const char* TEST_FILE = "/tmp/test_large_schema.parquet";
+static char TEST_FILE[512];
 
 /* ============================================================================
  * Test: Create and write a Parquet file with 1600+ columns
@@ -272,17 +270,20 @@ static int test_verify_with_pyarrow(void) {
     printf("Checking if file can be validated with pyarrow...\n");
 
     /* Try to run Python validation script */
-    int result = system("python3 -c \""
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+        "python3 -c \""
         "import pyarrow.parquet as pq; "
         "import sys; "
         "try: "
-        "    t = pq.read_table('/tmp/test_large_schema.parquet'); "
+        "    t = pq.read_table('%s'); "
         "    print(f'  PyArrow: {t.num_rows} rows, {t.num_columns} columns'); "
         "    sys.exit(0); "
         "except Exception as e: "
         "    print(f'  PyArrow error: {e}'); "
         "    sys.exit(1); "
-        "\" 2>/dev/null");
+        "\" 2>/dev/null", TEST_FILE);
+    int result = system(cmd);
 
     if (result == 0) {
         TEST_PASS("verify_with_pyarrow");
@@ -290,7 +291,7 @@ static int test_verify_with_pyarrow(void) {
     } else {
         /* PyArrow validation is optional - don't fail the test suite */
         printf("  PyArrow validation skipped (not available or failed)\n");
-        printf("  Run manually: python3 -c \"import pyarrow.parquet as pq; print(pq.read_table('/tmp/test_large_schema.parquet'))\"\n");
+        printf("  Run manually: python3 -c \"import pyarrow.parquet as pq; print(pq.read_table('%s'))\"\n", TEST_FILE);
         TEST_PASS("verify_with_pyarrow (skipped)");
         return 0;
     }
@@ -303,7 +304,8 @@ static int test_verify_with_pyarrow(void) {
 static int test_very_large_schema(void) {
     carquet_error_t err = CARQUET_ERROR_INIT;
     const int VERY_LARGE_COLS = 5000;
-    const char* test_file = "/tmp/test_very_large_schema.parquet";
+    char test_file[512];
+    carquet_test_temp_path(test_file, sizeof(test_file), "very_large_schema");
 
     printf("Creating schema with %d columns...\n", VERY_LARGE_COLS);
 
@@ -412,6 +414,9 @@ static int test_very_large_schema(void) {
 
 int main(void) {
     int failures = 0;
+
+    /* Initialize portable temp file path */
+    carquet_test_temp_path(TEST_FILE, sizeof(TEST_FILE), "large_schema");
 
     printf("=== Large Schema Tests ===\n\n");
 

@@ -20,7 +20,34 @@
 #include <limits.h>
 #include <time.h>
 
+#ifdef _WIN32
+#include <process.h>
+#define getpid _getpid
+#else
+#include <unistd.h>
+#endif
+
 #include <carquet/carquet.h>
+
+/* Portable temp directory helper */
+static const char* get_temp_dir(void) {
+#ifdef _WIN32
+    static char temp_dir[512] = {0};
+    if (temp_dir[0] == 0) {
+        const char* tmp = getenv("TEMP");
+        if (!tmp) tmp = getenv("TMP");
+        if (!tmp) tmp = ".";
+        snprintf(temp_dir, sizeof(temp_dir), "%s", tmp);
+    }
+    return temp_dir;
+#else
+    return "/tmp";
+#endif
+}
+
+static void make_temp_path(char* buf, size_t bufsize, const char* name) {
+    snprintf(buf, bufsize, "%s/%s.parquet", get_temp_dir(), name);
+}
 
 /* ============================================================================
  * Test Macros
@@ -68,7 +95,8 @@ static int g_tests_skipped = 0;
  * ============================================================================ */
 
 static int test_type_boolean(void) {
-    const char* test_file = "/tmp/test_maturity_boolean.parquet";
+    char test_file[512];
+    make_temp_path(test_file, sizeof(test_file), "test_maturity_boolean");
     carquet_error_t err = CARQUET_ERROR_INIT;
 
     /* Create schema */
@@ -163,7 +191,8 @@ static int test_type_boolean(void) {
 }
 
 static int test_type_int32(void) {
-    const char* test_file = "/tmp/test_maturity_int32.parquet";
+    char test_file[512];
+    make_temp_path(test_file, sizeof(test_file), "test_maturity_int32");
     carquet_error_t err = CARQUET_ERROR_INIT;
 
     carquet_schema_t* schema = carquet_schema_create(&err);
@@ -245,7 +274,8 @@ static int test_type_int32(void) {
 }
 
 static int test_type_int64(void) {
-    const char* test_file = "/tmp/test_maturity_int64.parquet";
+    char test_file[512];
+    make_temp_path(test_file, sizeof(test_file), "test_maturity_int64");
     carquet_error_t err = CARQUET_ERROR_INIT;
 
     carquet_schema_t* schema = carquet_schema_create(&err);
@@ -322,7 +352,8 @@ static int test_type_int64(void) {
 }
 
 static int test_type_float(void) {
-    const char* test_file = "/tmp/test_maturity_float.parquet";
+    char test_file[512];
+    make_temp_path(test_file, sizeof(test_file), "test_maturity_float");
     carquet_error_t err = CARQUET_ERROR_INIT;
 
     carquet_schema_t* schema = carquet_schema_create(&err);
@@ -414,7 +445,8 @@ static int test_type_float(void) {
 }
 
 static int test_type_double(void) {
-    const char* test_file = "/tmp/test_maturity_double.parquet";
+    char test_file[512];
+    make_temp_path(test_file, sizeof(test_file), "test_maturity_double");
     carquet_error_t err = CARQUET_ERROR_INIT;
 
     carquet_schema_t* schema = carquet_schema_create(&err);
@@ -501,7 +533,8 @@ static int test_type_double(void) {
 }
 
 static int test_type_byte_array(void) {
-    const char* test_file = "/tmp/test_maturity_byte_array.parquet";
+    char test_file[512];
+    make_temp_path(test_file, sizeof(test_file), "test_maturity_byte_array");
     carquet_error_t err = CARQUET_ERROR_INIT;
 
     carquet_schema_t* schema = carquet_schema_create(&err);
@@ -563,7 +596,8 @@ static int test_type_byte_array(void) {
  * ============================================================================ */
 
 static int test_edge_single_row(void) {
-    const char* test_file = "/tmp/test_maturity_single_row.parquet";
+    char test_file[512];
+    make_temp_path(test_file, sizeof(test_file), "test_maturity_single_row");
     carquet_error_t err = CARQUET_ERROR_INIT;
 
     carquet_schema_t* schema = carquet_schema_create(&err);
@@ -607,7 +641,8 @@ static int test_edge_single_row(void) {
 }
 
 static int test_edge_many_columns(void) {
-    const char* test_file = "/tmp/test_maturity_many_columns.parquet";
+    char test_file[512];
+    make_temp_path(test_file, sizeof(test_file), "test_maturity_many_columns");
     carquet_error_t err = CARQUET_ERROR_INIT;
 
     carquet_schema_t* schema = carquet_schema_create(&err);
@@ -678,7 +713,8 @@ static int test_edge_many_columns(void) {
 }
 
 static int test_edge_many_row_groups(void) {
-    const char* test_file = "/tmp/test_maturity_many_row_groups.parquet";
+    char test_file[512];
+    make_temp_path(test_file, sizeof(test_file), "test_maturity_many_row_groups");
     carquet_error_t err = CARQUET_ERROR_INIT;
 
     carquet_schema_t* schema = carquet_schema_create(&err);
@@ -745,7 +781,8 @@ static int test_edge_many_row_groups(void) {
  * ============================================================================ */
 
 static int test_nullable_all_null(void) {
-    const char* test_file = "/tmp/test_maturity_all_null.parquet";
+    char test_file[512];
+    make_temp_path(test_file, sizeof(test_file), "test_maturity_all_null");
     carquet_error_t err = CARQUET_ERROR_INIT;
 
     carquet_schema_t* schema = carquet_schema_create(&err);
@@ -791,7 +828,8 @@ static int test_nullable_all_null(void) {
 }
 
 static int test_nullable_none_null(void) {
-    const char* test_file = "/tmp/test_maturity_none_null.parquet";
+    char test_file[512];
+    make_temp_path(test_file, sizeof(test_file), "test_maturity_none_null");
     carquet_error_t err = CARQUET_ERROR_INIT;
 
     carquet_schema_t* schema = carquet_schema_create(&err);
@@ -837,7 +875,8 @@ static int test_nullable_none_null(void) {
 }
 
 static int test_nullable_mixed(void) {
-    const char* test_file = "/tmp/test_maturity_mixed_null.parquet";
+    char test_file[512];
+    make_temp_path(test_file, sizeof(test_file), "test_maturity_mixed_null");
     carquet_error_t err = CARQUET_ERROR_INIT;
 
     carquet_schema_t* schema = carquet_schema_create(&err);
@@ -899,7 +938,8 @@ static int test_error_invalid_file(void) {
 }
 
 static int test_error_corrupted_magic(void) {
-    const char* test_file = "/tmp/test_maturity_corrupted.parquet";
+    char test_file[512];
+    make_temp_path(test_file, sizeof(test_file), "test_maturity_corrupted");
     carquet_error_t err = CARQUET_ERROR_INIT;
 
     /* Create a file with invalid magic bytes */
@@ -925,7 +965,8 @@ static int test_error_corrupted_magic(void) {
 }
 
 static int test_error_truncated_file(void) {
-    const char* test_file = "/tmp/test_maturity_truncated.parquet";
+    char test_file[512];
+    make_temp_path(test_file, sizeof(test_file), "test_maturity_truncated");
     carquet_error_t err = CARQUET_ERROR_INIT;
 
     /* Create a file with just the header magic but nothing else */
@@ -959,7 +1000,9 @@ static int test_error_invalid_arguments(void) {
 
     carquet_writer_options_t opts;
     carquet_writer_options_init(&opts);
-    carquet_writer_t* writer = carquet_writer_create("/tmp/test_empty_schema.parquet", empty_schema, &opts, &err);
+    char empty_schema_file[512];
+    make_temp_path(empty_schema_file, sizeof(empty_schema_file), "test_empty_schema");
+    carquet_writer_t* writer = carquet_writer_create(empty_schema_file, empty_schema, &opts, &err);
     if (writer) {
         carquet_writer_close(writer);
     }
@@ -975,7 +1018,7 @@ static int test_error_invalid_arguments(void) {
 
 static int test_compression_roundtrip(carquet_compression_t compression, const char* name) {
     char test_file[256];
-    snprintf(test_file, sizeof(test_file), "/tmp/test_maturity_compress_%s.parquet", name);
+    snprintf(test_file, sizeof(test_file), "%s/test_maturity_compress_%s.parquet", get_temp_dir(), name);
     carquet_error_t err = CARQUET_ERROR_INIT;
 
     carquet_schema_t* schema = carquet_schema_create(&err);
@@ -1079,7 +1122,8 @@ static int test_all_compressions(void) {
  * ============================================================================ */
 
 static int test_stress_large_data(void) {
-    const char* test_file = "/tmp/test_maturity_large.parquet";
+    char test_file[512];
+    make_temp_path(test_file, sizeof(test_file), "test_maturity_large");
     carquet_error_t err = CARQUET_ERROR_INIT;
 
     carquet_schema_t* schema = carquet_schema_create(&err);
@@ -1181,7 +1225,8 @@ static int test_stress_large_data(void) {
  * ============================================================================ */
 
 static int test_interop_generate_files(void) {
-    const char* base_path = "/tmp/carquet_interop";
+    char base_path[512];
+    snprintf(base_path, sizeof(base_path), "%s/carquet_interop", get_temp_dir());
     carquet_error_t err = CARQUET_ERROR_INIT;
 
     /* Test 1: Simple integers */

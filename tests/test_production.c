@@ -16,14 +16,12 @@
 #include <math.h>
 
 #include <carquet/carquet.h>
-
-#define TEST_PASS(name) printf("[PASS] %s\n", name)
-#define TEST_FAIL(name, msg) do { printf("[FAIL] %s: %s\n", name, msg); return 1; } while(0)
+#include "test_helpers.h"
 
 #define NUM_ROWS 10000
 #define NUM_ROW_GROUPS 10
 
-static const char* TEST_FILE = "/tmp/test_production.parquet";
+static char TEST_FILE[512];
 
 /* ============================================================================
  * Helper: Create test file with multiple row groups
@@ -437,6 +435,9 @@ static int test_full_pipeline(void) {
 
 int main(void) {
     int failures = 0;
+
+    /* Initialize portable temp file path */
+    carquet_test_temp_path(TEST_FILE, sizeof(TEST_FILE), "production");
 
     printf("=== Production Feature Tests ===\n\n");
 

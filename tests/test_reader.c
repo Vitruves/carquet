@@ -9,9 +9,7 @@
 #include <assert.h>
 
 #include <carquet/carquet.h>
-
-#define TEST_PASS(name) printf("[PASS] %s\n", name)
-#define TEST_FAIL(name, msg) do { printf("[FAIL] %s: %s\n", name, msg); return 1; } while(0)
+#include "test_helpers.h"
 
 static int test_version(void) {
     const char* ver = carquet_version();
@@ -203,7 +201,8 @@ static int test_nested_schema_levels(void) {
     assert(num_cols == 6);  /* id, name, street, city, number, type */
 
     /* Write and read back to test level computation in reader */
-    const char* test_file = "/tmp/test_nested_schema.parquet";
+    char test_file[512];
+    carquet_test_temp_path(test_file, sizeof(test_file), "nested_schema");
     carquet_writer_options_t opts;
     carquet_writer_options_init(&opts);
     opts.compression = CARQUET_COMPRESSION_UNCOMPRESSED;
@@ -277,7 +276,8 @@ static int test_nested_schema_levels(void) {
 }
 
 static int test_write_simple_file(void) {
-    const char* test_file = "/tmp/test_carquet_simple.parquet";
+    char test_file[512];
+    carquet_test_temp_path(test_file, sizeof(test_file), "carquet_simple");
     carquet_error_t err = CARQUET_ERROR_INIT;
 
     /* Create schema */

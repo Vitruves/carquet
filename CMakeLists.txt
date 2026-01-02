@@ -117,6 +117,14 @@ if(CARQUET_COMPILER_GCC_LIKE)
     set(CMAKE_C_FLAGS_DEBUG "-g -O0 -DCARQUET_DEBUG")
     set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
     set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG")
+elseif(CARQUET_COMPILER_MSVC)
+    # MSVC warning levels and options
+    add_compile_options(/W3 /wd4996 /wd4244 /wd4267)
+
+    # Debug/Release flags
+    set(CMAKE_C_FLAGS_DEBUG "/Zi /Od /DCARQUET_DEBUG")
+    set(CMAKE_C_FLAGS_RELEASE "/O2 /DNDEBUG")
+    set(CMAKE_C_FLAGS_RELWITHDEBINFO "/O2 /Zi /DNDEBUG")
 endif()
 
 # Source files
@@ -201,6 +209,14 @@ if(CARQUET_ARCH_X86)
             COMPILE_FLAGS "-mavx2 -mbmi2")
         set_source_files_properties(src/simd/x86/avx512_ops.c PROPERTIES
             COMPILE_FLAGS "-mavx512f -mavx512bw -mavx512vl")
+    elseif(CARQUET_COMPILER_MSVC)
+        # MSVC: SSE4.2 is enabled by default on x64, no flag needed
+        # AVX2 requires /arch:AVX2
+        set_source_files_properties(src/simd/x86/avx2_ops.c PROPERTIES
+            COMPILE_FLAGS "/arch:AVX2")
+        # AVX-512 requires /arch:AVX512
+        set_source_files_properties(src/simd/x86/avx512_ops.c PROPERTIES
+            COMPILE_FLAGS "/arch:AVX512")
     endif()
 endif()
 
