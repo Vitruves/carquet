@@ -365,13 +365,41 @@ void carquet_sse_prefix_sum_i64(int64_t* values, int64_t count, int64_t initial)
 
 /**
  * Gather int32 values from dictionary using indices (SSE).
- * Note: True gather requires AVX2, this uses scalar loads with SIMD stores.
+ * Uses prefetching for better memory access patterns (matching NEON implementation).
  */
 void carquet_sse_gather_i32(const int32_t* dict, const uint32_t* indices,
                              int64_t count, int32_t* output) {
     int64_t i = 0;
 
-    /* Process 4 at a time with scalar loads, SIMD store */
+    /* Process 8 at a time with prefetching (like NEON) */
+    for (; i + 8 <= count; i += 8) {
+        /* Prefetch future indices */
+        __builtin_prefetch(indices + i + 16, 0, 1);
+
+        /* Prefetch dictionary entries for current batch */
+        __builtin_prefetch(dict + indices[i], 0, 0);
+        __builtin_prefetch(dict + indices[i + 2], 0, 0);
+        __builtin_prefetch(dict + indices[i + 4], 0, 0);
+        __builtin_prefetch(dict + indices[i + 6], 0, 0);
+
+        /* First 4 values */
+        int32_t v0 = dict[indices[i + 0]];
+        int32_t v1 = dict[indices[i + 1]];
+        int32_t v2 = dict[indices[i + 2]];
+        int32_t v3 = dict[indices[i + 3]];
+        __m128i result0 = _mm_set_epi32(v3, v2, v1, v0);
+        _mm_storeu_si128((__m128i*)(output + i), result0);
+
+        /* Second 4 values */
+        int32_t v4 = dict[indices[i + 4]];
+        int32_t v5 = dict[indices[i + 5]];
+        int32_t v6 = dict[indices[i + 6]];
+        int32_t v7 = dict[indices[i + 7]];
+        __m128i result1 = _mm_set_epi32(v7, v6, v5, v4);
+        _mm_storeu_si128((__m128i*)(output + i + 4), result1);
+    }
+
+    /* Process remaining 4 at a time */
     for (; i + 4 <= count; i += 4) {
         int32_t v0 = dict[indices[i + 0]];
         int32_t v1 = dict[indices[i + 1]];
@@ -390,11 +418,41 @@ void carquet_sse_gather_i32(const int32_t* dict, const uint32_t* indices,
 
 /**
  * Gather float values from dictionary using indices (SSE).
+ * Uses prefetching for better memory access patterns.
  */
 void carquet_sse_gather_float(const float* dict, const uint32_t* indices,
                                int64_t count, float* output) {
     int64_t i = 0;
 
+    /* Process 8 at a time with prefetching */
+    for (; i + 8 <= count; i += 8) {
+        /* Prefetch future indices */
+        __builtin_prefetch(indices + i + 16, 0, 1);
+
+        /* Prefetch dictionary entries */
+        __builtin_prefetch(dict + indices[i], 0, 0);
+        __builtin_prefetch(dict + indices[i + 2], 0, 0);
+        __builtin_prefetch(dict + indices[i + 4], 0, 0);
+        __builtin_prefetch(dict + indices[i + 6], 0, 0);
+
+        /* First 4 values */
+        float v0 = dict[indices[i + 0]];
+        float v1 = dict[indices[i + 1]];
+        float v2 = dict[indices[i + 2]];
+        float v3 = dict[indices[i + 3]];
+        __m128 result0 = _mm_set_ps(v3, v2, v1, v0);
+        _mm_storeu_ps(output + i, result0);
+
+        /* Second 4 values */
+        float v4 = dict[indices[i + 4]];
+        float v5 = dict[indices[i + 5]];
+        float v6 = dict[indices[i + 6]];
+        float v7 = dict[indices[i + 7]];
+        __m128 result1 = _mm_set_ps(v7, v6, v5, v4);
+        _mm_storeu_ps(output + i + 4, result1);
+    }
+
+    /* Process remaining 4 at a time */
     for (; i + 4 <= count; i += 4) {
         float v0 = dict[indices[i + 0]];
         float v1 = dict[indices[i + 1]];
@@ -405,6 +463,74 @@ void carquet_sse_gather_float(const float* dict, const uint32_t* indices,
         _mm_storeu_ps(output + i, result);
     }
 
+    for (; i < count; i++) {
+        output[i] = dict[indices[i]];
+    }
+}
+
+/**
+ * Gather int64 values from dictionary using indices (SSE).
+ * Uses prefetching for better memory access patterns.
+ */
+void carquet_sse_gather_i64(const int64_t* dict, const uint32_t* indices,
+                             int64_t count, int64_t* output) {
+    int64_t i = 0;
+
+    /* Process 4 at a time with prefetching */
+    for (; i + 4 <= count; i += 4) {
+        /* Prefetch future indices */
+        __builtin_prefetch(indices + i + 8, 0, 1);
+
+        /* Prefetch dictionary entries */
+        __builtin_prefetch(dict + indices[i], 0, 0);
+        __builtin_prefetch(dict + indices[i + 2], 0, 0);
+
+        int64_t v0 = dict[indices[i + 0]];
+        int64_t v1 = dict[indices[i + 1]];
+        int64_t v2 = dict[indices[i + 2]];
+        int64_t v3 = dict[indices[i + 3]];
+
+        __m128i result0 = _mm_set_epi64x(v1, v0);
+        __m128i result1 = _mm_set_epi64x(v3, v2);
+        _mm_storeu_si128((__m128i*)(output + i), result0);
+        _mm_storeu_si128((__m128i*)(output + i + 2), result1);
+    }
+
+    /* Handle remaining */
+    for (; i < count; i++) {
+        output[i] = dict[indices[i]];
+    }
+}
+
+/**
+ * Gather double values from dictionary using indices (SSE).
+ * Uses prefetching for better memory access patterns.
+ */
+void carquet_sse_gather_double(const double* dict, const uint32_t* indices,
+                                int64_t count, double* output) {
+    int64_t i = 0;
+
+    /* Process 4 at a time with prefetching */
+    for (; i + 4 <= count; i += 4) {
+        /* Prefetch future indices */
+        __builtin_prefetch(indices + i + 8, 0, 1);
+
+        /* Prefetch dictionary entries */
+        __builtin_prefetch(dict + indices[i], 0, 0);
+        __builtin_prefetch(dict + indices[i + 2], 0, 0);
+
+        double v0 = dict[indices[i + 0]];
+        double v1 = dict[indices[i + 1]];
+        double v2 = dict[indices[i + 2]];
+        double v3 = dict[indices[i + 3]];
+
+        __m128d result0 = _mm_set_pd(v1, v0);
+        __m128d result1 = _mm_set_pd(v3, v2);
+        _mm_storeu_pd(output + i, result0);
+        _mm_storeu_pd(output + i + 2, result1);
+    }
+
+    /* Handle remaining */
     for (; i < count; i++) {
         output[i] = dict[indices[i]];
     }
@@ -606,6 +732,219 @@ void carquet_sse_pack_bools(const uint8_t* input, uint8_t* output, int64_t count
             }
         }
         output[i / 8] = byte;
+    }
+}
+
+/* ============================================================================
+ * Compression Helpers
+ * ============================================================================
+ */
+
+/**
+ * Fast match copy for LZ4/Snappy decompression.
+ * Handles overlapping copies correctly using SSE optimizations.
+ */
+void carquet_sse_match_copy(uint8_t* dst, const uint8_t* src, size_t len, size_t offset) {
+    if (offset >= 16) {
+        /* Non-overlapping: use full SSE copies */
+        while (len >= 16) {
+            _mm_storeu_si128((__m128i*)dst, _mm_loadu_si128((const __m128i*)src));
+            dst += 16;
+            src += 16;
+            len -= 16;
+        }
+
+        if (len >= 8) {
+            _mm_storel_epi64((__m128i*)dst, _mm_loadl_epi64((const __m128i*)src));
+            dst += 8;
+            src += 8;
+            len -= 8;
+        }
+
+        while (len > 0) {
+            *dst++ = *src++;
+            len--;
+        }
+    } else if (offset == 1) {
+        /* Common pattern: fill with single byte */
+        uint8_t val = *src;
+        __m128i v = _mm_set1_epi8((char)val);
+
+        while (len >= 16) {
+            _mm_storeu_si128((__m128i*)dst, v);
+            dst += 16;
+            len -= 16;
+        }
+
+        while (len > 0) {
+            *dst++ = val;
+            len--;
+        }
+    } else if (offset == 2) {
+        /* Fill with 2-byte pattern */
+        uint8_t v0 = src[0], v1 = src[1];
+        while (len >= 2) {
+            *dst++ = v0;
+            *dst++ = v1;
+            len -= 2;
+        }
+        if (len) *dst = v0;
+    } else if (offset == 4) {
+        /* Fill with 4-byte pattern */
+        uint32_t pattern;
+        memcpy(&pattern, src, 4);
+        __m128i v = _mm_set1_epi32((int32_t)pattern);
+
+        while (len >= 16) {
+            _mm_storeu_si128((__m128i*)dst, v);
+            dst += 16;
+            len -= 16;
+        }
+
+        while (len >= 4) {
+            memcpy(dst, &pattern, 4);
+            dst += 4;
+            len -= 4;
+        }
+
+        for (size_t i = 0; i < len; i++) {
+            dst[i] = src[i];
+        }
+    } else {
+        /* General overlapping case: copy byte by byte */
+        while (len > 0) {
+            *dst++ = *src++;
+            len--;
+        }
+    }
+}
+
+/**
+ * Count matching bytes between two buffers using SSE.
+ * Returns the number of matching bytes from the start.
+ */
+size_t carquet_sse_match_length(const uint8_t* p, const uint8_t* match, const uint8_t* limit) {
+    const uint8_t* start = p;
+
+    /* Fast path: compare 16 bytes at a time */
+    while (p + 16 <= limit) {
+        __m128i a = _mm_loadu_si128((const __m128i*)p);
+        __m128i b = _mm_loadu_si128((const __m128i*)match);
+        __m128i cmp = _mm_cmpeq_epi8(a, b);
+        int mask = _mm_movemask_epi8(cmp);
+
+        if (mask != 0xFFFF) {
+            /* Find first differing byte */
+            int first_diff = __builtin_ctz(~mask);
+            return (size_t)(p - start) + (size_t)first_diff;
+        }
+
+        p += 16;
+        match += 16;
+    }
+
+    /* Byte-by-byte for remaining */
+    while (p < limit && *p == *match) {
+        p++;
+        match++;
+    }
+
+    return (size_t)(p - start);
+}
+
+/* ============================================================================
+ * Definition Level Processing (Critical for Read Performance)
+ * ============================================================================
+ */
+
+/**
+ * Count non-null values using SIMD.
+ * Counts how many def_levels[i] == max_def_level.
+ */
+int64_t carquet_sse_count_non_nulls(const int16_t* def_levels, int64_t count, int16_t max_def_level) {
+    int64_t non_null_count = 0;
+    int64_t i = 0;
+
+    __m128i max_vec = _mm_set1_epi16(max_def_level);
+
+    /* Process 8 int16_t values at a time */
+    for (; i + 8 <= count; i += 8) {
+        __m128i levels = _mm_loadu_si128((const __m128i*)(def_levels + i));
+        __m128i cmp = _mm_cmpeq_epi16(levels, max_vec);
+        int mask = _mm_movemask_epi8(cmp);
+        /* Each matching int16 produces 2 bits set, so count and divide by 2 */
+        non_null_count += __builtin_popcount(mask) >> 1;
+    }
+
+    /* Handle remaining */
+    for (; i < count; i++) {
+        if (def_levels[i] == max_def_level) {
+            non_null_count++;
+        }
+    }
+
+    return non_null_count;
+}
+
+/**
+ * Build null bitmap from definition levels using SIMD.
+ * Sets bit to 1 if def_levels[i] < max_def_level (null).
+ */
+void carquet_sse_build_null_bitmap(const int16_t* def_levels, int64_t count,
+                                    int16_t max_def_level, uint8_t* null_bitmap) {
+    int64_t i = 0;
+
+    __m128i max_vec = _mm_set1_epi16(max_def_level);
+
+    /* Process 8 int16_t values -> 1 byte of bitmap */
+    int64_t full_bytes = count / 8;
+    for (int64_t b = 0; b < full_bytes; b++) {
+        __m128i levels = _mm_loadu_si128((const __m128i*)(def_levels + b * 8));
+        /* levels < max_def means null */
+        __m128i cmp = _mm_cmplt_epi16(levels, max_vec);
+        /* Pack 8 comparison results to 8 bits */
+        int mask = _mm_movemask_epi8(cmp);
+        /* Take every other bit (since int16 comparisons set 2 bytes each) */
+        uint8_t null_bits = 0;
+        if (mask & 0x0001) null_bits |= 0x01;
+        if (mask & 0x0004) null_bits |= 0x02;
+        if (mask & 0x0010) null_bits |= 0x04;
+        if (mask & 0x0040) null_bits |= 0x08;
+        if (mask & 0x0100) null_bits |= 0x10;
+        if (mask & 0x0400) null_bits |= 0x20;
+        if (mask & 0x1000) null_bits |= 0x40;
+        if (mask & 0x4000) null_bits |= 0x80;
+        null_bitmap[b] = null_bits;
+        i += 8;
+    }
+
+    /* Handle remaining bits */
+    if (i < count) {
+        uint8_t null_bits = 0;
+        for (int64_t j = 0; i + j < count && j < 8; j++) {
+            if (def_levels[i + j] < max_def_level) {
+                null_bits |= (1 << j);
+            }
+        }
+        null_bitmap[full_bytes] = null_bits;
+    }
+}
+
+/**
+ * Fill definition levels with a constant value using SIMD.
+ */
+void carquet_sse_fill_def_levels(int16_t* def_levels, int64_t count, int16_t value) {
+    int64_t i = 0;
+    __m128i val_vec = _mm_set1_epi16(value);
+
+    /* Process 8 int16_t values at a time */
+    for (; i + 8 <= count; i += 8) {
+        _mm_storeu_si128((__m128i*)(def_levels + i), val_vec);
+    }
+
+    /* Handle remaining */
+    for (; i < count; i++) {
+        def_levels[i] = value;
     }
 }
 

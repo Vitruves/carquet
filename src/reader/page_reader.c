@@ -28,6 +28,11 @@ extern void carquet_dispatch_gather_float(const float* dict, const uint32_t* ind
 extern void carquet_dispatch_gather_double(const double* dict, const uint32_t* indices,
                                             int64_t count, double* output);
 
+/* SIMD dispatch functions for definition level processing */
+extern int64_t carquet_dispatch_count_non_nulls(const int16_t* def_levels, int64_t count,
+                                                  int16_t max_def_level);
+extern void carquet_dispatch_fill_def_levels(int16_t* def_levels, int64_t count, int16_t value);
+
 /* Forward declarations for compression functions */
 extern carquet_status_t carquet_lz4_decompress(
     const uint8_t* src, size_t src_size,

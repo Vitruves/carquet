@@ -20,6 +20,10 @@
 #include <omp.h>
 #endif
 
+/* SIMD dispatch function for null bitmap construction */
+extern void carquet_dispatch_build_null_bitmap(const int16_t* def_levels, int64_t count,
+                                                int16_t max_def_level, uint8_t* null_bitmap);
+
 /* ============================================================================
  * Internal Structures
  * ============================================================================
