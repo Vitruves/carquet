@@ -7,6 +7,9 @@
 
 A pure C library for reading and writing Apache Parquet files.
 
+<img width="1792" height="592" alt="carquet" src="https://github.com/user-attachments/assets/ef669e62-6cf0-4dc0-9de8-dd2ab5afaeb3" />
+
+
 ## Why Carquet?
 
 **The primary goal of Carquet is to provide Parquet support in pure C.** Before Carquet, there was no production-ready C library for Parquet - only C++ (Arrow), Rust, Java, and Python implementations.
