@@ -1231,7 +1231,7 @@ static int test_interop_generate_files(void) {
 
     /* Test 1: Simple integers */
     {
-        char path[256];
+        char path[1024];
         snprintf(path, sizeof(path), "%s_int32.parquet", base_path);
 
         carquet_schema_t* schema = carquet_schema_create(&err);
@@ -1254,7 +1254,7 @@ static int test_interop_generate_files(void) {
 
     /* Test 2: Multiple data types */
     {
-        char path[256];
+        char path[1024];
         snprintf(path, sizeof(path), "%s_mixed.parquet", base_path);
 
         carquet_schema_t* schema = carquet_schema_create(&err);
@@ -1290,7 +1290,7 @@ static int test_interop_generate_files(void) {
 
     /* Test 3: With ZSTD compression */
     {
-        char path[256];
+        char path[1024];
         snprintf(path, sizeof(path), "%s_zstd.parquet", base_path);
 
         carquet_schema_t* schema = carquet_schema_create(&err);
