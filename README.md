@@ -30,7 +30,7 @@ Carquet is **not** a replacement for Apache Arrow. Arrow is the industry standar
 | Language | C++ | **Pure C11** |
 | Dependencies | Many (Boost, etc.) | **zstd + zlib only** |
 | Binary size | ~50MB+ | **~200KB** |
-| Write speed (ARM) | Baseline | **1.5-4x faster** |
+| Write speed (ARM) | Baseline | **1.5-3x faster** |
 | Write speed (x86) | Baseline | ~same |
 | Read speed (ARM) | Baseline | ~same to 1.1x faster |
 | Read speed (x86) | **Baseline** | 3-5x slower |
@@ -863,23 +863,23 @@ Carquet's performance varies by platform and use case. These benchmarks show whe
 
 ### Apple M3 (ARM64, macOS)
 
-*MacBook Air, Apple M3, 8 cores, 16GB RAM*
+*MacBook Air (13-inch, M3, 2024), macOS Tahoe 26.2, PyArrow 20.0.0*
 
 #### Writing (Carquet Excels)
 
 | Codec | Carquet | PyArrow | Speedup |
 |-------|---------|---------|---------|
-| UNCOMPRESSED | 75 M rows/sec | 17 M rows/sec | **4.4x faster** |
+| UNCOMPRESSED | 54 M rows/sec | 17 M rows/sec | **3.2x faster** |
 | SNAPPY | 44 M rows/sec | 15 M rows/sec | **3.0x faster** |
-| ZSTD | 18 M rows/sec | 13 M rows/sec | **1.5x faster** |
+| ZSTD | 18 M rows/sec | 12 M rows/sec | **1.5x faster** |
 
 #### Reading
 
 | Codec | Carquet | PyArrow | Ratio |
 |-------|---------|---------|-------|
-| UNCOMPRESSED | 392 M rows/sec | 345 M rows/sec | 1.1x faster |
-| SNAPPY | 329 M rows/sec | 306 M rows/sec | 1.1x faster |
-| ZSTD | 105 M rows/sec | 194 M rows/sec | 0.5x slower |
+| UNCOMPRESSED | 413 M rows/sec | 363 M rows/sec | 1.1x faster |
+| SNAPPY | 335 M rows/sec | 314 M rows/sec | 1.1x faster |
+| ZSTD | 106 M rows/sec | 197 M rows/sec | 0.5x slower |
 
 #### Compression Ratio
 
