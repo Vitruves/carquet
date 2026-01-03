@@ -917,15 +917,6 @@ Carquet's performance varies by platform and use case. These benchmarks show whe
 | SNAPPY | 154 MB | 121 MB | 1.3x larger |
 | UNCOMPRESSED | 191 MB | 202 MB | 1.05x smaller |
 
-### Analysis
-
-- **ARM writes**: Carquet 2-4x faster due to simpler code path and efficient NEON optimizations
-- **ARM reads**: Carquet competitive or faster with hardware CRC32 and NEON optimizations
-- **x86 writes**: Similar performance; Carquet faster only with ZSTD compression
-- **x86 reads**: PyArrow 3-7x faster due to highly optimized Arrow columnar format and vectorized decompression
-- **ZSTD compression**: Carquet achieves 3x smaller files (using system libzstd with efficient encoding)
-- **SNAPPY size**: PyArrow produces smaller files due to dictionary encoding on categorical data
-
 ### Running Benchmarks
 
 ```bash
