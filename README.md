@@ -30,11 +30,11 @@ Carquet is **not** a replacement for Apache Arrow. Arrow is the industry standar
 | Language | C++ | **Pure C11** |
 | Dependencies | Many (Boost, etc.) | **zstd + zlib only** |
 | Binary size | ~50MB+ | **~200KB** |
-| Write speed (ARM) | Baseline | **2-4x faster** |
+| Write speed (ARM) | Baseline | **3-5x faster** |
 | Write speed (x86) | Baseline | ~same |
-| Read speed (ARM) | Baseline | **1.3x faster** |
+| Read speed (ARM) | Baseline | ~same to 1.2x faster |
 | Read speed (x86) | **Baseline** | 3-7x slower |
-| ZSTD file size | Baseline | **3x smaller** |
+| ZSTD file size | Baseline | **~1.4x smaller** |
 | Nested types | **Full support** | Basic |
 | Encryption | **Yes** | No |
 | Community | **Large, mature** | New |
@@ -869,25 +869,25 @@ Carquet's performance varies by platform and use case. These benchmarks show whe
 
 | Codec | Carquet | PyArrow | Speedup |
 |-------|---------|---------|---------|
-| UNCOMPRESSED | 87 M rows/sec | 21 M rows/sec | **4.1x faster** |
-| SNAPPY | 51 M rows/sec | 17 M rows/sec | **3.0x faster** |
-| ZSTD | 34 M rows/sec | 14 M rows/sec | **2.4x faster** |
+| UNCOMPRESSED | 80 M rows/sec | 17 M rows/sec | **4.6x faster** |
+| SNAPPY | 45 M rows/sec | 15 M rows/sec | **3.0x faster** |
+| ZSTD | 18 M rows/sec | 12 M rows/sec | **1.5x faster** |
 
 #### Reading
 
 | Codec | Carquet | PyArrow | Ratio |
 |-------|---------|---------|-------|
-| UNCOMPRESSED | 465 M rows/sec | 362 M rows/sec | 1.3x faster |
-| SNAPPY | 354 M rows/sec | 272 M rows/sec | 1.3x faster |
-| ZSTD | 132 M rows/sec | 247 M rows/sec | 0.5x slower |
+| UNCOMPRESSED | 421 M rows/sec | 363 M rows/sec | 1.2x faster |
+| SNAPPY | 319 M rows/sec | 289 M rows/sec | 1.1x faster |
+| ZSTD | 101 M rows/sec | 202 M rows/sec | 0.5x slower |
 
 #### Compression Ratio
 
 | Codec | Carquet | PyArrow | Ratio |
 |-------|---------|---------|-------|
-| ZSTD | 21 MB | 63 MB | **3.0x smaller** |
-| SNAPPY | 162 MB | 127 MB | 1.3x larger |
-| UNCOMPRESSED | 200 MB | 211 MB | 1.05x smaller |
+| ZSTD | 107 MB | 150 MB | **1.4x smaller** |
+| SNAPPY | 191 MB | 174 MB | 1.1x larger |
+| UNCOMPRESSED | 191 MB | 201 MB | 1.05x smaller |
 
 ### Intel Xeon E5-2680 (x86_64, Linux)
 

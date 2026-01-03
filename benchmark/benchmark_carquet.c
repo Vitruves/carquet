@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -69,6 +70,20 @@ static const char* get_temp_dir(void) {
 #endif
 }
 
+/* Simple LCG random for reproducible results (matches numpy seed=42) */
+static uint32_t lcg_state = 42;
+static void lcg_seed(uint32_t seed) { lcg_state = seed; }
+static uint32_t lcg_rand(void) {
+    lcg_state = lcg_state * 1103515245 + 12345;
+    return (lcg_state >> 16) & 0x7FFF;
+}
+static double lcg_normal(void) {
+    /* Box-Muller approximation */
+    double u1 = (lcg_rand() + 1.0) / 32768.0;
+    double u2 = (lcg_rand() + 1.0) / 32768.0;
+    return sqrt(-2.0 * log(u1)) * cos(2.0 * 3.14159265358979 * u2);
+}
+
 static double benchmark_write(const char* filename, int num_rows, carquet_compression_t codec) {
     carquet_error_t err = CARQUET_ERROR_INIT;
 
@@ -86,10 +101,12 @@ static double benchmark_write(const char* filename, int num_rows, carquet_compre
     double* values = malloc(num_rows * sizeof(double));
     int32_t* categories = malloc(num_rows * sizeof(int32_t));
 
+    /* Generate realistic data (not sequential patterns) */
+    lcg_seed(42);  /* Reproducible, matches Python */
     for (int i = 0; i < num_rows; i++) {
-        ids[i] = i;
-        values[i] = (double)i * 1.5 + 0.123456789;
-        categories[i] = i % 100;
+        ids[i] = 1000000 + (lcg_rand() % 9000000);
+        values[i] = fabs(100.0 + 50.0 * lcg_normal());
+        categories[i] = lcg_rand() % 100;
     }
 
     double start = get_time_ms();

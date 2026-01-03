@@ -16,10 +16,11 @@ BENCHMARK_ITERATIONS = 5
 
 def benchmark_write(filename, num_rows, compression):
     """Write a Parquet file and return (time_ms, file_size)"""
-    # Generate data
-    ids = np.arange(num_rows, dtype=np.int64)
-    values = ids.astype(np.float64) * 1.5 + 0.123456789
-    categories = (ids % 100).astype(np.int32)
+    # Generate realistic data (not sequential patterns)
+    np.random.seed(42)  # Reproducible
+    ids = np.random.randint(1_000_000, 9_999_999, size=num_rows, dtype=np.int64)
+    values = np.abs(np.random.normal(100.0, 50.0, size=num_rows))
+    categories = np.random.randint(0, 100, size=num_rows, dtype=np.int32)
 
     table = pa.table({
         'id': ids,
@@ -44,16 +45,14 @@ def benchmark_read(filename, expected_rows):
     if len(table) != expected_rows:
         raise ValueError(f"Row count mismatch: {len(table)} vs {expected_rows}")
 
-    # Verify some data
+    # Verify data was read (random data, just check ranges)
     ids = table['id'].to_numpy()
     values = table['value'].to_numpy()
     categories = table['category'].to_numpy()
 
-    for i in range(min(100, len(ids))):
-        assert ids[i] == i, f"ID mismatch at {i}"
-        expected = i * 1.5 + 0.123456789
-        assert abs(values[i] - expected) < 1e-10, f"Value mismatch at {i}"
-        assert categories[i] == i % 100, f"Category mismatch at {i}"
+    assert ids.min() >= 1_000_000 and ids.max() < 10_000_000, "ID range error"
+    assert values.min() >= 0 and values.max() < 500, "Value range error"
+    assert categories.min() >= 0 and categories.max() < 100, "Category range error"
 
     return elapsed_ms
 
