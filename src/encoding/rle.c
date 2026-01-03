@@ -8,6 +8,10 @@
 #include "core/bitpack.h"
 #include <string.h>
 
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
+
 /* ============================================================================
  * Internal Helpers
  * ============================================================================
@@ -436,12 +440,107 @@ int64_t carquet_rle_decode_levels(
     int16_t* output,
     int64_t max_values) {
 
-    carquet_rle_decoder_t dec;
-    carquet_rle_decoder_init(&dec, input, input_size, bit_width);
+    if (max_values <= 0 || input_size == 0) {
+        return 0;
+    }
 
+    /* Fast path: decode directly without per-value function calls */
+    size_t pos = 0;
     int64_t count = 0;
-    while (count < max_values && carquet_rle_decoder_has_next(&dec)) {
-        output[count++] = (int16_t)carquet_rle_decoder_get(&dec);
+    uint32_t value_mask = bit_width >= 32 ? ~0U : (1U << bit_width) - 1;
+    int value_bytes = (bit_width + 7) / 8;
+
+    while (count < max_values && pos < input_size) {
+        /* Read varint header inline */
+        uint32_t header = 0;
+        int shift = 0;
+        while (pos < input_size && shift < 32) {
+            uint8_t byte = input[pos++];
+            header |= (uint32_t)(byte & 0x7F) << shift;
+            if ((byte & 0x80) == 0) break;
+            shift += 7;
+        }
+
+        if ((header & 1) == 0) {
+            /* RLE run: fill output with repeated value */
+            int64_t run_length = (int64_t)(header >> 1);
+            if (run_length == 0) continue;
+
+            if (pos + (size_t)value_bytes > input_size) break;
+
+            /* Read the repeated value */
+            uint32_t rle_value = 0;
+            for (int i = 0; i < value_bytes; i++) {
+                rle_value |= (uint32_t)input[pos++] << (i * 8);
+            }
+            rle_value &= value_mask;
+            int16_t val16 = (int16_t)rle_value;
+
+            /* Fill output in bulk */
+            int64_t to_fill = run_length;
+            if (count + to_fill > max_values) {
+                to_fill = max_values - count;
+            }
+
+            /* Use optimized fill for common case of small values */
+            int16_t* dst = output + count;
+            int64_t i = 0;
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+            /* NEON: fill 8 int16_t at a time */
+            if (to_fill >= 8) {
+                int16x8_t vval = vdupq_n_s16(val16);
+                for (; i + 8 <= to_fill; i += 8) {
+                    vst1q_s16(dst + i, vval);
+                }
+            }
+#endif
+            /* Scalar remainder */
+            for (; i < to_fill; i++) {
+                dst[i] = val16;
+            }
+            count += to_fill;
+
+        } else {
+            /* Bit-packed run: decode 8 values at a time */
+            int num_groups = (int)(header >> 1);
+            int64_t run_length = (int64_t)num_groups * 8;
+            if (run_length == 0) continue;
+
+            size_t bytes_per_group = (size_t)bit_width;
+
+            for (int g = 0; g < num_groups && count < max_values; g++) {
+                if (pos + bytes_per_group > input_size) break;
+
+                /* Unpack 8 values */
+                uint32_t temp[8];
+                carquet_bitunpack8_32(input + pos, bit_width, temp);
+                pos += bytes_per_group;
+
+                /* Convert to int16_t and store */
+                int64_t to_store = 8;
+                if (count + to_store > max_values) {
+                    to_store = max_values - count;
+                }
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+                if (to_store == 8) {
+                    /* NEON: load 8 uint32_t, narrow to int16_t */
+                    uint32x4_t v0 = vld1q_u32(temp);
+                    uint32x4_t v1 = vld1q_u32(temp + 4);
+                    int16x4_t n0 = vmovn_s32(vreinterpretq_s32_u32(v0));
+                    int16x4_t n1 = vmovn_s32(vreinterpretq_s32_u32(v1));
+                    int16x8_t result = vcombine_s16(n0, n1);
+                    vst1q_s16(output + count, result);
+                    count += 8;
+                    continue;
+                }
+#endif
+                for (int64_t i = 0; i < to_store; i++) {
+                    output[count++] = (int16_t)temp[i];
+                }
+            }
+        }
     }
 
     return count;

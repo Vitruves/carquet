@@ -401,6 +401,13 @@ if(CARQUET_BUILD_BENCHMARKS)
     if(CARQUET_COMPILER_GCC_LIKE)
         target_compile_options(benchmark_carquet PRIVATE -Wno-unused-result)
     endif()
+
+    # Profiling benchmark for CPU profiling (sample, Instruments, perf)
+    add_executable(profile_core benchmark/profile_core.c)
+    target_link_libraries(profile_core PRIVATE carquet)
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(profile_core PRIVATE m)
+    endif()
 endif()
 
 # Fuzzing
