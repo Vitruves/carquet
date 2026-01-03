@@ -30,10 +30,10 @@ Carquet is **not** a replacement for Apache Arrow. Arrow is the industry standar
 | Language | C++ | **Pure C11** |
 | Dependencies | Many (Boost, etc.) | **zstd + zlib only** |
 | Binary size | ~50MB+ | **~200KB** |
-| Write speed (ARM) | Baseline | **3-5x faster** |
-| Write speed (x86) | **Baseline** | 0.5-1x slower |
-| Read speed (ARM) | Baseline | ~same to 1.2x faster |
-| Read speed (x86) | **Baseline** | 3-6x slower |
+| Write speed (ARM) | Baseline | **1.5-4x faster** |
+| Write speed (x86) | Baseline | ~same |
+| Read speed (ARM) | Baseline | ~same to 1.1x faster |
+| Read speed (x86) | **Baseline** | 3-5x slower |
 | ZSTD file size | Baseline | **~1.4x smaller** |
 | Nested types | **Full support** | Basic |
 | Encryption | **Yes** | No |
@@ -869,17 +869,17 @@ Carquet's performance varies by platform and use case. These benchmarks show whe
 
 | Codec | Carquet | PyArrow | Speedup |
 |-------|---------|---------|---------|
-| UNCOMPRESSED | 80 M rows/sec | 17 M rows/sec | **4.7x faster** |
-| SNAPPY | 43 M rows/sec | 15 M rows/sec | **2.9x faster** |
-| ZSTD | 18 M rows/sec | 12 M rows/sec | **1.5x faster** |
+| UNCOMPRESSED | 75 M rows/sec | 17 M rows/sec | **4.4x faster** |
+| SNAPPY | 44 M rows/sec | 15 M rows/sec | **3.0x faster** |
+| ZSTD | 18 M rows/sec | 13 M rows/sec | **1.5x faster** |
 
 #### Reading
 
 | Codec | Carquet | PyArrow | Ratio |
 |-------|---------|---------|-------|
-| UNCOMPRESSED | 420 M rows/sec | 355 M rows/sec | 1.2x faster |
-| SNAPPY | 311 M rows/sec | 310 M rows/sec | ~same |
-| ZSTD | 106 M rows/sec | 188 M rows/sec | 0.6x slower |
+| UNCOMPRESSED | 392 M rows/sec | 345 M rows/sec | 1.1x faster |
+| SNAPPY | 329 M rows/sec | 306 M rows/sec | 1.1x faster |
+| ZSTD | 105 M rows/sec | 194 M rows/sec | 0.5x slower |
 
 #### Compression Ratio
 
@@ -897,17 +897,17 @@ Carquet's performance varies by platform and use case. These benchmarks show whe
 
 | Codec | Carquet | PyArrow | Speedup |
 |-------|---------|---------|---------|
-| UNCOMPRESSED | 4.3 M rows/sec | 4.3 M rows/sec | ~same |
-| SNAPPY | 2.2 M rows/sec | 4.0 M rows/sec | 0.55x slower |
-| ZSTD | 2.5 M rows/sec | 3.4 M rows/sec | 0.76x slower |
+| UNCOMPRESSED | 4.3 M rows/sec | 4.0 M rows/sec | **1.07x faster** |
+| SNAPPY | 3.4 M rows/sec | 4.0 M rows/sec | 0.85x slower |
+| ZSTD | 3.1 M rows/sec | 2.6 M rows/sec | **1.20x faster** |
 
 #### Reading (PyArrow Faster)
 
 | Codec | Carquet | PyArrow | Ratio |
 |-------|---------|---------|-------|
-| UNCOMPRESSED | 29 M rows/sec | 86 M rows/sec | 0.33x slower |
-| SNAPPY | 18 M rows/sec | 89 M rows/sec | 0.20x slower |
-| ZSTD | 12 M rows/sec | 73 M rows/sec | 0.17x slower |
+| UNCOMPRESSED | 28 M rows/sec | 97 M rows/sec | 0.29x slower |
+| SNAPPY | 17 M rows/sec | 91 M rows/sec | 0.19x slower |
+| ZSTD | 12 M rows/sec | 71 M rows/sec | 0.17x slower |
 
 #### Compression Ratio
 
