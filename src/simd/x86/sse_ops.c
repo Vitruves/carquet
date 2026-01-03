@@ -21,6 +21,22 @@
 
 #ifdef _MSC_VER
 #include <intrin.h>
+
+/* MSVC doesn't have __builtin_prefetch, use _mm_prefetch instead */
+#define __builtin_prefetch(addr, rw, locality) \
+    _mm_prefetch((const char*)(addr), _MM_HINT_T0)
+
+/* MSVC doesn't have __builtin_ctz (count trailing zeros) */
+static inline int msvc_ctz(unsigned int x) {
+    unsigned long index;
+    _BitScanForward(&index, x);
+    return (int)index;
+}
+#define __builtin_ctz(x) msvc_ctz(x)
+
+/* MSVC doesn't have __builtin_popcount */
+#define __builtin_popcount(x) __popcnt(x)
+
 #endif
 #include <smmintrin.h>
 #include <nmmintrin.h>
