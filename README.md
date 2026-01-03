@@ -25,20 +25,20 @@ A pure C library for reading and writing Apache Parquet files.
 
 Carquet is **not** a replacement for Apache Arrow. Arrow is the industry standard with years of production use, full feature support, and a large community.
 
-| Aspect | Carquet | Arrow Parquet |
-|--------|---------|---------------|
-| Language | Pure C11 | C++ |
-| Dependencies | zstd + zlib only | Many (Boost, etc.) |
-| Binary size | ~200KB | ~50MB+ |
-| Write speed (ARM) | 2-4x faster | Baseline |
-| Write speed (x86) | ~same | Baseline |
-| Read speed (ARM) | 1.3x faster | Baseline |
-| Read speed (x86) | 3-7x slower | Baseline |
-| ZSTD file size | 3x smaller | Baseline |
-| Nested types | Basic | Full support |
-| Encryption | No | Yes |
-| Community | New | Large, mature |
-| Production tested | Limited | Extensive |
+| Aspect | Arrow Parquet | Carquet |
+|--------|---------------|---------|
+| Language | C++ | **Pure C11** |
+| Dependencies | Many (Boost, etc.) | **zstd + zlib only** |
+| Binary size | ~50MB+ | **~200KB** |
+| Write speed (ARM) | Baseline | **2-4x faster** |
+| Write speed (x86) | Baseline | ~same |
+| Read speed (ARM) | Baseline | **1.3x faster** |
+| Read speed (x86) | **Baseline** | 3-7x slower |
+| ZSTD file size | Baseline | **3x smaller** |
+| Nested types | **Full support** | Basic |
+| Encryption | **Yes** | No |
+| Community | **Large, mature** | New |
+| Production tested | **Extensive** | Limited |
 
 **Choose Carquet if:** You need Parquet in a C-only environment, want minimal dependencies, or are building for embedded/constrained systems.
 
