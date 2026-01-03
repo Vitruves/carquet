@@ -371,6 +371,7 @@ void carquet_neon_byte_stream_split_decode_float(
 
 /**
  * Encode doubles using byte stream split with NEON.
+ * Uses table lookup for efficient transpose of 2 doubles (16 bytes) at a time.
  */
 void carquet_neon_byte_stream_split_encode_double(
     const double* values,
@@ -380,13 +381,52 @@ void carquet_neon_byte_stream_split_encode_double(
     const uint8_t* src = (const uint8_t*)values;
     int64_t i = 0;
 
-    /* Process 2 doubles (16 bytes) at a time */
+    /* Process 2 doubles (16 bytes) at a time with NEON table lookup */
     for (; i + 2 <= count; i += 2) {
-        /* Transpose: extract each byte position from both doubles */
-        for (int b = 0; b < 8; b++) {
-            output[b * count + i + 0] = src[i * 8 + b];
-            output[b * count + i + 1] = src[i * 8 + 8 + b];
-        }
+        /* Load 2 doubles = 16 bytes */
+        uint8x16_t v = vld1q_u8(src + i * 8);
+
+        /* v = [a0 a1 a2 a3 a4 a5 a6 a7 | b0 b1 b2 b3 b4 b5 b6 b7]
+         * Want streams: [a0 b0], [a1 b1], [a2 b2], ... [a7 b7]
+         */
+
+        /* Table indices to extract byte pairs */
+        static const uint8_t tbl_byte0[16] = {0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        static const uint8_t tbl_byte1[16] = {1, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        static const uint8_t tbl_byte2[16] = {2, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        static const uint8_t tbl_byte3[16] = {3, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        static const uint8_t tbl_byte4[16] = {4, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        static const uint8_t tbl_byte5[16] = {5, 13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        static const uint8_t tbl_byte6[16] = {6, 14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        static const uint8_t tbl_byte7[16] = {7, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+
+        uint8x16_t out0 = vqtbl1q_u8(v, vld1q_u8(tbl_byte0));
+        uint8x16_t out1 = vqtbl1q_u8(v, vld1q_u8(tbl_byte1));
+        uint8x16_t out2 = vqtbl1q_u8(v, vld1q_u8(tbl_byte2));
+        uint8x16_t out3 = vqtbl1q_u8(v, vld1q_u8(tbl_byte3));
+        uint8x16_t out4 = vqtbl1q_u8(v, vld1q_u8(tbl_byte4));
+        uint8x16_t out5 = vqtbl1q_u8(v, vld1q_u8(tbl_byte5));
+        uint8x16_t out6 = vqtbl1q_u8(v, vld1q_u8(tbl_byte6));
+        uint8x16_t out7 = vqtbl1q_u8(v, vld1q_u8(tbl_byte7));
+
+        /* Extract first 2 bytes and store to each stream */
+        uint16_t t0 = vgetq_lane_u16(vreinterpretq_u16_u8(out0), 0);
+        uint16_t t1 = vgetq_lane_u16(vreinterpretq_u16_u8(out1), 0);
+        uint16_t t2 = vgetq_lane_u16(vreinterpretq_u16_u8(out2), 0);
+        uint16_t t3 = vgetq_lane_u16(vreinterpretq_u16_u8(out3), 0);
+        uint16_t t4 = vgetq_lane_u16(vreinterpretq_u16_u8(out4), 0);
+        uint16_t t5 = vgetq_lane_u16(vreinterpretq_u16_u8(out5), 0);
+        uint16_t t6 = vgetq_lane_u16(vreinterpretq_u16_u8(out6), 0);
+        uint16_t t7 = vgetq_lane_u16(vreinterpretq_u16_u8(out7), 0);
+
+        memcpy(output + 0 * count + i, &t0, sizeof(uint16_t));
+        memcpy(output + 1 * count + i, &t1, sizeof(uint16_t));
+        memcpy(output + 2 * count + i, &t2, sizeof(uint16_t));
+        memcpy(output + 3 * count + i, &t3, sizeof(uint16_t));
+        memcpy(output + 4 * count + i, &t4, sizeof(uint16_t));
+        memcpy(output + 5 * count + i, &t5, sizeof(uint16_t));
+        memcpy(output + 6 * count + i, &t6, sizeof(uint16_t));
+        memcpy(output + 7 * count + i, &t7, sizeof(uint16_t));
     }
 
     /* Handle remaining values */
@@ -399,6 +439,7 @@ void carquet_neon_byte_stream_split_encode_double(
 
 /**
  * Decode byte stream split doubles using NEON.
+ * Gathers bytes from 8 streams and interleaves them back into doubles.
  */
 void carquet_neon_byte_stream_split_decode_double(
     const uint8_t* data,
@@ -410,11 +451,56 @@ void carquet_neon_byte_stream_split_decode_double(
 
     /* Process 2 doubles at a time */
     for (; i + 2 <= count; i += 2) {
-        /* Gather bytes from 8 streams */
-        for (int b = 0; b < 8; b++) {
-            dst[i * 8 + b] = data[b * count + i];
-            dst[i * 8 + 8 + b] = data[b * count + i + 1];
-        }
+        /* Load 2 bytes from each of the 8 streams */
+        uint16_t b0, b1, b2, b3, b4, b5, b6, b7;
+        memcpy(&b0, data + 0 * count + i, sizeof(uint16_t));
+        memcpy(&b1, data + 1 * count + i, sizeof(uint16_t));
+        memcpy(&b2, data + 2 * count + i, sizeof(uint16_t));
+        memcpy(&b3, data + 3 * count + i, sizeof(uint16_t));
+        memcpy(&b4, data + 4 * count + i, sizeof(uint16_t));
+        memcpy(&b5, data + 5 * count + i, sizeof(uint16_t));
+        memcpy(&b6, data + 6 * count + i, sizeof(uint16_t));
+        memcpy(&b7, data + 7 * count + i, sizeof(uint16_t));
+
+        /* Create vectors with each byte pair */
+        uint8x8_t bytes0 = vreinterpret_u8_u16(vdup_n_u16(b0));
+        uint8x8_t bytes1 = vreinterpret_u8_u16(vdup_n_u16(b1));
+        uint8x8_t bytes2 = vreinterpret_u8_u16(vdup_n_u16(b2));
+        uint8x8_t bytes3 = vreinterpret_u8_u16(vdup_n_u16(b3));
+        uint8x8_t bytes4 = vreinterpret_u8_u16(vdup_n_u16(b4));
+        uint8x8_t bytes5 = vreinterpret_u8_u16(vdup_n_u16(b5));
+        uint8x8_t bytes6 = vreinterpret_u8_u16(vdup_n_u16(b6));
+        uint8x8_t bytes7 = vreinterpret_u8_u16(vdup_n_u16(b7));
+
+        /* Interleave bytes to reconstruct doubles:
+         * Input:  b0=[a0,b0], b1=[a1,b1], ..., b7=[a7,b7]
+         * Output: [a0,a1,a2,a3,a4,a5,a6,a7, b0,b1,b2,b3,b4,b5,b6,b7]
+         */
+
+        /* Interleave pairs of byte streams */
+        uint8x8x2_t zip01 = vzip_u8(bytes0, bytes1);  /* [a0,a1,b0,b1,...] */
+        uint8x8x2_t zip23 = vzip_u8(bytes2, bytes3);
+        uint8x8x2_t zip45 = vzip_u8(bytes4, bytes5);
+        uint8x8x2_t zip67 = vzip_u8(bytes6, bytes7);
+
+        /* Now interleave 16-bit pairs */
+        uint16x4_t lo01 = vreinterpret_u16_u8(zip01.val[0]);
+        uint16x4_t lo23 = vreinterpret_u16_u8(zip23.val[0]);
+        uint16x4_t lo45 = vreinterpret_u16_u8(zip45.val[0]);
+        uint16x4_t lo67 = vreinterpret_u16_u8(zip67.val[0]);
+
+        uint16x4x2_t zip0123 = vzip_u16(lo01, lo23);
+        uint16x4x2_t zip4567 = vzip_u16(lo45, lo67);
+
+        /* Interleave 32-bit pairs */
+        uint32x2_t lo0123 = vreinterpret_u32_u16(zip0123.val[0]);
+        uint32x2_t lo4567 = vreinterpret_u32_u16(zip4567.val[0]);
+
+        uint32x2x2_t zip_final = vzip_u32(lo0123, lo4567);
+
+        /* Store the two doubles */
+        vst1_u8(dst + i * 8, vreinterpret_u8_u32(zip_final.val[0]));
+        vst1_u8(dst + i * 8 + 8, vreinterpret_u8_u32(zip_final.val[1]));
     }
 
     /* Handle remaining values */
@@ -1142,6 +1228,131 @@ size_t carquet_neon_match_length(const uint8_t* p, const uint8_t* match, const u
     }
 
     return (size_t)(p - start);
+}
+
+/* ============================================================================
+ * Definition Level Processing - NEON Optimized
+ * ============================================================================
+ */
+
+/**
+ * Count non-null values using NEON.
+ * Counts how many def_levels[i] == max_def_level.
+ */
+int64_t carquet_neon_count_non_nulls(const int16_t* def_levels, int64_t count, int16_t max_def_level) {
+    int64_t non_null_count = 0;
+    int64_t i = 0;
+
+    int16x8_t max_vec = vdupq_n_s16(max_def_level);
+
+    /* Process 8 int16_t values at a time */
+    for (; i + 8 <= count; i += 8) {
+        int16x8_t levels = vld1q_s16(def_levels + i);
+        uint16x8_t cmp = vceqq_s16(levels, max_vec);
+
+        /* Narrow to 8-bit: 0xFFFF -> 0xFF, 0x0000 -> 0x00 */
+        uint8x8_t narrow = vmovn_u16(cmp);
+
+        /* AND with 1 to get 0 or 1 per lane */
+        uint8x8_t ones = vand_u8(narrow, vdup_n_u8(1));
+
+        /* Horizontal add all 8 values */
+        uint16x4_t sum16 = vpaddl_u8(ones);
+        uint32x2_t sum32 = vpaddl_u16(sum16);
+        uint64x1_t sum64 = vpaddl_u32(sum32);
+
+        non_null_count += vget_lane_u64(sum64, 0);
+    }
+
+    /* Handle remaining */
+    for (; i < count; i++) {
+        if (def_levels[i] == max_def_level) {
+            non_null_count++;
+        }
+    }
+
+    return non_null_count;
+}
+
+/**
+ * Build null bitmap from definition levels using NEON.
+ * Sets bit to 1 if def_levels[i] < max_def_level (null).
+ */
+void carquet_neon_build_null_bitmap(const int16_t* def_levels, int64_t count,
+                                     int16_t max_def_level, uint8_t* null_bitmap) {
+    int64_t i = 0;
+
+    int16x8_t max_vec = vdupq_n_s16(max_def_level);
+
+    /* Process 8 int16_t values -> 1 byte of bitmap */
+    int64_t full_bytes = count / 8;
+    for (int64_t b = 0; b < full_bytes; b++) {
+        int16x8_t levels = vld1q_s16(def_levels + b * 8);
+
+        /* levels < max_def means null */
+        uint16x8_t cmp = vcltq_s16(levels, max_vec);
+
+        /* Extract one bit per lane to form a byte
+         * cmp has 0xFFFF for null, 0x0000 for non-null
+         * We need bit 0 from lane 0, bit 1 from lane 1, etc.
+         */
+
+        /* Narrow to 8-bit: 0xFFFF -> 0xFF, 0x0000 -> 0x00 */
+        uint8x8_t narrow = vmovn_u16(cmp);
+
+        /* Use bit extraction pattern:
+         * Multiply each lane by its bit position weight and sum */
+        static const uint8_t bit_weights[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+        uint8x8_t weights = vld1_u8(bit_weights);
+
+        /* AND with weights (0xFF & weight = weight, 0x00 & weight = 0) */
+        uint8x8_t weighted = vand_u8(narrow, weights);
+
+        /* Horizontal add to get final byte */
+        uint16x4_t sum16 = vpaddl_u8(weighted);
+        uint32x2_t sum32 = vpaddl_u16(sum16);
+        uint64x1_t sum64 = vpaddl_u32(sum32);
+
+        null_bitmap[b] = (uint8_t)vget_lane_u64(sum64, 0);
+        i += 8;
+    }
+
+    /* Handle remaining bits */
+    if (i < count) {
+        uint8_t null_bits = 0;
+        for (int64_t j = 0; i + j < count && j < 8; j++) {
+            if (def_levels[i + j] < max_def_level) {
+                null_bits |= (1 << j);
+            }
+        }
+        null_bitmap[full_bytes] = null_bits;
+    }
+}
+
+/**
+ * Fill definition levels with a constant value using NEON.
+ */
+void carquet_neon_fill_def_levels(int16_t* def_levels, int64_t count, int16_t value) {
+    int64_t i = 0;
+    int16x8_t val_vec = vdupq_n_s16(value);
+
+    /* Process 32 int16_t values at a time (unrolled) */
+    for (; i + 32 <= count; i += 32) {
+        vst1q_s16(def_levels + i, val_vec);
+        vst1q_s16(def_levels + i + 8, val_vec);
+        vst1q_s16(def_levels + i + 16, val_vec);
+        vst1q_s16(def_levels + i + 24, val_vec);
+    }
+
+    /* Process 8 int16_t values at a time */
+    for (; i + 8 <= count; i += 8) {
+        vst1q_s16(def_levels + i, val_vec);
+    }
+
+    /* Handle remaining */
+    for (; i < count; i++) {
+        def_levels[i] = value;
+    }
 }
 
 #endif /* __ARM_NEON */

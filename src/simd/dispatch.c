@@ -397,6 +397,10 @@ extern int64_t carquet_neon_find_run_length_i32(const int32_t* values, int64_t c
 extern uint32_t carquet_neon_crc32c(uint32_t crc, const uint8_t* data, size_t len);
 extern void carquet_neon_match_copy(uint8_t* dst, const uint8_t* src, size_t len, size_t offset);
 extern size_t carquet_neon_match_length(const uint8_t* p, const uint8_t* match, const uint8_t* limit);
+extern int64_t carquet_neon_count_non_nulls(const int16_t* def_levels, int64_t count, int16_t max_def_level);
+extern void carquet_neon_build_null_bitmap(const int16_t* def_levels, int64_t count,
+                                            int16_t max_def_level, uint8_t* null_bitmap);
+extern void carquet_neon_fill_def_levels(int16_t* def_levels, int64_t count, int16_t value);
 #endif
 
 #ifdef __ARM_FEATURE_SVE
@@ -558,6 +562,9 @@ void carquet_simd_dispatch_init(void) {
     g_dispatch.crc32c = carquet_neon_crc32c;
     g_dispatch.match_copy = carquet_neon_match_copy;
     g_dispatch.match_length = carquet_neon_match_length;
+    g_dispatch.count_non_nulls = carquet_neon_count_non_nulls;
+    g_dispatch.build_null_bitmap = carquet_neon_build_null_bitmap;
+    g_dispatch.fill_def_levels = carquet_neon_fill_def_levels;
 #endif
 
     /* SVE overrides NEON if available (better performance on supporting hardware) */
