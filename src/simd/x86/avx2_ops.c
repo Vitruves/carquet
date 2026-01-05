@@ -407,42 +407,22 @@ void carquet_avx2_gather_i64(const int64_t* dict, const uint32_t* indices,
 
 /**
  * Gather float values from dictionary using AVX2 gather instructions.
+ * Note: float and int32 are both 4 bytes, so we reuse gather_i32 via cast.
  */
 void carquet_avx2_gather_float(const float* dict, const uint32_t* indices,
                                 int64_t count, float* output) {
-    int64_t i = 0;
-
-    /* Process 8 at a time using AVX2 gather */
-    for (; i + 8 <= count; i += 8) {
-        __m256i idx = _mm256_loadu_si256((const __m256i*)(indices + i));
-        __m256 result = _mm256_i32gather_ps(dict, idx, 4);  /* Scale = 4 bytes per float */
-        _mm256_storeu_ps(output + i, result);
-    }
-
-    /* Handle remaining */
-    for (; i < count; i++) {
-        output[i] = dict[indices[i]];
-    }
+    /* Data movement doesn't care about type - reuse int32 implementation */
+    carquet_avx2_gather_i32((const int32_t*)dict, indices, count, (int32_t*)output);
 }
 
 /**
  * Gather double values from dictionary using AVX2 gather instructions.
+ * Note: double and int64 are both 8 bytes, so we reuse gather_i64 via cast.
  */
 void carquet_avx2_gather_double(const double* dict, const uint32_t* indices,
                                  int64_t count, double* output) {
-    int64_t i = 0;
-
-    /* Process 4 at a time using AVX2 gather */
-    for (; i + 4 <= count; i += 4) {
-        __m128i idx = _mm_loadu_si128((const __m128i*)(indices + i));
-        __m256d result = _mm256_i32gather_pd(dict, idx, 8);  /* Scale = 8 bytes per double */
-        _mm256_storeu_pd(output + i, result);
-    }
-
-    /* Handle remaining */
-    for (; i < count; i++) {
-        output[i] = dict[indices[i]];
-    }
+    /* Data movement doesn't care about type - reuse int64 implementation */
+    carquet_avx2_gather_i64((const int64_t*)dict, indices, count, (int64_t*)output);
 }
 
 /* ============================================================================

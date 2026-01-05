@@ -116,95 +116,57 @@ void carquet_avx512_byte_stream_split_encode_float(
     int64_t i = 0;
 
 #ifdef __AVX512VBMI__
-    /* Permutation indices to gather bytes by position across 16 floats */
-    /* For 16 floats (64 bytes), gather all byte 0s, then byte 1s, etc. */
-    const __m512i perm_b0 = _mm512_set_epi8(
-        60, 56, 52, 48, 44, 40, 36, 32, 28, 24, 20, 16, 12, 8, 4, 0,
-        60, 56, 52, 48, 44, 40, 36, 32, 28, 24, 20, 16, 12, 8, 4, 0,
-        60, 56, 52, 48, 44, 40, 36, 32, 28, 24, 20, 16, 12, 8, 4, 0,
-        60, 56, 52, 48, 44, 40, 36, 32, 28, 24, 20, 16, 12, 8, 4, 0);
-    const __m512i perm_b1 = _mm512_set_epi8(
-        61, 57, 53, 49, 45, 41, 37, 33, 29, 25, 21, 17, 13, 9, 5, 1,
-        61, 57, 53, 49, 45, 41, 37, 33, 29, 25, 21, 17, 13, 9, 5, 1,
-        61, 57, 53, 49, 45, 41, 37, 33, 29, 25, 21, 17, 13, 9, 5, 1,
-        61, 57, 53, 49, 45, 41, 37, 33, 29, 25, 21, 17, 13, 9, 5, 1);
-    const __m512i perm_b2 = _mm512_set_epi8(
-        62, 58, 54, 50, 46, 42, 38, 34, 30, 26, 22, 18, 14, 10, 6, 2,
-        62, 58, 54, 50, 46, 42, 38, 34, 30, 26, 22, 18, 14, 10, 6, 2,
-        62, 58, 54, 50, 46, 42, 38, 34, 30, 26, 22, 18, 14, 10, 6, 2,
-        62, 58, 54, 50, 46, 42, 38, 34, 30, 26, 22, 18, 14, 10, 6, 2);
-    const __m512i perm_b3 = _mm512_set_epi8(
-        63, 59, 55, 51, 47, 43, 39, 35, 31, 27, 23, 19, 15, 11, 7, 3,
-        63, 59, 55, 51, 47, 43, 39, 35, 31, 27, 23, 19, 15, 11, 7, 3,
-        63, 59, 55, 51, 47, 43, 39, 35, 31, 27, 23, 19, 15, 11, 7, 3,
-        63, 59, 55, 51, 47, 43, 39, 35, 31, 27, 23, 19, 15, 11, 7, 3);
+    /* Single permutation that places all 4 byte streams in the 4 128-bit lanes:
+     * Lane 0 (bits 0-127):   byte 0 from each of 16 floats
+     * Lane 1 (bits 128-255): byte 1 from each of 16 floats
+     * Lane 2 (bits 256-383): byte 2 from each of 16 floats
+     * Lane 3 (bits 384-511): byte 3 from each of 16 floats
+     */
+    const __m512i perm_all = _mm512_set_epi8(
+        63, 59, 55, 51, 47, 43, 39, 35, 31, 27, 23, 19, 15, 11, 7, 3,  /* byte 3s */
+        62, 58, 54, 50, 46, 42, 38, 34, 30, 26, 22, 18, 14, 10, 6, 2,  /* byte 2s */
+        61, 57, 53, 49, 45, 41, 37, 33, 29, 25, 21, 17, 13, 9, 5, 1,   /* byte 1s */
+        60, 56, 52, 48, 44, 40, 36, 32, 28, 24, 20, 16, 12, 8, 4, 0);  /* byte 0s */
 
     for (; i + 16 <= count; i += 16) {
         __m512i v = _mm512_loadu_si512((const __m512i*)(src + i * 4));
 
-        /* Permute to gather bytes by position */
-        __m512i b0 = _mm512_permutexvar_epi8(perm_b0, v);
-        __m512i b1 = _mm512_permutexvar_epi8(perm_b1, v);
-        __m512i b2 = _mm512_permutexvar_epi8(perm_b2, v);
-        __m512i b3 = _mm512_permutexvar_epi8(perm_b3, v);
+        /* Single permutation gathers all 4 streams */
+        __m512i transposed = _mm512_permutexvar_epi8(perm_all, v);
 
-        /* Store 16 bytes to each stream (only lower 128 bits valid) */
-        _mm_storeu_si128((__m128i*)(output + 0 * count + i), _mm512_castsi512_si128(b0));
-        _mm_storeu_si128((__m128i*)(output + 1 * count + i), _mm512_castsi512_si128(b1));
-        _mm_storeu_si128((__m128i*)(output + 2 * count + i), _mm512_castsi512_si128(b2));
-        _mm_storeu_si128((__m128i*)(output + 3 * count + i), _mm512_castsi512_si128(b3));
+        /* Extract and store each 128-bit lane to its stream */
+        _mm_storeu_si128((__m128i*)(output + 0 * count + i), _mm512_castsi512_si128(transposed));
+        _mm_storeu_si128((__m128i*)(output + 1 * count + i), _mm512_extracti32x4_epi32(transposed, 1));
+        _mm_storeu_si128((__m128i*)(output + 2 * count + i), _mm512_extracti32x4_epi32(transposed, 2));
+        _mm_storeu_si128((__m128i*)(output + 3 * count + i), _mm512_extracti32x4_epi32(transposed, 3));
     }
 #else
-    /* Fallback without VBMI: use shuffle approach */
+    /* Fallback without VBMI: use shuffle + permutexvar approach
+     * Step 1: shuffle_epi8 transposes within each 128-bit lane (4 floats -> 4 bytes per stream)
+     * Step 2: permutexvar_epi32 rearranges dwords to group all byte 0s, byte 1s, etc.
+     */
+    const __m512i intra_lane_shuf = _mm512_set_epi8(
+        15, 11, 7, 3, 14, 10, 6, 2, 13, 9, 5, 1, 12, 8, 4, 0,
+        15, 11, 7, 3, 14, 10, 6, 2, 13, 9, 5, 1, 12, 8, 4, 0,
+        15, 11, 7, 3, 14, 10, 6, 2, 13, 9, 5, 1, 12, 8, 4, 0,
+        15, 11, 7, 3, 14, 10, 6, 2, 13, 9, 5, 1, 12, 8, 4, 0);
+    const __m512i cross_lane_perm = _mm512_set_epi32(
+        15, 11, 7, 3, 14, 10, 6, 2, 13, 9, 5, 1, 12, 8, 4, 0);
+
     for (; i + 16 <= count; i += 16) {
-        /* Load as 4 128-bit chunks */
-        __m128i v0 = _mm_loadu_si128((const __m128i*)(src + i * 4 + 0));
-        __m128i v1 = _mm_loadu_si128((const __m128i*)(src + i * 4 + 16));
-        __m128i v2 = _mm_loadu_si128((const __m128i*)(src + i * 4 + 32));
-        __m128i v3 = _mm_loadu_si128((const __m128i*)(src + i * 4 + 48));
+        __m512i v = _mm512_loadu_si512((const __m512i*)(src + i * 4));
 
-        /* Transpose 4x4 blocks of bytes using unpack operations */
-        __m128i t0 = _mm_unpacklo_epi8(v0, v1);  /* a0b0a1b1... */
-        __m128i t1 = _mm_unpackhi_epi8(v0, v1);
-        __m128i t2 = _mm_unpacklo_epi8(v2, v3);
-        __m128i t3 = _mm_unpackhi_epi8(v2, v3);
+        /* Transpose within each 128-bit lane */
+        __m512i shuffled = _mm512_shuffle_epi8(v, intra_lane_shuf);
 
-        __m128i u0 = _mm_unpacklo_epi8(t0, t2);
-        __m128i u1 = _mm_unpackhi_epi8(t0, t2);
-        __m128i u2 = _mm_unpacklo_epi8(t1, t3);
-        __m128i u3 = _mm_unpackhi_epi8(t1, t3);
+        /* Rearrange dwords across lanes to group streams */
+        __m512i transposed = _mm512_permutexvar_epi32(cross_lane_perm, shuffled);
 
-        /* Extract and store byte streams using shuffle */
-        const __m128i shuf_b0 = _mm_set_epi8(-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 12,8,4,0);
-        const __m128i shuf_b1 = _mm_set_epi8(-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 13,9,5,1);
-        const __m128i shuf_b2 = _mm_set_epi8(-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 14,10,6,2);
-        const __m128i shuf_b3 = _mm_set_epi8(-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 15,11,7,3);
-
-        /* Extract 4 bytes from each of 4 chunks = 16 bytes per stream */
-        uint32_t* out0 = (uint32_t*)(output + 0 * count + i);
-        uint32_t* out1 = (uint32_t*)(output + 1 * count + i);
-        uint32_t* out2 = (uint32_t*)(output + 2 * count + i);
-        uint32_t* out3 = (uint32_t*)(output + 3 * count + i);
-
-        out0[0] = _mm_extract_epi32(_mm_shuffle_epi8(u0, shuf_b0), 0);
-        out0[1] = _mm_extract_epi32(_mm_shuffle_epi8(u1, shuf_b0), 0);
-        out0[2] = _mm_extract_epi32(_mm_shuffle_epi8(u2, shuf_b0), 0);
-        out0[3] = _mm_extract_epi32(_mm_shuffle_epi8(u3, shuf_b0), 0);
-
-        out1[0] = _mm_extract_epi32(_mm_shuffle_epi8(u0, shuf_b1), 0);
-        out1[1] = _mm_extract_epi32(_mm_shuffle_epi8(u1, shuf_b1), 0);
-        out1[2] = _mm_extract_epi32(_mm_shuffle_epi8(u2, shuf_b1), 0);
-        out1[3] = _mm_extract_epi32(_mm_shuffle_epi8(u3, shuf_b1), 0);
-
-        out2[0] = _mm_extract_epi32(_mm_shuffle_epi8(u0, shuf_b2), 0);
-        out2[1] = _mm_extract_epi32(_mm_shuffle_epi8(u1, shuf_b2), 0);
-        out2[2] = _mm_extract_epi32(_mm_shuffle_epi8(u2, shuf_b2), 0);
-        out2[3] = _mm_extract_epi32(_mm_shuffle_epi8(u3, shuf_b2), 0);
-
-        out3[0] = _mm_extract_epi32(_mm_shuffle_epi8(u0, shuf_b3), 0);
-        out3[1] = _mm_extract_epi32(_mm_shuffle_epi8(u1, shuf_b3), 0);
-        out3[2] = _mm_extract_epi32(_mm_shuffle_epi8(u2, shuf_b3), 0);
-        out3[3] = _mm_extract_epi32(_mm_shuffle_epi8(u3, shuf_b3), 0);
+        /* Extract and store each 128-bit lane to its stream */
+        _mm_storeu_si128((__m128i*)(output + 0 * count + i), _mm512_castsi512_si128(transposed));
+        _mm_storeu_si128((__m128i*)(output + 1 * count + i), _mm512_extracti32x4_epi32(transposed, 1));
+        _mm_storeu_si128((__m128i*)(output + 2 * count + i), _mm512_extracti32x4_epi32(transposed, 2));
+        _mm_storeu_si128((__m128i*)(output + 3 * count + i), _mm512_extracti32x4_epi32(transposed, 3));
     }
 #endif
 
@@ -400,49 +362,22 @@ void carquet_avx512_gather_i64(const int64_t* dict, const uint32_t* indices,
 
 /**
  * Gather float values from dictionary using AVX-512 gather instructions.
+ * Note: float and int32 are both 4 bytes, so we reuse gather_i32 via cast.
  */
 void carquet_avx512_gather_float(const float* dict, const uint32_t* indices,
                                   int64_t count, float* output) {
-    int64_t i = 0;
-
-    /* Process 16 at a time using AVX-512 gather */
-    for (; i + 16 <= count; i += 16) {
-        __m512i idx = _mm512_loadu_si512((const __m512i*)(indices + i));
-        __m512 result = _mm512_i32gather_ps(idx, dict, 4);
-        _mm512_storeu_ps(output + i, result);
-    }
-
-    /* Handle remaining with AVX2 */
-    for (; i + 8 <= count; i += 8) {
-        __m256i idx = _mm256_loadu_si256((const __m256i*)(indices + i));
-        __m256 result = _mm256_i32gather_ps(dict, idx, 4);
-        _mm256_storeu_ps(output + i, result);
-    }
-
-    /* Handle remaining */
-    for (; i < count; i++) {
-        output[i] = dict[indices[i]];
-    }
+    /* Data movement doesn't care about type - reuse int32 implementation */
+    carquet_avx512_gather_i32((const int32_t*)dict, indices, count, (int32_t*)output);
 }
 
 /**
  * Gather double values from dictionary using AVX-512 gather instructions.
+ * Note: double and int64 are both 8 bytes, so we reuse gather_i64 via cast.
  */
 void carquet_avx512_gather_double(const double* dict, const uint32_t* indices,
                                    int64_t count, double* output) {
-    int64_t i = 0;
-
-    /* Process 8 at a time using AVX-512 gather */
-    for (; i + 8 <= count; i += 8) {
-        __m256i idx = _mm256_loadu_si256((const __m256i*)(indices + i));
-        __m512d result = _mm512_i32gather_pd(idx, dict, 8);
-        _mm512_storeu_pd(output + i, result);
-    }
-
-    /* Handle remaining */
-    for (; i < count; i++) {
-        output[i] = dict[indices[i]];
-    }
+    /* Data movement doesn't care about type - reuse int64 implementation */
+    carquet_avx512_gather_i64((const int64_t*)dict, indices, count, (int64_t*)output);
 }
 
 /* ============================================================================
@@ -558,13 +493,8 @@ void carquet_avx512_unpack_bools(const uint8_t* input, uint8_t* output, int64_t 
         uint64_t packed;
         memcpy(&packed, input + byte_idx, 8);
 
-        /* Convert to mask */
-        __mmask64 mask = (__mmask64)packed;
-
-        /* Create result: 1 where mask bit is set, 0 otherwise */
-        __m512i ones = _mm512_set1_epi8(1);
-        __m512i zeros = _mm512_setzero_si512();
-        __m512i result = _mm512_mask_mov_epi8(zeros, mask, ones);
+        /* Convert to mask and create result with maskz_set1 (1 where set, 0 otherwise) */
+        __m512i result = _mm512_maskz_set1_epi8((__mmask64)packed, 1);
 
         _mm512_storeu_si512((__m512i*)(output + i), result);
     }
@@ -587,23 +517,30 @@ void carquet_avx512_pack_bools(const uint8_t* input, uint8_t* output, int64_t co
     for (; i + 64 <= count; i += 64) {
         __m512i bools = _mm512_loadu_si512((const __m512i*)(input + i));
 
-        /* Compare with zero to get mask */
-        __mmask64 mask = _mm512_cmpneq_epi8_mask(bools, _mm512_setzero_si512());
+        /* Use test_epi8_mask: bit is set if (a & b) != 0, i.e., if bool is non-zero */
+        __mmask64 mask = _mm512_test_epi8_mask(bools, bools);
 
         /* Store mask as 8 bytes */
         uint64_t packed = (uint64_t)mask;
         memcpy(output + i / 8, &packed, 8);
     }
 
-    /* Handle remaining */
-    for (; i < count; i += 8) {
-        uint8_t byte = 0;
-        for (int64_t j = 0; j < 8 && i + j < count; j++) {
-            if (input[i + j]) {
-                byte |= (1 << j);
-            }
-        }
-        output[i / 8] = byte;
+    /* Handle remaining elements with masked load */
+    if (i < count) {
+        int64_t remaining = count - i;
+        /* Create mask for remaining elements: set bits 0..(remaining-1) */
+        __mmask64 load_mask = (remaining >= 64) ? ~0ULL : ((1ULL << remaining) - 1);
+
+        /* Masked load zeros out elements beyond the mask */
+        __m512i bools = _mm512_maskz_loadu_epi8(load_mask, input + i);
+
+        /* Test for non-zero values */
+        __mmask64 result_mask = _mm512_test_epi8_mask(bools, bools);
+
+        /* Write only the bytes we need */
+        int64_t bytes_to_write = (remaining + 7) / 8;
+        uint64_t packed = (uint64_t)result_mask;
+        memcpy(output + i / 8, &packed, (size_t)bytes_to_write);
     }
 }
 
