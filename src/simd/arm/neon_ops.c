@@ -270,7 +270,7 @@ void carquet_neon_bitunpack8_32(const uint8_t* input, int bit_width, uint32_t* v
 
 /**
  * Encode floats using byte stream split with NEON.
- * Optimized transpose using native NEON operations.
+ * Optimized transpose using single combined table lookup.
  */
 void carquet_neon_byte_stream_split_encode_float(
     const float* values,
@@ -280,35 +280,38 @@ void carquet_neon_byte_stream_split_encode_float(
     const uint8_t* src = (const uint8_t*)values;
     int64_t i = 0;
 
-    /* Process 4 floats (16 bytes) at a time with optimized transpose */
+    /* Single combined table that transposes all 4 streams at once:
+     * Bytes 0-3:   byte 0 from each float (a0,b0,c0,d0)
+     * Bytes 4-7:   byte 1 from each float (a1,b1,c1,d1)
+     * Bytes 8-11:  byte 2 from each float (a2,b2,c2,d2)
+     * Bytes 12-15: byte 3 from each float (a3,b3,c3,d3)
+     */
+    static const uint8_t tbl_transpose[16] = {
+        0, 4, 8, 12,   /* byte 0s */
+        1, 5, 9, 13,   /* byte 1s */
+        2, 6, 10, 14,  /* byte 2s */
+        3, 7, 11, 15   /* byte 3s */
+    };
+
+    /* Load table once outside the loop */
+    const uint8x16_t idx = vld1q_u8(tbl_transpose);
+
+    /* Process 4 floats (16 bytes) at a time */
     for (; i + 4 <= count; i += 4) {
         /* Load 4 floats = 16 bytes */
         uint8x16_t v = vld1q_u8(src + i * 4);
 
-        /* Use optimized table lookup for transposition */
-        /* v = [a0 a1 a2 a3 | b0 b1 b2 b3 | c0 c1 c2 c3 | d0 d1 d2 d3] */
-        /* Want: [a0 b0 c0 d0], [a1 b1 c1 d1], [a2 b2 c2 d2], [a3 b3 c3 d3] */
+        /* Single table lookup transposes all 4 streams */
+        uint8x16_t transposed = vqtbl1q_u8(v, idx);
 
-        static const uint8_t tbl_byte0[16] = {0, 4, 8, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-        static const uint8_t tbl_byte1[16] = {1, 5, 9, 13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-        static const uint8_t tbl_byte2[16] = {2, 6, 10, 14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-        static const uint8_t tbl_byte3[16] = {3, 7, 11, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        /* Extract each 32-bit lane containing one stream */
+        uint32x4_t t = vreinterpretq_u32_u8(transposed);
+        uint32_t t0 = vgetq_lane_u32(t, 0);
+        uint32_t t1 = vgetq_lane_u32(t, 1);
+        uint32_t t2 = vgetq_lane_u32(t, 2);
+        uint32_t t3 = vgetq_lane_u32(t, 3);
 
-        uint8x16_t idx0 = vld1q_u8(tbl_byte0);
-        uint8x16_t idx1 = vld1q_u8(tbl_byte1);
-        uint8x16_t idx2 = vld1q_u8(tbl_byte2);
-        uint8x16_t idx3 = vld1q_u8(tbl_byte3);
-
-        uint8x16_t out0 = vqtbl1q_u8(v, idx0);
-        uint8x16_t out1 = vqtbl1q_u8(v, idx1);
-        uint8x16_t out2 = vqtbl1q_u8(v, idx2);
-        uint8x16_t out3 = vqtbl1q_u8(v, idx3);
-
-        /* Store to transposed positions (use memcpy for unaligned access) */
-        uint32_t t0 = vgetq_lane_u32(vreinterpretq_u32_u8(out0), 0);
-        uint32_t t1 = vgetq_lane_u32(vreinterpretq_u32_u8(out1), 0);
-        uint32_t t2 = vgetq_lane_u32(vreinterpretq_u32_u8(out2), 0);
-        uint32_t t3 = vgetq_lane_u32(vreinterpretq_u32_u8(out3), 0);
+        /* Store to transposed positions */
         memcpy(output + 0 * count + i, &t0, sizeof(uint32_t));
         memcpy(output + 1 * count + i, &t1, sizeof(uint32_t));
         memcpy(output + 2 * count + i, &t2, sizeof(uint32_t));
@@ -371,7 +374,7 @@ void carquet_neon_byte_stream_split_decode_float(
 
 /**
  * Encode doubles using byte stream split with NEON.
- * Uses table lookup for efficient transpose of 2 doubles (16 bytes) at a time.
+ * Optimized transpose using single combined table lookup.
  */
 void carquet_neon_byte_stream_split_encode_double(
     const double* values,
@@ -381,44 +384,44 @@ void carquet_neon_byte_stream_split_encode_double(
     const uint8_t* src = (const uint8_t*)values;
     int64_t i = 0;
 
-    /* Process 2 doubles (16 bytes) at a time with NEON table lookup */
+    /* Single combined table that transposes all 8 streams at once:
+     * For 2 doubles = 16 bytes input [a0-a7, b0-b7]
+     * Output: bytes 0-1 = [a0,b0], bytes 2-3 = [a1,b1], etc.
+     */
+    static const uint8_t tbl_transpose[16] = {
+        0, 8,    /* stream 0: byte 0 from each double */
+        1, 9,    /* stream 1: byte 1 from each double */
+        2, 10,   /* stream 2: byte 2 from each double */
+        3, 11,   /* stream 3: byte 3 from each double */
+        4, 12,   /* stream 4: byte 4 from each double */
+        5, 13,   /* stream 5: byte 5 from each double */
+        6, 14,   /* stream 6: byte 6 from each double */
+        7, 15    /* stream 7: byte 7 from each double */
+    };
+
+    /* Load table once outside the loop */
+    const uint8x16_t idx = vld1q_u8(tbl_transpose);
+
+    /* Process 2 doubles (16 bytes) at a time */
     for (; i + 2 <= count; i += 2) {
         /* Load 2 doubles = 16 bytes */
         uint8x16_t v = vld1q_u8(src + i * 8);
 
-        /* v = [a0 a1 a2 a3 a4 a5 a6 a7 | b0 b1 b2 b3 b4 b5 b6 b7]
-         * Want streams: [a0 b0], [a1 b1], [a2 b2], ... [a7 b7]
-         */
+        /* Single table lookup transposes all 8 streams */
+        uint8x16_t transposed = vqtbl1q_u8(v, idx);
 
-        /* Table indices to extract byte pairs */
-        static const uint8_t tbl_byte0[16] = {0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-        static const uint8_t tbl_byte1[16] = {1, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-        static const uint8_t tbl_byte2[16] = {2, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-        static const uint8_t tbl_byte3[16] = {3, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-        static const uint8_t tbl_byte4[16] = {4, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-        static const uint8_t tbl_byte5[16] = {5, 13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-        static const uint8_t tbl_byte6[16] = {6, 14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-        static const uint8_t tbl_byte7[16] = {7, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        /* Extract each 16-bit lane containing one stream (2 bytes) */
+        uint16x8_t t = vreinterpretq_u16_u8(transposed);
+        uint16_t t0 = vgetq_lane_u16(t, 0);
+        uint16_t t1 = vgetq_lane_u16(t, 1);
+        uint16_t t2 = vgetq_lane_u16(t, 2);
+        uint16_t t3 = vgetq_lane_u16(t, 3);
+        uint16_t t4 = vgetq_lane_u16(t, 4);
+        uint16_t t5 = vgetq_lane_u16(t, 5);
+        uint16_t t6 = vgetq_lane_u16(t, 6);
+        uint16_t t7 = vgetq_lane_u16(t, 7);
 
-        uint8x16_t out0 = vqtbl1q_u8(v, vld1q_u8(tbl_byte0));
-        uint8x16_t out1 = vqtbl1q_u8(v, vld1q_u8(tbl_byte1));
-        uint8x16_t out2 = vqtbl1q_u8(v, vld1q_u8(tbl_byte2));
-        uint8x16_t out3 = vqtbl1q_u8(v, vld1q_u8(tbl_byte3));
-        uint8x16_t out4 = vqtbl1q_u8(v, vld1q_u8(tbl_byte4));
-        uint8x16_t out5 = vqtbl1q_u8(v, vld1q_u8(tbl_byte5));
-        uint8x16_t out6 = vqtbl1q_u8(v, vld1q_u8(tbl_byte6));
-        uint8x16_t out7 = vqtbl1q_u8(v, vld1q_u8(tbl_byte7));
-
-        /* Extract first 2 bytes and store to each stream */
-        uint16_t t0 = vgetq_lane_u16(vreinterpretq_u16_u8(out0), 0);
-        uint16_t t1 = vgetq_lane_u16(vreinterpretq_u16_u8(out1), 0);
-        uint16_t t2 = vgetq_lane_u16(vreinterpretq_u16_u8(out2), 0);
-        uint16_t t3 = vgetq_lane_u16(vreinterpretq_u16_u8(out3), 0);
-        uint16_t t4 = vgetq_lane_u16(vreinterpretq_u16_u8(out4), 0);
-        uint16_t t5 = vgetq_lane_u16(vreinterpretq_u16_u8(out5), 0);
-        uint16_t t6 = vgetq_lane_u16(vreinterpretq_u16_u8(out6), 0);
-        uint16_t t7 = vgetq_lane_u16(vreinterpretq_u16_u8(out7), 0);
-
+        /* Store to transposed positions */
         memcpy(output + 0 * count + i, &t0, sizeof(uint16_t));
         memcpy(output + 1 * count + i, &t1, sizeof(uint16_t));
         memcpy(output + 2 * count + i, &t2, sizeof(uint16_t));
@@ -680,83 +683,22 @@ void carquet_neon_gather_i64(const int64_t* dict, const uint32_t* indices,
 
 /**
  * Gather float values from dictionary using indices (NEON).
+ * Note: float and int32 are both 4 bytes, so we reuse gather_i32 via cast.
  */
 void carquet_neon_gather_float(const float* dict, const uint32_t* indices,
                                 int64_t count, float* output) {
-    int64_t i = 0;
-
-    /* Process 8 at a time with prefetching */
-    for (; i + 8 <= count; i += 8) {
-        __builtin_prefetch(indices + i + 16, 0, 1);
-
-        uint32x4_t idx0 = vld1q_u32(indices + i);
-        uint32x4_t idx1 = vld1q_u32(indices + i + 4);
-
-        __builtin_prefetch(dict + vgetq_lane_u32(idx0, 0), 0, 0);
-        __builtin_prefetch(dict + vgetq_lane_u32(idx1, 0), 0, 0);
-
-        float v0 = dict[vgetq_lane_u32(idx0, 0)];
-        float v1 = dict[vgetq_lane_u32(idx0, 1)];
-        float v2 = dict[vgetq_lane_u32(idx0, 2)];
-        float v3 = dict[vgetq_lane_u32(idx0, 3)];
-        float v4 = dict[vgetq_lane_u32(idx1, 0)];
-        float v5 = dict[vgetq_lane_u32(idx1, 1)];
-        float v6 = dict[vgetq_lane_u32(idx1, 2)];
-        float v7 = dict[vgetq_lane_u32(idx1, 3)];
-
-        float32x4_t result0 = {v0, v1, v2, v3};
-        float32x4_t result1 = {v4, v5, v6, v7};
-        vst1q_f32(output + i, result0);
-        vst1q_f32(output + i + 4, result1);
-    }
-
-    for (; i + 4 <= count; i += 4) {
-        uint32x4_t idx = vld1q_u32(indices + i);
-        float v0 = dict[vgetq_lane_u32(idx, 0)];
-        float v1 = dict[vgetq_lane_u32(idx, 1)];
-        float v2 = dict[vgetq_lane_u32(idx, 2)];
-        float v3 = dict[vgetq_lane_u32(idx, 3)];
-
-        float32x4_t result = {v0, v1, v2, v3};
-        vst1q_f32(output + i, result);
-    }
-
-    for (; i < count; i++) {
-        output[i] = dict[indices[i]];
-    }
+    /* Data movement doesn't care about type - reuse int32 implementation */
+    carquet_neon_gather_i32((const int32_t*)dict, indices, count, (int32_t*)output);
 }
 
 /**
  * Gather double values from dictionary using indices (NEON).
+ * Note: double and int64 are both 8 bytes, so we reuse gather_i64 via cast.
  */
 void carquet_neon_gather_double(const double* dict, const uint32_t* indices,
                                  int64_t count, double* output) {
-    int64_t i = 0;
-
-    /* Process 4 at a time with prefetching */
-    for (; i + 4 <= count; i += 4) {
-        __builtin_prefetch(indices + i + 8, 0, 1);
-
-        uint32x4_t idx = vld1q_u32(indices + i);
-
-        __builtin_prefetch(dict + vgetq_lane_u32(idx, 0), 0, 0);
-        __builtin_prefetch(dict + vgetq_lane_u32(idx, 2), 0, 0);
-
-        double v0 = dict[vgetq_lane_u32(idx, 0)];
-        double v1 = dict[vgetq_lane_u32(idx, 1)];
-        double v2 = dict[vgetq_lane_u32(idx, 2)];
-        double v3 = dict[vgetq_lane_u32(idx, 3)];
-
-        float64x2_t result0 = {v0, v1};
-        float64x2_t result1 = {v2, v3};
-        vst1q_f64(output + i, result0);
-        vst1q_f64(output + i + 2, result1);
-    }
-
-    /* Handle remaining */
-    for (; i < count; i++) {
-        output[i] = dict[indices[i]];
-    }
+    /* Data movement doesn't care about type - reuse int64 implementation */
+    carquet_neon_gather_i64((const int64_t*)dict, indices, count, (int64_t*)output);
 }
 
 /* ============================================================================
