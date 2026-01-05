@@ -717,26 +717,15 @@ void carquet_sse_unpack_bools(const uint8_t* input, uint8_t* output, int64_t cou
 void carquet_sse_pack_bools(const uint8_t* input, uint8_t* output, int64_t count) {
     int64_t i = 0;
 
-    /* Process 8 bools (1 output byte) at a time */
+    /* Process 8 bools (1 output byte) at a time using movemask trick:
+     * 1. Load 8 bytes (each 0 or 1)
+     * 2. Shift left by 7 within 32-bit lanes: moves bit 0 of each byte to bit 7
+     * 3. movemask extracts bit 7 from each byte position
+     */
     for (; i + 8 <= count; i += 8) {
         __m128i bools = _mm_loadl_epi64((const __m128i*)(input + i));
-
-        /* Multiply by bit positions: 1, 2, 4, 8, 16, 32, 64, 128 */
-        __m128i mult = _mm_set_epi8(0, 0, 0, 0, 0, 0, 0, 0,
-                                     (char)128, 64, 32, 16, 8, 4, 2, 1);
-
-        /* Zero extend to 16-bit, multiply, and sum */
-        __m128i zero = _mm_setzero_si128();
-        __m128i words = _mm_unpacklo_epi8(bools, zero);
-        __m128i mwords = _mm_unpacklo_epi8(mult, zero);
-
-        /* Horizontal operations to sum */
-        __m128i prod = _mm_mullo_epi16(words, mwords);
-        prod = _mm_add_epi16(prod, _mm_srli_si128(prod, 2));
-        prod = _mm_add_epi16(prod, _mm_srli_si128(prod, 4));
-        prod = _mm_add_epi16(prod, _mm_srli_si128(prod, 8));
-
-        output[i / 8] = (uint8_t)_mm_extract_epi16(prod, 0);
+        __m128i shifted = _mm_slli_epi32(bools, 7);
+        output[i / 8] = (uint8_t)_mm_movemask_epi8(shifted);
     }
 
     /* Handle remaining */
@@ -911,26 +900,18 @@ void carquet_sse_build_null_bitmap(const int16_t* def_levels, int64_t count,
     int64_t i = 0;
 
     __m128i max_vec = _mm_set1_epi16(max_def_level);
+    __m128i zero = _mm_setzero_si128();
 
     /* Process 8 int16_t values -> 1 byte of bitmap */
     int64_t full_bytes = count / 8;
     for (int64_t b = 0; b < full_bytes; b++) {
         __m128i levels = _mm_loadu_si128((const __m128i*)(def_levels + b * 8));
-        /* levels < max_def means null */
+        /* levels < max_def means null: result is 0x0000 or 0xFFFF per lane */
         __m128i cmp = _mm_cmplt_epi16(levels, max_vec);
-        /* Pack 8 comparison results to 8 bits */
-        int mask = _mm_movemask_epi8(cmp);
-        /* Take every other bit (since int16 comparisons set 2 bytes each) */
-        uint8_t null_bits = 0;
-        if (mask & 0x0001) null_bits |= 0x01;
-        if (mask & 0x0004) null_bits |= 0x02;
-        if (mask & 0x0010) null_bits |= 0x04;
-        if (mask & 0x0040) null_bits |= 0x08;
-        if (mask & 0x0100) null_bits |= 0x10;
-        if (mask & 0x0400) null_bits |= 0x20;
-        if (mask & 0x1000) null_bits |= 0x40;
-        if (mask & 0x4000) null_bits |= 0x80;
-        null_bitmap[b] = null_bits;
+        /* Pack 8 int16 results (0x0000 or 0xFFFF) to 8 int8 (0x00 or 0xFF) */
+        __m128i packed = _mm_packs_epi16(cmp, zero);
+        /* movemask extracts bit 7 from each byte -> 8-bit result in low byte */
+        null_bitmap[b] = (uint8_t)_mm_movemask_epi8(packed);
         i += 8;
     }
 
