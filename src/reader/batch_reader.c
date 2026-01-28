@@ -326,6 +326,7 @@ carquet_status_t carquet_batch_reader_next(
             (void)carquet_column_read_batch(col_reader, NULL, 0, NULL, NULL);
         }
     }
+#endif
 
     /* ========================================================================
      * MAIN COLUMN READING PHASE
@@ -334,6 +335,7 @@ carquet_status_t carquet_batch_reader_next(
      * this phase is mostly memory copies which are fast.
      */
     int32_t col_i;  /* Declared outside for MSVC OpenMP compatibility */
+#ifdef _OPENMP
     #pragma omp parallel for num_threads(num_threads) schedule(dynamic)
 #endif
     for (col_i = 0; col_i < batch_reader->num_projected; col_i++) {
