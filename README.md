@@ -31,9 +31,9 @@ Carquet is **not** a replacement for Apache Arrow. Arrow is the industry standar
 | Dependencies | Many (Boost, etc.) | **zstd + zlib only** |
 | Binary size | ~50MB+ | **~200KB** |
 | Write speed (ARM) | Baseline | **1.5-5x faster** |
-| Write speed (x86) | Baseline | ~same |
+| Write speed (x86) | Baseline | **1.2-1.4x faster** |
 | Read speed (ARM) | Baseline | ~same to 1.3x faster |
-| Read speed (x86) | **Baseline** | 2-3x slower |
+| Read speed (x86) | **Baseline** | 1.5-2x slower |
 | ZSTD file size | Baseline | **~1.4x smaller** |
 | Nested types | **Full support** | Basic |
 | Encryption | **Yes** | No |
@@ -896,17 +896,17 @@ Carquet's performance varies by platform and use case. These benchmarks show whe
 
 | Codec | Carquet | PyArrow | Speedup |
 |-------|---------|---------|---------|
-| UNCOMPRESSED | 4.6 M rows/sec | 4.1 M rows/sec | **1.14x faster** |
-| SNAPPY | 3.6 M rows/sec | 3.8 M rows/sec | ~same |
-| ZSTD | 3.8 M rows/sec | 3.5 M rows/sec | **1.09x faster** |
+| UNCOMPRESSED | 5.6 M rows/sec | 4.0 M rows/sec | **1.40x faster** |
+| SNAPPY | 4.6 M rows/sec | 3.8 M rows/sec | **1.22x faster** |
+| ZSTD | 4.1 M rows/sec | 3.5 M rows/sec | **1.17x faster** |
 
 #### Reading (PyArrow Faster)
 
 | Codec | Carquet | PyArrow | Ratio |
 |-------|---------|---------|-------|
-| UNCOMPRESSED | 27 M rows/sec | 65 M rows/sec | 0.42x slower |
-| SNAPPY | 21 M rows/sec | 51 M rows/sec | 0.41x slower |
-| ZSTD | 19 M rows/sec | 49 M rows/sec | 0.39x slower |
+| UNCOMPRESSED | 35 M rows/sec | 67 M rows/sec | 0.53x slower |
+| SNAPPY | 36 M rows/sec | 53 M rows/sec | 0.67x slower |
+| ZSTD | 26 M rows/sec | 49 M rows/sec | 0.52x slower |
 
 #### Compression Ratio
 
@@ -914,7 +914,7 @@ Carquet's performance varies by platform and use case. These benchmarks show whe
 |-------|---------|---------|-------|
 | ZSTD | 108 MB | 148 MB | **1.37x smaller** |
 | SNAPPY | 191 MB | 173 MB | 1.10x larger |
-| UNCOMPRESSED | 191 MB | 199 MB | 1.04x smaller |
+| UNCOMPRESSED | 191 MB | 199 MB | 1.05x smaller |
 
 ### Running Benchmarks
 
