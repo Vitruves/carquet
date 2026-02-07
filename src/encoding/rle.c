@@ -8,7 +8,9 @@
 #include "core/bitpack.h"
 #include <string.h>
 
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
 #endif
 
@@ -486,7 +488,15 @@ int64_t carquet_rle_decode_levels(
             int16_t* dst = output + count;
             int64_t i = 0;
 
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#if defined(__SSE2__)
+            /* SSE2: fill 8 int16_t at a time */
+            if (to_fill >= 8) {
+                __m128i vval = _mm_set1_epi16(val16);
+                for (; i + 8 <= to_fill; i += 8) {
+                    _mm_storeu_si128((__m128i*)(dst + i), vval);
+                }
+            }
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
             /* NEON: fill 8 int16_t at a time */
             if (to_fill >= 8) {
                 int16x8_t vval = vdupq_n_s16(val16);
@@ -523,7 +533,17 @@ int64_t carquet_rle_decode_levels(
                     to_store = max_values - count;
                 }
 
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#if defined(__SSE2__)
+                if (to_store == 8) {
+                    /* SSE2: load 2x4 int32_t, pack-saturate to 8 int16_t */
+                    __m128i v0 = _mm_loadu_si128((const __m128i*)temp);
+                    __m128i v1 = _mm_loadu_si128((const __m128i*)(temp + 4));
+                    __m128i packed = _mm_packs_epi32(v0, v1);
+                    _mm_storeu_si128((__m128i*)(output + count), packed);
+                    count += 8;
+                    continue;
+                }
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
                 if (to_store == 8) {
                     /* NEON: load 8 uint32_t, narrow to int16_t */
                     uint32x4_t v0 = vld1q_u32(temp);
