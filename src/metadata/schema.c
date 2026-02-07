@@ -299,3 +299,9 @@ int16_t carquet_schema_node_max_rep_level(const carquet_schema_node_t* node) {
     const parquet_schema_element_t* elem = (const parquet_schema_element_t*)node;
     return (elem->repetition_type == CARQUET_REPETITION_REPEATED) ? 1 : 0;
 }
+
+int32_t carquet_schema_node_type_length(const carquet_schema_node_t* node) {
+    /* node is nonnull per API contract */
+    const parquet_schema_element_t* elem = (const parquet_schema_element_t*)node;
+    return elem->type_length;
+}

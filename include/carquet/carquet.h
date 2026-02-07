@@ -742,6 +742,20 @@ int16_t carquet_schema_node_max_def_level(const carquet_schema_node_t* node);
 CARQUET_API CARQUET_PURE CARQUET_NONNULL(1)
 int16_t carquet_schema_node_max_rep_level(const carquet_schema_node_t* node);
 
+/**
+ * @brief Get the type length for a FIXED_LEN_BYTE_ARRAY column.
+ *
+ * Returns the fixed byte length of each value. This is needed to allocate
+ * correctly sized buffers for carquet_column_read_batch().
+ *
+ * @param[in] node Schema node (must be a leaf)
+ * @return Type length in bytes, or 0 if not a FIXED_LEN_BYTE_ARRAY
+ *
+ * @note Thread-safe: Yes (read-only)
+ */
+CARQUET_API CARQUET_PURE CARQUET_NONNULL(1)
+int32_t carquet_schema_node_type_length(const carquet_schema_node_t* node);
+
 /* ============================================================================
  * Reader API
  * ============================================================================
