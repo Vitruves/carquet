@@ -408,15 +408,14 @@ if (!writer) {
 int64_t ids[] = {1, 2, 3, 4, 5};
 carquet_writer_write_batch(writer, 0, ids, 5, NULL, NULL);
 
-// Write column 1 (name) - with nulls
+// Write column 1 (name) - with nulls (sparse: only non-null values in array)
 carquet_byte_array_t names[] = {
     {5, (uint8_t*)"Alice"},
     {3, (uint8_t*)"Bob"},
-    {0, NULL},  // Will be marked as null
     {5, (uint8_t*)"David"},
     {3, (uint8_t*)"Eve"}
 };
-int16_t def_levels[] = {1, 1, 0, 1, 1};  // 0 = null, 1 = present
+int16_t def_levels[] = {1, 1, 0, 1, 1};  // 5 rows: 0 = null, 1 = present
 carquet_writer_write_batch(writer, 1, names, 5, def_levels, NULL);
 
 // Write column 2 (timestamp)
