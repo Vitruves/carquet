@@ -33,7 +33,7 @@ Carquet is **not** a replacement for Apache Arrow. Arrow is the industry standar
 | Write speed (ARM) | Baseline | **1.5-5x faster** |
 | Write speed (x86) | Baseline | ~same |
 | Read speed (ARM) | Baseline | ~same to 1.3x faster |
-| Read speed (x86) | **Baseline** | 2.5-5x slower |
+| Read speed (x86) | **Baseline** | 2-3x slower |
 | ZSTD file size | Baseline | **~1.4x smaller** |
 | Nested types | **Full support** | Basic |
 | Encryption | **Yes** | No |
@@ -888,33 +888,33 @@ Carquet's performance varies by platform and use case. These benchmarks show whe
 | SNAPPY | 191 MB | 174 MB | 1.1x larger |
 | UNCOMPRESSED | 191 MB | 201 MB | 1.05x smaller |
 
-### Intel Xeon E5-2680 (x86_64, Linux)
+### Intel Xeon D-1531 (x86_64, Linux)
 
-*Dell Precision T7600, 2x Intel Xeon E5-2680 (32 cores @ 2.7GHz), 94GB RAM, Ubuntu 24.04*
+*Supermicro SYS-5038MD-H24TRF, Intel Xeon D-1531 (12 threads @ 2.7GHz), 32GB RAM, Ubuntu 24.04, PyArrow 23.0.0*
 
 #### Writing
 
 | Codec | Carquet | PyArrow | Speedup |
 |-------|---------|---------|---------|
-| UNCOMPRESSED | 4.3 M rows/sec | 4.2 M rows/sec | ~same |
-| SNAPPY | 3.4 M rows/sec | 4.1 M rows/sec | 0.84x slower |
-| ZSTD | 3.1 M rows/sec | 3.4 M rows/sec | 0.93x slower |
+| UNCOMPRESSED | 4.6 M rows/sec | 4.1 M rows/sec | **1.14x faster** |
+| SNAPPY | 3.6 M rows/sec | 3.8 M rows/sec | ~same |
+| ZSTD | 3.8 M rows/sec | 3.5 M rows/sec | **1.09x faster** |
 
 #### Reading (PyArrow Faster)
 
 | Codec | Carquet | PyArrow | Ratio |
 |-------|---------|---------|-------|
-| UNCOMPRESSED | 29 M rows/sec | 73 M rows/sec | 0.40x slower |
-| SNAPPY | 18 M rows/sec | 83 M rows/sec | 0.22x slower |
-| ZSTD | 12 M rows/sec | 70 M rows/sec | 0.17x slower |
+| UNCOMPRESSED | 27 M rows/sec | 65 M rows/sec | 0.42x slower |
+| SNAPPY | 21 M rows/sec | 51 M rows/sec | 0.41x slower |
+| ZSTD | 19 M rows/sec | 49 M rows/sec | 0.39x slower |
 
 #### Compression Ratio
 
 | Codec | Carquet | PyArrow | Ratio |
 |-------|---------|---------|-------|
-| ZSTD | 107 MB | 150 MB | **1.4x smaller** |
-| SNAPPY | 191 MB | 174 MB | 1.1x larger |
-| UNCOMPRESSED | 191 MB | 201 MB | 1.05x smaller |
+| ZSTD | 108 MB | 148 MB | **1.37x smaller** |
+| SNAPPY | 191 MB | 173 MB | 1.10x larger |
+| UNCOMPRESSED | 191 MB | 199 MB | 1.04x smaller |
 
 ### Running Benchmarks
 
