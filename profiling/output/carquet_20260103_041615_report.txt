@@ -1,0 +1,245 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 12K of event 'cycles:P'
+# Event count (approx.): 30180981945
+#
+#       Overhead  Command / Shared Object / Symbol
+# ..............  ...............................................
+#
+   100.00%        profile_read
+       71.68%        libgomp.so.1.0.0 
+          23.97%        [.] 0x00000000000258a0
+            |
+            ---0x79b233a228a0
+               |          
+               |--23.23%--0x79b233a1f7ab
+               |          0x79b23369caa3
+               |          0x79b233729c6b
+               |          
+                --0.74%--0x79b233a211d0
+                          0x5e3abc6dfafa
+                          0x5e3abc6ddfac
+                          0x5e3abc6de229
+                          0x5e3abc6dd849
+                          0x79b23362a1c9
+                          0x79b23362a28a
+                          0x5e3abc6ddcc4
+
+          14.61%        [.] 0x00000000000258a2
+            |
+            ---0x79b233a228a2
+               |          
+               |--14.11%--0x79b233a1f7ab
+               |          0x79b23369caa3
+               |          0x79b233729c6b
+               |          
+                --0.50%--0x79b233a211d0
+                          0x5e3abc6dfafa
+                          0x5e3abc6ddfac
+                          0x5e3abc6de229
+                          0x5e3abc6dd849
+                          0x79b23362a1c9
+                          0x79b23362a28a
+                          0x5e3abc6ddcc4
+
+          11.50%        [.] 0x00000000000256c0
+            |
+            ---0x79b233a226c0
+               |          
+                --10.96%--0x79b233a1f778
+                          0x79b23369caa3
+                          0x79b233729c6b
+
+           5.83%        [.] 0x00000000000256c2
+            |          
+             --5.82%--0x79b233a226c2
+                       |          
+                        --5.63%--0x79b233a1f778
+                                  0x79b23369caa3
+                                  0x79b233729c6b
+
+           4.87%        [.] 0x00000000000258b1
+            |
+            ---0x79b233a228b1
+               |          
+                --4.78%--0x79b233a1f7ab
+                          0x79b23369caa3
+                          0x79b233729c6b
+
+           4.70%        [.] 0x00000000000258a9
+            |
+            ---0x79b233a228a9
+               |          
+                --4.57%--0x79b233a1f7ab
+                          0x79b23369caa3
+                          0x79b233729c6b
+
+           2.12%        [.] 0x00000000000256cf
+            |
+            ---0x79b233a226cf
+               |          
+                --2.02%--0x79b233a1f778
+                          0x79b23369caa3
+                          0x79b233729c6b
+
+           2.04%        [.] 0x00000000000256c9
+            |
+            ---0x79b233a226c9
+               |          
+                --1.98%--0x79b233a1f778
+                          0x79b23369caa3
+                          0x79b233729c6b
+
+           1.17%        [.] 0x00000000000258ab
+            |
+            ---0x79b233a228ab
+               |          
+                --1.06%--0x79b233a1f7ab
+                          0x79b23369caa3
+                          0x79b233729c6b
+
+        7.97%        [kernel.kallsyms]
+           1.25%        [k] clear_page_rep
+            |
+            ---0xffffffff99dcabea
+               0xffffffff9905a642
+               0xffffffff9905be29
+               0xffffffff99095971
+               |          
+                --1.01%--0xffffffff99095ce4
+                          0xffffffff9902c9bc
+                          0xffffffff9902cbaf
+                          0xffffffff9902dd9b
+                          0xffffffff9902e404
+                          0xffffffff9902e74a
+                          0xffffffff98cd6e19
+                          0xffffffff99e493d3
+                          0xffffffff9a000bc7
+                          |          
+                           --0.73%--0x79b2336bac00
+                                     |          
+                                      --0.69%--0x5e3abc6e4057
+                                                |          
+                                                 --0.54%--0x5e3abc6e4057
+
+           0.74%        [k] __irqentry_text_end
+            |
+            ---0xffffffff9a0011da
+
+        7.63%        profile_read     
+           4.36%        [.] carquet_crc32
+            |          
+             --4.35%--0x5e3abc6e35cc
+                       0x5e3abc6e35cc
+                       0x5e3abc6e2d33
+                       0x5e3abc6e184f
+                       0x5e3abc6e0872
+                       0x5e3abc6dd025
+                       0x5e3abc6dd025
+                       0x79b23362a1c9
+                       0x79b23362a28a
+                       0x5e3abc6ddcc4
+
+           2.34%        [.] lcg_normal
+            |          
+             --1.91%--0x5e3abc6dde20
+                       |          
+                        --1.81%--0x5e3abc6dcd21
+                                  0x5e3abc6dcd21
+                                  0x79b23362a1c9
+                                  0x79b23362a28a
+                                  0x5e3abc6ddcc4
+
+        7.35%        libc.so.6        
+           6.17%        [.] __memmove_sse2_unaligned_erms
+            |          
+             --5.87%--0x79b2336baba9
+                       |          
+                        --5.71%--0x5e3abc6e4057
+                                  |          
+                                  |--3.53%--0x5e3abc6ec9a6
+                                  |          0x5e3abc6eb00e
+                                  |          0x5e3abc6df25b
+                                  |          |          
+                                  |           --3.43%--0x79b233a1f79e
+                                  |                     0x79b23369caa3
+                                  |                     0x79b233729c6b
+                                  |          
+                                   --2.18%--0x5e3abc6e4057
+                                             |          
+                                              --0.78%--0x5e3abc6e2865
+                                                        0x5e3abc6e184f
+                                                        0x5e3abc6e0872
+                                                        0x5e3abc6dd025
+                                                        0x5e3abc6dd025
+                                                        0x79b23362a1c9
+                                                        0x79b23362a28a
+                                                        0x5e3abc6ddcc4
+
+           1.14%        [.] __memset_sse2_unaligned_erms
+            |          
+             --1.13%--0x79b2336bb240
+                       |          
+                        --1.08%--0x5e3abc6ecf39
+                                  0x5e3abc6ecf39
+                                  0x5e3abc6ecf39
+                                  0x5e3abc6ecf39
+                                  0x5e3abc6eb080
+                                  |          
+                                   --0.88%--0x5e3abc6df25b
+                                             |          
+                                              --0.86%--0x79b233a1f79e
+                                                        0x79b23369caa3
+                                                        0x79b233729c6b
+
+        5.36%        libm.so.6        
+           3.41%        [.] __cos_avx
+            |          
+            |--1.44%--0x79b233af45fc
+            |          |          
+            |          |--0.77%--0x79b233af444d
+            |          |          0x5e3abc6dde55
+            |          |          0x5e3abc6dccfc
+            |          |          0x5e3abc6dccfc
+            |          |          0x79b23362a1c9
+            |          |          0x79b23362a28a
+            |          |          0x5e3abc6ddcc4
+            |          |          
+            |           --0.66%--0x79b233af45fc
+            |                     0x79b233af45fc
+            |                     0x5e3abc6dde55
+            |                     0x5e3abc6dcd74
+            |                     0x5e3abc6dcd74
+            |                     0x79b23362a1c9
+            |                     0x79b23362a28a
+            |                     0x5e3abc6ddcc4
+            |          
+             --1.12%--0x79b233af475e
+                       |          
+                        --0.87%--0x79b233af475e
+                                  0x79b233af475e
+                                  0x5e3abc6dde55
+                                  0x5e3abc6dccfc
+                                  0x5e3abc6dccfc
+                                  0x79b23362a1c9
+                                  0x79b23362a28a
+                                  0x5e3abc6ddcc4
+
+           1.82%        [.] __ieee754_log_avx
+            |          
+             --1.80%--0x79b233af25ec
+                       0x5e3abc6dde0e
+                       0x5e3abc6dcd74
+                       0x5e3abc6dcd74
+                       0x79b23362a1c9
+                       0x79b23362a28a
+                       0x5e3abc6ddcc4
+
+
+
+#
+# (Tip: Order by the overhead of source file name and line number: perf report -s srcline)
+#

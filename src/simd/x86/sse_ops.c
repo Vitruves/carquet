@@ -928,6 +928,43 @@ void carquet_sse_build_null_bitmap(const int16_t* def_levels, int64_t count,
 }
 
 /**
+ * Find the length of a run of identical int32 values starting from values[0].
+ * Returns the number of consecutive values equal to values[0].
+ * Uses SSE4.2 to compare 4 int32 values at a time.
+ */
+int64_t carquet_sse_find_run_length_i32(const int32_t* values, int64_t count) {
+    if (count == 0) return 0;
+
+    int32_t first = values[0];
+    __m128i target = _mm_set1_epi32(first);
+    int64_t i = 0;
+
+    /* Check 4 at a time */
+    for (; i + 4 <= count; i += 4) {
+        __m128i v = _mm_loadu_si128((const __m128i*)(values + i));
+        __m128i cmp = _mm_cmpeq_epi32(v, target);
+        int mask = _mm_movemask_epi8(cmp);
+
+        if (mask != 0xFFFF) {
+            /* Not all equal - find first mismatch.
+             * Each int32 produces 4 bits in the mask (all-1s if equal, all-0s if not).
+             * Find first zero bit and divide by 4 to get the lane index. */
+            int first_zero = __builtin_ctz(~mask);
+            return i + (first_zero >> 2);
+        }
+    }
+
+    /* Handle remaining */
+    for (; i < count; i++) {
+        if (values[i] != first) {
+            return i;
+        }
+    }
+
+    return count;
+}
+
+/**
  * Fill definition levels with a constant value using SIMD.
  */
 void carquet_sse_fill_def_levels(int16_t* def_levels, int64_t count, int16_t value) {

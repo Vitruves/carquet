@@ -325,6 +325,7 @@ extern int64_t carquet_sse_count_non_nulls(const int16_t* def_levels, int64_t co
 extern void carquet_sse_build_null_bitmap(const int16_t* def_levels, int64_t count,
                                            int16_t max_def_level, uint8_t* null_bitmap);
 extern void carquet_sse_fill_def_levels(int16_t* def_levels, int64_t count, int16_t value);
+extern int64_t carquet_sse_find_run_length_i32(const int32_t* values, int64_t count);
 #endif
 
 #ifdef CARQUET_ENABLE_AVX2
@@ -504,6 +505,7 @@ void carquet_simd_dispatch_init(void) {
         g_dispatch.count_non_nulls = carquet_sse_count_non_nulls;
         g_dispatch.build_null_bitmap = carquet_sse_build_null_bitmap;
         g_dispatch.fill_def_levels = carquet_sse_fill_def_levels;
+        g_dispatch.find_run_length_i32 = carquet_sse_find_run_length_i32;
     }
 #endif
 

@@ -1,0 +1,239 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 12K of event 'cycles:P'
+# Event count (approx.): 30180981945
+#
+# Overhead       Samples  Command       Shared Object      Symbol                                   
+# ........  ............  ............  .................  .........................................
+#
+    23.97%          2938  profile_read  libgomp.so.1.0.0   [.] 0x00000000000258a0
+            |
+            ---0x79b233a228a0
+               |          
+               |--23.23%--0x79b233a1f7ab
+               |          start_thread
+               |          clone3
+               |          
+                --0.74%--0x79b233a211d0
+                          carquet_batch_reader_next
+                          read_batch_loop (inlined)
+                          read_test_file
+                          main
+                          __libc_start_call_main
+                          __libc_start_main_impl (inlined)
+                          _start
+
+    14.61%          1772  profile_read  libgomp.so.1.0.0   [.] 0x00000000000258a2
+            |
+            ---0x79b233a228a2
+               |          
+               |--14.11%--0x79b233a1f7ab
+               |          start_thread
+               |          clone3
+               |          
+                --0.50%--0x79b233a211d0
+                          carquet_batch_reader_next
+                          read_batch_loop (inlined)
+                          read_test_file
+                          main
+                          __libc_start_call_main
+                          __libc_start_main_impl (inlined)
+                          _start
+
+    11.50%          1440  profile_read  libgomp.so.1.0.0   [.] 0x00000000000256c0
+            |
+            ---0x79b233a226c0
+               |          
+                --10.96%--0x79b233a1f778
+                          start_thread
+                          clone3
+
+     6.17%           705  profile_read  libc.so.6          [.] __memmove_sse2_unaligned_erms
+            |          
+             --5.87%--__memcpy_sse2_unaligned_erms (inlined)
+                       |          
+                        --5.71%--memcpy (inlined)
+                                  |          
+                                  |--3.53%--carquet_read_next_page
+                                  |          carquet_column_read_batch
+                                  |          carquet_batch_reader_next._omp_fn.1
+                                  |          |          
+                                  |           --3.43%--0x79b233a1f79e
+                                  |                     start_thread
+                                  |                     clone3
+                                  |          
+                                   --2.18%--carquet_buffer_append
+                                             |          
+                                              --0.78%--carquet_page_writer_finalize
+                                                        flush_current_page
+                                                        carquet_writer_write_batch
+                                                        write_test_file (inlined)
+                                                        main
+                                                        __libc_start_call_main
+                                                        __libc_start_main_impl (inlined)
+                                                        _start
+
+     5.83%           724  profile_read  libgomp.so.1.0.0   [.] 0x00000000000256c2
+            |          
+             --5.82%--0x79b233a226c2
+                       |          
+                        --5.63%--0x79b233a1f778
+                                  start_thread
+                                  clone3
+
+     4.87%           596  profile_read  libgomp.so.1.0.0   [.] 0x00000000000258b1
+            |
+            ---0x79b233a228b1
+               |          
+                --4.78%--0x79b233a1f7ab
+                          start_thread
+                          clone3
+
+     4.70%           576  profile_read  libgomp.so.1.0.0   [.] 0x00000000000258a9
+            |
+            ---0x79b233a228a9
+               |          
+                --4.57%--0x79b233a1f7ab
+                          start_thread
+                          clone3
+
+     4.36%           493  profile_read  profile_read       [.] carquet_crc32
+            |          
+             --4.35%--carquet_crc32_table (inlined)
+                       carquet_crc32
+                       carquet_page_writer_finalize
+                       flush_current_page
+                       carquet_writer_write_batch
+                       write_test_file (inlined)
+                       main
+                       __libc_start_call_main
+                       __libc_start_main_impl (inlined)
+                       _start
+
+     3.41%           397  profile_read  libm.so.6          [.] __cos_avx
+            |          
+            |--1.44%--do_sin (inlined)
+            |          |          
+            |          |--0.77%--__cos_avx
+            |          |          lcg_normal
+            |          |          generate_test_data (inlined)
+            |          |          main
+            |          |          __libc_start_call_main
+            |          |          __libc_start_main_impl (inlined)
+            |          |          _start
+            |          |          
+            |           --0.66%--do_sincos (inlined)
+            |                     __cos_avx
+            |                     lcg_normal
+            |                     generate_test_data (inlined)
+            |                     main
+            |                     __libc_start_call_main
+            |                     __libc_start_main_impl (inlined)
+            |                     _start
+            |          
+             --1.12%--do_cos (inlined)
+                       |          
+                        --0.87%--do_sincos (inlined)
+                                  __cos_avx
+                                  lcg_normal
+                                  generate_test_data (inlined)
+                                  main
+                                  __libc_start_call_main
+                                  __libc_start_main_impl (inlined)
+                                  _start
+
+     2.34%           274  profile_read  profile_read       [.] lcg_normal
+            |          
+             --1.91%--lcg_normal
+                       |          
+                        --1.81%--generate_test_data (inlined)
+                                  main
+                                  __libc_start_call_main
+                                  __libc_start_main_impl (inlined)
+                                  _start
+
+     2.12%           259  profile_read  libgomp.so.1.0.0   [.] 0x00000000000256cf
+            |
+            ---0x79b233a226cf
+               |          
+                --2.02%--0x79b233a1f778
+                          start_thread
+                          clone3
+
+     2.04%           253  profile_read  libgomp.so.1.0.0   [.] 0x00000000000256c9
+            |
+            ---0x79b233a226c9
+               |          
+                --1.98%--0x79b233a1f778
+                          start_thread
+                          clone3
+
+     1.82%           214  profile_read  libm.so.6          [.] __ieee754_log_avx
+            |          
+             --1.80%--__ieee754_log_avx
+                       lcg_normal
+                       generate_test_data (inlined)
+                       main
+                       __libc_start_call_main
+                       __libc_start_main_impl (inlined)
+                       _start
+
+     1.25%           151  profile_read  [kernel.kallsyms]  [k] clear_page_rep
+            |
+            ---clear_page_rep
+               get_page_from_freelist
+               __alloc_pages
+               alloc_pages_mpol
+               |          
+                --1.01%--vma_alloc_folio
+                          alloc_anon_folio
+                          do_anonymous_page
+                          handle_pte_fault
+                          __handle_mm_fault
+                          handle_mm_fault
+                          do_user_addr_fault
+                          exc_page_fault
+                          asm_exc_page_fault
+                          |          
+                           --0.73%--__memcpy_sse2_unaligned_erms (inlined)
+                                     |          
+                                      --0.69%--memcpy (inlined)
+                                                |          
+                                                 --0.54%--carquet_buffer_append
+
+     1.17%           138  profile_read  libgomp.so.1.0.0   [.] 0x00000000000258ab
+            |
+            ---0x79b233a228ab
+               |          
+                --1.06%--0x79b233a1f7ab
+                          start_thread
+                          clone3
+
+     1.14%           131  profile_read  libc.so.6          [.] __memset_sse2_unaligned_erms
+            |          
+             --1.13%--__memset_sse2_unaligned_erms
+                       |          
+                        --1.08%--memset (inlined)
+                                  load_next_page_mmap (inlined)
+                                  load_next_page (inlined)
+                                  carquet_read_next_page
+                                  carquet_column_read_batch
+                                  |          
+                                   --0.88%--carquet_batch_reader_next._omp_fn.1
+                                             |          
+                                              --0.86%--0x79b233a1f79e
+                                                        start_thread
+                                                        clone3
+
+     0.74%            87  profile_read  [kernel.kallsyms]  [k] __irqentry_text_end
+            |
+            ---__irqentry_text_end
+
+
+
+#
+# (Tip: Customize output of perf script with: perf script -F event,ip,sym)
+#
