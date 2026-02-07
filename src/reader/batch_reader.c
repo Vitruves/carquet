@@ -307,6 +307,20 @@ carquet_status_t carquet_batch_reader_next(
         num_threads = omp_get_max_threads();
     }
 
+    /* Determine if parallel prefetch is worthwhile.
+     * The prefetch phase triggers page loading (including decompression).
+     * For uncompressed mmap data, page loading is trivial (just pointer
+     * setup), so the OpenMP barrier cost (~10-50us) exceeds the work.
+     * For compressed data, parallel decompression is critical for throughput. */
+    bool needs_decompression = false;
+    for (int32_t pi = 0; pi < batch_reader->num_projected; pi++) {
+        carquet_column_reader_t* cr = batch_reader->col_readers[pi];
+        if (cr && cr->col_meta->codec != CARQUET_COMPRESSION_UNCOMPRESSED) {
+            needs_decompression = true;
+            break;
+        }
+    }
+
     /* ========================================================================
      * PARALLEL PAGE PREFETCH PHASE
      * ========================================================================
@@ -315,9 +329,12 @@ carquet_status_t carquet_batch_reader_next(
      * parallelism during decompression, we now decompress all column pages
      * simultaneously. For a file with 30 pages across 3 columns, this gives
      * up to 30-way parallelism instead of 3-way.
+     *
+     * The if(needs_decompression) clause runs this serially when columns
+     * are uncompressed, avoiding ~10-50us of barrier overhead per batch.
      */
     int32_t omp_i;  /* Declared outside for MSVC OpenMP compatibility */
-    #pragma omp parallel for num_threads(num_threads) schedule(dynamic)
+    #pragma omp parallel for num_threads(num_threads) schedule(dynamic) if(needs_decompression)
     for (omp_i = 0; omp_i < batch_reader->num_projected; omp_i++) {
         carquet_column_reader_t* col_reader = batch_reader->col_readers[omp_i];
         if (col_reader && !col_reader->page_loaded && col_reader->values_remaining > 0) {
