@@ -894,8 +894,8 @@ static int test_nullable_mixed(void) {
         TEST_FAIL("nullable_mixed", "writer creation failed");
     }
 
-    /* Mix of null and non-null */
-    int32_t values[10] = {1, 0, 3, 0, 5, 0, 7, 0, 9, 0};
+    /* Mix of null and non-null (sparse encoding: values array has only non-null values) */
+    int32_t values[5] = {1, 3, 5, 7, 9};
     int16_t def_levels[10] = {1, 0, 1, 0, 1, 0, 1, 0, 1, 0};  /* alternating */
 
     carquet_status_t status = carquet_writer_write_batch(writer, 0, values, 10, def_levels, NULL);

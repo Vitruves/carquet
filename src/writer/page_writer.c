@@ -319,171 +319,67 @@ carquet_status_t carquet_page_writer_add_values(
                       &writer->rep_levels_buffer);
     }
 
-    /* Encode values using PLAIN encoding
-     * When there are nulls (def_levels provided), we must only encode
-     * the non-null values, skipping positions where def_level < max_def_level
+    /* Encode values using PLAIN encoding.
+     *
+     * The values array uses sparse encoding: it contains only non-null values
+     * (packed at the front), with num_non_null entries. The def_levels array
+     * has num_values entries (one per logical row) indicating which rows are
+     * null vs present.
      */
     carquet_status_t status = CARQUET_OK;
-    bool has_nulls = def_levels && writer->max_def_level > 0 && num_non_null < num_values;
 
     switch (writer->type) {
         case CARQUET_PHYSICAL_BOOLEAN: {
             const uint8_t* bools = (const uint8_t*)values;
-            if (has_nulls) {
-                uint8_t* non_null_bools = malloc(num_non_null);
-                if (!non_null_bools) return CARQUET_ERROR_OUT_OF_MEMORY;
-                int64_t j = 0;
-                for (int64_t i = 0; i < num_values && j < num_non_null; i++) {
-                    if (def_levels[i] == writer->max_def_level) {
-                        non_null_bools[j++] = bools[i];
-                    }
-                }
-                status = carquet_encode_plain_boolean(non_null_bools, num_non_null,
-                                                       &writer->values_buffer);
-                free(non_null_bools);
-            } else {
-                status = carquet_encode_plain_boolean(bools, num_non_null,
-                                                       &writer->values_buffer);
-            }
+            status = carquet_encode_plain_boolean(bools, num_non_null,
+                                                   &writer->values_buffer);
             break;
         }
 
         case CARQUET_PHYSICAL_INT32: {
             const int32_t* ints = (const int32_t*)values;
-            if (has_nulls) {
-                int32_t* non_null_ints = malloc(num_non_null * sizeof(int32_t));
-                if (!non_null_ints) return CARQUET_ERROR_OUT_OF_MEMORY;
-                int64_t j = 0;
-                for (int64_t i = 0; i < num_values && j < num_non_null; i++) {
-                    if (def_levels[i] == writer->max_def_level) {
-                        non_null_ints[j++] = ints[i];
-                    }
-                }
-                status = carquet_encode_plain_int32(non_null_ints, num_non_null,
-                                                     &writer->values_buffer);
-                update_statistics_i32(writer, non_null_ints, num_non_null);
-                free(non_null_ints);
-            } else {
-                status = carquet_encode_plain_int32(ints, num_non_null,
-                                                     &writer->values_buffer);
-                update_statistics_i32(writer, ints, num_non_null);
-            }
+            status = carquet_encode_plain_int32(ints, num_non_null,
+                                                 &writer->values_buffer);
+            update_statistics_i32(writer, ints, num_non_null);
             break;
         }
 
         case CARQUET_PHYSICAL_INT64: {
             const int64_t* ints = (const int64_t*)values;
-            if (has_nulls) {
-                int64_t* non_null_ints = malloc(num_non_null * sizeof(int64_t));
-                if (!non_null_ints) return CARQUET_ERROR_OUT_OF_MEMORY;
-                int64_t j = 0;
-                for (int64_t i = 0; i < num_values && j < num_non_null; i++) {
-                    if (def_levels[i] == writer->max_def_level) {
-                        non_null_ints[j++] = ints[i];
-                    }
-                }
-                status = carquet_encode_plain_int64(non_null_ints, num_non_null,
-                                                     &writer->values_buffer);
-                update_statistics_i64(writer, non_null_ints, num_non_null);
-                free(non_null_ints);
-            } else {
-                status = carquet_encode_plain_int64(ints, num_non_null,
-                                                     &writer->values_buffer);
-                update_statistics_i64(writer, ints, num_non_null);
-            }
+            status = carquet_encode_plain_int64(ints, num_non_null,
+                                                 &writer->values_buffer);
+            update_statistics_i64(writer, ints, num_non_null);
             break;
         }
 
         case CARQUET_PHYSICAL_FLOAT: {
             const float* floats = (const float*)values;
-            if (has_nulls) {
-                float* non_null_floats = malloc(num_non_null * sizeof(float));
-                if (!non_null_floats) return CARQUET_ERROR_OUT_OF_MEMORY;
-                int64_t j = 0;
-                for (int64_t i = 0; i < num_values && j < num_non_null; i++) {
-                    if (def_levels[i] == writer->max_def_level) {
-                        non_null_floats[j++] = floats[i];
-                    }
-                }
-                status = carquet_encode_plain_float(non_null_floats, num_non_null,
-                                                     &writer->values_buffer);
-                update_statistics_float(writer, non_null_floats, num_non_null);
-                free(non_null_floats);
-            } else {
-                status = carquet_encode_plain_float(floats, num_non_null,
-                                                     &writer->values_buffer);
-                update_statistics_float(writer, floats, num_non_null);
-            }
+            status = carquet_encode_plain_float(floats, num_non_null,
+                                                 &writer->values_buffer);
+            update_statistics_float(writer, floats, num_non_null);
             break;
         }
 
         case CARQUET_PHYSICAL_DOUBLE: {
             const double* doubles = (const double*)values;
-            if (has_nulls) {
-                double* non_null_doubles = malloc(num_non_null * sizeof(double));
-                if (!non_null_doubles) return CARQUET_ERROR_OUT_OF_MEMORY;
-                int64_t j = 0;
-                for (int64_t i = 0; i < num_values && j < num_non_null; i++) {
-                    if (def_levels[i] == writer->max_def_level) {
-                        non_null_doubles[j++] = doubles[i];
-                    }
-                }
-                status = carquet_encode_plain_double(non_null_doubles, num_non_null,
-                                                      &writer->values_buffer);
-                update_statistics_double(writer, non_null_doubles, num_non_null);
-                free(non_null_doubles);
-            } else {
-                status = carquet_encode_plain_double(doubles, num_non_null,
-                                                      &writer->values_buffer);
-                update_statistics_double(writer, doubles, num_non_null);
-            }
+            status = carquet_encode_plain_double(doubles, num_non_null,
+                                                  &writer->values_buffer);
+            update_statistics_double(writer, doubles, num_non_null);
             break;
         }
 
         case CARQUET_PHYSICAL_BYTE_ARRAY: {
             const carquet_byte_array_t* arrays = (const carquet_byte_array_t*)values;
-            if (has_nulls) {
-                carquet_byte_array_t* non_null_arrays = malloc(num_non_null * sizeof(carquet_byte_array_t));
-                if (!non_null_arrays) return CARQUET_ERROR_OUT_OF_MEMORY;
-                int64_t j = 0;
-                for (int64_t i = 0; i < num_values && j < num_non_null; i++) {
-                    if (def_levels[i] == writer->max_def_level) {
-                        non_null_arrays[j++] = arrays[i];
-                    }
-                }
-                status = carquet_encode_plain_byte_array(non_null_arrays, num_non_null,
-                                                          &writer->values_buffer);
-                free(non_null_arrays);
-            } else {
-                status = carquet_encode_plain_byte_array(arrays, num_non_null,
-                                                          &writer->values_buffer);
-            }
+            status = carquet_encode_plain_byte_array(arrays, num_non_null,
+                                                      &writer->values_buffer);
             break;
         }
 
         case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY: {
             const uint8_t* fixed = (const uint8_t*)values;
-            if (has_nulls) {
-                uint8_t* non_null_fixed = malloc(num_non_null * writer->type_length);
-                if (!non_null_fixed) return CARQUET_ERROR_OUT_OF_MEMORY;
-                int64_t j = 0;
-                for (int64_t i = 0; i < num_values && j < num_non_null; i++) {
-                    if (def_levels[i] == writer->max_def_level) {
-                        memcpy(non_null_fixed + j * writer->type_length,
-                               fixed + i * writer->type_length,
-                               writer->type_length);
-                        j++;
-                    }
-                }
-                status = carquet_encode_plain_fixed_byte_array(non_null_fixed, num_non_null,
-                                                                writer->type_length,
-                                                                &writer->values_buffer);
-                free(non_null_fixed);
-            } else {
-                status = carquet_encode_plain_fixed_byte_array(fixed, num_non_null,
-                                                                writer->type_length,
-                                                                &writer->values_buffer);
-            }
+            status = carquet_encode_plain_fixed_byte_array(fixed, num_non_null,
+                                                            writer->type_length,
+                                                            &writer->values_buffer);
             break;
         }
 

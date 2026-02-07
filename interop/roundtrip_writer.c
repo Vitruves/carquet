@@ -27,7 +27,7 @@ static carquet_compression_t COMPRESSIONS[] = {
     CARQUET_COMPRESSION_ZSTD
 };
 
-/* Test data generation */
+/* Test data generation (sparse encoding: values arrays contain only non-null values) */
 static void generate_test_data(
     uint8_t* bools, int32_t* int32s, int64_t* int64s,
     float* floats, double* doubles,
@@ -40,6 +40,9 @@ static void generate_test_data(
         "alpha", "beta", "gamma", "delta", "epsilon"
     };
 
+    int string_value_count = 0;
+    int nullable_int_count = 0;
+
     for (int i = 0; i < n; i++) {
         bools[i] = (i % 2 == 0) ? 1 : 0;
         int32s[i] = i * 10 - 5000;  /* Negative and positive */
@@ -47,21 +50,25 @@ static void generate_test_data(
         floats[i] = (float)i * 0.5f - 1250.0f;
         doubles[i] = (double)i * 0.125 - 312.5;
 
-        /* Strings: every 7th is null */
+        /* Strings: every 7th is null (sparse: only non-null in values array) */
         if (i % 7 == 0) {
             string_def_levels[i] = 0;
-            strings[i].length = 0;
-            strings[i].data = NULL;
         } else {
             string_def_levels[i] = 1;
             const char* s = sample_strings[i % 10];
-            strings[i].length = (int32_t)strlen(s);
-            strings[i].data = (uint8_t*)s;
+            strings[string_value_count].length = (int32_t)strlen(s);
+            strings[string_value_count].data = (uint8_t*)s;
+            string_value_count++;
         }
 
-        /* Nullable ints: every 5th is null */
-        nullable_ints[i] = i * 100;
-        nullable_def_levels[i] = (i % 5 == 0) ? 0 : 1;
+        /* Nullable ints: every 5th is null (sparse: only non-null in values array) */
+        if (i % 5 == 0) {
+            nullable_def_levels[i] = 0;
+        } else {
+            nullable_def_levels[i] = 1;
+            nullable_ints[nullable_int_count] = i * 100;
+            nullable_int_count++;
+        }
     }
 }
 

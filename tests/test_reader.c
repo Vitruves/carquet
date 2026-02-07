@@ -15,13 +15,13 @@ static int test_version(void) {
     const char* ver = carquet_version();
     (void)ver;
     assert(ver != NULL);
-    assert(strcmp(ver, "0.1.0") == 0);
+    assert(strcmp(ver, "0.1.1") == 0);
 
     int major, minor, patch;
     carquet_version_components(&major, &minor, &patch);
     assert(major == 0);
     assert(minor == 1);
-    assert(patch == 0);
+    assert(patch == 1);
 
     TEST_PASS("version");
     return 0;

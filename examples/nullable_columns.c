@@ -156,13 +156,13 @@ static int write_nullable_data(const char* filename, carquet_schema_t* schema) {
         if (age_def_levels[i] == 0) {
             printf("%-6s ", "NULL");
         } else {
-            printf("%-6d ", ages[age_value_count - 1 - (i % 3 == 2 ? 0 : (i >= 2 ? (i - i % 3) / 3 : 0))]);
+            printf("%-6d ", ages[age_value_count - 1]);
         }
 
         if (score_def_levels[i] == 0) {
             printf("%-8s ", "NULL");
         } else {
-            printf("%-8.1f ", scores[score_value_count - 1 - (i % 4 == 3 ? 0 : (i >= 3 ? (i - i % 4) / 4 : 0))]);
+            printf("%-8.1f ", scores[score_value_count - 1]);
         }
 
         if (email_def_levels[i] == 0) {
@@ -315,13 +315,15 @@ static void explain_definition_levels(void) {
     printf("  - def_level = 1: Outer struct present, inner field is NULL\n");
     printf("  - def_level = 2: Both outer struct and inner field are present\n\n");
 
-    printf("Important: When writing, only provide non-NULL values in the values array!\n");
-    printf("The definition levels array should have one entry per logical row.\n\n");
+    printf("When writing, only provide non-NULL values in the values array\n");
+    printf("(sparse encoding). The definition levels array has one entry per\n");
+    printf("logical row. num_values = number of logical rows.\n\n");
 
     printf("Example:\n");
     printf("  Logical rows:  [10, NULL, 20, NULL, 30]\n");
-    printf("  Values array:  [10, 20, 30]  (only 3 values)\n");
-    printf("  Def levels:    [1, 0, 1, 0, 1]  (5 entries, one per row)\n\n");
+    printf("  Values array:  [10, 20, 30]       (3 non-null values, packed)\n");
+    printf("  Def levels:    [1, 0, 1, 0, 1]    (5 entries, one per row)\n");
+    printf("  num_values:    5                   (logical row count)\n\n");
 }
 
 int main(int argc, char* argv[]) {

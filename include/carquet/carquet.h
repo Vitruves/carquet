@@ -1,7 +1,7 @@
 /**
  * @file carquet.h
  * @brief Carquet - High-Performance Pure C Parquet Library
- * @version 0.1.0
+ * @version 0.1.1
  *
  * @copyright Copyright (c) 2025. All rights reserved.
  * @license MIT License
@@ -196,10 +196,10 @@ extern "C" {
 #define CARQUET_VERSION_MINOR 1
 
 /** @brief Patch version number */
-#define CARQUET_VERSION_PATCH 0
+#define CARQUET_VERSION_PATCH 1
 
 /** @brief Version string in "MAJOR.MINOR.PATCH" format */
-#define CARQUET_VERSION_STRING "0.1.0"
+#define CARQUET_VERSION_STRING "0.1.1"
 
 /** @brief Numeric version for compile-time comparisons: (MAJOR * 10000 + MINOR * 100 + PATCH) */
 #define CARQUET_VERSION_NUMBER (CARQUET_VERSION_MAJOR * 10000 + CARQUET_VERSION_MINOR * 100 + CARQUET_VERSION_PATCH)
@@ -1664,9 +1664,12 @@ carquet_writer_t* carquet_writer_create_file(
  *
  * @param[in] writer File writer
  * @param[in] column_index Column index
- * @param[in] values Input values (type must match column physical type)
- * @param[in] num_values Number of values to write
- * @param[in] def_levels Definition levels (NULL if all values defined)
+ * @param[in] values Input values (type must match column physical type).
+ *                    For nullable columns, this contains only the non-null
+ *                    values, packed contiguously (sparse encoding).
+ * @param[in] num_values Number of logical rows (length of def_levels if provided)
+ * @param[in] def_levels Definition levels (NULL if all values defined).
+ *                        One entry per logical row.
  * @param[in] rep_levels Repetition levels (NULL if no repetition)
  * @return CARQUET_OK on success
  *
@@ -1677,14 +1680,19 @@ carquet_writer_t* carquet_writer_create_file(
  * - def_level = max_def_level: value is present
  * - def_level < max_def_level: value is null
  *
+ * The values array uses sparse encoding: it contains only the non-null values,
+ * packed contiguously. The def_levels array has num_values entries (one per
+ * logical row). The number of entries in values must equal the number of
+ * entries in def_levels where def_level == max_def_level.
+ *
  * @code{.c}
- * // Write non-nullable column
+ * // Write non-nullable column (5 rows, all present)
  * int64_t ids[] = {1, 2, 3, 4, 5};
  * carquet_writer_write_batch(writer, 0, ids, 5, NULL, NULL);
  *
- * // Write nullable column with some nulls
- * double values[] = {1.1, 0.0, 3.3, 0.0, 5.5};  // 0.0 will be null
- * int16_t def_levels[] = {1, 0, 1, 0, 1};       // 0 = null, 1 = present
+ * // Write nullable column: logical rows [1.1, NULL, 3.3, NULL, 5.5]
+ * double values[] = {1.1, 3.3, 5.5};              // 3 non-null values only
+ * int16_t def_levels[] = {1, 0, 1, 0, 1};         // 5 entries, one per row
  * carquet_writer_write_batch(writer, 1, values, 5, def_levels, NULL);
  * @endcode
  */
