@@ -925,7 +925,17 @@ static carquet_status_t load_next_page_mmap(
         reader->decoded_def_levels, reader->decoded_rep_levels,
         &decoded_count, error);
 
-    free(decompressed);
+    /* For BYTE_ARRAY PLAIN columns with compressed data, retain the
+     * decompressed buffer since carquet_byte_array_t.data pointers
+     * reference it. For uncompressed mmap, pointers go directly to mmap
+     * which persists for the reader's lifetime, so no retention needed. */
+    if (decompressed && reader->type == CARQUET_PHYSICAL_BYTE_ARRAY &&
+        page_header.data_page_header.encoding == CARQUET_ENCODING_PLAIN) {
+        free(reader->page_data_for_values);
+        reader->page_data_for_values = decompressed;
+    } else {
+        free(decompressed);
+    }
 
     if (status != CARQUET_OK) {
         return status;
@@ -1097,11 +1107,26 @@ static carquet_status_t load_next_page_fread(
         reader->decoded_def_levels, reader->decoded_rep_levels,
         &decoded_count, error);
 
-    if (page_data != compressed) {
-        free(page_data);
-    }
-    if (compressed) {
-        free(compressed);
+    /* For BYTE_ARRAY PLAIN columns, the decoded carquet_byte_array_t structs
+     * have .data pointers into the page data buffer. Retain the buffer so
+     * these pointers remain valid until the next page is loaded. */
+    bool retain = (reader->type == CARQUET_PHYSICAL_BYTE_ARRAY &&
+                   page_header.data_page_header.encoding == CARQUET_ENCODING_PLAIN);
+
+    if (retain) {
+        free(reader->page_data_for_values);
+        reader->page_data_for_values = page_data;
+        /* Free compressed buffer only if it's a separate allocation */
+        if (compressed && compressed != page_data) {
+            free(compressed);
+        }
+    } else {
+        if (page_data != compressed) {
+            free(page_data);
+        }
+        if (compressed) {
+            free(compressed);
+        }
     }
 
     if (status != CARQUET_OK) {

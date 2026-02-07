@@ -131,6 +131,9 @@ struct carquet_column_reader {
     int32_t dictionary_count;
     uint32_t* dictionary_offsets;  /* Offset cache for O(1) BYTE_ARRAY lookup */
 
+    /* Retained page data for BYTE_ARRAY value pointers */
+    uint8_t* page_data_for_values;
+
     /* Current page state for partial reads */
     bool page_loaded;           /* Is a page currently loaded? */
     int32_t page_num_values;    /* Total values in current page */

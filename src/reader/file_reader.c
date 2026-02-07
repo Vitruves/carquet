@@ -547,6 +547,7 @@ void carquet_column_reader_free(carquet_column_reader_t* reader) {
     if (!reader) return;
 
     free(reader->page_buffer);
+    free(reader->page_data_for_values);
     free(reader->dictionary_data);
     free(reader->dictionary_offsets);
 
