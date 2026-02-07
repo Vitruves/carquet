@@ -303,6 +303,16 @@ void thrift_read_list_begin(thrift_decoder_t* dec,
     if (*count < 0) {
         set_error(dec, CARQUET_ERROR_THRIFT_DECODE, "Negative list size");
         *count = 0;
+        return;
+    }
+
+    /* Each list element consumes at least 1 byte, so count cannot exceed
+     * remaining data.  This prevents billion-iteration busy loops from
+     * malicious varints in tiny payloads. */
+    size_t remaining = carquet_buffer_reader_remaining(&dec->reader);
+    if ((size_t)*count > remaining) {
+        set_error(dec, CARQUET_ERROR_THRIFT_DECODE, "List count exceeds remaining data");
+        *count = 0;
     }
 }
 
@@ -334,6 +344,18 @@ void thrift_read_map_begin(thrift_decoder_t* dec,
         return;
     }
 
+    /* Each map entry consumes at least 1 byte (types byte already read
+     * separately), so count cannot exceed remaining data.  This prevents
+     * billion-iteration busy loops from malicious varints. */
+    size_t remaining = carquet_buffer_reader_remaining(&dec->reader);
+    if ((size_t)*count > remaining) {
+        set_error(dec, CARQUET_ERROR_THRIFT_DECODE, "Map count exceeds remaining data");
+        *count = 0;
+        *key_type = THRIFT_TYPE_STOP;
+        *value_type = THRIFT_TYPE_STOP;
+        return;
+    }
+
     /* Key and value types in one byte */
     uint8_t types = read_byte_raw(dec);
     *key_type = (thrift_type_t)((types >> 4) & 0x0F);
@@ -352,6 +374,10 @@ void thrift_skip(thrift_decoder_t* dec, thrift_type_t type) {
 
     switch (type) {
         case THRIFT_TYPE_STOP:
+            /* STOP is a struct terminator, never a value type to skip.
+             * Treating it as a no-op would cause infinite loops when it
+             * appears as a container element type from malformed data. */
+            set_error(dec, CARQUET_ERROR_THRIFT_DECODE, "Cannot skip STOP type");
             break;
 
         case THRIFT_TYPE_TRUE:

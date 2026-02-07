@@ -33,7 +33,7 @@ Carquet is **not** a replacement for Apache Arrow. Arrow is the industry standar
 | Write speed (ARM) | Baseline | **1.5-5x faster** |
 | Write speed (x86) | Baseline | **1.2-1.4x faster** |
 | Read speed (ARM) | Baseline | ~same to 1.3x faster |
-| Read speed (x86) | **Baseline** | 1.5-2x slower |
+| Read speed (x86) | Baseline | 1.5-2x slower |
 | ZSTD file size | Baseline | **~1.4x smaller** |
 | Nested types | **Full support** | Basic |
 | Encryption | **Yes** | No |
