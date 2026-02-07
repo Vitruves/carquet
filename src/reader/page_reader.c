@@ -616,6 +616,15 @@ static carquet_status_t load_dictionary_page_mmap(
         reader, page_data, page_size,
         &page_header.dictionary_page_header, error);
 
+    /* Compute actual first data page offset from dictionary page layout.
+     * Some writers (e.g. DuckDB) set data_page_offset incorrectly for
+     * dictionary-encoded columns. The reliable offset is always right
+     * after the dictionary page: dict_offset + header + compressed data. */
+    if (status == CARQUET_OK) {
+        reader->data_start_offset = dict_offset + (int64_t)header_size +
+                                    page_header.compressed_page_size;
+    }
+
     free(decompressed);  /* Safe to free NULL */
     return status;
 }
@@ -725,6 +734,16 @@ static carquet_status_t load_dictionary_page_fread(
         reader, page_data, page_size,
         &page_header.dictionary_page_header, error);
 
+    /* Compute actual first data page offset from dictionary page layout.
+     * Some writers (e.g. DuckDB) set data_page_offset incorrectly for
+     * dictionary-encoded columns. The reliable offset is always right
+     * after the dictionary page: dict_offset + header + compressed data. */
+    if (status == CARQUET_OK) {
+        reader->data_start_offset = col_meta->dictionary_page_offset +
+                                    (int64_t)header_size +
+                                    page_header.compressed_page_size;
+    }
+
     if (page_data != compressed) {
         free(page_data);
     } else {
@@ -746,9 +765,8 @@ static carquet_status_t load_next_page_mmap(
     carquet_reader_t* file_reader = reader->file_reader;
     const uint8_t* mmap_data = file_reader->mmap_data;
     const parquet_column_metadata_t* col_meta = reader->col_meta;
-    int64_t data_offset = col_meta->data_page_offset;
 
-    /* Load dictionary if needed */
+    /* Load dictionary if needed (may update data_start_offset) */
     if (col_meta->has_dictionary_page_offset && !reader->has_dictionary) {
         carquet_status_t status = load_dictionary_page_mmap(reader, error);
         if (status != CARQUET_OK) {
@@ -757,7 +775,7 @@ static carquet_status_t load_next_page_mmap(
     }
 
     /* Parse page header directly from mmap */
-    int64_t page_offset = data_offset + reader->current_page;
+    int64_t page_offset = reader->data_start_offset + reader->current_page;
     const uint8_t* header_ptr = mmap_data + page_offset;
 
     parquet_page_header_t page_header;
@@ -934,9 +952,8 @@ static carquet_status_t load_next_page_fread(
     carquet_reader_t* file_reader = reader->file_reader;
     FILE* file = file_reader->file;
     const parquet_column_metadata_t* col_meta = reader->col_meta;
-    int64_t data_offset = col_meta->data_page_offset;
 
-    /* Load dictionary if needed */
+    /* Load dictionary if needed (may update data_start_offset) */
     if (col_meta->has_dictionary_page_offset && !reader->has_dictionary) {
         carquet_status_t status = load_dictionary_page_fread(reader, error);
         if (status != CARQUET_OK) {
@@ -945,6 +962,7 @@ static carquet_status_t load_next_page_fread(
     }
 
     /* Seek to data page */
+    int64_t data_offset = reader->data_start_offset;
     if (fseek(file, data_offset + reader->current_page, SEEK_SET) != 0) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_SEEK, "Failed to seek to data page");
         return CARQUET_ERROR_FILE_SEEK;

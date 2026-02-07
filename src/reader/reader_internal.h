@@ -116,6 +116,7 @@ struct carquet_column_reader {
 
     /* Reading state */
     int64_t values_remaining;
+    int64_t data_start_offset;    /* Actual offset of first data page in file */
     int64_t current_page;
 
     /* Page data */

@@ -538,6 +538,7 @@ carquet_column_reader_t* carquet_reader_get_column(
     col_reader->type_length = schema_elem->type_length;
 
     col_reader->values_remaining = col_reader->col_meta->num_values;
+    col_reader->data_start_offset = col_reader->col_meta->data_page_offset;
 
     return col_reader;
 }
