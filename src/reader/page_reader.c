@@ -6,6 +6,7 @@
  */
 
 #include "core/allocator.h"
+#include "core/compat.h"
 #include <carquet/carquet.h>
 #include "reader_internal.h"
 #include "thrift/parquet_types.h"
@@ -155,9 +156,8 @@ static size_t prebuf_read_at(carquet_reader_t* file_reader,
         return size;
     }
 
-    /* Fall back to fseek + fread */
-    if (offset > LONG_MAX) return 0;
-    if (fseek(file_reader->file, (long)offset, SEEK_SET) != 0) return 0;
+    /* Fall back to 64-bit aware seek + fread */
+    if (carquet_fseek64(file_reader->file, (int64_t)offset, SEEK_SET) != 0) return 0;
     return fread(buf, 1, size, file_reader->file);
 }
 

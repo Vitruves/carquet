@@ -1053,8 +1053,11 @@ void carquet_simd_dispatch_init(void) {
     g_dispatch.checked_gather_i64 = carquet_neon_checked_gather_i64;
     g_dispatch.checked_gather_float = carquet_neon_checked_gather_float;
     g_dispatch.checked_gather_double = carquet_neon_checked_gather_double;
-    g_dispatch.byte_split_encode_float = carquet_neon_byte_stream_split_encode_float;
-    g_dispatch.byte_split_decode_float = carquet_neon_byte_stream_split_decode_float;
+    /* Byte-stream-split: keep the scalar/compiler path for float (the
+     * auto-vectorized 4-byte transpose beats hand-written NEON on Apple
+     * Silicon), but use NEON for double, where the scalar 8-byte transpose
+     * does not auto-vectorize well. Measured on M3: NEON double encode
+     * ~2.0x, decode ~1.3x faster than scalar, byte-exact identical output. */
     g_dispatch.byte_split_encode_double = carquet_neon_byte_stream_split_encode_double;
     g_dispatch.byte_split_decode_double = carquet_neon_byte_stream_split_decode_double;
     g_dispatch.unpack_bools = carquet_neon_unpack_bools;
@@ -1066,11 +1069,13 @@ void carquet_simd_dispatch_init(void) {
     g_dispatch.build_null_bitmap = carquet_neon_build_null_bitmap;
     g_dispatch.fill_def_levels = carquet_neon_fill_def_levels;
     g_dispatch.minmax_i32 = carquet_neon_minmax_i32;
-    g_dispatch.minmax_i64 = carquet_neon_minmax_i64;
+    /* i64 min/max is a short loop with scalar compares on NEON, and measured
+     * slower than the compiler-generated scalar path on Apple Silicon. */
     g_dispatch.minmax_float = carquet_neon_minmax_float;
     g_dispatch.minmax_double = carquet_neon_minmax_double;
     g_dispatch.copy_minmax_i32 = carquet_neon_copy_minmax_i32;
-    g_dispatch.copy_minmax_i64 = carquet_neon_copy_minmax_i64;
+    /* Same for i64 copy+minmax: keep scalar copy/min/max, which measured
+     * substantially faster than the NEON implementation. */
     g_dispatch.copy_minmax_float = carquet_neon_copy_minmax_float;
     g_dispatch.copy_minmax_double = carquet_neon_copy_minmax_double;
     g_dispatch.bitunpack8_u32[1] = carquet_neon_bitunpack8_1bit;

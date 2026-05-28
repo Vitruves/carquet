@@ -28,6 +28,7 @@
 #endif
 
 #include <carquet/carquet.h>
+#include "core/compat.h"
 
 /* Portable temp directory helper */
 static const char* get_temp_dir(void) {
@@ -1273,10 +1274,10 @@ static int test_compression_roundtrip(carquet_compression_t compression, const c
     /* Get file size for compression ratio */
     FILE* f = fopen(test_file, "rb");
     if (f) {
-        fseek(f, 0, SEEK_END);
-        long size = ftell(f);
+        carquet_fseek64(f, 0, SEEK_END);
+        int64_t size = carquet_ftell64(f);
         fclose(f);
-        printf("  %s: file size = %ld bytes (raw = 4000)\n", name, size);
+        printf("  %s: file size = %lld bytes (raw = 4000)\n", name, (long long)size);
     }
 
     carquet_reader_close(reader);
@@ -1529,10 +1530,10 @@ static int test_stress_large_data(void) {
 
     /* Get file size */
     FILE* f = fopen(test_file, "rb");
-    long file_size = 0;
+    int64_t file_size = 0;
     if (f) {
-        fseek(f, 0, SEEK_END);
-        file_size = ftell(f);
+        carquet_fseek64(f, 0, SEEK_END);
+        file_size = carquet_ftell64(f);
         fclose(f);
     }
 

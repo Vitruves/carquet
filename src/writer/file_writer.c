@@ -1899,17 +1899,8 @@ carquet_status_t carquet_writer_close(carquet_writer_t* writer) {
     if (writer->is_buffer_writer && writer->file) {
         fflush(writer->file);
         int64_t file_size = -1;
-#if defined(_WIN32)
-        if (_fseeki64(writer->file, 0, SEEK_END) == 0)
-            file_size = _ftelli64(writer->file);
-#elif defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L || \
-      defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
-        if (fseeko(writer->file, 0, SEEK_END) == 0)
-            file_size = (int64_t)ftello(writer->file);
-#else
-        if (fseek(writer->file, 0, SEEK_END) == 0)
-            file_size = (int64_t)ftell(writer->file);
-#endif
+        if (carquet_fseek64(writer->file, 0, SEEK_END) == 0)
+            file_size = carquet_ftell64(writer->file);
         if (file_size > 0) {
             writer->output_buffer = carquet_mem_malloc((size_t)file_size);
             if (!writer->output_buffer) {

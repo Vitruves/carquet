@@ -219,6 +219,23 @@ typedef struct carquet_column_writer_internal {
     int64_t dict_total_nulls;
     bool has_dictionary_page;           /* Set when a dict page was emitted */
     int64_t dictionary_page_size_bytes; /* Size of the emitted dict page */
+
+    /* Deferred-encode state. For non-dictionary, compressed, fixed-stride
+     * columns in a parallel-capable row group, write_batch stashes the raw
+     * input verbatim instead of encoding+compressing eagerly on the caller's
+     * thread. The whole stashed batch is replayed through the normal eager
+     * encode path inside the OpenMP per-column finalize, so encode AND
+     * compression run concurrently across columns. Output is byte-identical
+     * to the eager path (same bytes, same code, different thread). */
+    bool defer_encode;
+    carquet_buffer_t deferred_values;   /* full-width raw value bytes */
+    int64_t deferred_count;             /* logical values stashed */
+    int16_t* deferred_def_levels;
+    size_t deferred_def_capacity;
+    int64_t deferred_def_count;
+    int16_t* deferred_rep_levels;
+    size_t deferred_rep_capacity;
+    int64_t deferred_rep_count;
 } carquet_column_writer_internal_t;
 
 /* ============================================================================
@@ -278,6 +295,7 @@ carquet_column_writer_internal_t* carquet_column_writer_create(
     writer->dictionary_page_size_limit = 1024 * 1024;
     carquet_buffer_init(&writer->dict_values);
     carquet_buffer_init(&writer->dict_ba_storage);
+    carquet_buffer_init(&writer->deferred_values);
 
     return writer;
 }
@@ -292,6 +310,9 @@ void carquet_column_writer_destroy(carquet_column_writer_internal_t* writer) {
         carquet_buffer_destroy(&writer->column_buffer);
         carquet_buffer_destroy(&writer->dict_values);
         carquet_buffer_destroy(&writer->dict_ba_storage);
+        carquet_buffer_destroy(&writer->deferred_values);
+        carquet_mem_free(writer->deferred_def_levels);
+        carquet_mem_free(writer->deferred_rep_levels);
         carquet_mem_free(writer->dict_ba);
         carquet_mem_free(writer->dict_def_levels);
         carquet_mem_free(writer->dict_rep_levels);
@@ -331,6 +352,29 @@ void carquet_column_writer_set_data_page_v2(
     }
 }
 
+static size_t physical_type_stride(carquet_physical_type_t type,
+                                   int32_t type_length);
+
+/* True when this column would benefit from deferred encode: a non-dictionary
+ * (dictionary already defers to finalize), compressed, fixed-stride column.
+ * Uncompressed columns gain nothing (no compression to parallelize) and would
+ * only pay an extra stash copy; variable-length BYTE_ARRAY is not stashed. */
+bool carquet_column_writer_defer_eligible(
+    const carquet_column_writer_internal_t* writer) {
+    if (!writer) return false;
+    if (writer->use_dictionary) return false;
+    if (writer->compression == CARQUET_COMPRESSION_UNCOMPRESSED) return false;
+    return physical_type_stride(writer->type, writer->type_length) > 0;
+}
+
+void carquet_column_writer_set_defer_encode(
+    carquet_column_writer_internal_t* writer, bool enabled) {
+    if (writer) {
+        writer->defer_encode =
+            enabled && carquet_column_writer_defer_eligible(writer);
+    }
+}
+
 const parquet_geospatial_statistics_t* carquet_column_writer_get_geo_stats(
     const carquet_column_writer_internal_t* writer) {
     if (!writer) return NULL;
@@ -356,6 +400,10 @@ void carquet_column_writer_reset(carquet_column_writer_internal_t* writer) {
 
     carquet_buffer_clear(&writer->dict_values);
     carquet_buffer_clear(&writer->dict_ba_storage);
+    carquet_buffer_clear(&writer->deferred_values);
+    writer->deferred_count = 0;
+    writer->deferred_def_count = 0;
+    writer->deferred_rep_count = 0;
     writer->dict_value_count = 0;
     writer->dict_def_count = 0;
     writer->dict_rep_count = 0;
@@ -788,24 +836,17 @@ static carquet_status_t dict_accumulate(
     return CARQUET_OK;
 }
 
-carquet_status_t carquet_column_writer_write_batch(
+/* Encode + (eagerly) compress one batch through the page pipeline. Does NOT
+ * track total_values; the caller owns that so the deferred replay path does
+ * not double-count. This is the exact, unchanged eager encode path; the
+ * deferred path replays a whole row group's stashed input through it from
+ * inside the OpenMP per-column finalize, so the output is byte-identical. */
+static carquet_status_t encode_batch_eager(
     carquet_column_writer_internal_t* writer,
     const void* values,
     int64_t num_values,
     const int16_t* def_levels,
     const int16_t* rep_levels) {
-
-    if (!writer || !values) {
-        return CARQUET_ERROR_INVALID_ARGUMENT;
-    }
-
-    if (writer->use_dictionary) {
-        carquet_status_t s = dict_accumulate(writer, values, num_values,
-                                             def_levels, rep_levels);
-        if (s != CARQUET_OK) return s;
-        writer->total_values += num_values;
-        return CARQUET_OK;
-    }
 
     /* For fixed-size types, split large batches into page-sized chunks.
      * This keeps the working set in cache and avoids huge buffer
@@ -851,8 +892,6 @@ carquet_status_t carquet_column_writer_write_batch(
 
         if (status != CARQUET_OK) return status;
 
-        writer->total_values += chunk;
-
         bloom_filter_insert_chunk(writer, chunk_values, chunk,
                                   def_levels ? def_levels + offset : NULL);
 
@@ -869,6 +908,102 @@ carquet_status_t carquet_column_writer_write_batch(
         }
     }
 
+    return CARQUET_OK;
+}
+
+/* Stash a full-width batch verbatim for deferred encode. Levels are copied so
+ * the caller's buffers need not outlive the call (matching the eager API
+ * contract). Only used for fixed-stride types (stride > 0). */
+static carquet_status_t stash_deferred_batch(
+    carquet_column_writer_internal_t* writer,
+    const void* values,
+    int64_t num_values,
+    const int16_t* def_levels,
+    const int16_t* rep_levels) {
+
+    size_t stride = physical_type_stride(writer->type, writer->type_length);
+    carquet_status_t s = carquet_buffer_append(
+        &writer->deferred_values, (const uint8_t*)values,
+        (size_t)num_values * stride);
+    if (s != CARQUET_OK) return s;
+
+    if (writer->max_def_level > 0) {
+        s = dict_levels_reserve(&writer->deferred_def_levels,
+                                &writer->deferred_def_capacity,
+                                writer->deferred_def_count + num_values);
+        if (s != CARQUET_OK) return s;
+        if (def_levels) {
+            memcpy(writer->deferred_def_levels + writer->deferred_def_count,
+                   def_levels, (size_t)num_values * sizeof(int16_t));
+        } else {
+            carquet_dispatch_fill_def_levels(
+                writer->deferred_def_levels + writer->deferred_def_count,
+                num_values, writer->max_def_level);
+        }
+        writer->deferred_def_count += num_values;
+    }
+    if (writer->max_rep_level > 0 && rep_levels) {
+        s = dict_levels_reserve(&writer->deferred_rep_levels,
+                                &writer->deferred_rep_capacity,
+                                writer->deferred_rep_count + num_values);
+        if (s != CARQUET_OK) return s;
+        memcpy(writer->deferred_rep_levels + writer->deferred_rep_count,
+               rep_levels, (size_t)num_values * sizeof(int16_t));
+        writer->deferred_rep_count += num_values;
+    }
+    writer->deferred_count += num_values;
+    return CARQUET_OK;
+}
+
+/* Replay all stashed input through the eager encode path. Called from
+ * carquet_column_writer_finalize, which runs inside the OpenMP per-column
+ * parallel region, so encode + compression run concurrently across columns. */
+static carquet_status_t drain_deferred(
+    carquet_column_writer_internal_t* writer) {
+    if (writer->deferred_count == 0) return CARQUET_OK;
+    carquet_status_t s = encode_batch_eager(
+        writer, writer->deferred_values.data, writer->deferred_count,
+        writer->max_def_level > 0 ? writer->deferred_def_levels : NULL,
+        writer->max_rep_level > 0 ? writer->deferred_rep_levels : NULL);
+    /* Free the stash early; the column buffer now holds the encoded pages. */
+    carquet_buffer_clear(&writer->deferred_values);
+    writer->deferred_count = 0;
+    writer->deferred_def_count = 0;
+    writer->deferred_rep_count = 0;
+    return s;
+}
+
+carquet_status_t carquet_column_writer_write_batch(
+    carquet_column_writer_internal_t* writer,
+    const void* values,
+    int64_t num_values,
+    const int16_t* def_levels,
+    const int16_t* rep_levels) {
+
+    if (!writer || !values) {
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (writer->use_dictionary) {
+        carquet_status_t s = dict_accumulate(writer, values, num_values,
+                                             def_levels, rep_levels);
+        if (s != CARQUET_OK) return s;
+        writer->total_values += num_values;
+        return CARQUET_OK;
+    }
+
+    if (writer->defer_encode) {
+        carquet_status_t s = stash_deferred_batch(writer, values, num_values,
+                                                  def_levels, rep_levels);
+        if (s != CARQUET_OK) return s;
+        writer->total_values += num_values;
+        return CARQUET_OK;
+    }
+
+    carquet_status_t s = encode_batch_eager(writer, values, num_values,
+                                            def_levels, rep_levels);
+    if (s != CARQUET_OK) return s;
+    writer->total_values += num_values;
     return CARQUET_OK;
 }
 
@@ -1164,6 +1299,13 @@ carquet_status_t carquet_column_writer_finalize(
             return status;
         }
     } else {
+        /* Replay any deferred input here. This runs inside the OpenMP
+         * per-column parallel finalize, so encode + compression of distinct
+         * columns proceed concurrently. */
+        status = drain_deferred(writer);
+        if (status != CARQUET_OK) {
+            return status;
+        }
         /* Flush any remaining data */
         status = flush_current_page(writer);
         if (status != CARQUET_OK) {

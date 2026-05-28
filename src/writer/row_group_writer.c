@@ -85,6 +85,8 @@ extern void carquet_column_writer_set_crc(
     carquet_column_writer_internal_t* writer, bool enabled);
 extern void carquet_column_writer_set_data_page_v2(
     carquet_column_writer_internal_t* writer, bool enabled);
+extern void carquet_column_writer_set_defer_encode(
+    carquet_column_writer_internal_t* writer, bool enabled);
 extern void carquet_column_writer_reset(
     carquet_column_writer_internal_t* writer);
 
@@ -461,6 +463,13 @@ carquet_status_t carquet_row_group_writer_write_column(
     if (!writer || column_index < 0 || column_index >= writer->num_columns) {
         return CARQUET_ERROR_INVALID_ARGUMENT;
     }
+
+    /* Defer encode+compress to the parallel per-column finalize only when that
+     * finalize will actually run in parallel. num_columns and write_page_index
+     * are fixed before any write, so this is invariant across a row group's
+     * batches; set_defer_encode also self-gates on column eligibility. */
+    carquet_column_writer_set_defer_encode(
+        writer->column_writers[column_index], can_parallel_finalize(writer));
 
     return carquet_column_writer_write_batch(
         writer->column_writers[column_index],

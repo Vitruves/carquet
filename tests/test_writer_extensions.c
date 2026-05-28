@@ -14,6 +14,7 @@
 #include <carquet/carquet.h>
 #include "thrift/parquet_types.h"
 #include "core/bitpack.h"
+#include "core/compat.h"
 #include "test_helpers.h"
 #include <stdio.h>
 #include <string.h>
@@ -64,9 +65,9 @@ static int test_int96_roundtrip(void) {
 static int read_file(const char* path, uint8_t** buf, size_t* size) {
     FILE* f = fopen(path, "rb");
     if (!f) return 0;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    carquet_fseek64(f, 0, SEEK_END);
+    int64_t sz = carquet_ftell64(f);
+    carquet_fseek64(f, 0, SEEK_SET);
     if (sz <= 0) { fclose(f); return 0; }
     *buf = (uint8_t*)malloc((size_t)sz);
     if (!*buf) { fclose(f); return 0; }

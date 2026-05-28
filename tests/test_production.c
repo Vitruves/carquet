@@ -18,6 +18,7 @@
 #include <limits.h>
 
 #include <carquet/carquet.h>
+#include "core/compat.h"
 #include "test_helpers.h"
 
 #define NUM_ROWS 10000
@@ -1140,9 +1141,9 @@ static int test_buffer_reading(void) {
         TEST_FAIL("buffer_reading", "failed to open file");
     }
 
-    fseek(f, 0, SEEK_END);
-    size_t size = (size_t)ftell(f);
-    fseek(f, 0, SEEK_SET);
+    carquet_fseek64(f, 0, SEEK_END);
+    size_t size = (size_t)carquet_ftell64(f);
+    carquet_fseek64(f, 0, SEEK_SET);
 
     uint8_t* buffer = malloc(size);
     if (!buffer) {

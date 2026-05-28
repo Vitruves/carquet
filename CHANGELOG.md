@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.5.1
+
+Bug-fix + performance release. No public API/ABI change; default output bytes unchanged.
+
+### Bug Fixes
+
+- **Windows large-file reads (>2 GiB)**: `src/reader/file_reader.c` and `src/reader/page_reader.c` used plain `fseek`/`ftell`, which silently truncate on 64-bit Windows where `long` is 32-bit. All I/O now routes through `carquet_fseek64`/`carquet_ftell64` (`src/core/compat.h`) dispatching to `_fseeki64`/`_ftelli64` on Windows, `fseeko`/`ftello` on POSIX. Tests migrated too so Windows CI exercises the wrappers.
+
+### Performance
+
+- **Parallel encode + compress**: non-dictionary, compressed, fixed-stride columns now stash raw input during `write_batch` and replay the unchanged eager encode path inside the OpenMP per-column finalize, so encode and compression run concurrently across columns. Output byte-identical to the eager path; self-gated per column and per row group, no cost when not applicable.
+- **NEON dispatch tuned**: dropped hand-written NEON paths for `byte_stream_split` float and i64 min/max + copy-min/max — measured slower than the auto-vectorized scalar on Apple M3. Double `byte_stream_split` and i32/float/double min/max keep their NEON paths. Bit-identical output.
+
 ## v0.5.0
 
 Closes several Arrow-interoperability and Parquet-conformance gaps: dictionary writing, writer encoding breadth (now symmetric — readable by carquet itself), the `INTERVAL` logical type, `sorting_columns` metadata, per-column bloom configuration, a row-count page-flush knob, INT96 writing, opt-in Data Page V2 writing, opt-in `ARROW:schema` footer metadata, correct FLOAT16 statistics ordering, deprecated BIT_PACKED level decoding, GEOMETRY/GEOGRAPHY GeospatialStatistics, and the Arrow-writer parity knobs (TIMESTAMP coercion/truncation, `write_batch_size`). No new dependencies; default output bytes are unchanged (every addition is opt-in, a previously-unsupported type, or a read-path/spec-correctness fix). It also lands an API/correctness audit: previously-unlinkable public functions are implemented, a configured custom allocator is now actually honored library-wide, row-group predicate pushdown is type-correct, and x86 SIMD feature dispatch is OS-state-gated and race-free.

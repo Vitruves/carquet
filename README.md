@@ -559,8 +559,9 @@ python3 interop/run_interop.py
 | Feature | Status |
 |---------|--------|
 | Physical types | All 8 (BOOLEAN through FIXED_LEN_BYTE_ARRAY) |
-| Logical types | STRING, DATE, TIME, TIMESTAMP, DECIMAL, UUID, JSON |
-| Encodings | PLAIN, RLE, DICTIONARY, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT |
+| Logical types | STRING, DATE, TIME, TIMESTAMP, DECIMAL, UUID, JSON, INTERVAL, FLOAT16, VARIANT, GEOMETRY, GEOGRAPHY |
+| Encodings | PLAIN, RLE, DICTIONARY, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT (read + write) |
+| Data Page versions | V1 (default) and V2 (read + write) |
 | Compression | UNCOMPRESSED, SNAPPY, GZIP, LZ4, ZSTD |
 | Nested schemas | Groups, lists, maps with definition/repetition levels |
 | Bloom filters | Read, write, and query (`carquet_bloom_filter_check_*`) |

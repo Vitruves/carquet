@@ -4,6 +4,7 @@
  */
 
 #include "core/allocator.h"
+#include "core/compat.h"
 #include <carquet/carquet.h>
 #include "reader_internal.h"
 #include "thrift/parquet_types.h"
@@ -239,13 +240,13 @@ void carquet_reader_options_init(carquet_reader_options_t* options) {
 #define CARQUET_FOOTER_SPECULATIVE_SIZE (64 * 1024)
 
 static carquet_status_t read_footer(carquet_reader_t* reader, carquet_error_t* error) {
-    /* Seek to end to get file size */
-    if (fseek(reader->file, 0, SEEK_END) != 0) {
+    /* Seek to end to get file size (64-bit aware for files >2 GiB on Windows) */
+    if (carquet_fseek64(reader->file, 0, SEEK_END) != 0) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_SEEK, "Failed to seek to end");
         return CARQUET_ERROR_FILE_SEEK;
     }
 
-    long file_size = ftell(reader->file);
+    int64_t file_size = carquet_ftell64(reader->file);
     if (file_size < 0) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_READ, "Failed to get file size");
         return CARQUET_ERROR_FILE_READ;
@@ -269,8 +270,8 @@ static carquet_status_t read_footer(carquet_reader_t* reader, carquet_error_t* e
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
 
-    long spec_offset = (long)(reader->file_size - spec_size);
-    if (fseek(reader->file, spec_offset, SEEK_SET) != 0) {
+    int64_t spec_offset = (int64_t)(reader->file_size - spec_size);
+    if (carquet_fseek64(reader->file, spec_offset, SEEK_SET) != 0) {
         carquet_mem_free(spec_buf);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_SEEK, "Failed to seek to footer");
         return CARQUET_ERROR_FILE_SEEK;
@@ -312,8 +313,8 @@ static carquet_status_t read_footer(carquet_reader_t* reader, carquet_error_t* e
             return CARQUET_ERROR_OUT_OF_MEMORY;
         }
 
-        long footer_offset = (long)(reader->file_size - 8 - footer_size);
-        if (fseek(reader->file, footer_offset, SEEK_SET) != 0) {
+        int64_t footer_offset = (int64_t)(reader->file_size - 8 - footer_size);
+        if (carquet_fseek64(reader->file, footer_offset, SEEK_SET) != 0) {
             carquet_mem_free(fallback_buf);
             carquet_mem_free(spec_buf);
             CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_SEEK, "Failed to seek to footer data");
@@ -768,8 +769,7 @@ carquet_status_t carquet_reader_prebuffer(
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
 
-    if (min_offset > LONG_MAX ||
-        fseek(reader->file, (long)min_offset, SEEK_SET) != 0) {
+    if (carquet_fseek64(reader->file, (int64_t)min_offset, SEEK_SET) != 0) {
         carquet_mem_free(buf);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_SEEK, "Failed to seek for prebuffer");
         return CARQUET_ERROR_FILE_SEEK;
@@ -1045,17 +1045,7 @@ static carquet_status_t reader_read_bytes(
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
 
-    /* Use 64-bit seek when available (long is 32-bit on Win64) */
-    int seek_ok;
-#if defined(_WIN32)
-    seek_ok = _fseeki64(reader->file, (__int64)offset, SEEK_SET);
-#elif defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L || \
-      defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
-    seek_ok = fseeko(reader->file, (off_t)offset, SEEK_SET);
-#else
-    seek_ok = fseek(reader->file, (long)offset, SEEK_SET);
-#endif
-    if (seek_ok != 0) {
+    if (carquet_fseek64(reader->file, (int64_t)offset, SEEK_SET) != 0) {
         carquet_mem_free(buf);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_SEEK,
             "Failed to seek to offset %lld", (long long)offset);

@@ -10,6 +10,7 @@
 
 #include <carquet/carquet.h>
 #include "reader/reader_internal.h"
+#include "core/compat.h"
 #include "test_helpers.h"
 
 /* Bloom filter API (from bloom_filter.c) */
@@ -119,7 +120,7 @@ static int test_bloom_filter_write(void) {
 
     uint8_t* bf0_data = malloc(bf0_length);
     assert(bf0_data);
-    fseek(f, (long)bf0_offset, SEEK_SET);
+    carquet_fseek64(f, bf0_offset, SEEK_SET);
     assert(fread(bf0_data, 1, bf0_length, f) == (size_t)bf0_length);
 
     /* The bloom filter data starts after the Thrift header.
