@@ -158,7 +158,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                 (void)carquet_column_index_boundary_order(ci);
                 for (int32_t p = 0; p < np && p < 5; p++) {
                     carquet_page_stats_t ps;
-                    carquet_column_index_get_page_stats(ci, p, &ps);
+                    (void)carquet_column_index_get_page_stats(ci, p, &ps);
                     (void)ps.min_value;
                     (void)ps.null_count;
                 }
@@ -172,7 +172,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                 int32_t np = carquet_offset_index_num_pages(oi);
                 for (int32_t p = 0; p < np && p < 5; p++) {
                     carquet_page_location_t loc;
-                    carquet_offset_index_get_page_location(oi, p, &loc);
+                    (void)carquet_offset_index_get_page_location(oi, p, &loc);
                     (void)loc.offset;
                 }
                 carquet_offset_index_free(oi);

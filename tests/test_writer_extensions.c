@@ -458,6 +458,473 @@ static int test_write_batch_size(void) {
     return 0;
 }
 
+/* ---- Append row groups to existing file ---- */
+static int test_append_row_groups(void) {
+    char path[512]; carquet_test_temp_path(path, sizeof(path), "ext_append");
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    enum { N1 = 1000, N2 = 1500, N3 = 800 };
+    static int32_t v1[N1], v2[N2], v3[N3], out[N1 + N2 + N3];
+    for (int i = 0; i < N1; i++) v1[i] = i;
+    for (int i = 0; i < N2; i++) v2[i] = N1 + i;
+    for (int i = 0; i < N3; i++) v3[i] = N1 + N2 + i;
+
+    /* Build schema reused across the three writers. */
+    carquet_schema_t* s = carquet_schema_create(&err);
+    if (!s) TEST_FAIL("append", "schema");
+    if (carquet_schema_add_column(s, "v", CARQUET_PHYSICAL_INT32, NULL,
+            CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK)
+        { carquet_schema_free(s); TEST_FAIL("append", "add col"); }
+
+    /* 1) Initial write: one row group with v1. */
+    {
+        carquet_writer_t* w = carquet_writer_create(path, s, NULL, &err);
+        if (!w) { carquet_schema_free(s); TEST_FAIL("append", "create"); }
+        if (carquet_writer_add_metadata(w, "origin", "v0.5") != CARQUET_OK ||
+            carquet_writer_write_batch(w, 0, v1, N1, NULL, NULL) != CARQUET_OK ||
+            carquet_writer_close(w) != CARQUET_OK)
+            { carquet_schema_free(s); carquet_test_cleanup(path);
+              TEST_FAIL("append", "initial write"); }
+    }
+
+    /* 2) Append: add a second row group with v2. */
+    {
+        carquet_writer_t* w = carquet_writer_open_append(path, s, NULL, &err);
+        if (!w) { carquet_schema_free(s); carquet_test_cleanup(path);
+                  TEST_FAIL("append", "open_append"); }
+        if (carquet_writer_write_batch(w, 0, v2, N2, NULL, NULL) != CARQUET_OK ||
+            carquet_writer_close(w) != CARQUET_OK)
+            { carquet_schema_free(s); carquet_test_cleanup(path);
+              TEST_FAIL("append", "append1 write"); }
+    }
+
+    /* 3) Append again: a third row group with v3 plus extra metadata. */
+    {
+        carquet_writer_t* w = carquet_writer_open_append(path, s, NULL, &err);
+        if (!w) { carquet_schema_free(s); carquet_test_cleanup(path);
+                  TEST_FAIL("append", "open_append2"); }
+        if (carquet_writer_add_metadata(w, "appended", "yes") != CARQUET_OK ||
+            carquet_writer_write_batch(w, 0, v3, N3, NULL, NULL) != CARQUET_OK ||
+            carquet_writer_close(w) != CARQUET_OK)
+            { carquet_schema_free(s); carquet_test_cleanup(path);
+              TEST_FAIL("append", "append2 write"); }
+    }
+    carquet_schema_free(s);
+
+    /* Verify: three row groups, correct total, values intact in order. */
+    carquet_reader_t* r = carquet_reader_open(path, NULL, &err);
+    if (!r) { carquet_test_cleanup(path); TEST_FAIL("append", "open reader"); }
+    int32_t num_rg = carquet_reader_num_row_groups(r);
+    int64_t num_rows = carquet_reader_num_rows(r);
+    int ok = (num_rg == 3) && (num_rows == N1 + N2 + N3);
+    if (ok) {
+        int64_t got = 0;
+        for (int32_t rg = 0; rg < num_rg && ok; rg++) {
+            carquet_column_reader_t* c =
+                carquet_reader_get_column(r, rg, 0, &err);
+            if (!c) { ok = 0; break; }
+            int64_t n = carquet_column_read_batch(c, out + got,
+                                                  N1 + N2 + N3 - got,
+                                                  NULL, NULL);
+            carquet_column_reader_free(c);
+            if (n < 0) { ok = 0; break; }
+            got += n;
+        }
+        ok = ok && (got == N1 + N2 + N3);
+        if (ok) {
+            for (int i = 0; i < N1 + N2 + N3 && ok; i++) ok = (out[i] == i);
+        }
+    }
+    carquet_reader_close(r);
+
+    /* Schema-mismatch rejection: open append with a schema that has the
+     * wrong physical type. */
+    if (ok) {
+        carquet_schema_t* bad = carquet_schema_create(&err);
+        carquet_schema_add_column(bad, "v", CARQUET_PHYSICAL_INT64, NULL,
+                                  CARQUET_REPETITION_REQUIRED, 0, 0);
+        carquet_writer_t* w = carquet_writer_open_append(path, bad, NULL, &err);
+        ok = ok && (w == NULL);
+        if (w) carquet_writer_close(w);
+        carquet_schema_free(bad);
+
+        /* A rejected append must NOT destroy the pre-existing file: the
+         * original three row groups must still be readable intact. */
+        if (ok) {
+            carquet_reader_t* r2 = carquet_reader_open(path, NULL, &err);
+            ok = ok && (r2 != NULL)
+                && (carquet_reader_num_row_groups(r2) == 3)
+                && (carquet_reader_num_rows(r2) == N1 + N2 + N3);
+            if (r2) carquet_reader_close(r2);
+        }
+    }
+
+    /* Logical-type-mismatch rejection: same physical type (INT32) but a logical
+     * annotation the existing chunks lack must be rejected, not silently
+     * appended into a semantically inconsistent file. */
+    if (ok) {
+        carquet_logical_type_t int_lt = { .id = CARQUET_LOGICAL_INTEGER };
+        int_lt.params.integer.bit_width = 32;
+        int_lt.params.integer.is_signed = true;
+        carquet_schema_t* bad_lt = carquet_schema_create(&err);
+        carquet_schema_add_column(bad_lt, "v", CARQUET_PHYSICAL_INT32, &int_lt,
+                                  CARQUET_REPETITION_REQUIRED, 0, 0);
+        carquet_writer_t* w = carquet_writer_open_append(path, bad_lt, NULL, &err);
+        ok = ok && (w == NULL);
+        if (w) carquet_writer_close(w);
+        carquet_schema_free(bad_lt);
+    }
+    carquet_test_cleanup(path);
+
+    if (!ok) TEST_FAIL("append", "roundtrip / schema-check failed");
+    TEST_PASS("append");
+    return 0;
+}
+
+/* ---- Truncated BYTE_ARRAY statistics ---- */
+/* Writes one BYTE_ARRAY value of `value_len` bytes filled with `fill`, then
+ * reads back the stored min size. Returns -1 on failure. */
+static int32_t write_and_read_min_size(int64_t cap, int value_len, uint8_t fill,
+                                       int32_t* out_max_size) {
+    char path[512]; carquet_test_temp_path(path, sizeof(path), "ext_stats_trunc");
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    int32_t min_size = -1;
+    if (out_max_size) *out_max_size = -1;
+
+    static uint8_t buf[512];
+    if (value_len > (int)sizeof(buf)) return -1;
+    memset(buf, fill, (size_t)value_len);
+    carquet_byte_array_t v;
+    v.data = buf;
+    v.length = value_len;
+
+    carquet_schema_t* s = carquet_schema_create(&err);
+    if (!s) return -1;
+    carquet_logical_type_t str_lt = { .id = CARQUET_LOGICAL_STRING };
+    if (carquet_schema_add_column(s, "v", CARQUET_PHYSICAL_BYTE_ARRAY, &str_lt,
+            CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK)
+        { carquet_schema_free(s); return -1; }
+
+    carquet_writer_options_t wo; carquet_writer_options_init(&wo);
+    carquet_writer_t* w = carquet_writer_create(path, s, &wo, &err);
+    if (!w) { carquet_schema_free(s); return -1; }
+    if (cap > 0 && carquet_writer_set_max_statistics_size(w, cap) != CARQUET_OK)
+        { carquet_writer_close(w); carquet_schema_free(s);
+          carquet_test_cleanup(path); return -1; }
+
+    if (carquet_writer_write_batch(w, 0, &v, 1, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_close(w) != CARQUET_OK)
+        { carquet_schema_free(s); carquet_test_cleanup(path); return -1; }
+    carquet_schema_free(s);
+
+    carquet_reader_t* r = carquet_reader_open(path, NULL, &err);
+    if (r) {
+        carquet_column_statistics_t st;
+        if (carquet_reader_column_statistics(r, 0, 0, &st) == CARQUET_OK &&
+            st.has_min_max) {
+            min_size = st.min_value_size;
+            if (out_max_size) *out_max_size = st.max_value_size;
+        } else if (out_max_size) {
+            /* min/max suppressed — return 0 to flag the edge case. */
+            *out_max_size = 0;
+            min_size = 0;
+        }
+        carquet_reader_close(r);
+    }
+    carquet_test_cleanup(path);
+    return min_size;
+}
+
+static int test_max_statistics_size(void) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    (void)err;
+
+    /* Validation: non-positive bytes rejected. */
+    {
+        carquet_schema_t* s = carquet_schema_create(&err);
+        carquet_schema_add_column(s, "v", CARQUET_PHYSICAL_INT32, NULL,
+                                  CARQUET_REPETITION_REQUIRED, 0, 0);
+        char path[512]; carquet_test_temp_path(path, sizeof(path), "ext_stats_v");
+        carquet_writer_t* w = carquet_writer_create(path, s, NULL, &err);
+        int validation_ok =
+            (carquet_writer_set_max_statistics_size(w, 0) ==
+                CARQUET_ERROR_INVALID_ARGUMENT) &&
+            (carquet_writer_set_max_statistics_size(w, -1) ==
+                CARQUET_ERROR_INVALID_ARGUMENT);
+        carquet_writer_close(w); carquet_schema_free(s); carquet_test_cleanup(path);
+        if (!validation_ok) TEST_FAIL("max_statistics_size", "validation");
+    }
+
+    /* Default cap (32): a 100-byte value is truncated to 32. */
+    int32_t n = write_and_read_min_size(0 /* unchanged */, 100, 'A', NULL);
+    if (n != 32) TEST_FAIL("max_statistics_size", "default cap should produce 32-byte min");
+
+    /* Custom cap of 64: same value truncated to 64. */
+    n = write_and_read_min_size(64, 100, 'A', NULL);
+    if (n != 64) TEST_FAIL("max_statistics_size", "cap=64 should produce 64-byte min");
+
+    /* Cap larger than value: no truncation. */
+    n = write_and_read_min_size(200, 50, 'A', NULL);
+    if (n != 50) TEST_FAIL("max_statistics_size", "cap > value should not truncate");
+
+    /* Cap of 1 byte: smallest legal cap, still works. */
+    n = write_and_read_min_size(1, 100, 'A', NULL);
+    if (n != 1) TEST_FAIL("max_statistics_size", "cap=1 should produce 1-byte min");
+
+    /* All-0xFF input with cap < length: max prefix can't be incremented, so
+     * the writer suppresses max — which currently makes has_min_max false in
+     * the reader API (it only surfaces min+max as a pair). The point of the
+     * test is that the file is still well-formed, not corrupted by an
+     * invalid bound. */
+    int32_t max_size = -1;
+    n = write_and_read_min_size(32, 50, 0xFF, &max_size);
+    /* n == 0 / max_size == 0 means the pair was suppressed, which is the
+     * intended behavior for the all-0xFF edge case. */
+    if (!(n == 0 && max_size == 0))
+        TEST_FAIL("max_statistics_size", "all-0xFF max should be suppressed");
+
+    TEST_PASS("max_statistics_size");
+    return 0;
+}
+
+/* ---- Per-column page size override ---- */
+/* With one column overridden to a tiny page size and another left at the
+ * (large) default, the small-page column must accumulate many more pages.
+ * We use the offset index to count pages exactly. */
+static int test_column_page_size_override(void) {
+    char path[512]; carquet_test_temp_path(path, sizeof(path), "ext_col_pgsz");
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    enum { ROWS = 20000 };
+    static int32_t big_col[ROWS], small_col[ROWS];
+    for (int i = 0; i < ROWS; i++) { big_col[i] = i; small_col[i] = i; }
+
+    carquet_schema_t* s = carquet_schema_create(&err);
+    if (!s) TEST_FAIL("column_page_size", "schema");
+    if (carquet_schema_add_column(s, "big", CARQUET_PHYSICAL_INT32, NULL,
+            CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK ||
+        carquet_schema_add_column(s, "small", CARQUET_PHYSICAL_INT32, NULL,
+            CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK)
+        { carquet_schema_free(s); TEST_FAIL("column_page_size", "add cols"); }
+
+    carquet_writer_options_t wo; carquet_writer_options_init(&wo);
+    wo.page_size = 1024 * 1024;        /* default: one big page per column */
+    wo.write_page_index = true;        /* we need the offset index to count */
+    carquet_writer_t* w = carquet_writer_create(path, s, &wo, &err);
+    if (!w) { carquet_schema_free(s); TEST_FAIL("column_page_size", "writer"); }
+
+    /* Validation: reject non-positive bytes and out-of-range index. */
+    if (carquet_writer_set_column_page_size(w, 0, 0) != CARQUET_ERROR_INVALID_ARGUMENT ||
+        carquet_writer_set_column_page_size(w, 0, -1) != CARQUET_ERROR_INVALID_ARGUMENT ||
+        carquet_writer_set_column_page_size(w, 99, 1024) != CARQUET_ERROR_INVALID_ARGUMENT) {
+        carquet_writer_close(w); carquet_schema_free(s); carquet_test_cleanup(path);
+        TEST_FAIL("column_page_size", "validation");
+    }
+    /* Override column 1 to a tiny page size — forces many pages. */
+    if (carquet_writer_set_column_page_size(w, 1, 1024) != CARQUET_OK)
+        { carquet_writer_close(w); carquet_schema_free(s); carquet_test_cleanup(path);
+          TEST_FAIL("column_page_size", "set override"); }
+
+    if (carquet_writer_write_batch(w, 0, big_col, ROWS, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_write_batch(w, 1, small_col, ROWS, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_close(w) != CARQUET_OK)
+        { carquet_schema_free(s); carquet_test_cleanup(path);
+          TEST_FAIL("column_page_size", "write"); }
+    carquet_schema_free(s);
+
+    carquet_reader_t* r = carquet_reader_open(path, NULL, &err);
+    if (!r) { carquet_test_cleanup(path); TEST_FAIL("column_page_size", "open"); }
+    carquet_offset_index_t* oi_big = carquet_reader_get_offset_index(r, 0, 0, &err);
+    carquet_offset_index_t* oi_small = carquet_reader_get_offset_index(r, 0, 1, &err);
+    int32_t n_big = oi_big ? carquet_offset_index_num_pages(oi_big) : -1;
+    int32_t n_small = oi_small ? carquet_offset_index_num_pages(oi_small) : -1;
+    carquet_offset_index_free(oi_big);
+    carquet_offset_index_free(oi_small);
+    carquet_reader_close(r); carquet_test_cleanup(path);
+
+    /* big_col fits in one page at the default 1 MB page size; small_col with
+     * 1 KB pages must produce many. Lower bound 5 is generous — at 1 KB / 4 B
+     * stride we expect ~80, but exact count depends on header overhead. */
+    if (n_big != 1)
+        TEST_FAIL("column_page_size", "default column should produce 1 page");
+    if (n_small < 5)
+        TEST_FAIL("column_page_size", "overridden column did not split into many pages");
+    TEST_PASS("column_page_size");
+    return 0;
+}
+
+/* ---- Custom codec registration ---- */
+/* Trivial "identity" codec: stores values uncompressed but goes through the
+ * codec dispatch path so we can prove user callbacks are reached. We register
+ * it against the BROTLI slot, which has no built-in — that proves the API can
+ * fill an otherwise-unsupported slot. */
+static int g_identity_compress_calls;
+static int g_identity_decompress_calls;
+static int g_identity_user_token = 0xC0DEC;
+
+static carquet_status_t identity_compress(
+    const uint8_t* src, size_t src_size,
+    uint8_t* dst, size_t dst_capacity, size_t* out_size,
+    int32_t level, void* user_data) {
+    (void)level;
+    if (user_data != &g_identity_user_token) return CARQUET_ERROR_INVALID_ARGUMENT;
+    if (src_size > dst_capacity) return CARQUET_ERROR_INVALID_ARGUMENT;
+    memcpy(dst, src, src_size);
+    *out_size = src_size;
+    g_identity_compress_calls++;
+    return CARQUET_OK;
+}
+
+static carquet_status_t identity_decompress(
+    const uint8_t* src, size_t src_size,
+    uint8_t* dst, size_t dst_capacity, size_t* out_size,
+    void* user_data) {
+    if (user_data != &g_identity_user_token) return CARQUET_ERROR_INVALID_ARGUMENT;
+    if (src_size > dst_capacity) return CARQUET_ERROR_INVALID_ARGUMENT;
+    memcpy(dst, src, src_size);
+    *out_size = src_size;
+    g_identity_decompress_calls++;
+    return CARQUET_OK;
+}
+
+static size_t identity_bound(size_t src_size, void* user_data) {
+    (void)user_data;
+    return src_size;
+}
+
+static int test_custom_codec(void) {
+    char path[512]; carquet_test_temp_path(path, sizeof(path), "ext_custom_codec");
+    carquet_error_t err = CARQUET_ERROR_INIT;
+
+    /* Validation: NULL function pointer, UNCOMPRESSED slot, out-of-range
+     * slot all rejected; NULL impl is the documented unregister path. */
+    carquet_custom_codec_t bad = { 0 };
+    if (carquet_register_codec(CARQUET_COMPRESSION_BROTLI, &bad) !=
+            CARQUET_ERROR_INVALID_ARGUMENT)
+        TEST_FAIL("custom_codec", "NULL fn ptrs should be rejected");
+    carquet_custom_codec_t ok_codec = {
+        .compress = identity_compress,
+        .decompress = identity_decompress,
+        .compress_bound = identity_bound,
+        .user_data = &g_identity_user_token,
+    };
+    if (carquet_register_codec(CARQUET_COMPRESSION_UNCOMPRESSED, &ok_codec) !=
+            CARQUET_ERROR_INVALID_ARGUMENT)
+        TEST_FAIL("custom_codec", "UNCOMPRESSED override should be rejected");
+    if (carquet_register_codec((carquet_compression_t)99, &ok_codec) !=
+            CARQUET_ERROR_INVALID_ARGUMENT)
+        TEST_FAIL("custom_codec", "out-of-range slot should be rejected");
+
+    /* Register on the BROTLI slot — no built-in, so this proves the slot is
+     * truly reachable through the user callback. */
+    if (carquet_register_codec(CARQUET_COMPRESSION_BROTLI, &ok_codec) != CARQUET_OK)
+        TEST_FAIL("custom_codec", "register failed");
+
+    g_identity_compress_calls = 0;
+    g_identity_decompress_calls = 0;
+
+    enum { M = 1024 };
+    static int32_t in[M], out[M];
+    for (int i = 0; i < M; i++) in[i] = i * 7 - 100;
+
+    carquet_schema_t* s = carquet_schema_create(&err);
+    if (!s) TEST_FAIL("custom_codec", "schema");
+    if (carquet_schema_add_column(s, "v", CARQUET_PHYSICAL_INT32, NULL,
+            CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK)
+        { carquet_schema_free(s); TEST_FAIL("custom_codec", "add col"); }
+
+    carquet_writer_options_t wo; carquet_writer_options_init(&wo);
+    wo.compression = CARQUET_COMPRESSION_BROTLI;
+    carquet_writer_t* w = carquet_writer_create(path, s, &wo, &err);
+    if (!w) { carquet_schema_free(s); carquet_test_cleanup(path);
+              TEST_FAIL("custom_codec", "writer create"); }
+    if (carquet_writer_write_batch(w, 0, in, M, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_close(w) != CARQUET_OK)
+        { carquet_schema_free(s); carquet_test_cleanup(path);
+          TEST_FAIL("custom_codec", "write"); }
+    carquet_schema_free(s);
+
+    if (g_identity_compress_calls == 0)
+        { carquet_test_cleanup(path); TEST_FAIL("custom_codec", "compress not called"); }
+
+    /* Read back through carquet's reader: must hit the registered decompress. */
+    carquet_reader_t* r = carquet_reader_open(path, NULL, &err);
+    if (!r) { carquet_test_cleanup(path); TEST_FAIL("custom_codec", "open"); }
+    carquet_column_reader_t* c = carquet_reader_get_column(r, 0, 0, &err);
+    int64_t n = c ? carquet_column_read_batch(c, out, M, NULL, NULL) : -1;
+    int ok = (n == M) && (memcmp(in, out, sizeof(in)) == 0) &&
+             (g_identity_decompress_calls > 0);
+    carquet_column_reader_free(c); carquet_reader_close(r);
+    carquet_test_cleanup(path);
+
+    /* Unregister; subsequent BROTLI writes must now fail with UNSUPPORTED_CODEC,
+     * proving NULL really clears the slot. */
+    if (carquet_register_codec(CARQUET_COMPRESSION_BROTLI, NULL) != CARQUET_OK)
+        TEST_FAIL("custom_codec", "unregister failed");
+
+    char path2[512]; carquet_test_temp_path(path2, sizeof(path2), "ext_custom_codec2");
+    carquet_schema_t* s2 = carquet_schema_create(&err);
+    carquet_schema_add_column(s2, "v", CARQUET_PHYSICAL_INT32, NULL,
+                              CARQUET_REPETITION_REQUIRED, 0, 0);
+    carquet_writer_options_t wo2; carquet_writer_options_init(&wo2);
+    wo2.compression = CARQUET_COMPRESSION_BROTLI;
+    carquet_writer_t* w2 = carquet_writer_create(path2, s2, &wo2, &err);
+    int unregister_ok = 1;
+    if (w2) {
+        /* Writer creation may succeed and defer the codec call until first
+         * page emit; either the write or the close should now surface the
+         * missing-codec error. */
+        carquet_status_t wst = carquet_writer_write_batch(w2, 0, in, M, NULL, NULL);
+        carquet_status_t cst = carquet_writer_close(w2);
+        unregister_ok = (wst == CARQUET_ERROR_UNSUPPORTED_CODEC) ||
+                        (cst == CARQUET_ERROR_UNSUPPORTED_CODEC);
+    }
+    carquet_schema_free(s2);
+    carquet_test_cleanup(path2);
+
+    if (!ok) TEST_FAIL("custom_codec", "roundtrip mismatch or decompress not called");
+    if (!unregister_ok) TEST_FAIL("custom_codec", "unregister did not clear slot");
+    TEST_PASS("custom_codec");
+    return 0;
+}
+
+/* ---- File format version (FileMetaData.version) ---- */
+static int test_file_format_version_one(int requested, int expected) {
+    char path[512]; carquet_test_temp_path(path, sizeof(path), "ext_ver");
+    carquet_error_t err = CARQUET_ERROR_INIT;
+
+    carquet_schema_t* s = carquet_schema_create(&err);
+    if (!s) TEST_FAIL("file_format_version", "schema create");
+    if (carquet_schema_add_column(s, "v", CARQUET_PHYSICAL_INT32, NULL,
+            CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK)
+        { carquet_schema_free(s); TEST_FAIL("file_format_version", "add col"); }
+
+    carquet_writer_options_t wo; carquet_writer_options_init(&wo);
+    wo.file_format_version = requested;
+    carquet_writer_t* w = carquet_writer_create(path, s, &wo, &err);
+    if (!w) { carquet_schema_free(s); TEST_FAIL("file_format_version", "writer"); }
+    int32_t in[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+    if (carquet_writer_write_batch(w, 0, in, 8, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_close(w) != CARQUET_OK)
+        { carquet_schema_free(s); carquet_test_cleanup(path);
+          TEST_FAIL("file_format_version", "write"); }
+    carquet_schema_free(s);
+
+    carquet_file_info_t info;
+    carquet_status_t st = carquet_get_file_info(path, &info, &err);
+    int ok = (st == CARQUET_OK) && (info.version == expected);
+    carquet_test_cleanup(path);
+    if (!ok) TEST_FAIL("file_format_version", "footer version mismatch");
+    return 0;
+}
+
+static int test_file_format_version(void) {
+    if (test_file_format_version_one(1, 1)) return 1;   /* explicit v1 */
+    if (test_file_format_version_one(2, 2)) return 1;   /* explicit v2 */
+    if (test_file_format_version_one(0, 2)) return 1;   /* invalid -> v2 */
+    if (test_file_format_version_one(99, 2)) return 1;  /* invalid -> v2 */
+    TEST_PASS("file_format_version");
+    return 0;
+}
+
 int main(void) {
     int failures = 0;
     failures += test_int96_roundtrip();
@@ -470,6 +937,11 @@ int main(void) {
     failures += test_geospatial_stats();
     failures += test_timestamp_coercion();
     failures += test_write_batch_size();
+    failures += test_file_format_version();
+    failures += test_custom_codec();
+    failures += test_column_page_size_override();
+    failures += test_max_statistics_size();
+    failures += test_append_row_groups();
     if (failures) { printf("\n%d test(s) FAILED\n", failures); return 1; }
     printf("\nAll writer-extension tests passed\n");
     return 0;

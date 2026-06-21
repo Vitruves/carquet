@@ -14,6 +14,7 @@
 #include "core/geo_wkb.h"
 #include "encoding/plain.h"
 #include "encoding/rle.h"
+#include "compression/custom.h"
 #include "thrift/thrift_decode.h"
 #include "thrift/thrift_encode.h"
 #include "thrift/parquet_types.h"
@@ -1064,9 +1065,14 @@ carquet_status_t carquet_page_writer_add_values(
      * If def_levels is NULL for an OPTIONAL column, generate all-present levels
      * since Parquet requires definition levels for non-REQUIRED columns. */
     if (writer->max_def_level > 0) {
+        /* Encode raw RLE with no length prefix. A V1 page accumulates the
+         * levels of one or more add_values calls; the single 4-byte length
+         * prefix that V1 requires is written once at page assembly time
+         * (see build_page_payload / finalize). Concatenated raw RLE runs
+         * decode as one stream, so multi-chunk pages stay spec-conformant. */
         status = encode_levels(def_levels, num_values, writer->max_def_level,
                                &writer->def_levels_buffer,
-                               !writer->data_page_v2);
+                               false);
         if (status != CARQUET_OK) {
             goto fail;
         }
@@ -1076,7 +1082,7 @@ carquet_status_t carquet_page_writer_add_values(
     if (writer->max_rep_level > 0 && rep_levels) {
         status = encode_levels(rep_levels, num_values, writer->max_rep_level,
                                &writer->rep_levels_buffer,
-                               !writer->data_page_v2);
+                               false);
         if (status != CARQUET_OK) {
             goto fail;
         }
@@ -1299,23 +1305,31 @@ static carquet_status_t compress_data(
         return CARQUET_OK;
     }
 
+    /* User-registered codec (if any) wins over the built-in. */
+    carquet_custom_codec_t custom;
+    bool have_custom = carquet_custom_codec_lookup(codec, &custom);
+
     size_t bound = 0;
-    switch (codec) {
-        case CARQUET_COMPRESSION_SNAPPY:
-            bound = carquet_snappy_compress_bound(input_size);
-            break;
-        case CARQUET_COMPRESSION_LZ4:
-        case CARQUET_COMPRESSION_LZ4_RAW:
-            bound = carquet_lz4_compress_bound(input_size);
-            break;
-        case CARQUET_COMPRESSION_GZIP:
-            bound = carquet_gzip_compress_bound(input_size);
-            break;
-        case CARQUET_COMPRESSION_ZSTD:
-            bound = carquet_zstd_compress_bound(input_size);
-            break;
-        default:
-            return CARQUET_ERROR_UNSUPPORTED_CODEC;
+    if (have_custom) {
+        bound = custom.compress_bound(input_size, custom.user_data);
+    } else {
+        switch (codec) {
+            case CARQUET_COMPRESSION_SNAPPY:
+                bound = carquet_snappy_compress_bound(input_size);
+                break;
+            case CARQUET_COMPRESSION_LZ4:
+            case CARQUET_COMPRESSION_LZ4_RAW:
+                bound = carquet_lz4_compress_bound(input_size);
+                break;
+            case CARQUET_COMPRESSION_GZIP:
+                bound = carquet_gzip_compress_bound(input_size);
+                break;
+            case CARQUET_COMPRESSION_ZSTD:
+                bound = carquet_zstd_compress_bound(input_size);
+                break;
+            default:
+                return CARQUET_ERROR_UNSUPPORTED_CODEC;
+        }
     }
 
     /* Ensure temp buffer is large enough */
@@ -1330,28 +1344,34 @@ static carquet_status_t compress_data(
     size_t local_compressed_size = 0;
     carquet_status_t status;
 
-    switch (codec) {
-        case CARQUET_COMPRESSION_SNAPPY:
-            status = carquet_snappy_compress(input, input_size,
-                                              compressed, bound, &local_compressed_size);
-            break;
-        case CARQUET_COMPRESSION_LZ4:
-        case CARQUET_COMPRESSION_LZ4_RAW:
-            status = carquet_lz4_compress(input, input_size,
-                                           compressed, bound, &local_compressed_size);
-            break;
-        case CARQUET_COMPRESSION_GZIP:
-            status = carquet_gzip_compress(input, input_size,
-                                            compressed, bound, &local_compressed_size,
-                                            compression_level > 0 ? compression_level : 6);
-            break;
-        case CARQUET_COMPRESSION_ZSTD:
-            status = carquet_zstd_compress(input, input_size,
-                                            compressed, bound, &local_compressed_size,
-                                            compression_level > 0 ? compression_level : 3);
-            break;
-        default:
-            status = CARQUET_ERROR_UNSUPPORTED_CODEC;
+    if (have_custom) {
+        status = custom.compress(input, input_size, compressed, bound,
+                                 &local_compressed_size, compression_level,
+                                 custom.user_data);
+    } else {
+        switch (codec) {
+            case CARQUET_COMPRESSION_SNAPPY:
+                status = carquet_snappy_compress(input, input_size,
+                                                  compressed, bound, &local_compressed_size);
+                break;
+            case CARQUET_COMPRESSION_LZ4:
+            case CARQUET_COMPRESSION_LZ4_RAW:
+                status = carquet_lz4_compress(input, input_size,
+                                               compressed, bound, &local_compressed_size);
+                break;
+            case CARQUET_COMPRESSION_GZIP:
+                status = carquet_gzip_compress(input, input_size,
+                                                compressed, bound, &local_compressed_size,
+                                                compression_level > 0 ? compression_level : 6);
+                break;
+            case CARQUET_COMPRESSION_ZSTD:
+                status = carquet_zstd_compress(input, input_size,
+                                                compressed, bound, &local_compressed_size,
+                                                compression_level > 0 ? compression_level : 3);
+                break;
+            default:
+                status = CARQUET_ERROR_UNSUPPORTED_CODEC;
+        }
     }
 
     if (status != CARQUET_OK) {
@@ -1364,14 +1384,29 @@ static carquet_status_t compress_data(
     return CARQUET_OK;
 }
 
+/* Append a V1 level section to a growable buffer: a 4-byte little-endian
+ * length prefix followed by the raw RLE bytes. The page writer stores levels
+ * without a prefix (so multiple add_values calls concatenate into one valid
+ * RLE stream); this writes the single per-section prefix the V1 page format
+ * requires, exactly once, at assembly time. */
+static carquet_status_t append_v1_level_section(
+    carquet_buffer_t* out, const carquet_buffer_t* lvl) {
+    carquet_status_t s = carquet_buffer_append_u32_le(out, (uint32_t)lvl->size);
+    if (s != CARQUET_OK) return s;
+    return carquet_buffer_append(out, lvl->data, lvl->size);
+}
+
 static carquet_status_t build_page_payload(
     carquet_page_writer_t* writer,
     const uint8_t** payload_data,
     size_t* payload_size) {
 
+    /* Each present level section gains a 4-byte length prefix. */
     size_t total_size = writer->rep_levels_buffer.size +
                         writer->def_levels_buffer.size +
-                        writer->values_buffer.size;
+                        writer->values_buffer.size +
+                        (writer->rep_levels_buffer.size > 0 ? 4 : 0) +
+                        (writer->def_levels_buffer.size > 0 ? 4 : 0);
 
     if (writer->rep_levels_buffer.size == 0 && writer->def_levels_buffer.size == 0) {
         *payload_data = writer->values_buffer.data;
@@ -1386,18 +1421,16 @@ static carquet_status_t build_page_payload(
     }
 
     if (writer->rep_levels_buffer.size > 0) {
-        status = carquet_buffer_append(&writer->staging_buffer,
-                                       writer->rep_levels_buffer.data,
-                                       writer->rep_levels_buffer.size);
+        status = append_v1_level_section(&writer->staging_buffer,
+                                         &writer->rep_levels_buffer);
         if (status != CARQUET_OK) {
             return status;
         }
     }
 
     if (writer->def_levels_buffer.size > 0) {
-        status = carquet_buffer_append(&writer->staging_buffer,
-                                       writer->def_levels_buffer.data,
-                                       writer->def_levels_buffer.size);
+        status = append_v1_level_section(&writer->staging_buffer,
+                                         &writer->def_levels_buffer);
         if (status != CARQUET_OK) {
             return status;
         }
@@ -1431,12 +1464,22 @@ static uint32_t compute_page_crc(
     }
 
     uint32_t crc = 0;
+    /* Mirror the on-disk layout: each level section is preceded by a 4-byte
+     * little-endian length prefix (see append_v1_level_section). */
     if (writer->rep_levels_buffer.size > 0) {
+        uint32_t n = (uint32_t)writer->rep_levels_buffer.size;
+        uint8_t pfx[4] = { (uint8_t)(n & 0xFF), (uint8_t)((n >> 8) & 0xFF),
+                           (uint8_t)((n >> 16) & 0xFF), (uint8_t)((n >> 24) & 0xFF) };
+        crc = carquet_crc32_update(crc, pfx, 4);
         crc = carquet_crc32_update(crc,
                                    writer->rep_levels_buffer.data,
                                    writer->rep_levels_buffer.size);
     }
     if (writer->def_levels_buffer.size > 0) {
+        uint32_t n = (uint32_t)writer->def_levels_buffer.size;
+        uint8_t pfx[4] = { (uint8_t)(n & 0xFF), (uint8_t)((n >> 8) & 0xFF),
+                           (uint8_t)((n >> 16) & 0xFF), (uint8_t)((n >> 24) & 0xFF) };
+        crc = carquet_crc32_update(crc, pfx, 4);
         crc = carquet_crc32_update(crc,
                                    writer->def_levels_buffer.data,
                                    writer->def_levels_buffer.size);
@@ -1704,7 +1747,9 @@ carquet_status_t carquet_page_writer_finalize_to_buffer(
     if (writer->compression == CARQUET_COMPRESSION_UNCOMPRESSED) {
         *uncompressed_size = (int32_t)(writer->rep_levels_buffer.size +
                                        writer->def_levels_buffer.size +
-                                       writer->values_buffer.size);
+                                       writer->values_buffer.size +
+                                       (writer->rep_levels_buffer.size > 0 ? 4 : 0) +
+                                       (writer->def_levels_buffer.size > 0 ? 4 : 0));
         *compressed_size = *uncompressed_size;
 
         uint32_t page_crc = compute_page_crc(writer, NULL, 0);
@@ -1724,18 +1769,16 @@ carquet_status_t carquet_page_writer_finalize_to_buffer(
 
         if (has_levels) {
             if (writer->rep_levels_buffer.size > 0) {
-                status = carquet_buffer_append(output_buffer,
-                                              writer->rep_levels_buffer.data,
-                                              writer->rep_levels_buffer.size);
+                status = append_v1_level_section(output_buffer,
+                                                 &writer->rep_levels_buffer);
                 if (status != CARQUET_OK) {
                     output_buffer->size = page_start;
                     return status;
                 }
             }
             if (writer->def_levels_buffer.size > 0) {
-                status = carquet_buffer_append(output_buffer,
-                                              writer->def_levels_buffer.data,
-                                              writer->def_levels_buffer.size);
+                status = append_v1_level_section(output_buffer,
+                                                 &writer->def_levels_buffer);
                 if (status != CARQUET_OK) {
                     output_buffer->size = page_start;
                     return status;
@@ -1909,15 +1952,16 @@ carquet_status_t carquet_page_writer_add_dictionary_indices(
 
     carquet_status_t status = CARQUET_OK;
     if (writer->max_def_level > 0) {
+        /* Raw RLE; the V1 length prefix is applied once at page assembly. */
         status = encode_levels(def_levels, num_values_total, writer->max_def_level,
                                &writer->def_levels_buffer,
-                               !writer->data_page_v2);
+                               false);
         if (status != CARQUET_OK) return status;
     }
     if (writer->max_rep_level > 0 && rep_levels) {
         status = encode_levels(rep_levels, num_values_total, writer->max_rep_level,
                                &writer->rep_levels_buffer,
-                               !writer->data_page_v2);
+                               false);
         if (status != CARQUET_OK) return status;
     }
 

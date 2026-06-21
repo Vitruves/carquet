@@ -54,6 +54,8 @@ extern carquet_status_t carquet_offset_index_add_page(
     int64_t first_row_index, int32_t uncompressed_size);
 extern carquet_status_t carquet_offset_index_serialize(
     const carquet_offset_index_builder_t* builder, carquet_buffer_t* output);
+extern void carquet_offset_index_builder_shift_offsets(
+    carquet_offset_index_builder_t* builder, int64_t delta);
 
 /* Forward declaration from page_writer.c */
 typedef struct carquet_page_writer carquet_page_writer_t;
@@ -634,11 +636,17 @@ static carquet_status_t flush_current_page(carquet_column_writer_internal_t* wri
     }
 
     if (writer->offset_index) {
-        /* Page offset = column's file offset + current buffer position (before append) */
-        int64_t page_offset = writer->column_file_offset + (int64_t)page_start;
+        /* Record offsets relative to the column start; the column's absolute
+         * file offset is not yet known when most pages are flushed (eager
+         * flushes happen during write_batch, before the row-group writer
+         * positions this column). carquet_column_writer_finalize() shifts
+         * the accumulated offsets by column_file_offset once that value
+         * has been set, producing absolute offsets as the Parquet spec
+         * requires for OffsetIndex.PageLocation.offset. */
+        int64_t page_offset_relative = (int64_t)page_start;
         carquet_offset_index_add_page(
             writer->offset_index,
-            page_offset,
+            page_offset_relative,
             (int32_t)page_size,
             writer->page_row_offset,
             uncompressed_size);
@@ -876,14 +884,22 @@ static carquet_status_t encode_batch_eager(
 
     const uint8_t* val_bytes = (const uint8_t*)values;
     int64_t offset = 0;
+    /* The caller's `values` array is dense (sparse encoding): for OPTIONAL
+     * columns it contains only the non-null entries, packed contiguously,
+     * while `def_levels` has one entry per logical row. When we chunk the
+     * batch, `chunk_values` must point at the dense offset corresponding
+     * to the current logical chunk, not the logical row offset.
+     * `values_offset` tracks the cumulative count of non-null entries
+     * already consumed; for REQUIRED columns it stays equal to `offset`. */
+    int64_t values_offset = 0;
 
     while (offset < num_values) {
         int64_t chunk = num_values - offset;
         if (chunk > max_chunk) chunk = max_chunk;
 
         const void* chunk_values = (stride > 0)
-            ? (const void*)(val_bytes + offset * stride)
-            : (const void*)((const carquet_byte_array_t*)values + offset);
+            ? (const void*)(val_bytes + values_offset * stride)
+            : (const void*)((const carquet_byte_array_t*)values + values_offset);
 
         carquet_status_t status = carquet_page_writer_add_values(
             writer->page_writer, chunk_values, chunk,
@@ -894,6 +910,20 @@ static carquet_status_t encode_batch_eager(
 
         bloom_filter_insert_chunk(writer, chunk_values, chunk,
                                   def_levels ? def_levels + offset : NULL);
+
+        /* Advance the dense values cursor by the non-null count in this
+         * chunk. REQUIRED columns (max_def_level == 0 or def_levels NULL)
+         * have all entries non-null. */
+        if (def_levels && writer->max_def_level > 0) {
+            int64_t non_null = 0;
+            int16_t max_def = writer->max_def_level;
+            for (int64_t k = 0; k < chunk; k++) {
+                if (def_levels[offset + k] == max_def) non_null++;
+            }
+            values_offset += non_null;
+        } else {
+            values_offset += chunk;
+        }
 
         offset += chunk;
 
@@ -1313,6 +1343,16 @@ carquet_status_t carquet_column_writer_finalize(
         }
     }
 
+    /* Convert relative page offsets (recorded during eager flushes) into
+     * absolute file offsets now that this column's start in the file is
+     * known. The serial finalize path sets column_file_offset before
+     * calling us; the parallel path leaves it 0 and does not build an
+     * offset index (write_page_index is disabled in that mode). */
+    if (writer->offset_index && writer->column_file_offset != 0) {
+        carquet_offset_index_builder_shift_offsets(
+            writer->offset_index, writer->column_file_offset);
+    }
+
     if (data) *data = writer->column_buffer.data;
     if (size) *size = writer->column_buffer.size;
     if (total_values) *total_values = writer->total_values;
@@ -1378,6 +1418,16 @@ void carquet_column_writer_set_max_rows_per_page(
     carquet_column_writer_internal_t* writer, int64_t max_rows) {
     if (writer && max_rows > 0) {
         writer->max_rows_per_page = max_rows;
+    }
+}
+
+/* Per-column override for the byte-based page-flush trigger. Safe between page
+ * flushes; the new size kicks in for the next page being filled. */
+void carquet_column_writer_set_target_page_size(
+    carquet_column_writer_internal_t* writer, int64_t bytes) {
+    if (writer && bytes > 0) {
+        writer->target_page_size = (size_t)bytes;
+        writer->max_page_size = writer->target_page_size * 2;
     }
 }
 

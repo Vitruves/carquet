@@ -84,6 +84,9 @@ typedef enum carquet_status {
     CARQUET_ERROR_ALREADY_CLOSED = 81,
     CARQUET_ERROR_NOT_OPEN = 82,
 
+    /* Filter / page-index errors */
+    CARQUET_ERROR_PAGE_INDEX_REQUIRED = 90,
+
 } carquet_status_t;
 
 /* ============================================================================

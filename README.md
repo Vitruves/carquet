@@ -33,15 +33,15 @@
 
 ## Performance
 
-Carquet v0.4.4 vs Arrow C++ 23.0.1 at 10M rows (the most representative size). Higher ratio = Carquet faster.
+At 10M rows (the most representative size); higher ratio = Carquet faster. ARM (Apple M3): Carquet 0.6.0 vs Arrow C++ 24.0.0. x86 (Xeon D-1531): Carquet 0.4.4 vs Arrow C++ 23.0.1.
 
 | | x86 (Xeon D-1531) | | ARM (Apple M3) | |
 |---|---|---|---|---|
 | **Codec** | **Write** | **Read** | **Write** | **Read** |
-| snappy | **1.55x** | **1.25x** | **1.10x** | **1.69x** |
-| zstd | **1.31x** | **1.04x** | **1.70x** | **1.29x** |
-| lz4 | **1.02x** | 0.83x | **1.21x** | **1.38x** |
-| none | **1.13x** | **40.6x**\* | **2.31x** | **58.4x**\* |
+| snappy | **1.55x** | **1.25x** | **1.88x** | **1.59x** |
+| zstd | **1.31x** | **1.04x** | **2.23x** | **1.30x** |
+| lz4 | **1.02x** | 0.83x | **1.89x** | **1.59x** |
+| none | **1.13x** | **40.6x**\* | **1.97x** | **52.9x**\* |
 
 \* Uncompressed reads use mmap zero-copy -- see note below.
 
@@ -121,34 +121,34 @@ Both libraries read the **same** Parquet file — the fairest apples-to-apples c
 <details>
 <summary>Full ARM results (Apple M3, macOS)</summary>
 
-*MacBook Air M3, 16GB RAM, macOS 26.2, Arrow C++ 23.0.1, PyArrow 23.0.1 -- ZSTD level 1*
+*Carquet 0.6.0 -- MacBook Air M3, 16GB RAM, macOS 26.5, Arrow C++ 24.0.0, PyArrow 23.0.1 -- ZSTD level 1*
 
 #### 10M rows vs Arrow C++
 
 | Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio | Size |
 |-------|--------------|-----------------|---------|-------------|----------------|---------|------|
-| none | **71.71ms** | 165.9ms | **2.31x** | **0.29ms** | 16.94ms | **58.4x**\* | 190.7MB |
-| snappy | **223.1ms** | 244.6ms | **1.10x** | **15.00ms** | 25.39ms | **1.69x** | 125.1MB |
-| zstd | **239.9ms** | 406.9ms | **1.70x** | **21.99ms** | 28.44ms | **1.29x** | 95.3MB |
-| lz4 | **201.4ms** | 243.8ms | **1.21x** | **12.08ms** | 16.65ms | **1.38x** | 122.9MB |
+| none | **62.21ms** | 122.5ms | **1.97x** | **0.26ms** | 13.75ms | **52.9x**\* | 190.7MB |
+| snappy | **129.0ms** | 242.6ms | **1.88x** | **14.15ms** | 22.47ms | **1.59x** | 125.1MB |
+| zstd | **149.6ms** | 334.0ms | **2.23x** | **21.39ms** | 27.91ms | **1.30x** | 95.3MB |
+| lz4 | **128.1ms** | 241.7ms | **1.89x** | **10.13ms** | 16.08ms | **1.59x** | 122.9MB |
 
 #### 1M rows vs Arrow C++
 
 | Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio |
 |-------|--------------|-----------------|---------|-------------|----------------|---------|
-| none | **8.31ms** | 15.64ms | **1.88x** | **0.07ms** | 1.87ms | **26.7x**\* |
-| snappy | **15.06ms** | 24.96ms | **1.66x** | **2.44ms** | 2.76ms | **1.13x** |
-| zstd | **17.24ms** | 34.31ms | **1.99x** | 3.40ms | **3.12ms** | 0.92x |
-| lz4 | **15.92ms** | 32.32ms | **2.03x** | **1.55ms** | 3.32ms | **2.14x** |
+| none | **5.85ms** | 12.65ms | **2.16x** | **0.05ms** | 1.54ms | **30.8x**\* |
+| snappy | **12.39ms** | 23.62ms | **1.91x** | **1.36ms** | 2.41ms | **1.77x** |
+| zstd | **15.26ms** | 33.90ms | **2.22x** | **2.39ms** | 3.17ms | **1.33x** |
+| lz4 | **12.28ms** | 24.51ms | **2.00x** | **0.97ms** | 1.77ms | **1.82x** |
 
 #### 100K rows vs Arrow C++
 
 | Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio |
 |-------|--------------|-----------------|---------|-------------|----------------|---------|
-| none | **1.00ms** | 1.63ms | **1.63x** | **0.02ms** | 0.23ms | **11.5x**\* |
-| snappy | **1.51ms** | 2.62ms | **1.74x** | **0.36ms** | 0.90ms | **2.50x** |
-| zstd | **2.39ms** | 4.86ms | **2.03x** | **0.74ms** | 1.38ms | **1.86x** |
-| lz4 | **1.55ms** | 3.68ms | **2.37x** | **0.30ms** | 0.71ms | **2.37x** |
+| none | **1.02ms** | 1.54ms | **1.51x** | **0.02ms** | 0.22ms | **11.0x**\* |
+| snappy | **1.51ms** | 2.45ms | **1.62x** | **0.36ms** | 0.90ms | **2.50x** |
+| zstd | **1.65ms** | 3.58ms | **2.17x** | **0.63ms** | 1.23ms | **1.95x** |
+| lz4 | **1.57ms** | 2.45ms | **1.56x** | **0.24ms** | 0.55ms | **2.29x** |
 
 #### Same-file cross-read (10M rows)
 
@@ -156,41 +156,41 @@ Both libraries read the **same** Parquet file — the fairest apples-to-apples c
 
 | Codec | Writer | Carquet Read | Arrow C++ Read | Ratio |
 |-------|--------|-------------|----------------|-------|
-| none | Carquet | **0.28ms** | 17.62ms | **62.9x**\* |
-| none | Arrow | **0.97ms** | 16.86ms | **17.4x**\* |
-| snappy | Carquet | **15.66ms** | 24.19ms | **1.54x** |
-| snappy | Arrow | **14.71ms** | 22.82ms | **1.55x** |
-| zstd | Carquet | **22.14ms** | 29.30ms | **1.32x** |
-| zstd | Arrow | **22.49ms** | 32.10ms | **1.43x** |
-| lz4 | Carquet | **11.53ms** | 18.65ms | **1.62x** |
-| lz4 | Arrow | **10.17ms** | 17.38ms | **1.71x** |
+| none | Carquet | **0.27ms** | 15.60ms | **57.8x**\* |
+| none | Arrow | **0.91ms** | 13.68ms | **15.0x**\* |
+| snappy | Carquet | **14.63ms** | 23.29ms | **1.59x** |
+| snappy | Arrow | **13.20ms** | 22.15ms | **1.68x** |
+| zstd | Carquet | **20.96ms** | 28.04ms | **1.34x** |
+| zstd | Arrow | **21.03ms** | 27.73ms | **1.32x** |
+| lz4 | Carquet | **10.16ms** | 16.89ms | **1.66x** |
+| lz4 | Arrow | **9.66ms** | 16.09ms | **1.67x** |
 
 #### 10M rows vs PyArrow
 
 | Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
 |-------|--------------|---------------|---------|-------------|--------------|---------|
-| none | **71.71ms** | 183.4ms | **2.56x** | **0.29ms** | 36.99ms | **127.6x**\* |
-| snappy | **223.1ms** | 303.1ms | **1.36x** | **15.00ms** | 48.68ms | **3.25x** |
-| zstd | **239.9ms** | 406.7ms | **1.70x** | **21.99ms** | 57.71ms | **2.62x** |
-| lz4 | **201.4ms** | 338.2ms | **1.68x** | **12.08ms** | 48.68ms | **4.03x** |
+| none | **62.21ms** | 176.4ms | **2.83x** | **0.26ms** | 36.49ms | **140.4x**\* |
+| snappy | **129.0ms** | 294.2ms | **2.28x** | **14.15ms** | 44.19ms | **3.12x** |
+| zstd | **149.6ms** | 396.3ms | **2.65x** | **21.39ms** | 55.96ms | **2.62x** |
+| lz4 | **128.1ms** | 305.3ms | **2.38x** | **10.13ms** | 38.00ms | **3.75x** |
 
 #### 1M rows vs PyArrow
 
 | Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
 |-------|--------------|---------------|---------|-------------|--------------|---------|
-| none | **8.31ms** | 18.53ms | **2.23x** | **0.07ms** | 2.67ms | **38.1x**\* |
-| snappy | **15.06ms** | 30.54ms | **2.03x** | **2.44ms** | 3.75ms | **1.54x** |
-| zstd | **17.24ms** | 40.43ms | **2.35x** | **3.40ms** | 4.48ms | **1.32x** |
-| lz4 | **15.92ms** | 40.69ms | **2.56x** | **1.55ms** | 5.83ms | **3.76x** |
+| none | **5.85ms** | 17.13ms | **2.93x** | **0.05ms** | 2.55ms | **51.0x**\* |
+| snappy | **12.39ms** | 29.62ms | **2.39x** | **1.36ms** | 3.57ms | **2.62x** |
+| zstd | **15.26ms** | 40.26ms | **2.64x** | **2.39ms** | 4.41ms | **1.85x** |
+| lz4 | **12.28ms** | 31.15ms | **2.54x** | **0.97ms** | 3.11ms | **3.21x** |
 
 #### 100K rows vs PyArrow
 
 | Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
 |-------|--------------|---------------|---------|-------------|--------------|---------|
-| none | **1.00ms** | 2.81ms | **2.81x** | **0.02ms** | 0.25ms | **12.5x**\* |
-| snappy | **1.51ms** | 4.46ms | **2.95x** | **0.36ms** | 0.63ms | **1.75x** |
-| zstd | **2.39ms** | 5.59ms | **2.34x** | **0.74ms** | 0.86ms | **1.16x** |
-| lz4 | **1.55ms** | 4.33ms | **2.79x** | **0.30ms** | 0.45ms | **1.50x** |
+| none | **1.02ms** | 1.94ms | **1.90x** | **0.02ms** | 0.23ms | **11.5x**\* |
+| snappy | **1.51ms** | 2.96ms | **1.96x** | **0.36ms** | 0.58ms | **1.61x** |
+| zstd | **1.65ms** | 4.15ms | **2.52x** | **0.63ms** | 0.80ms | **1.27x** |
+| lz4 | **1.57ms** | 3.01ms | **1.92x** | **0.24ms** | 0.41ms | **1.71x** |
 
 \* Zero-copy mmap path
 
@@ -285,11 +285,13 @@ Commands:
   info       Print detailed file metadata
   head       Print first N rows
   tail       Print last N rows
+  cat        Print rows with slicing/column/row filtering
   count      Print total row count
   columns    List column names (one per line)
   stat       Print column statistics
   validate   Verify file integrity
   sample     Print N random rows
+  export     Write rows to stdout as CSV
   codegen    Generate C reader code
 ```
 
@@ -299,6 +301,16 @@ carquet head -n 20 data.parquet
 carquet stat data.parquet
 carquet validate data.parquet
 ```
+
+`cat`, `count`, `head`, and `export` accept `-p / --filter EXPR` to push a row predicate down to the page level — only pages whose column-index min/max can match the predicate are decompressed:
+
+```bash
+carquet cat -p "price > 100 AND status = 'active'" data.parquet
+carquet count --filter "id >= 1000" data.parquet
+carquet export --filter "ts IS NOT NULL" -c id,ts data.parquet
+```
+
+The grammar is `column OP value [AND column OP value]...` with `OP` ∈ {`=`, `==`, `!=`, `<>`, `<`, `<=`, `>`, `>=`}, plus `column IS NULL` / `column IS NOT NULL`. Filtering requires the file to have a page index (`write_page_index = true`).
 
 ### Code Generation
 
@@ -482,6 +494,38 @@ cfg.row_group_filter_ctx = &threshold;
 // Non-matching row groups are skipped with zero I/O
 ```
 
+### Page-Level Filtering
+
+Push a predicate down to individual data pages: only pages whose column-index min/max range could match are decompressed and decoded. Predicate columns need not be in the projection — when they are not, only their column + offset index is read, never the data pages. Requires the file to be written with `write_page_index = true`.
+
+```c
+carquet_batch_reader_t* br = carquet_batch_reader_create(r, &cfg, &err);
+
+// Conjunction: price > 100 AND status == "active"
+int64_t price = 100;
+const char* status = "active";   // BYTE_ARRAY: raw bytes + length, not carquet_byte_array_t
+carquet_filter_clause_t clauses[] = {
+    { .column_index = 1, .op = CARQUET_FILTER_GT, .value = &price,  .value_size = sizeof(price) },
+    { .column_index = 3, .op = CARQUET_FILTER_EQ, .value = status,  .value_size = 6 },
+};
+carquet_batch_reader_set_page_filter(br, clauses, 2);
+
+// ... iterate as usual; non-matching pages are pruned ...
+int64_t pruned = carquet_batch_reader_rows_skipped(br);
+```
+
+Ops: `EQ` / `NE` / `LT` / `LE` / `GT` / `GE` / `RANGE` / `IN` / `IS_NULL` / `IS_NOT_NULL`. Referencing a column with no page index returns `CARQUET_ERROR_PAGE_INDEX_REQUIRED`.
+
+### Appending Row Groups
+
+Add row groups to an existing file without a read-then-rewrite. The supplied schema must match the file's leaf columns; `close()` rewrites the footer to list the existing row groups followed by the new ones. Existing bloom filters, page indexes, and key-value metadata are preserved.
+
+```c
+carquet_writer_t* w = carquet_writer_open_append("data.parquet", schema, &opts, &err);
+carquet_writer_write_batch(w, 0, more_ids, n, NULL, NULL);
+carquet_writer_close(w);
+```
+
 ### I/O Coalescing
 
 Pre-buffer multiple columns in a single read (reduces seeks for fread path, no-op for mmap):
@@ -506,6 +550,18 @@ opts.compression = CARQUET_COMPRESSION_ZSTD;
 opts.compression_level = 1;  // 0 = codec default; ZSTD: 1-22, GZIP: 1-9
 ```
 
+You can also register a custom codec implementation for any slot — to plug in a hardware-accelerated codec or fill the `LZO` / `BROTLI` slots carquet has no built-in for. A registered codec takes priority over the built-in on both read and write; pass `NULL` to unregister:
+
+```c
+carquet_custom_codec_t impl = {
+    .compress       = my_compress,
+    .decompress     = my_decompress,
+    .compress_bound = my_compress_bound,
+    .user_data      = NULL,
+};
+carquet_register_codec(CARQUET_COMPRESSION_BROTLI, &impl);
+```
+
 ### Writer Options
 
 ```c
@@ -517,6 +573,14 @@ opts.write_statistics   = true;                // min/max for predicate pushdown
 opts.write_crc          = true;                // CRC32 page verification
 opts.write_bloom_filters = true;               // bloom filters per column
 opts.write_page_index   = true;                // column/offset page indexes
+opts.file_format_version = 2;                   // footer version (1 for older readers)
+```
+
+Per-writer overrides refine output further:
+
+```c
+carquet_writer_set_column_page_size(w, col, 16 * 1024);   // per-column page size
+carquet_writer_set_max_statistics_size(w, 64);            // BYTE_ARRAY min/max cap (default 32)
 ```
 
 ### Error Handling
@@ -525,7 +589,7 @@ opts.write_page_index   = true;                // column/offset page indexes
 carquet_error_t err = CARQUET_ERROR_INIT;
 carquet_reader_t* r = carquet_reader_open("data.parquet", NULL, &err);
 if (!r) {
-    printf("[%s] %s\n", carquet_status_name(err.code), err.message);
+    printf("[%s] %s\n", carquet_status_string(err.code), err.message);
     printf("Hint: %s\n", carquet_error_recovery_hint(err.code));
     return 1;
 }
@@ -567,7 +631,9 @@ python3 interop/run_interop.py
 | Bloom filters | Read, write, and query (`carquet_bloom_filter_check_*`) |
 | Page indexes | Column index + offset index (read + write + per-page stats access) |
 | Statistics | Min/max/null count per column chunk |
-| Predicate pushdown | Row group filtering via statistics; page-level via column index |
+| Predicate pushdown | Row group filtering via statistics; page-level filtering via column index (`carquet_batch_reader_set_page_filter`) |
+| Append | Add row groups to an existing file (`carquet_writer_open_append`) |
+| Custom codecs | Register a custom compress/decompress impl per codec slot (`carquet_register_codec`) |
 | Key-value metadata | Read and write arbitrary footer metadata |
 | Per-column options | Per-column encoding, compression, statistics, bloom filter |
 | Buffer writer | Write Parquet to in-memory buffer |
@@ -684,7 +750,8 @@ src/
   cli/             CLI tool and code generator
   util/            CRC32, xxHash
 tests/             18 test files
-examples/          basic_write_read, data_types, compression_codecs, nullable_columns, advanced_features
+examples/          basic_write_read, data_types, compression_codecs, nullable_columns,
+                   advanced_features, append_rows, page_filter, nested_data
 benchmark/         Performance benchmarks and comparison tools
 ```
 

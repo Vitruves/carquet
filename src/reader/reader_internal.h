@@ -174,7 +174,10 @@ struct carquet_column_reader {
     uint8_t* decoded_values;    /* Buffer for decoded values from current page */
     int16_t* decoded_def_levels; /* Buffer for decoded definition levels */
     int16_t* decoded_rep_levels; /* Buffer for decoded repetition levels */
-    size_t decoded_capacity;    /* Capacity of decoded buffers */
+    size_t decoded_capacity;    /* Capacity of decoded buffers, in values */
+    size_t decoded_value_size;  /* Per-value byte width the values buffer was
+                                 * allocated with; realloc when it changes (e.g.
+                                 * preserve_dictionary flips index/value width) */
     carquet_data_ownership_t decoded_ownership; /* OWNED or VIEW (mmap) */
 
     /* Reusable buffers to reduce allocations */
@@ -251,6 +254,32 @@ uint8_t* carquet_column_retain_page(
  * Free and clear the retained page list on the column reader.
  */
 void carquet_column_clear_retained_pages(carquet_column_reader_t* reader);
+
+/**
+ * Ensure the column's dictionary page (if any) is loaded. Idempotent.
+ * After this returns CARQUET_OK, reader->data_start_offset points to the
+ * first data page even when the writer recorded a stale data_page_offset.
+ */
+carquet_status_t carquet_column_ensure_dictionary_loaded(
+    carquet_column_reader_t* reader,
+    carquet_error_t* error);
+
+/**
+ * Seek the column reader to a specific data page so that the next page
+ * load decodes that page. Dictionary state is preserved. The value count
+ * for skipped pages is recovered by walking page headers between the
+ * current position and the target, so the caller does not need to know
+ * it; the `values_before_page` parameter is informational only.
+ *
+ * @param reader              Column reader
+ * @param page_file_offset    Absolute file offset of the target data page
+ * @param values_before_page  Reserved; currently unused (pass 0).
+ */
+carquet_status_t carquet_column_reader_seek_to_data_page(
+    carquet_column_reader_t* reader,
+    int64_t page_file_offset,
+    int64_t values_before_page,
+    carquet_error_t* error);
 
 /* ============================================================================
  * Page Decompression (shared between page_reader and batch_reader)

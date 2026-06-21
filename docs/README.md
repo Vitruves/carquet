@@ -16,6 +16,7 @@ For runnable code, start with:
 | Scan rows for analytics, project a few columns, or parallelize reads | [`reading.md`](./reading.md) and `carquet_batch_reader_t` |
 | Read one column from one row group, or work with raw definition/repetition levels | [`reading.md`](./reading.md) and `carquet_column_reader_t` |
 | Write flat data to a file | [`writing.md`](./writing.md) and `carquet_writer_t` |
+| Add row groups to an existing file | [`writing.md`](./writing.md#append-to-an-existing-file) and `carquet_writer_open_append()` |
 | Write nested schemas or nullable/repeated data | [`nested-data.md`](./nested-data.md) |
 | Push performance on local files or string-heavy datasets | [`performance.md`](./performance.md) |
 | Inspect footer metadata only | `carquet_get_file_info()` and `carquet_validate_file()` |

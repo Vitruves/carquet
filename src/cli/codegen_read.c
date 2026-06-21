@@ -14,10 +14,18 @@
 #ifdef _WIN32
 #include <io.h>
 #include <direct.h>
+#include <stdlib.h>      /* _MAX_PATH, _fullpath */
 #define codegen_getcwd _getcwd
+#define CODEGEN_PATH_MAX _MAX_PATH
 #else
 #include <unistd.h>
+#include <limits.h>      /* PATH_MAX */
 #define codegen_getcwd getcwd
+#ifdef PATH_MAX
+#define CODEGEN_PATH_MAX PATH_MAX
+#else
+#define CODEGEN_PATH_MAX 4096
+#endif
 #endif
 
 /* ── Helpers ──────────────────────────────────────────────────────────── */
@@ -410,16 +418,29 @@ int cmd_codegen_read(FILE* out, carquet_reader_t* reader,
 
     /* ── main() ───────────────────────────────────────────────────── */
 
-    /* DEFAULT_FILE: resolve to absolute, or use placeholder */
-    char escaped_path[2048];
+    /* DEFAULT_FILE: resolve to absolute, or use placeholder.
+     * Sized for the escaped form of a full PATH_MAX path (each byte may double). */
+    char escaped_path[CODEGEN_PATH_MAX * 2];
     if (opts->input_path) {
-        char abs_input[1024];
+        /* realpath() requires a buffer of at least PATH_MAX bytes regardless of
+         * the actual path length; an undersized buffer trips glibc's
+         * _FORTIFY_SOURCE check (__realpath_chk -> "buffer overflow detected")
+         * in optimized builds where fortification is active. */
+        char abs_input[CODEGEN_PATH_MAX];
 #ifdef _WIN32
         if (!_fullpath(abs_input, opts->input_path, sizeof(abs_input)))
             snprintf(abs_input, sizeof(abs_input), "%s", opts->input_path);
 #else
-        if (!realpath(opts->input_path, abs_input))
+        /* Pass NULL so realpath() allocates a buffer of the system's actual
+         * PATH_MAX itself; writing into a fixed CODEGEN_PATH_MAX stack buffer
+         * overflows when the runtime PATH_MAX exceeds the compile-time fallback. */
+        char* resolved = realpath(opts->input_path, NULL);
+        if (resolved) {
+            snprintf(abs_input, sizeof(abs_input), "%s", resolved);
+            free(resolved);
+        } else {
             snprintf(abs_input, sizeof(abs_input), "%s", opts->input_path);
+        }
 #endif
         size_t j = 0;
         for (size_t i = 0; abs_input[i] && j < sizeof(escaped_path) - 2; i++) {

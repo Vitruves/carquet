@@ -126,6 +126,37 @@ Also available:
 - `carquet_column_has_next()`
 - `carquet_column_remaining()`
 
+## Reading Nested Data (lists, structs, maps)
+
+Carquet reads nested schemas — structs (groups), `LIST`, and `MAP` — at the **physical leaf-column level**, which is how Parquet stores nested data on disk. It does not currently reassemble leaves into materialized nested value objects for you (that is, there is no `List<Struct<…>>`-shaped result type); instead you read each leaf column plus its repetition and definition levels and reconstruct the structure yourself. This is a deliberate boundary: the format-level support is complete (nested files written by carquet are read back as native nested types by Arrow/PyArrow and DuckDB), but high-level nested materialization is tracked as future work in `TODO.md`.
+
+What this means in practice:
+
+- A nested field expands to one column chunk **per leaf**. For example a PyArrow `struct<a, b>` is two leaf columns (`a`, `b`); a `map<string,int32>` is two leaves (`key`, `value`); a `list<int32>` is one leaf (`element`). `carquet_reader_num_columns()` therefore counts leaves, not top-level fields.
+- Read each leaf with the column-reader workflow above, requesting **definition and repetition levels**. Definition levels tell you which entries are null / which optional ancestors are present; repetition levels tell you where each list/row begins.
+- Use the reconstruction helpers to recover structure from the levels:
+  - `carquet_count_rows(rep_levels, n, ...)` — count logical (top-level) rows from repetition levels.
+  - `carquet_list_offsets(rep_levels, n, list_level, offsets, max)` — compute list boundaries (offsets) for a given repetition level.
+
+```c
+/* list<int32> "tags": one leaf, max_def = 3, max_rep = 1 */
+carquet_column_reader_t* col = carquet_reader_get_column(reader, 0, leaf_index, &err);
+
+int32_t values[1024];
+int16_t def_levels[1024];
+int16_t rep_levels[1024];
+int64_t n = carquet_column_read_batch(col, values, 1024, def_levels, rep_levels);
+
+int64_t offsets[256];
+int64_t num_lists = carquet_list_offsets(rep_levels, n, 1, offsets, 256);
+/* offsets[i]..offsets[i+1] delimits the i-th list; def_level < max_def marks
+ * null lists / null elements per the Parquet level rules. */
+
+carquet_column_reader_free(col);
+```
+
+If you need values presented as native nested types rather than leaves + levels, that reassembly currently lives in the calling application (or a higher-level binding). See `tests/test_nested.c` for end-to-end reconstruction examples.
+
 ## Predicate Pushdown and Cheap Inspection
 
 Use row-group statistics before you start reading payload pages:
@@ -178,6 +209,52 @@ int32_t n = carquet_reader_filter_row_groups(
     reader, /*column=*/0, CARQUET_COMPARE_GT,
     &threshold, sizeof(threshold), matches, 64);
 ```
+
+## Filtering Rows With a Page Filter
+
+The batch reader can attach a page-level filter that skips data pages whose column-index statistics prove no value can satisfy the predicate. Only the matching pages are decompressed and decoded; pruned pages are never read from disk past their offset-index entry. This applies to both the sequential reader and the parallel pipeline.
+
+```c
+carquet_batch_reader_t* br = carquet_batch_reader_create(reader, &cfg, &err);
+
+int32_t lo = 1000;
+int32_t hi = 2000;
+carquet_filter_clause_t clause = {
+    .column_index = 3,                 /* file column to filter on */
+    .op = CARQUET_FILTER_RANGE,
+    .has_lo = true, .lo = &lo, .lo_size = sizeof(lo),
+    .has_hi = true, .hi = &hi, .hi_size = sizeof(hi),
+};
+carquet_batch_reader_set_page_filter(br, &clause, 1);
+```
+
+Each clause is a `(column_index, op, value)` triple; multiple clauses are AND'd together and may reference different columns (whether or not those columns are part of the projection — a predicate column that is not projected is read **only** via its column + offset index, never decompressed). Supported ops cover `EQ`, `NE`, `LT`, `LE`, `GT`, `GE`, `RANGE`, `IN`, `IS_NULL`, and `IS_NOT_NULL`.
+
+```c
+int64_t in_values[] = {10, 20, 30};
+carquet_filter_clause_t in_clause = {
+    .column_index = 0,
+    .op = CARQUET_FILTER_IN,
+    .values = in_values,
+    .value_count = 3,
+};
+```
+
+Pass `clauses = NULL, count = 0` to clear an active filter.
+
+After reading, `carquet_batch_reader_rows_skipped()` reports the running count of rows the filter pruned — useful for confirming selectivity:
+
+```c
+int64_t skipped = carquet_batch_reader_rows_skipped(br);
+```
+
+**Requirements and semantics**
+
+- The file must have been written with `write_page_index = true` for every column the filter references. Filtering a column without a page index returns `CARQUET_ERROR_PAGE_INDEX_REQUIRED` on the next `carquet_batch_reader_next()` call.
+- `INT96` columns have no defined sort order per the Parquet spec and are rejected with `CARQUET_ERROR_INVALID_ARGUMENT` at filter-set time.
+- For BYTE_ARRAY columns with truncated min/max stats, the filter is conservative: a page may be kept even when no row in it actually matches. Filtering is page-granular by design — rows inside a matching page that fail the predicate are still returned and the caller must apply the exact predicate to the batch if needed.
+- Floats whose predicate value is NaN match nothing under ordered ops (`EQ`, `LT`, …), mirroring Arrow semantics.
+- The clauses array and any pointers it references must remain valid until the next `set_page_filter()` call or until the batch reader is freed; no copy is made.
 
 ## Metadata, Bloom Filters, and Page Indexes
 

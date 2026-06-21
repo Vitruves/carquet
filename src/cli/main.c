@@ -63,15 +63,19 @@ static void print_help_info(void) {
 
 static void print_help_head(void) {
     fprintf(stderr,
-        "Usage: carquet head [-n NUM] <file.parquet>\n"
+        "Usage: carquet head [-n NUM] [-p EXPR] <file.parquet>\n"
         "\n"
-        "Print the first N rows in a tabular format.\n"
+        "Print the first N rows in a tabular format. With --filter, prints the\n"
+        "first N rows matching the predicate; pages that cannot match are\n"
+        "skipped without decompression (requires a file written with\n"
+        "write_page_index = true).\n"
         "\n"
         "Arguments:\n"
         "  <file.parquet>    Input Parquet file\n"
         "\n"
         "Options:\n"
-        "  -n NUM            Number of rows to display (default: %d)\n",
+        "  -n NUM            Number of rows to display (default: %d)\n"
+        "  -p, --filter EXPR Filter expression (see `carquet cat -h`)\n",
         CLI_DEFAULT_NUM_ROWS);
 }
 
@@ -91,13 +95,17 @@ static void print_help_tail(void) {
 
 static void print_help_count(void) {
     fprintf(stderr,
-        "Usage: carquet count <file.parquet>\n"
+        "Usage: carquet count [-p EXPR] <file.parquet>\n"
         "\n"
         "Print the total number of rows. Output is a single integer,\n"
-        "suitable for use in shell scripts.\n"
+        "suitable for use in shell scripts. With --filter, prints the number\n"
+        "of rows that match the predicate (page-level pruning skips work).\n"
         "\n"
         "Arguments:\n"
-        "  <file.parquet>    Input Parquet file\n");
+        "  <file.parquet>    Input Parquet file\n"
+        "\n"
+        "Options:\n"
+        "  -p, --filter EXPR Filter expression (see `carquet cat -h`)\n");
 }
 
 static void print_help_columns(void) {
@@ -151,8 +159,9 @@ static void print_help_cat(void) {
     fprintf(stderr,
         "Usage: carquet cat [options] <file.parquet>\n"
         "\n"
-        "Print rows in a tabular format with optional slicing and a column\n"
-        "filter. Unlike head/tail, supports arbitrary row offsets.\n"
+        "Print rows in a tabular format with optional slicing, column\n"
+        "projection, and row-predicate filtering. Unlike head/tail, supports\n"
+        "arbitrary row offsets.\n"
         "\n"
         "Arguments:\n"
         "  <file.parquet>    Input Parquet file\n"
@@ -161,10 +170,29 @@ static void print_help_cat(void) {
         "  -n, --limit N     Number of rows to print (default: all)\n"
         "  -s, --offset N    Skip the first N rows (default: 0)\n"
         "  -c, --columns L   Comma-separated column names (default: all)\n"
+        "  -p, --filter EXPR Filter expression (see below)\n"
+        "\n"
+        "Filter expression grammar (case-insensitive keywords):\n"
+        "  expr   := clause (AND clause)*\n"
+        "  clause := column OP value\n"
+        "          | column IS NULL\n"
+        "          | column IS NOT NULL\n"
+        "  OP     := = | == | != | <> | < | <= | > | >=\n"
+        "  value  := signed_number | 'single-quoted string' | TRUE | FALSE\n"
+        "\n"
+        "Page-level filtering: pages whose column-index min/max prove no\n"
+        "value can match the predicate are skipped without decompression.\n"
+        "The file must have been written with write_page_index = true for\n"
+        "every column referenced by the filter. INT96 columns are rejected\n"
+        "(no defined sort order). Page granularity means rows inside a\n"
+        "matching page that fail the predicate are still returned; pipe\n"
+        "through awk/grep for exact post-filtering.\n"
         "\n"
         "Examples:\n"
         "  carquet cat -n 1000 data.parquet\n"
-        "  carquet cat -c id,name --offset 5000 -n 100 data.parquet\n");
+        "  carquet cat -c id,name --offset 5000 -n 100 data.parquet\n"
+        "  carquet cat -p 'age >= 30 AND status = \\'active\\'' data.parquet\n"
+        "  carquet cat -p 'ts >= 1700000000 AND ts < 1700001000' -c ts,event log.parquet\n");
 }
 
 static void print_help_export(void) {
@@ -182,10 +210,12 @@ static void print_help_export(void) {
         "  -n, --limit N     Number of rows to export (default: all)\n"
         "  -s, --offset N    Skip the first N rows (default: 0)\n"
         "  -c, --columns L   Comma-separated column names (default: all)\n"
+        "  -p, --filter EXPR Filter expression (see `carquet cat -h`)\n"
         "\n"
         "Examples:\n"
         "  carquet export data.parquet > data.csv\n"
-        "  carquet export -c id,name -n 1000 data.parquet | head\n");
+        "  carquet export -c id,name -n 1000 data.parquet | head\n"
+        "  carquet export -p 'price > 100' data.parquet > expensive.csv\n");
 }
 
 static void print_help_codegen(void) {
@@ -259,6 +289,7 @@ int main(int argc, char** argv) {
         opts.offset = 0;
         opts.limit = -1;
         opts.columns = NULL;
+        opts.filter = NULL;
         const char* file_path = NULL;
         const char* format = "csv";  /* only used by export */
 
@@ -279,6 +310,8 @@ int main(int argc, char** argv) {
                 opts.offset = v;
             } else if ((strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--columns") == 0) && i + 1 < argc) {
                 opts.columns = argv[++i];
+            } else if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--filter") == 0) && i + 1 < argc) {
+                opts.filter = argv[++i];
             } else if (is_export && strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
                 format = argv[++i];
             } else if (argv[i][0] != '-') {
@@ -390,6 +423,7 @@ int main(int argc, char** argv) {
 
     int64_t num_rows = CLI_DEFAULT_NUM_ROWS;
     const char* file_path = NULL;
+    const char* filter = NULL;
 
     for (int i = 2; i < argc; i++) {
         if ((strcmp(argv[i], "-n") == 0) && i + 1 < argc) {
@@ -397,6 +431,9 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "error: invalid number '%s'\n", argv[i]);
                 return 1;
             }
+        } else if ((strcmp(argv[i], "-p") == 0 ||
+                    strcmp(argv[i], "--filter") == 0) && i + 1 < argc) {
+            filter = argv[++i];
         } else if (argv[i][0] != '-') {
             file_path = argv[i];
         } else {
@@ -428,13 +465,13 @@ int main(int argc, char** argv) {
 
     if (strcmp(cmd, "schema") == 0)        return cmd_schema(file_path);
     if (strcmp(cmd, "info") == 0)          return cmd_info(file_path);
-    if (strcmp(cmd, "head") == 0)          return cmd_head(file_path, num_rows);
-    if (strcmp(cmd, "tail") == 0)          return cmd_tail(file_path, num_rows);
-    if (strcmp(cmd, "count") == 0)         return cmd_count(file_path);
+    if (strcmp(cmd, "head") == 0)          return cmd_head(file_path, num_rows, filter);
+    if (strcmp(cmd, "tail") == 0)          return cmd_tail(file_path, num_rows, filter);
+    if (strcmp(cmd, "count") == 0)         return cmd_count(file_path, filter);
     if (strcmp(cmd, "columns") == 0)       return cmd_columns(file_path);
     if (strcmp(cmd, "stat") == 0)          return cmd_stat(file_path);
     if (strcmp(cmd, "validate") == 0)      return cmd_validate(file_path);
-    if (strcmp(cmd, "sample") == 0)        return cmd_sample(file_path, num_rows);
+    if (strcmp(cmd, "sample") == 0)        return cmd_sample(file_path, num_rows, filter);
 
     fprintf(stderr, "error: unknown command '%s'\n\n", cmd);
     print_usage();

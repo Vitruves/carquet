@@ -30,6 +30,7 @@
 
 static carquet_cpu_info_t g_cpu_info = {0};
 static int g_initialized = 0;
+static volatile int g_init_lock = 0;
 
 /* External initialization/cleanup functions for compression */
 extern void carquet_gzip_init_tables(void);
@@ -192,9 +193,36 @@ static void detect_arm_features(void) {
 
 #endif
 
+/* Serialize the initialization critical section. The atomic init flag alone
+ * only gates the fast path; without this lock two threads that both observe
+ * the flag unset would race writing g_cpu_info and the compression tables. */
+static void init_lock_acquire(void) {
+#if defined(__GNUC__) || defined(__clang__)
+    while (__atomic_exchange_n(&g_init_lock, 1, __ATOMIC_ACQUIRE)) { /* spin */ }
+#elif defined(_MSC_VER)
+    while (_InterlockedExchange((volatile long*)&g_init_lock, 1)) { /* spin */ }
+#endif
+}
+
+static void init_lock_release(void) {
+#if defined(__GNUC__) || defined(__clang__)
+    __atomic_store_n(&g_init_lock, 0, __ATOMIC_RELEASE);
+#elif defined(_MSC_VER)
+    _InterlockedExchange((volatile long*)&g_init_lock, 0);
+#endif
+}
+
 carquet_status_t carquet_init(void) {
     /* Fast path: already initialized */
     if (carquet_is_initialized()) {
+        return CARQUET_OK;
+    }
+
+    init_lock_acquire();
+    /* Re-check under the lock: another thread may have completed init while we
+     * waited. Only the first thread runs detection; the rest fall through. */
+    if (carquet_is_initialized()) {
+        init_lock_release();
         return CARQUET_OK;
     }
 
@@ -219,10 +247,9 @@ carquet_status_t carquet_init(void) {
     carquet_gzip_init_tables();
     carquet_zstd_init_tables();
 
-    /* Use memory barrier to ensure all writes are visible before flag is set.
-     * Note: For full thread safety, callers should ensure carquet_init()
-     * is called once before spawning threads that use carquet. */
+    /* Use memory barrier to ensure all writes are visible before flag is set. */
     carquet_set_initialized();
+    init_lock_release();
 
     return CARQUET_OK;
 }

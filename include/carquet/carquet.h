@@ -1,7 +1,7 @@
 /**
  * @file carquet.h
  * @brief Carquet - High-Performance Pure C Parquet Library
- * @version 0.5.1
+ * @version 0.6.0
  *
  * @copyright Copyright (c) 2025. All rights reserved.
  * @license MIT License
@@ -199,13 +199,13 @@ extern "C" {
 #define CARQUET_VERSION_MAJOR 0
 
 /** @brief Minor version number */
-#define CARQUET_VERSION_MINOR 5
+#define CARQUET_VERSION_MINOR 6
 
 /** @brief Patch version number */
-#define CARQUET_VERSION_PATCH 1
+#define CARQUET_VERSION_PATCH 0
 
 /** @brief Version string in "MAJOR.MINOR.PATCH" format */
-#define CARQUET_VERSION_STRING "0.5.1"
+#define CARQUET_VERSION_STRING "0.6.0"
 
 /** @brief Numeric version for compile-time comparisons: (MAJOR * 10000 + MINOR * 100 + PATCH) */
 #define CARQUET_VERSION_NUMBER (CARQUET_VERSION_MAJOR * 10000 + CARQUET_VERSION_MINOR * 100 + CARQUET_VERSION_PATCH)
@@ -437,6 +437,93 @@ void carquet_set_allocator(const carquet_allocator_t* allocator);
  */
 CARQUET_API CARQUET_PURE
 const carquet_allocator_t* carquet_get_allocator(void);
+
+/* ============================================================================
+ * Custom Codec Registration
+ * ============================================================================
+ *
+ * Carquet ships built-in compress/decompress implementations for SNAPPY, GZIP,
+ * LZ4, LZ4_RAW, and ZSTD. The remaining Parquet codec slots (LZO, BROTLI) have
+ * no built-in. Users can register their own implementation against any codec
+ * enum value to either fill an unsupported slot or override a built-in (for
+ * example, swap in a hardware-accelerated GZIP).
+ *
+ * Registrations are process-wide and are not safe to mutate while reader or
+ * writer threads are mid-compress / mid-decompress; install codecs at startup
+ * before opening files.
+ */
+
+/**
+ * @brief Pluggable compress/decompress implementation for one codec slot.
+ *
+ * All three function pointers are required; passing a struct with any of them
+ * NULL to @ref carquet_register_codec returns CARQUET_ERROR_INVALID_ARGUMENT.
+ * @ref user_data is forwarded back into every callback unchanged and is meant
+ * for codec-side state (allocator pools, level overrides, etc.).
+ */
+typedef struct carquet_custom_codec {
+    /**
+     * @brief Compress @p src_size bytes from @p src into @p dst.
+     *
+     * @p dst is already sized to `compress_bound(src_size, user_data)`.
+     * On success, set @p *out_size to the bytes actually written and return
+     * `CARQUET_OK`. @p level mirrors `carquet_writer_options_t.compression_level`
+     * (0 means "codec default"); the codec is free to ignore it.
+     */
+    carquet_status_t (*compress)(
+        const uint8_t* src, size_t src_size,
+        uint8_t* dst, size_t dst_capacity, size_t* out_size,
+        int32_t level, void* user_data);
+
+    /**
+     * @brief Decompress @p src_size bytes from @p src into @p dst.
+     *
+     * @p dst_capacity is the exact uncompressed size declared in the page
+     * header; the codec must produce exactly that many bytes or return an
+     * error. Set @p *out_size to the bytes written on success.
+     */
+    carquet_status_t (*decompress)(
+        const uint8_t* src, size_t src_size,
+        uint8_t* dst, size_t dst_capacity, size_t* out_size,
+        void* user_data);
+
+    /**
+     * @brief Worst-case compressed-output size for @p src_size bytes.
+     *
+     * The writer allocates this many bytes for the destination buffer before
+     * calling @ref compress, so the bound must hold for any input of that
+     * size or the writer will fail to compress legitimate pages.
+     */
+    size_t (*compress_bound)(size_t src_size, void* user_data);
+
+    /** @brief Opaque pointer passed back into every callback. */
+    void* user_data;
+} carquet_custom_codec_t;
+
+/**
+ * @brief Register or unregister a custom codec implementation.
+ *
+ * The registered codec takes priority over any built-in implementation for
+ * the given codec slot, so this can also be used to swap a built-in for an
+ * alternative implementation. Pass @p impl == NULL to clear the slot and
+ * restore the built-in (or leave the slot unsupported if no built-in
+ * exists). Registering against `CARQUET_COMPRESSION_UNCOMPRESSED` is
+ * rejected, since that path has a no-copy fast lane that must not be
+ * intercepted.
+ *
+ * @param[in] codec Codec slot to bind to.
+ * @param[in] impl  Implementation, or NULL to unregister.
+ * @return CARQUET_OK on success;
+ *         CARQUET_ERROR_INVALID_ARGUMENT if @p codec is out of range, equals
+ *         `UNCOMPRESSED`, or @p impl has a NULL function pointer.
+ *
+ * @note Thread-safety: Not safe to call concurrently with reader/writer
+ *       compression activity on the same codec slot.
+ */
+CARQUET_API
+carquet_status_t carquet_register_codec(
+    carquet_compression_t codec,
+    const carquet_custom_codec_t* impl);
 
 /* ============================================================================
  * Opaque Type Declarations
@@ -1793,7 +1880,10 @@ int32_t carquet_row_batch_num_columns(const carquet_row_batch_t* batch);
  * @param[out] data Pointer to column data (type depends on physical type)
  * @param[out] null_bitmap Null bitmap (1 bit per value, set = not null) or NULL
  * @param[out] num_values Number of values in the column
- * @return CARQUET_OK on success
+ * @return CARQUET_OK on success, or CARQUET_ERROR_INVALID_ARGUMENT if the
+ *         column is dictionary-preserved (preserve_dictionaries enabled and the
+ *         column kept its dictionary): its data is uint32_t indices, not values,
+ *         so it must be read via carquet_row_batch_column_dictionary() instead.
  *
  * @note Thread-safe: Yes (read-only)
  *
@@ -2188,6 +2278,20 @@ typedef struct carquet_writer_options {
      * Default: 0 (automatic)
      */
     int64_t write_batch_size;
+
+    /**
+     * @brief Parquet file format version written into the footer (1 or 2).
+     *
+     * Controls the `version` field of `FileMetaData`. Version 2 (default) is
+     * what every modern reader expects and what carquet has always emitted.
+     * Setting this to 1 produces a footer compatible with very old readers
+     * that reject version-2 files; it does not change page or encoding format
+     * (use @ref data_page_version for that). Any value other than 1 is
+     * treated as 2.
+     *
+     * Default: 2
+     */
+    int32_t file_format_version;
 } carquet_writer_options_t;
 
 /**
@@ -2245,6 +2349,44 @@ carquet_writer_t* carquet_writer_create(
 CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1, 2)
 carquet_writer_t* carquet_writer_create_file(
     FILE* file,
+    const carquet_schema_t* schema,
+    const carquet_writer_options_t* options,
+    carquet_error_t* error);
+
+/**
+ * @brief Open an existing Parquet file and append new row groups to it.
+ *
+ * Parses the existing file's footer, validates that @p schema describes the
+ * same leaf columns (count / name / physical type / repetition), and returns
+ * a writer positioned just before the existing footer. Subsequent calls to
+ * `carquet_writer_write_batch()` and `carquet_writer_new_row_group()` add new
+ * row groups; on `carquet_writer_close()` the writer emits a fresh footer
+ * that lists the existing row groups followed by the new ones. Existing
+ * bloom filters and page indexes are preserved (they sit between the row
+ * group data and the old footer, which is the region we overwrite).
+ *
+ * Restrictions:
+ * - The file must exist and contain a valid Parquet footer.
+ * - The supplied schema must match the existing file's leaf columns. Logical
+ *   types and adjacent metadata on the new row groups follow @p schema and
+ *   @p options; the existing row groups keep their original metadata as
+ *   parsed from the footer.
+ * - Existing key-value metadata is carried over; calls to
+ *   `carquet_writer_add_metadata()` add additional entries.
+ *
+ * @param[in] path Path to an existing Parquet file (opened with read+write
+ *                 access; not truncated).
+ * @param[in] schema Schema describing the file's leaf columns.
+ * @param[in] options Writer options for the new row groups (may be NULL).
+ * @param[out] error Error information (may be NULL).
+ * @return Writer handle, or NULL on error (e.g. schema mismatch, footer
+ *         missing).
+ *
+ * @note Thread-safe: Yes (returns an independent handle).
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1, 2)
+carquet_writer_t* carquet_writer_open_append(
+    const char* path,
     const carquet_schema_t* schema,
     const carquet_writer_options_t* options,
     carquet_error_t* error);
@@ -2612,6 +2754,129 @@ CARQUET_API
 void carquet_offset_index_free(carquet_offset_index_t* index);
 
 /* ============================================================================
+ * Page Filter API
+ * ============================================================================
+ *
+ * Page-level predicate pushdown for the batch reader. Each filter is a
+ * conjunction (AND) of clauses; each clause references one column and
+ * compares it against a literal value (or value set). Clauses are evaluated
+ * against per-page min/max statistics in the column index, and only pages
+ * whose value range could match the predicate are decompressed.
+ *
+ * Both the predicate column(s) and the projection are independent — the
+ * filter may reference columns that are not projected, in which case those
+ * columns are inspected only via their column + offset index (no pages of
+ * those columns are decompressed).
+ *
+ * Page filters are conservative: rows within a matching page that do not
+ * satisfy the predicate are still returned. Callers needing exact filtering
+ * should apply the predicate themselves after the batch.
+ *
+ * The file must have been written with write_page_index = true for every
+ * column the filter references. INT96 columns have no defined sort order
+ * per the Parquet spec and cannot be used in a filter.
+ */
+
+/**
+ * @brief Comparison operators for page filter clauses.
+ */
+typedef enum carquet_filter_op {
+    CARQUET_FILTER_EQ = 0,
+    CARQUET_FILTER_NE,
+    CARQUET_FILTER_LT,
+    CARQUET_FILTER_LE,
+    CARQUET_FILTER_GT,
+    CARQUET_FILTER_GE,
+    CARQUET_FILTER_RANGE,        /**< closed [lo, hi]; either endpoint may be omitted */
+    CARQUET_FILTER_IN,           /**< value membership; values + value_count */
+    CARQUET_FILTER_IS_NULL,
+    CARQUET_FILTER_IS_NOT_NULL,
+} carquet_filter_op_t;
+
+/**
+ * @brief One clause in a conjunctive page filter.
+ *
+ * For numeric types (INT32/INT64/FLOAT/DOUBLE/BOOLEAN), `value` points to
+ * a scalar of the column's native width and `value_size` is ignored.
+ *
+ * For BYTE_ARRAY, `value` is a pointer to the raw bytes and `value_size`
+ * is the byte length. For FIXED_LEN_BYTE_ARRAY, `value_size` must equal
+ * the column's declared type_length.
+ *
+ * For RANGE: when has_lo is true, lo/lo_size give the lower bound;
+ * when has_hi is true, hi/hi_size give the upper bound. At least one
+ * endpoint must be present.
+ *
+ * For IN: `values` points to a packed array of `value_count` entries.
+ * For fixed-width numeric types, the entries are native-width scalars laid
+ * out contiguously (stride = sizeof(physical type)). For BYTE_ARRAY and
+ * FIXED_LEN_BYTE_ARRAY, `values` is a contiguous array of
+ * carquet_byte_array_t entries.
+ *
+ * For IS_NULL / IS_NOT_NULL, all value fields are ignored.
+ *
+ * The clauses array and all data it points to are referenced (not copied)
+ * by the batch reader for the lifetime of the filter — the caller must
+ * keep them alive until set_page_filter() is called again or the batch
+ * reader is freed.
+ */
+typedef struct carquet_filter_clause {
+    int32_t column_index;
+    carquet_filter_op_t op;
+
+    /* Unary ops (EQ, NE, LT, LE, GT, GE) */
+    const void* value;
+    int32_t value_size;
+
+    /* RANGE */
+    const void* lo;
+    int32_t lo_size;
+    const void* hi;
+    int32_t hi_size;
+    bool has_lo;
+    bool has_hi;
+
+    /* IN */
+    const void* values;
+    int32_t value_count;
+} carquet_filter_clause_t;
+
+/**
+ * @brief Attach a conjunctive page filter to the batch reader.
+ *
+ * Pass clauses = NULL or count = 0 to clear any previously installed filter.
+ *
+ * The filter is evaluated lazily, per row group, the first time each row
+ * group is read. Subsequent batches within a row group reuse the cached
+ * row-range list.
+ *
+ * @param[in] reader   Batch reader
+ * @param[in] clauses  Array of filter clauses (AND'd together), or NULL
+ * @param[in] count    Number of clauses
+ * @return CARQUET_OK on success;
+ *         CARQUET_ERROR_INVALID_ARGUMENT for an out-of-range column,
+ *         a type/size mismatch, or an INT96 predicate;
+ *         CARQUET_ERROR_PAGE_INDEX_REQUIRED if any referenced column lacks
+ *         a column index (file was not written with write_page_index = true).
+ *
+ * @note Thread-safe: No
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1)
+carquet_status_t carquet_batch_reader_set_page_filter(
+    carquet_batch_reader_t* reader,
+    const carquet_filter_clause_t* clauses,
+    int32_t count);
+
+/**
+ * @brief Number of rows skipped by the active page filter so far.
+ *
+ * Returns 0 when no filter is set, or when no rows have been skipped yet.
+ * Useful for confirming that filtering is firing on a given workload.
+ */
+CARQUET_API CARQUET_PURE CARQUET_NONNULL(1)
+int64_t carquet_batch_reader_rows_skipped(const carquet_batch_reader_t* reader);
+
+/* ============================================================================
  * Key-Value Metadata API
  * ============================================================================
  *
@@ -2801,6 +3066,54 @@ carquet_status_t carquet_writer_set_column_compression(
     int32_t column_index,
     carquet_compression_t codec,
     int32_t level);
+
+/**
+ * @brief Override the target byte-based page-flush size for one column.
+ *
+ * Overrides `carquet_writer_options_t.page_size` for the given column.
+ * Useful when some columns benefit from smaller pages (finer page-level
+ * pruning via the page index) while others benefit from larger pages
+ * (lower per-page header overhead). Must be called before writing data,
+ * like the other per-column setters.
+ *
+ * @param[in] writer File writer
+ * @param[in] column_index Column index
+ * @param[in] bytes Target page size in bytes (must be > 0)
+ * @return CARQUET_OK on success; CARQUET_ERROR_INVALID_ARGUMENT if
+ *         @p column_index is out of range or @p bytes is non-positive.
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1)
+carquet_status_t carquet_writer_set_column_page_size(
+    carquet_writer_t* writer,
+    int32_t column_index,
+    int64_t bytes);
+
+/**
+ * @brief Maximum stored size of variable-length min/max statistics.
+ *
+ * Caps how many bytes of a BYTE_ARRAY column's `min` / `max` are stored in
+ * column statistics. Longer values are truncated: the min is stored as the
+ * leading prefix (still a valid lower bound), and the max is stored as the
+ * leading prefix incremented lexicographically (still a valid upper bound).
+ * If the max prefix is all `0xFF` so the increment cannot be represented,
+ * the max is omitted entirely rather than being stored as an invalid bound.
+ * The `is_min_value_exact` / `is_max_value_exact` flags reflect whether the
+ * stored value equals the actual column min / max.
+ *
+ * Fixed-width physical types (numeric, BOOLEAN, FIXED_LEN_BYTE_ARRAY) are
+ * stored at their natural width and ignore this setting.
+ *
+ * Default: 32 bytes (matches Arrow and the Parquet spec recommendation).
+ *
+ * @param[in] writer File writer
+ * @param[in] bytes Maximum stored size (must be > 0)
+ * @return CARQUET_OK on success; CARQUET_ERROR_INVALID_ARGUMENT if
+ *         @p bytes is non-positive.
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1)
+carquet_status_t carquet_writer_set_max_statistics_size(
+    carquet_writer_t* writer,
+    int64_t bytes);
 
 /**
  * @brief Enable or disable statistics for a specific column.

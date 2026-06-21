@@ -66,6 +66,7 @@ opts.write_page_index = true;
 opts.write_bloom_filters = true;
 opts.write_arrow_schema = false;  /* embed Arrow IPC schema as ARROW:schema (opt-in) */
 opts.data_page_version = 1;       /* 1 = DATA_PAGE (default); 2 = DATA_PAGE_V2 */
+opts.file_format_version = 2;     /* FileMetaData.version; 1 for very old readers */
 opts.coerce_timestamps = false;   /* rescale all TIMESTAMP columns to one unit */
 opts.write_batch_size = 0;        /* 0 = automatic internal batching */
 
@@ -84,7 +85,8 @@ Two opt-in options, both off by default so default output bytes are unchanged:
 - `write_arrow_schema`: when `true`, embeds the original Arrow schema as a base64-encoded Arrow IPC Schema message under the `ARROW:schema` footer key, so Arrow/PyArrow recover Arrow-specific type information losslessly. Emitted only for flat (non-nested) schemas and only when you have not already set that key yourself.
 - `data_page_version`: `2` writes `DATA_PAGE_V2` (repetition/definition levels stored uncompressed and outside the compressed value region, matching parquet-cpp); any other value keeps the default V1 path.
 - `coerce_timestamps` / `coerce_timestamp_unit` / `allow_timestamp_truncation`: when `coerce_timestamps` is true, every `TIMESTAMP` column is rescaled to `coerce_timestamp_unit` (and its metadata emitted at that unit) regardless of the unit declared in the schema — the equivalent of PyArrow's `coerce_timestamps`. A coarser target loses precision and is rejected unless `allow_timestamp_truncation` is true (PyArrow's `allow_truncated_timestamps`).
-- `write_batch_size`: caps how many values are processed per internal chunk before a page flush is considered (PyArrow's `write_batch_size`); `0` keeps the automatic page-size-derived heuristic. This tunes streaming/memory behavior, not the output format. carquet's "format version" is controlled by `data_page_version` plus its always-compatible metadata (modern `LogicalType` + legacy `ConvertedType`), so there is no separate version-policy knob.
+- `write_batch_size`: caps how many values are processed per internal chunk before a page flush is considered (PyArrow's `write_batch_size`); `0` keeps the automatic page-size-derived heuristic. This tunes streaming/memory behavior, not the output format.
+- `file_format_version`: the value written into `FileMetaData.version` in the footer. Default `2`; set to `1` for the very small set of historical readers that reject version-2 files. Independent of `data_page_version` (which controls page format) and of carquet's always-compatible metadata (modern `LogicalType` + legacy `ConvertedType`); any value other than `1` is treated as `2`.
 
 Other writer entry points:
 
@@ -145,6 +147,10 @@ Useful APIs before the first write:
 
 Per-column overrides must be set after writer creation and before writing data.
 
+### Custom Compression Codecs
+
+`carquet_register_codec(codec, impl)` installs a user-supplied `carquet_custom_codec_t` (compress / decompress / compress_bound + opaque `user_data`) against any `carquet_compression_t` slot. A registered codec wins over the built-in for that slot, so this both fills the slots carquet does not ship a built-in for (`LZO`, `BROTLI`) and lets you swap a built-in for an alternative implementation (e.g. a hardware-accelerated `GZIP`). Pass `impl = NULL` to unregister. Registering against `UNCOMPRESSED` is rejected — that path has a no-copy fast lane that must not be intercepted. Registrations are process-wide and not safe to mutate while reader or writer threads are mid-compress / mid-decompress; install codecs at startup before opening files.
+
 ### Encoding defaults
 
 By default columns use `PLAIN`, with automatic `BYTE_STREAM_SPLIT` for `FLOAT`/`DOUBLE` columns when a compression codec is set. This favors carquet's fast (near zero-copy) read path; it does not dictionary-encode by default.
@@ -177,6 +183,44 @@ carquet_writer_set_column_statistics(writer, 2, false);
 ```
 
 See [`reading.md`](./reading.md#column-statistics) for how to read these stats back and use them for predicate pushdown.
+
+## Append to an Existing File
+
+`carquet_writer_open_append()` opens an existing Parquet file with read+write access and returns a writer positioned to add new row groups. The closing footer is rewritten to list the existing row groups followed by the new ones. Existing bloom filters, page indexes, and key-value metadata are preserved.
+
+```c
+carquet_schema_t* schema = /* ...same shape as the existing file's columns... */;
+
+carquet_writer_t* writer = carquet_writer_open_append(
+    "events.parquet", schema, /* options= */ NULL, &err);
+if (!writer) {
+    fprintf(stderr, "%s\n", err.message);
+    carquet_schema_free(schema);
+    return 1;
+}
+carquet_schema_free(schema);
+
+int32_t batch[] = { /* new rows */ };
+carquet_writer_write_batch(writer, 0, batch, sizeof(batch) / sizeof(*batch), NULL, NULL);
+carquet_writer_close(writer);
+```
+
+What the writer validates and preserves:
+
+- The supplied schema must match the existing file's leaf columns by count, name, physical type, and repetition. Logical-type metadata for already-written row groups stays exactly as recorded in the existing footer; only new row groups follow the current `schema` + `options`.
+- Existing key-value footer metadata is carried over. Further `carquet_writer_add_metadata()` calls add to it.
+- Bloom filters and page indexes for the existing row groups stay valid — they live between the row group data and the old footer, which is the region the writer overwrites.
+- A schema mismatch surfaces as `CARQUET_ERROR_INVALID_SCHEMA` and the file is left untouched.
+
+When this is the right tool:
+
+- Streaming ingestion, log accumulation, periodic snapshots — anywhere you would otherwise read-then-rewrite.
+- The footer is rewritten on every close, so each append pays the cost of one footer serialization, not a full file rewrite.
+
+Limitations to be aware of:
+
+- The writer needs read+write access to the file; `r+b` open mode is used internally.
+- Existing bloom filters and page indexes are preserved as-is; they are not merged with bloom filters / page indexes you write for the new row groups (each row group's auxiliary structures stay scoped to that row group, which is how Parquet readers expect them).
 
 ## Write to Memory Instead of a File
 

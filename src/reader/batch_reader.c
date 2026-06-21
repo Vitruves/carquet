@@ -15,6 +15,7 @@
 #include <carquet/carquet.h>
 #include "reader_internal.h"
 #include "worker_pool.h"
+#include "page_filter.h"
 #include "core/arena.h"
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +26,7 @@
 
 #if !defined(_WIN32)
 #include <sys/mman.h>
+#include <unistd.h>   /* sysconf(_SC_PAGESIZE) */
 #endif
 
 /* SIMD dispatch function for null bitmap construction */
@@ -87,8 +89,16 @@ typedef struct {
     void** col_values;       /* [num_projected] value buffers */
     size_t* col_buf_sizes;   /* [num_projected] buffer capacities in bytes */
     int64_t* col_num_values; /* [num_projected] values actually read */
-    int64_t total_rows;      /* total rows in this RG (min of col values read) */
+    int64_t total_rows;      /* total rows in this slot (= range total when filter active) */
     int64_t rows_consumed;   /* rows already served to batch_reader_next */
+
+    /* Page-filter row ranges for this slot (only populated when a page
+     * filter is active). Per-projected-column offset indexes are cached
+     * here so worker tasks can seek to matching pages without going
+     * through the file reader again. */
+    carquet_row_range_list_t ranges;
+    bool filter_ranges_valid;
+    carquet_offset_index_t** col_offset_indexes;  /* [num_projected], may be NULL entries */
 
     /* Per-slot independent mmap for this row group's byte range.
      * Avoids page table lock contention when 12+ threads fault pages
@@ -99,6 +109,13 @@ typedef struct {
     int64_t  slot_mmap_offset;  /* file offset corresponding to slot_mmap[0] */
 #endif
 } rg_slot_t;
+
+/* Forward decl shared with filtered bulk-read task (defined later). */
+static int32_t find_page_for_row(
+    const carquet_offset_index_t* oi,
+    int64_t row_group_num_rows,
+    int64_t target_row,
+    int64_t* page_first_row_out);
 
 /* Forward declarations for coalesced read fast path.
  * data_base: pointer to file data (per-slot mmap or shared mmap).
@@ -128,6 +145,13 @@ typedef struct {
     int64_t start_offset;      /* 0 = full chunk */
     int64_t end_offset;        /* 0 = full chunk */
     int64_t local_values_read; /* scratch for split tasks */
+
+    /* Page-filter mode: when ranges is non-NULL the task reads only the
+     * matching pages, writing rows contiguously into dest. */
+    const carquet_row_range_list_t* ranges;
+    const carquet_offset_index_t* offset_index;
+    int64_t rg_num_rows;
+    size_t value_size;
 } bulk_read_arg_t;
 
 struct carquet_batch_reader {
@@ -179,6 +203,27 @@ struct carquet_batch_reader {
     /* Per-reader task args (replaces static global array) */
     bulk_read_arg_t* task_args;
     int32_t task_args_capacity;
+
+    /* ====================================================================
+     * Page filter state
+     * ==================================================================== */
+    /* Active filter clauses (caller-owned; not copied). NULL = no filter. */
+    const carquet_filter_clause_t* filter_clauses;
+    int32_t filter_clause_count;
+
+    /* Row ranges that survive the conjunction for current_row_group.
+     * Valid only when filter_rg_state_valid is true. */
+    carquet_row_range_list_t current_rg_ranges;
+    bool filter_rg_state_valid;
+    int32_t current_range_index;
+    int64_t current_range_rows_emitted;
+    bool range_positioned;          /* Column readers seeked to current range start? */
+    int64_t rows_skipped;           /* Diagnostic accumulator */
+
+    /* Per-projected-column offset index cache for the current row group.
+     * Loaded lazily on first range positioning, freed on RG transition. */
+    carquet_offset_index_t** projected_offset_indexes;
+    int32_t projected_oi_rg;        /* -1 when cache is empty */
 };
 
 /* ============================================================================
@@ -368,14 +413,10 @@ static void read_projected_column(
     col_data->dictionary_count = 0;
     col_data->dictionary_offsets = NULL;
 
-    /* Dictionary preservation: if enabled and column has a dictionary,
-     * return uint32_t indices instead of materializing values */
-    bool use_dict_preserve = batch_reader->config.preserve_dictionaries &&
-                             col_reader->has_dictionary;
-
-    /* Set the preserve_dictionary flag on the column reader so the page
-     * decoder knows to skip materialization */
-    col_reader->preserve_dictionary = use_dict_preserve;
+    /* Dictionary preservation was decided in reset_column_reader_for_row_group
+     * (before any page load), so the decode/copy width is consistent. Just
+     * read the resolved flag here. */
+    bool use_dict_preserve = col_reader->preserve_dictionary;
 
     /* When preserving dictionaries, value_size is sizeof(uint32_t) for indices */
     size_t effective_value_size = use_dict_preserve ? sizeof(uint32_t) : value_size;
@@ -519,12 +560,14 @@ static void reset_column_reader_for_row_group(
     carquet_column_reader_t* col_reader,
     carquet_reader_t* file_reader,
     int32_t row_group_index,
-    int32_t column_index) {
+    int32_t column_index,
+    bool preserve_dictionaries) {
 
     const parquet_row_group_t* rg = &file_reader->metadata.row_groups[row_group_index];
 
     col_reader->row_group_index = row_group_index;
     col_reader->column_index = column_index;
+    col_reader->preserve_dictionary = false;
 
     if (!rg->columns || column_index >= rg->num_columns) {
         col_reader->chunk = NULL;
@@ -540,6 +583,14 @@ static void reset_column_reader_for_row_group(
         return;
     }
     col_reader->col_meta = &col_reader->chunk->metadata;
+
+    /* Decide dictionary preservation up front, before any page is loaded.
+     * Pages are pre-loaded (and decoded/sized) ahead of the read phase, so the
+     * decode width (physical value vs. 4-byte index) must be fixed now; keying
+     * off has_dictionary instead would only flip after the first load and
+     * desync the buffer width from the copy width. */
+    col_reader->preserve_dictionary =
+        preserve_dictionaries && col_reader->col_meta->has_dictionary_page_offset;
 
     /* Reset reading state */
     col_reader->values_remaining = col_reader->col_meta->num_values;
@@ -720,6 +771,16 @@ carquet_batch_reader_t* carquet_batch_reader_create(
     }
 
     batch_reader->current_row_group = -1;
+
+    /* Filter state init */
+    carquet_row_range_list_init(&batch_reader->current_rg_ranges);
+    batch_reader->filter_rg_state_valid = false;
+    batch_reader->current_range_index = 0;
+    batch_reader->current_range_rows_emitted = 0;
+    batch_reader->range_positioned = false;
+    batch_reader->rows_skipped = 0;
+    batch_reader->projected_offset_indexes = NULL;
+    batch_reader->projected_oi_rg = -1;
 
     /* ====================================================================
      * Pre-compute filtered row group order
@@ -921,7 +982,8 @@ static carquet_status_t open_row_group_readers(
             reset_column_reader_for_row_group(
                 batch_reader->col_readers[i],
                 batch_reader->reader,
-                row_group_index, file_col_idx);
+                row_group_index, file_col_idx,
+                batch_reader->config.preserve_dictionaries);
         } else {
             /* First time: create new reader */
             batch_reader->col_readers[i] = carquet_reader_get_column(
@@ -936,6 +998,15 @@ static carquet_status_t open_row_group_readers(
                 return error ? error->code : CARQUET_ERROR_COLUMN_NOT_FOUND;
             }
         }
+
+        /* Decide dictionary preservation up front for BOTH the reset and the
+         * freshly-created reader, before any page is pre-loaded. The decode
+         * buffer width depends on this (physical value vs. 4-byte index), and
+         * pages are pre-loaded ahead of the read phase, so it must be fixed
+         * now rather than at read time. */
+        carquet_column_reader_t* cr = batch_reader->col_readers[i];
+        cr->preserve_dictionary = batch_reader->config.preserve_dictionaries &&
+            cr->col_meta && cr->col_meta->has_dictionary_page_offset;
     }
 
     batch_reader->current_row_group = row_group_index;
@@ -962,23 +1033,94 @@ static carquet_status_t open_row_group_readers(
  */
 static void bulk_read_task(void* arg) {
     bulk_read_arg_t* t = (bulk_read_arg_t*)arg;
-    if (t->col_reader && t->dest && t->max_values > 0) {
-        if (can_coalesce_column(t->col_reader)) {
-            if (t->start_offset > 0 && t->end_offset > t->start_offset) {
-                coalesced_read_column_range(t->col_reader, t->data_base,
-                                            t->dest, t->max_values,
-                                            t->start_offset, t->end_offset,
-                                            t->out_values_read);
+    if (!t->col_reader || !t->dest || t->max_values <= 0) {
+        *t->out_values_read = 0;
+        return;
+    }
+
+    /* ------------------------------------------------------------------
+     * Filtered branch: read only matching pages for this column, writing
+     * each range's rows contiguously into the slot buffer.
+     *
+     * When this column has an offset index we seek by file offset to the
+     * page covering each range. When it doesn't (e.g. an externally
+     * written file that supplied a page index for the predicate column
+     * but not for this one), we degrade to monotonic read-and-discard:
+     * skip the gap between the previous range end and the next range
+     * start, then read the range's row count. This is the same fallback
+     * the sequential filtered path uses (§6.5 of the design doc).
+     * ------------------------------------------------------------------ */
+    if (t->ranges && t->ranges->count > 0 && t->value_size > 0) {
+        carquet_error_t err = CARQUET_ERROR_INIT;
+        size_t dest_offset_bytes = 0;
+        int64_t total_read = 0;
+        int64_t cursor_row = 0;   /* logical row position used by the
+                                   * no-offset-index fallback. */
+        for (int32_t r = 0; r < t->ranges->count; r++) {
+            int64_t first = t->ranges->ranges[r].first_row;
+            int64_t num = t->ranges->ranges[r].num_rows;
+            if (num <= 0) continue;
+
+            if (t->offset_index) {
+                int64_t page_first_row = 0;
+                int32_t page_idx = find_page_for_row(
+                    t->offset_index, t->rg_num_rows, first, &page_first_row);
+                if (page_idx < 0) break;
+
+                carquet_page_location_t loc;
+                if (carquet_offset_index_get_page_location(
+                        t->offset_index, page_idx, &loc) != CARQUET_OK) {
+                    break;
+                }
+
+                if (carquet_column_reader_seek_to_data_page(
+                        t->col_reader, loc.offset, 0, &err) != CARQUET_OK) {
+                    break;
+                }
+
+                int64_t intra_skip = first - page_first_row;
+                if (intra_skip > 0) {
+                    int64_t skipped = carquet_column_skip(
+                        t->col_reader, intra_skip);
+                    if (skipped != intra_skip) break;
+                }
             } else {
-                coalesced_read_column(t->col_reader, t->dest, t->max_values,
-                                      t->out_values_read);
+                /* Forward read-and-discard from cursor to range start. */
+                int64_t gap = first - cursor_row;
+                if (gap > 0) {
+                    int64_t skipped = carquet_column_skip(t->col_reader, gap);
+                    if (skipped != gap) break;
+                }
             }
+
+            uint8_t* dest_ptr = (uint8_t*)t->dest + dest_offset_bytes;
+            int64_t got = carquet_column_read_batch(
+                t->col_reader, dest_ptr, num, NULL, NULL);
+            if (got != num) break;
+            dest_offset_bytes += (size_t)num * t->value_size;
+            total_read += num;
+            cursor_row = first + num;
+        }
+        *t->out_values_read = total_read;
+        return;
+    }
+
+    /* ------------------------------------------------------------------
+     * Unfiltered branch: existing fast paths.
+     * ------------------------------------------------------------------ */
+    if (can_coalesce_column(t->col_reader)) {
+        if (t->start_offset > 0 && t->end_offset > t->start_offset) {
+            coalesced_read_column_range(t->col_reader, t->data_base,
+                                        t->dest, t->max_values,
+                                        t->start_offset, t->end_offset,
+                                        t->out_values_read);
         } else {
-            *t->out_values_read = carquet_column_read_batch(
-                t->col_reader, t->dest, t->max_values, NULL, NULL);
+            coalesced_read_column(t->col_reader, t->dest, t->max_values,
+                                  t->out_values_read);
         }
     } else {
-        *t->out_values_read = 0;
+        *t->out_values_read = carquet_column_read_batch(
+            t->col_reader, t->dest, t->max_values, NULL, NULL);
     }
 }
 
@@ -1224,12 +1366,36 @@ static int32_t plan_coalesced_column_splits(
     return (num_segments >= 2) ? num_segments : 0;
 }
 
+static void slot_release_filter_state(rg_slot_t* slot, int32_t num_projected) {
+    if (slot->col_offset_indexes) {
+        for (int32_t i = 0; i < num_projected; i++) {
+            if (slot->col_offset_indexes[i]) {
+                carquet_offset_index_free(slot->col_offset_indexes[i]);
+                slot->col_offset_indexes[i] = NULL;
+            }
+        }
+    }
+    if (slot->filter_ranges_valid) {
+        carquet_row_range_list_destroy(&slot->ranges);
+        slot->filter_ranges_valid = false;
+    }
+}
+
 /**
  * Fill pipeline slots by reading entire column chunks in parallel.
  * Each task reads ALL values from one column in one row group.
+ *
+ * When a page filter is active, each slot's row-range list is computed
+ * up front; the worker tasks read only matching pages, sized to the
+ * range total rather than the whole row group. Row groups that match no
+ * rows are skipped without consuming a pipeline slot (their rows are
+ * still credited to rows_skipped).
  */
 static void pipeline_fill(carquet_batch_reader_t* br) {
     if (!br->pipeline_active || !br->pool) return;
+
+    bool filter_active =
+        br->filter_clauses != NULL && br->filter_clause_count > 0;
 
     while (br->pipeline_count < br->pipeline_depth &&
            br->rg_order_next < br->rg_order_len) {
@@ -1242,6 +1408,66 @@ static void pipeline_fill(carquet_batch_reader_t* br) {
         const parquet_row_group_t* rg = &br->reader->metadata.row_groups[target_rg];
         int64_t rg_rows = rg->num_rows;
 
+        /* Page filter evaluation: skip whole row groups that match nothing,
+         * and clip per-slot allocations to the matching row count. */
+        slot_release_filter_state(slot, br->num_projected);
+        int64_t slot_rows = rg_rows;
+        if (filter_active) {
+            carquet_error_t feval_err = CARQUET_ERROR_INIT;
+            carquet_row_range_list_init(&slot->ranges);
+            carquet_status_t fst = carquet_page_filter_eval_row_group(
+                br->reader, target_rg,
+                br->filter_clauses, br->filter_clause_count,
+                &slot->ranges, &feval_err);
+            if (fst != CARQUET_OK) {
+                /* Surface the error on the next batch_reader_next() by
+                 * leaving the slot empty and advancing past the row group. */
+                carquet_row_range_list_destroy(&slot->ranges);
+                br->rg_order_next++;
+                continue;
+            }
+            slot->filter_ranges_valid = true;
+
+            br->rows_skipped += rg_rows - slot->ranges.total_rows;
+            if (slot->ranges.count == 0) {
+                /* No rows from this RG; do not occupy a pipeline slot. */
+                carquet_row_range_list_destroy(&slot->ranges);
+                slot->filter_ranges_valid = false;
+                br->rg_order_next++;
+                continue;
+            }
+            slot_rows = slot->ranges.total_rows;
+
+            /* Load per-column offset indexes so worker tasks can seek
+             * directly to matching pages. A NULL entry is allowed: that
+             * column simply falls back to read-and-discard skip in the
+             * worker (this can happen with externally-written files that
+             * supplied a page index for the predicate column but not for
+             * every projected column). */
+            if (!slot->col_offset_indexes) {
+                slot->col_offset_indexes = carquet_mem_calloc(
+                    (size_t)br->num_projected,
+                    sizeof(carquet_offset_index_t*));
+                if (!slot->col_offset_indexes) return;
+            }
+            for (int32_t i = 0; i < br->num_projected; i++) {
+                carquet_error_t oi_err = CARQUET_ERROR_INIT;
+                slot->col_offset_indexes[i] = carquet_reader_get_offset_index(
+                    br->reader, target_rg, br->projected_columns[i], &oi_err);
+                /* NULL is fine — handled by the worker fallback. */
+            }
+        }
+
+        /* A row group physically cannot contain more rows than the file has
+         * bits (the densest encoding is 1 bit/row), so a num_rows beyond
+         * file_size*8 is malformed. Reject it before sizing per-column buffers
+         * so a tiny crafted file can't claim billions of rows and drive a
+         * multi-hundred-GB allocation (memory-exhaustion DoS). */
+        if (br->reader->file_size > 0 &&
+            (uint64_t)slot_rows > (uint64_t)br->reader->file_size * 8u) {
+            return;
+        }
+
         /* Ensure column readers exist and are reset for this slot */
         carquet_error_t err = CARQUET_ERROR_INIT;
         for (int32_t i = 0; i < br->num_projected; i++) {
@@ -1249,7 +1475,8 @@ static void pipeline_fill(carquet_batch_reader_t* br) {
             if (slot->col_readers[i]) {
                 reset_column_reader_for_row_group(
                     slot->col_readers[i], br->reader,
-                    target_rg, file_col_idx);
+                    target_rg, file_col_idx,
+                    br->config.preserve_dictionaries);
             } else {
                 slot->col_readers[i] = carquet_reader_get_column(
                     br->reader, target_rg, file_col_idx, &err);
@@ -1258,8 +1485,17 @@ static void pipeline_fill(carquet_batch_reader_t* br) {
                 }
             }
 
-            /* Ensure value buffer is large enough (grow-only via realloc) */
-            size_t needed = (size_t)rg_rows * br->projected_value_sizes[i];
+            /* Ensure value buffer is large enough (grow-only via realloc).
+             * slot_rows derives from row-group metadata (num_rows), which is
+             * attacker-controlled: guard against a negative count and against
+             * size_t overflow in the multiply so a malformed file cannot drive
+             * a wrapped-around (or absurd) allocation. */
+            size_t vsz = br->projected_value_sizes[i];
+            if (slot_rows < 0 ||
+                (vsz != 0 && (uint64_t)slot_rows > (uint64_t)(SIZE_MAX / vsz))) {
+                return;
+            }
+            size_t needed = (size_t)slot_rows * vsz;
             if (needed > slot->col_buf_sizes[i]) {
                 void* new_buf = carquet_mem_realloc(slot->col_values[i], needed);
                 if (!new_buf) return;
@@ -1270,7 +1506,7 @@ static void pipeline_fill(carquet_batch_reader_t* br) {
 
         slot->rg_index = target_rg;
         slot->ready = false;
-        slot->total_rows = rg_rows;
+        slot->total_rows = slot_rows;
         slot->rows_consumed = 0;
 
         /* Create an independent mmap for this row group's byte range.
@@ -1293,8 +1529,13 @@ static void pipeline_fill(carquet_batch_reader_t* br) {
                 }
             }
             if (range_lo < range_hi) {
-                /* Page-align the range for mmap */
-                int64_t page_lo = range_lo & ~(int64_t)4095;
+                /* Page-align the offset for mmap. mmap requires the offset to be
+                 * a multiple of the system page size, which is 16K on Apple
+                 * Silicon and up to 64K on some Linux arm64/ppc64 configs — a
+                 * hardcoded 4K mask would EINVAL there. Query it at runtime. */
+                long ps = sysconf(_SC_PAGESIZE);
+                int64_t page_mask = (ps > 0) ? (int64_t)ps - 1 : (int64_t)4095;
+                int64_t page_lo = range_lo & ~page_mask;
                 size_t mmap_len = (size_t)(range_hi - page_lo);
                 uint8_t* m = (uint8_t*)mmap(NULL, mmap_len, PROT_READ, MAP_PRIVATE,
                                              br->reader->mmap_info->fd, (off_t)page_lo);
@@ -1326,6 +1567,30 @@ static void pipeline_fill(carquet_batch_reader_t* br) {
         int64_t split_values_arr[513];
 
         for (int32_t i = 0; i < br->num_projected; i++) {
+            /* Filtered branch: one task per column, reads matching pages
+             * only via the cached offset index. Splitting is not used —
+             * range-skipping already constrains the work. */
+            if (filter_active) {
+                int32_t tidx = base + task_offset++;
+                if (tidx >= br->task_args_capacity) break;
+                br->task_args[tidx].col_reader = slot->col_readers[i];
+                br->task_args[tidx].data_base = slot_data;
+                br->task_args[tidx].dest = slot->col_values[i];
+                br->task_args[tidx].max_values = slot_rows;
+                br->task_args[tidx].out_values_read = &slot->col_num_values[i];
+                br->task_args[tidx].start_offset = 0;
+                br->task_args[tidx].end_offset = 0;
+                br->task_args[tidx].local_values_read = 0;
+                br->task_args[tidx].ranges = &slot->ranges;
+                br->task_args[tidx].offset_index = slot->col_offset_indexes[i];
+                br->task_args[tidx].rg_num_rows = rg_rows;
+                br->task_args[tidx].value_size = br->projected_value_sizes[i];
+                slot->col_num_values[i] = slot_rows;
+                carquet_worker_pool_submit(br->pool, bulk_read_task,
+                                           &br->task_args[tidx]);
+                continue;
+            }
+
             int32_t nseg = plan_coalesced_column_splits(
                 slot->col_readers[i], slot_data,
                 rg_rows, max_splits_per_col,
@@ -1349,6 +1614,8 @@ static void pipeline_fill(carquet_batch_reader_t* br) {
                     br->task_args[tidx].start_offset = split_offsets[s];
                     br->task_args[tidx].end_offset = split_offsets[s + 1];
                     br->task_args[tidx].local_values_read = 0;
+                    br->task_args[tidx].ranges = NULL;
+                    br->task_args[tidx].offset_index = NULL;
                     carquet_worker_pool_submit(br->pool, bulk_read_task,
                                                &br->task_args[tidx]);
                 }
@@ -1363,6 +1630,8 @@ static void pipeline_fill(carquet_batch_reader_t* br) {
                 br->task_args[tidx].start_offset = 0;
                 br->task_args[tidx].end_offset = 0;
                 br->task_args[tidx].local_values_read = 0;
+                br->task_args[tidx].ranges = NULL;
+                br->task_args[tidx].offset_index = NULL;
                 carquet_worker_pool_submit(br->pool, bulk_read_task,
                                            &br->task_args[tidx]);
             }
@@ -1373,12 +1642,388 @@ static void pipeline_fill(carquet_batch_reader_t* br) {
     }
 }
 
+/* ============================================================================
+ * Page Filter — internal helpers
+ * ============================================================================ */
+
+static void filter_release_offset_indexes(carquet_batch_reader_t* br) {
+    if (!br->projected_offset_indexes) return;
+    for (int32_t i = 0; i < br->num_projected; i++) {
+        if (br->projected_offset_indexes[i]) {
+            carquet_offset_index_free(br->projected_offset_indexes[i]);
+            br->projected_offset_indexes[i] = NULL;
+        }
+    }
+    br->projected_oi_rg = -1;
+}
+
+static carquet_status_t filter_load_offset_indexes(
+    carquet_batch_reader_t* br, int32_t row_group_index,
+    carquet_error_t* error) {
+
+    if (br->projected_oi_rg == row_group_index &&
+        br->projected_offset_indexes != NULL) {
+        return CARQUET_OK;
+    }
+    filter_release_offset_indexes(br);
+    if (!br->projected_offset_indexes) {
+        br->projected_offset_indexes = carquet_mem_calloc(
+            (size_t)br->num_projected, sizeof(carquet_offset_index_t*));
+        if (!br->projected_offset_indexes) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY,
+                "Failed to allocate offset index cache");
+            return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
+    }
+    for (int32_t i = 0; i < br->num_projected; i++) {
+        carquet_error_t local = CARQUET_ERROR_INIT;
+        br->projected_offset_indexes[i] = carquet_reader_get_offset_index(
+            br->reader, row_group_index, br->projected_columns[i], &local);
+        /* NULL is allowed (no offset index ⇒ fallback read-and-discard); the
+         * skip path is only taken for that column. */
+    }
+    br->projected_oi_rg = row_group_index;
+    return CARQUET_OK;
+}
+
+/* Returns the page index in oi that contains logical row `target_row`, or
+ * -1 if not found. Sets *page_first_row to that page's first_row_index. */
+static int32_t find_page_for_row(
+    const carquet_offset_index_t* oi,
+    int64_t row_group_num_rows,
+    int64_t target_row,
+    int64_t* page_first_row_out) {
+
+    int32_t n = carquet_offset_index_num_pages(oi);
+    /* Binary search: pages are sorted by first_row_index. */
+    int32_t lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        int32_t mid = lo + (hi - lo) / 2;
+        carquet_page_location_t loc;
+        if (carquet_offset_index_get_page_location(oi, mid, &loc) != CARQUET_OK) {
+            return -1;
+        }
+        int64_t end_row;
+        if (mid + 1 < n) {
+            carquet_page_location_t nxt;
+            if (carquet_offset_index_get_page_location(oi, mid + 1, &nxt) !=
+                CARQUET_OK) {
+                return -1;
+            }
+            end_row = nxt.first_row_index;
+        } else {
+            end_row = row_group_num_rows;
+        }
+        if (target_row < loc.first_row_index) {
+            hi = mid - 1;
+        } else if (target_row >= end_row) {
+            lo = mid + 1;
+        } else {
+            *page_first_row_out = loc.first_row_index;
+            return mid;
+        }
+    }
+    return -1;
+}
+
+static carquet_status_t position_projected_column(
+    carquet_batch_reader_t* br,
+    int32_t pi,
+    int64_t target_row,
+    carquet_error_t* error) {
+
+    carquet_column_reader_t* cr = br->col_readers[pi];
+    int32_t file_col = br->projected_columns[pi];
+    int64_t rg_num_rows = br->reader->metadata.row_groups[
+        br->current_row_group].num_rows;
+
+    carquet_offset_index_t* oi = br->projected_offset_indexes
+        ? br->projected_offset_indexes[pi] : NULL;
+
+    if (oi) {
+        int64_t page_first_row = 0;
+        int32_t page_idx = find_page_for_row(oi, rg_num_rows, target_row,
+                                             &page_first_row);
+        if (page_idx < 0) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_INTERNAL,
+                "Could not locate page for row %lld in column %d",
+                (long long)target_row, file_col);
+            return CARQUET_ERROR_INTERNAL;
+        }
+        carquet_page_location_t loc;
+        (void)carquet_offset_index_get_page_location(oi, page_idx, &loc);
+
+        carquet_status_t st = carquet_column_reader_seek_to_data_page(
+            cr, loc.offset, 0, error);
+        if (st != CARQUET_OK) return st;
+
+        int64_t intra_skip = target_row - page_first_row;
+        if (intra_skip > 0) {
+            int64_t skipped = carquet_column_skip(cr, intra_skip);
+            if (skipped != intra_skip) {
+                CARQUET_SET_ERROR(error, CARQUET_ERROR_INTERNAL,
+                    "Intra-page skip short (column %d): asked %lld, got %lld",
+                    file_col, (long long)intra_skip, (long long)skipped);
+                return CARQUET_ERROR_INTERNAL;
+            }
+        }
+        return CARQUET_OK;
+    }
+
+    /* No offset index for this column: reset to chunk start and read-and-
+     * discard up to target_row. Forward-only — backward seeks are handled
+     * by the reset. */
+    reset_column_reader_for_row_group(cr, br->reader,
+        br->current_row_group, file_col,
+        br->config.preserve_dictionaries);
+    if (target_row > 0) {
+        int64_t skipped = carquet_column_skip(cr, target_row);
+        if (skipped != target_row) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_INTERNAL,
+                "Fallback skip short (column %d): asked %lld, got %lld",
+                file_col, (long long)target_row, (long long)skipped);
+            return CARQUET_ERROR_INTERNAL;
+        }
+    }
+    return CARQUET_OK;
+}
+
+/**
+ * Advance to a row group that survives both the user's row-group filter
+ * and the active page filter. On success, the batch reader is positioned
+ * at the first non-empty range of that row group, or returns
+ * CARQUET_ERROR_END_OF_DATA when no more matching rows exist.
+ */
+static carquet_status_t filter_advance_to_active_row_group(
+    carquet_batch_reader_t* br, carquet_error_t* error) {
+
+    int32_t num_row_groups = carquet_reader_num_row_groups(br->reader);
+    for (;;) {
+        if (br->current_row_group < 0) {
+            br->current_row_group = 0;
+        } else if (!br->filter_rg_state_valid ||
+                   br->current_range_index >= br->current_rg_ranges.count) {
+            br->current_row_group++;
+            br->filter_rg_state_valid = false;
+        }
+        if (br->current_row_group >= num_row_groups) {
+            return CARQUET_ERROR_END_OF_DATA;
+        }
+
+        if (br->config.row_group_filter) {
+            bool keep = br->config.row_group_filter(br->reader,
+                br->current_row_group, br->config.row_group_filter_ctx);
+            if (!keep) {
+                /* Move on without counting rows toward rows_skipped (user-
+                 * level RG filter, not page filter). */
+                br->filter_rg_state_valid = false;
+                br->current_range_index = br->current_rg_ranges.count;
+                continue;
+            }
+        }
+
+        if (!br->filter_rg_state_valid) {
+            carquet_status_t st = carquet_page_filter_eval_row_group(
+                br->reader, br->current_row_group,
+                br->filter_clauses, br->filter_clause_count,
+                &br->current_rg_ranges, error);
+            if (st != CARQUET_OK) return st;
+            br->filter_rg_state_valid = true;
+            br->current_range_index = 0;
+            br->current_range_rows_emitted = 0;
+            br->range_positioned = false;
+
+            int64_t rg_rows = br->reader->metadata.row_groups[
+                br->current_row_group].num_rows;
+            br->rows_skipped += rg_rows - br->current_rg_ranges.total_rows;
+
+            /* Open the row group's column readers if we'll need them. */
+            if (br->current_rg_ranges.count > 0) {
+                carquet_status_t open_st = open_row_group_readers(
+                    br, br->current_row_group, error);
+                if (open_st != CARQUET_OK) return open_st;
+                open_st = filter_load_offset_indexes(br,
+                    br->current_row_group, error);
+                if (open_st != CARQUET_OK) return open_st;
+            } else {
+                filter_release_offset_indexes(br);
+            }
+        }
+
+        if (br->current_range_index < br->current_rg_ranges.count) {
+            return CARQUET_OK;
+        }
+        /* Empty row group ⇒ try the next. */
+    }
+}
+
+/**
+ * Sequential next() path with an active page filter. Reads one range
+ * (clipped to batch_size) per call, advancing range/row-group state.
+ */
+static carquet_status_t batch_reader_next_filtered(
+    carquet_batch_reader_t* br, carquet_row_batch_t** batch) {
+
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_status_t st = filter_advance_to_active_row_group(br, &err);
+    if (st != CARQUET_OK) {
+        *batch = NULL;
+        return st;
+    }
+
+    const carquet_row_range_t* range =
+        &br->current_rg_ranges.ranges[br->current_range_index];
+    int64_t range_remaining = range->num_rows - br->current_range_rows_emitted;
+    int64_t batch_size = br->config.batch_size;
+    if (batch_size <= 0) batch_size = 65536;
+    int64_t rows_to_read = range_remaining < batch_size
+        ? range_remaining : batch_size;
+
+    if (!br->range_positioned) {
+        int64_t target_row = range->first_row + br->current_range_rows_emitted;
+        for (int32_t i = 0; i < br->num_projected; i++) {
+            st = position_projected_column(br, i, target_row, &err);
+            if (st != CARQUET_OK) return st;
+        }
+        br->range_positioned = true;
+    }
+
+    /* Reuse or allocate batch struct. */
+    carquet_row_batch_t* new_batch = br->cached_batch;
+    if (!new_batch) {
+        new_batch = carquet_mem_calloc(1, sizeof(carquet_row_batch_t));
+        if (!new_batch) return CARQUET_ERROR_OUT_OF_MEMORY;
+        if (carquet_arena_init(&new_batch->arena) != CARQUET_OK) {
+            carquet_mem_free(new_batch);
+            return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
+        new_batch->columns = carquet_arena_calloc(&new_batch->arena,
+            br->num_projected, sizeof(carquet_column_data_t));
+        if (!new_batch->columns) {
+            carquet_arena_destroy(&new_batch->arena);
+            carquet_mem_free(new_batch);
+            return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
+        new_batch->pooled = true;
+        br->cached_batch = new_batch;
+    }
+    memset(new_batch->columns, 0,
+           sizeof(carquet_column_data_t) * br->num_projected);
+    new_batch->num_columns = br->num_projected;
+
+    bool read_error = false;
+    for (int32_t i = 0; i < br->num_projected; i++) {
+        read_projected_column(br, new_batch, i, rows_to_read, &read_error);
+    }
+    if (read_error) {
+        return CARQUET_ERROR_DECODE;
+    }
+
+    new_batch->num_rows = new_batch->columns[0].num_values;
+    br->total_rows_read += new_batch->num_rows;
+
+    br->current_range_rows_emitted += new_batch->num_rows;
+    if (br->current_range_rows_emitted >= range->num_rows) {
+        br->current_range_index++;
+        br->current_range_rows_emitted = 0;
+        br->range_positioned = false;
+    }
+
+    *batch = new_batch;
+    return CARQUET_OK;
+}
+
+/* ============================================================================
+ * Page Filter — public API
+ * ============================================================================ */
+
+carquet_status_t carquet_batch_reader_set_page_filter(
+    carquet_batch_reader_t* reader,
+    const carquet_filter_clause_t* clauses,
+    int32_t count) {
+
+    /* reader is nonnull per API contract. */
+
+    if (clauses == NULL || count <= 0) {
+        reader->filter_clauses = NULL;
+        reader->filter_clause_count = 0;
+        carquet_row_range_list_clear(&reader->current_rg_ranges);
+        reader->filter_rg_state_valid = false;
+        reader->current_range_index = 0;
+        reader->current_range_rows_emitted = 0;
+        reader->range_positioned = false;
+        filter_release_offset_indexes(reader);
+        return CARQUET_OK;
+    }
+
+    /* Validate every clause up front. */
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    for (int32_t i = 0; i < count; i++) {
+        carquet_status_t st = carquet_page_filter_validate_clause(
+            reader->reader, &clauses[i], &err);
+        if (st != CARQUET_OK) return st;
+    }
+
+    /* If a pipeline is currently active, drain in-flight tasks and drop
+     * any pre-read slots whose contents predate the new filter state. */
+    if (reader->pipeline_active && reader->pool) {
+        carquet_worker_pool_wait(reader->pool);
+        for (int32_t s = 0; s < reader->pipeline_depth; s++) {
+            rg_slot_t* slot = &reader->pipeline[s];
+            if (slot->rg_index >= 0) {
+                slot_release_filter_state(slot, reader->num_projected);
+                slot->rg_index = -1;
+            }
+        }
+        reader->pipeline_head = 0;
+        reader->pipeline_count = 0;
+        reader->rg_order_next = 0;
+    }
+
+    reader->filter_clauses = clauses;
+    reader->filter_clause_count = count;
+    reader->filter_rg_state_valid = false;
+    reader->current_range_index = 0;
+    reader->current_range_rows_emitted = 0;
+    reader->range_positioned = false;
+    filter_release_offset_indexes(reader);
+
+    /* A new filter restarts iteration from the beginning of the file:
+     * the predicate may match row groups the previous filter (or
+     * unfiltered read) already advanced past. */
+    reader->current_row_group = -1;
+    reader->rows_read_in_group = 0;
+    return CARQUET_OK;
+}
+
+int64_t carquet_batch_reader_rows_skipped(
+    const carquet_batch_reader_t* reader) {
+    /* reader is nonnull per API contract. */
+    return reader->rows_skipped;
+}
+
 carquet_status_t carquet_batch_reader_next(
     carquet_batch_reader_t* batch_reader,
     carquet_row_batch_t** batch) {
 
     /* batch_reader and batch are nonnull per API contract */
     carquet_error_t err = CARQUET_ERROR_INIT;
+
+    /* ====================================================================
+     * FILTERED + SEQUENTIAL PATH (page filter active, pipeline disabled)
+     *
+     * The pipeline path's filtered variant (pipeline_fill below) handles
+     * the case where pipeline_active is true: it pre-reads only matching
+     * pages into the slot buffers and is then served by the pipeline
+     * fast path further down. When the pipeline is not active (e.g.
+     * single-row-group, uncompressed, OPTIONAL columns), we drive the
+     * sequential range-iterator instead.
+     * ==================================================================== */
+    if (batch_reader->filter_clauses &&
+        batch_reader->filter_clause_count > 0 &&
+        !batch_reader->pipeline_active) {
+        return batch_reader_next_filtered(batch_reader, batch);
+    }
 
     /* ====================================================================
      * PIPELINE FAST PATH: serve pre-read data directly from ring buffer
@@ -1394,6 +2039,7 @@ carquet_status_t carquet_batch_reader_next(
             if (slot->rows_consumed >= slot->total_rows) {
                 /* Current slot exhausted — retire it and advance */
                 slot->rg_index = -1;
+                slot_release_filter_state(slot, batch_reader->num_projected);
                 batch_reader->pipeline_head = (batch_reader->pipeline_head + 1) % batch_reader->pipeline_depth;
                 batch_reader->pipeline_count--;
                 slot = NULL;
@@ -1581,7 +2227,8 @@ carquet_status_t carquet_batch_reader_next(
     bool needs_decompression = false;
     for (int32_t pi = 0; pi < batch_reader->num_projected; pi++) {
         carquet_column_reader_t* cr = batch_reader->col_readers[pi];
-        if (cr && cr->col_meta->codec != CARQUET_COMPRESSION_UNCOMPRESSED) {
+        if (cr && cr->col_meta &&
+            cr->col_meta->codec != CARQUET_COMPRESSION_UNCOMPRESSED) {
             needs_decompression = true;
             break;
         }
@@ -1698,6 +2345,11 @@ void carquet_batch_reader_free(carquet_batch_reader_t* batch_reader) {
     if (batch_reader->pipeline) {
         for (int32_t s = 0; s < batch_reader->pipeline_depth; s++) {
             rg_slot_t* slot = &batch_reader->pipeline[s];
+            slot_release_filter_state(slot, batch_reader->num_projected);
+            if (slot->col_offset_indexes) {
+                carquet_mem_free(slot->col_offset_indexes);
+                slot->col_offset_indexes = NULL;
+            }
             if (slot->col_readers) {
                 for (int32_t i = 0; i < batch_reader->num_projected; i++) {
                     if (slot->col_readers[i]) {
@@ -1755,6 +2407,11 @@ void carquet_batch_reader_free(carquet_batch_reader_t* batch_reader) {
         carquet_arena_destroy(&batch_reader->cached_batch->arena);
         carquet_mem_free(batch_reader->cached_batch);
     }
+
+    /* Filter state cleanup */
+    filter_release_offset_indexes(batch_reader);
+    carquet_mem_free(batch_reader->projected_offset_indexes);
+    carquet_row_range_list_destroy(&batch_reader->current_rg_ranges);
 
     carquet_mem_free(batch_reader->rg_order);
     carquet_mem_free(batch_reader->projected_value_sizes);
@@ -1814,6 +2471,14 @@ carquet_status_t carquet_row_batch_column(
     }
 
     const carquet_column_data_t* col = &batch->columns[column_index];
+
+    /* When preserve_dictionaries is enabled, col->data holds uint32_t indices,
+     * not materialized values. Returning it through the value accessor would
+     * hand the caller indices silently mis-cast as the column's physical type.
+     * Force the caller to use carquet_row_batch_column_dictionary() instead. */
+    if (col->is_dictionary) {
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
 
     *data = col->data;
     *null_bitmap = col->null_bitmap;

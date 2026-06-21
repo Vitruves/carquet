@@ -92,6 +92,9 @@ extern void carquet_row_group_writer_set_column_max_rows_per_page(
 extern void carquet_row_group_writer_set_column_write_batch_size(
     carquet_row_group_writer_t* writer,
     int column_index, int64_t batch_size);
+extern void carquet_row_group_writer_set_column_page_size(
+    carquet_row_group_writer_t* writer,
+    int column_index, int64_t bytes);
 extern void carquet_row_group_writer_set_column_data_page_v2(
     carquet_row_group_writer_t* writer,
     int column_index, bool enabled);
@@ -233,6 +236,10 @@ typedef struct row_group_info {
 struct carquet_writer {
     FILE* file;
     bool owns_file;
+    /* True when this writer was opened over an existing file via
+     * carquet_writer_open_append(). Such files must never be deleted on abort:
+     * remove() would destroy the user's pre-existing data. */
+    bool is_append;
     char* path;
 
     /* Schema */
@@ -278,6 +285,11 @@ struct carquet_writer {
     int32_t num_kv_metadata;
     int32_t kv_metadata_capacity;
 
+    /* Max bytes for BYTE_ARRAY min/max in column statistics. The Parquet spec
+       recommends truncating; carquet's historical default of 32 matches what
+       Arrow uses. Configurable via carquet_writer_set_max_statistics_size. */
+    int64_t max_statistics_size;
+
     /* Per-column overrides. _set flags distinguish "not overridden" from an
        overriding value of 0 (PLAIN / UNCOMPRESSED are both 0 in their enums). */
     carquet_encoding_t* column_encoding_overrides;
@@ -292,6 +304,10 @@ struct carquet_writer {
     int64_t* column_bloom_ndv_overrides;
     double* column_bloom_fpp_overrides;
     bool* column_bloom_options_set;
+    /* Per-column page-size override (target bytes). 0 / unset means use
+       options.page_size. */
+    int64_t* column_page_size_overrides;
+    bool* column_page_size_override_set;
     bool column_overrides_allocated;
 
     /* Sorting columns metadata, applied to every row group */
@@ -330,6 +346,7 @@ void carquet_writer_options_init(carquet_writer_options_t* options) {
     options->coerce_timestamp_unit = CARQUET_TIME_UNIT_MICROS;
     options->allow_timestamp_truncation = false;
     options->write_batch_size = 0;
+    options->file_format_version = 2;
 }
 
 /* ============================================================================
@@ -387,10 +404,16 @@ static int64_t estimate_column_batch_bytes(
             break;
         case CARQUET_PHYSICAL_BYTE_ARRAY: {
             const carquet_byte_array_t* arrays = (const carquet_byte_array_t*)values;
+            /* Accumulate in a local with a single saturation check at the end:
+             * each length is <= UINT32_MAX, so num_values entries cannot overflow
+             * uint64_t until ~2^32 values, which num_values (int64_t) cannot reach. */
+            uint64_t chunk_total = 0;
             for (int64_t i = 0; i < num_values; i++) {
-                total = saturating_add_i64(total, sizeof(uint32_t));
-                total = saturating_add_i64(total, arrays[i].length);
+                chunk_total += (uint64_t)sizeof(uint32_t) + arrays[i].length;
             }
+            total = (chunk_total > (uint64_t)INT64_MAX)
+                        ? INT64_MAX
+                        : saturating_add_i64(total, (int64_t)chunk_total);
             break;
         }
         default:
@@ -652,12 +675,15 @@ static carquet_status_t ensure_column_overrides(carquet_writer_t* writer) {
     writer->column_bloom_ndv_overrides = carquet_mem_calloc(n, sizeof(int64_t));
     writer->column_bloom_fpp_overrides = carquet_mem_calloc(n, sizeof(double));
     writer->column_bloom_options_set = carquet_mem_calloc(n, sizeof(bool));
+    writer->column_page_size_overrides = carquet_mem_calloc(n, sizeof(int64_t));
+    writer->column_page_size_override_set = carquet_mem_calloc(n, sizeof(bool));
     if (!writer->column_encoding_overrides || !writer->column_encoding_override_set ||
         !writer->column_compression_overrides || !writer->column_compression_levels ||
         !writer->column_compression_override_set ||
         !writer->column_statistics_overrides || !writer->column_bloom_filter_overrides ||
         !writer->column_bloom_ndv_overrides || !writer->column_bloom_fpp_overrides ||
-        !writer->column_bloom_options_set) {
+        !writer->column_bloom_options_set ||
+        !writer->column_page_size_overrides || !writer->column_page_size_override_set) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
     for (int32_t i = 0; i < n; i++) {
@@ -679,6 +705,8 @@ static void free_column_overrides(carquet_writer_t* writer) {
     carquet_mem_free(writer->column_bloom_ndv_overrides);
     carquet_mem_free(writer->column_bloom_fpp_overrides);
     carquet_mem_free(writer->column_bloom_options_set);
+    carquet_mem_free(writer->column_page_size_overrides);
+    carquet_mem_free(writer->column_page_size_override_set);
     writer->column_encoding_overrides = NULL;
     writer->column_encoding_override_set = NULL;
     writer->column_compression_overrides = NULL;
@@ -689,6 +717,8 @@ static void free_column_overrides(carquet_writer_t* writer) {
     writer->column_bloom_ndv_overrides = NULL;
     writer->column_bloom_fpp_overrides = NULL;
     writer->column_bloom_options_set = NULL;
+    writer->column_page_size_overrides = NULL;
+    writer->column_page_size_override_set = NULL;
     writer->column_overrides_allocated = false;
 }
 
@@ -924,6 +954,16 @@ static carquet_status_t ensure_row_group(carquet_writer_t* writer) {
             carquet_row_group_writer_set_column_write_batch_size(
                 writer->current_row_group, i,
                 writer->options.write_batch_size);
+        }
+
+        /* Apply per-column page-size override if set; otherwise the column
+         * inherits the row-group default derived from options.page_size. */
+        if (writer->column_overrides_allocated &&
+            writer->column_page_size_override_set &&
+            writer->column_page_size_override_set[i]) {
+            carquet_row_group_writer_set_column_page_size(
+                writer->current_row_group, i,
+                writer->column_page_size_overrides[i]);
         }
 
         /* Opt-in Data Page V2 output. */
@@ -1256,7 +1296,7 @@ static carquet_status_t build_file_metadata(
 
     memset(metadata, 0, sizeof(*metadata));
 
-    metadata->version = 2;  /* Parquet version 2 */
+    metadata->version = (writer->options.file_format_version == 1) ? 1 : 2;
     metadata->num_rows = writer->total_rows;
     metadata->num_column_orders = writer->num_columns;
     metadata->created_by = carquet_arena_strdup(&writer->arena,
@@ -1423,8 +1463,10 @@ static carquet_status_t build_file_metadata(
 
                     /* Truncate variable-length min/max per the Parquet spec
                      * recommendation. Numeric / BOOLEAN / FLBA stats are
-                     * already at their natural fixed width so pass through. */
-                    const size_t TRUNC = 32;
+                     * already at their natural fixed width so pass through.
+                     * The cap is configurable via
+                     * carquet_writer_set_max_statistics_size. */
+                    const size_t TRUNC = (size_t)writer->max_statistics_size;
                     bool variable_len =
                         (src_col->type == CARQUET_PHYSICAL_BYTE_ARRAY);
 
@@ -1552,6 +1594,7 @@ carquet_writer_t* carquet_writer_create(
     } else {
         carquet_writer_options_init(&writer->options);
     }
+    writer->max_statistics_size = 32;  /* Parquet spec recommendation; matches Arrow */
 
     /* Store full schema elements for metadata serialization */
     {
@@ -1627,6 +1670,7 @@ carquet_writer_t* carquet_writer_create_file(
     } else {
         carquet_writer_options_init(&writer->options);
     }
+    writer->max_statistics_size = 32;  /* Parquet spec recommendation; matches Arrow */
 
     /* Store full schema elements for metadata serialization */
     {
@@ -1670,6 +1714,413 @@ carquet_writer_t* carquet_writer_create_file(
         }
     }
 
+    return writer;
+}
+
+/* ============================================================================
+ * Append-mode helpers
+ * ============================================================================
+ *
+ * Parse an existing file's footer + restore writer state so subsequent writes
+ * are placed *after* the last byte of existing data (which sits just before
+ * the existing footer's 8-byte tail). The existing footer is discarded; the
+ * new one written by carquet_writer_close() lists existing + new row groups.
+ */
+
+/* Read PAR1 tail, footer-length, and footer bytes; parse into the writer's
+ * arena. On success returns CARQUET_OK and fills *out_insert_offset with the
+ * byte position where new data should start being written. */
+static carquet_status_t append_parse_existing_footer(
+    FILE* file,
+    carquet_arena_t* arena,
+    parquet_file_metadata_t* out_meta,
+    int64_t* out_insert_offset,
+    carquet_error_t* error) {
+
+    if (carquet_fseek64(file, 0, SEEK_END) != 0) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_SEEK,
+            "append: failed to seek to end");
+        return CARQUET_ERROR_FILE_SEEK;
+    }
+    int64_t file_size = carquet_ftell64(file);
+    if (file_size < 12) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_FOOTER,
+            "append: file too small to contain a Parquet footer");
+        return CARQUET_ERROR_INVALID_FOOTER;
+    }
+
+    /* Read the 8-byte tail: footer_length (uint32 LE) + PAR1 magic. */
+    uint8_t tail[8];
+    if (carquet_fseek64(file, file_size - 8, SEEK_SET) != 0 ||
+        fread(tail, 1, 8, file) != 8) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_READ,
+            "append: failed to read footer tail");
+        return CARQUET_ERROR_FILE_READ;
+    }
+    if (memcmp(tail + 4, "PAR1", 4) != 0) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_MAGIC,
+            "append: trailing PAR1 magic not found");
+        return CARQUET_ERROR_INVALID_MAGIC;
+    }
+    uint32_t footer_len =
+        (uint32_t)tail[0] |
+        ((uint32_t)tail[1] << 8) |
+        ((uint32_t)tail[2] << 16) |
+        ((uint32_t)tail[3] << 24);
+    if ((int64_t)footer_len + 8 > file_size) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_FOOTER,
+            "append: footer length exceeds file size");
+        return CARQUET_ERROR_INVALID_FOOTER;
+    }
+
+    int64_t footer_offset = file_size - 8 - (int64_t)footer_len;
+    uint8_t* footer_buf = carquet_mem_malloc(footer_len);
+    if (!footer_buf) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "append: footer alloc");
+        return CARQUET_ERROR_OUT_OF_MEMORY;
+    }
+    if (carquet_fseek64(file, footer_offset, SEEK_SET) != 0 ||
+        fread(footer_buf, 1, footer_len, file) != footer_len) {
+        carquet_mem_free(footer_buf);
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_READ,
+            "append: failed to read footer bytes");
+        return CARQUET_ERROR_FILE_READ;
+    }
+
+    carquet_status_t status = parquet_parse_file_metadata(
+        footer_buf, footer_len, arena, out_meta, error);
+    carquet_mem_free(footer_buf);
+    if (status != CARQUET_OK) return status;
+
+    /* New row groups start where the existing footer used to start, so the
+     * existing data pages and any bloom filters / page indexes are preserved
+     * (those sit between the last row group's data and the old footer). */
+    *out_insert_offset = footer_offset;
+    return CARQUET_OK;
+}
+
+/* Verify the caller-supplied schema describes the same leaf columns as the
+ * existing file. We only check the structural facts the writer relies on
+ * (count, name, physical type, repetition) — strict enough that a successful
+ * append produces a self-consistent file, loose enough that small writer-
+ * option differences (compression, page size) don't trip it. */
+static carquet_status_t append_validate_schema_matches(
+    const carquet_schema_t* user_schema,
+    const parquet_file_metadata_t* parsed,
+    carquet_error_t* error) {
+
+    /* Count parsed leaves. */
+    int32_t parsed_leaves = 0;
+    for (int32_t i = 1; i < parsed->num_schema_elements; i++) {
+        if (parsed->schema[i].num_children == 0) parsed_leaves++;
+    }
+    if (parsed_leaves != user_schema->num_leaves) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_SCHEMA,
+            "append: schema leaf count mismatch (existing=%d, supplied=%d)",
+            parsed_leaves, user_schema->num_leaves);
+        return CARQUET_ERROR_INVALID_SCHEMA;
+    }
+
+    /* Walk parsed leaves in document order and compare to user leaves. */
+    int32_t leaf_idx = 0;
+    for (int32_t i = 1; i < parsed->num_schema_elements; i++) {
+        if (parsed->schema[i].num_children != 0) continue;
+        int32_t user_elem_idx = user_schema->leaf_indices[leaf_idx];
+        const parquet_schema_element_t* u = &user_schema->elements[user_elem_idx];
+        const parquet_schema_element_t* p = &parsed->schema[i];
+
+        if (u->type != p->type ||
+            u->repetition_type != p->repetition_type ||
+            (u->type == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY &&
+             u->type_length != p->type_length)) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_SCHEMA,
+                "append: column %d type/repetition mismatch", leaf_idx);
+            return CARQUET_ERROR_INVALID_SCHEMA;
+        }
+        /* Logical type must match too: appending a BYTE_ARRAY annotated JSON
+         * onto chunks annotated STRING (or any logical-type divergence) yields
+         * a file whose row groups disagree on semantics, which stricter readers
+         * (Java/Rust) reject. Physical type alone is not enough. */
+        if (u->has_logical_type != p->has_logical_type ||
+            (u->has_logical_type &&
+             u->logical_type.id != p->logical_type.id)) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_SCHEMA,
+                "append: column %d logical type mismatch", leaf_idx);
+            return CARQUET_ERROR_INVALID_SCHEMA;
+        }
+        if (!u->name || !p->name || strcmp(u->name, p->name) != 0) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_SCHEMA,
+                "append: column %d name mismatch", leaf_idx);
+            return CARQUET_ERROR_INVALID_SCHEMA;
+        }
+        leaf_idx++;
+    }
+    return CARQUET_OK;
+}
+
+/* Deep-copy one parsed column chunk into the writer's row_group_column_info_t
+ * representation. Statistics min/max byte buffers are heap-allocated to match
+ * the lifetime of writer->row_groups[i].columns[j], which free_row_groups
+ * (called from writer_abort/close) frees individually. */
+static carquet_status_t append_restore_column_chunk(
+    const parquet_column_chunk_t* src,
+    row_group_column_info_t* dst) {
+
+    const parquet_column_metadata_t* m = &src->metadata;
+    dst->file_offset = src->file_offset;
+    dst->type = m->type;
+    dst->codec = m->codec;
+    dst->num_values = m->num_values;
+    dst->total_compressed_size = m->total_compressed_size;
+    dst->total_uncompressed_size = m->total_uncompressed_size;
+    dst->data_page_offset = m->data_page_offset;
+    if (m->has_dictionary_page_offset) {
+        dst->has_dictionary_page_offset = true;
+        dst->dictionary_page_offset = m->dictionary_page_offset;
+        dst->has_dictionary_page = true;
+    }
+    /* Copy the existing encodings list (cap at the writer's storage of 3). */
+    int32_t ne = m->num_encodings < 3 ? m->num_encodings : 3;
+    for (int32_t k = 0; k < ne; k++) dst->encodings[k] = m->encodings[k];
+    dst->num_encodings = ne;
+
+    if (m->has_bloom_filter_offset) {
+        dst->has_bloom_filter_offset = true;
+        dst->bloom_filter_offset = m->bloom_filter_offset;
+    }
+    if (m->has_bloom_filter_length) {
+        dst->has_bloom_filter_length = true;
+        dst->bloom_filter_length = m->bloom_filter_length;
+    }
+    if (src->has_column_index_offset) {
+        dst->has_column_index_offset = true;
+        dst->column_index_offset = src->column_index_offset;
+    }
+    if (src->has_column_index_length) {
+        dst->has_column_index_length = true;
+        dst->column_index_length = src->column_index_length;
+    }
+    if (src->has_offset_index_offset) {
+        dst->has_offset_index_offset = true;
+        dst->offset_index_offset = src->offset_index_offset;
+    }
+    if (src->has_offset_index_length) {
+        dst->has_offset_index_length = true;
+        dst->offset_index_length = src->offset_index_length;
+    }
+
+    if (m->has_geospatial_statistics) {
+        dst->has_geo_stats = true;
+        dst->geo_stats = m->geospatial_statistics;
+    }
+
+    if (m->has_statistics) {
+        dst->has_statistics = true;
+        const parquet_statistics_t* s = &m->statistics;
+        if (s->has_null_count) {
+            dst->has_null_count = true;
+            dst->null_count = s->null_count;
+        }
+        if (s->min_value && s->min_value_len > 0 &&
+            s->max_value && s->max_value_len > 0) {
+            dst->has_min_max = true;
+            dst->min_value = carquet_mem_malloc((size_t)s->min_value_len);
+            dst->max_value = carquet_mem_malloc((size_t)s->max_value_len);
+            if (!dst->min_value || !dst->max_value) {
+                carquet_mem_free(dst->min_value);
+                carquet_mem_free(dst->max_value);
+                dst->min_value = dst->max_value = NULL;
+                return CARQUET_ERROR_OUT_OF_MEMORY;
+            }
+            memcpy(dst->min_value, s->min_value, (size_t)s->min_value_len);
+            memcpy(dst->max_value, s->max_value, (size_t)s->max_value_len);
+            dst->min_value_size = s->min_value_len;
+            dst->max_value_size = s->max_value_len;
+        }
+    }
+    return CARQUET_OK;
+}
+
+static carquet_status_t append_restore_row_groups(
+    carquet_writer_t* writer,
+    const parquet_file_metadata_t* parsed) {
+
+    if (parsed->num_row_groups == 0) return CARQUET_OK;
+
+    writer->row_groups = carquet_mem_calloc(
+        (size_t)parsed->num_row_groups, sizeof(row_group_info_t));
+    if (!writer->row_groups) return CARQUET_ERROR_OUT_OF_MEMORY;
+    writer->row_groups_capacity = parsed->num_row_groups;
+
+    for (int32_t i = 0; i < parsed->num_row_groups; i++) {
+        const parquet_row_group_t* src = &parsed->row_groups[i];
+        row_group_info_t* dst = &writer->row_groups[i];
+
+        /* The close-time footer rewrite indexes the writer's per-column
+         * arrays (paths, encodings — all sized to the schema leaf count) by
+         * each restored row group's column position. A malformed file can
+         * declare a row group with a different num_columns than the schema
+         * has leaves; restoring it would read those arrays out of bounds at
+         * close. Reject such files (open_append fails, file untouched). */
+        if (src->num_columns != writer->num_columns) {
+            return CARQUET_ERROR_INVALID_SCHEMA;
+        }
+
+        dst->num_rows = src->num_rows;
+        dst->total_byte_size = src->total_byte_size;
+        dst->total_compressed_size = src->has_total_compressed_size
+            ? src->total_compressed_size : 0;
+        dst->file_offset = src->has_file_offset ? src->file_offset : 0;
+        dst->ordinal = src->has_ordinal ? src->ordinal : (int16_t)i;
+        dst->num_columns = src->num_columns;
+        dst->columns = carquet_mem_calloc(
+            (size_t)src->num_columns, sizeof(row_group_column_info_t));
+        if (!dst->columns) return CARQUET_ERROR_OUT_OF_MEMORY;
+        /* This row group now owns a columns allocation. Publish it to
+         * writer->num_row_groups immediately so that if a later step fails
+         * (column-chunk restore below, or a subsequent row group), the abort
+         * path's free_row_groups() reclaims it instead of leaking. */
+        writer->num_row_groups = i + 1;
+
+        for (int32_t j = 0; j < src->num_columns; j++) {
+            carquet_status_t s = append_restore_column_chunk(
+                &src->columns[j], &dst->columns[j]);
+            if (s != CARQUET_OK) return s;
+        }
+
+        writer->total_rows += src->num_rows;
+    }
+    writer->num_row_groups = parsed->num_row_groups;
+    return CARQUET_OK;
+}
+
+static carquet_status_t append_restore_kv_metadata(
+    carquet_writer_t* writer,
+    const parquet_file_metadata_t* parsed) {
+
+    if (parsed->num_key_value == 0) return CARQUET_OK;
+
+    writer->kv_metadata = carquet_mem_calloc(
+        (size_t)parsed->num_key_value, sizeof(parquet_key_value_t));
+    if (!writer->kv_metadata) return CARQUET_ERROR_OUT_OF_MEMORY;
+    writer->kv_metadata_capacity = parsed->num_key_value;
+
+    for (int32_t i = 0; i < parsed->num_key_value; i++) {
+        const parquet_key_value_t* src = &parsed->key_value_metadata[i];
+        if (src->key) {
+            writer->kv_metadata[i].key = carquet_heap_strdup(src->key);
+            if (!writer->kv_metadata[i].key) return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
+        if (src->value) {
+            writer->kv_metadata[i].value = carquet_heap_strdup(src->value);
+            if (!writer->kv_metadata[i].value) return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
+        writer->num_kv_metadata++;
+    }
+    return CARQUET_OK;
+}
+
+carquet_writer_t* carquet_writer_open_append(
+    const char* path,
+    const carquet_schema_t* schema,
+    const carquet_writer_options_t* options,
+    carquet_error_t* error) {
+
+    /* path and schema are nonnull per API contract */
+    carquet_writer_t* writer = carquet_mem_calloc(1, sizeof(carquet_writer_t));
+    if (!writer) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "append: writer alloc");
+        return NULL;
+    }
+    if (carquet_arena_init_size(&writer->arena, 4096) != CARQUET_OK) {
+        carquet_mem_free(writer);
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "append: arena init");
+        return NULL;
+    }
+
+    /* "r+b": read+write, do not truncate, fail if missing. */
+    writer->file = fopen(path, "r+b");
+    if (!writer->file) {
+        carquet_arena_destroy(&writer->arena);
+        carquet_mem_free(writer);
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_OPEN,
+            "append: cannot open %s for read+write", path);
+        return NULL;
+    }
+    writer->owns_file = true;
+    writer->is_append = true;
+    writer->path = carquet_heap_strdup(path);
+
+    if (options) writer->options = *options;
+    else carquet_writer_options_init(&writer->options);
+    writer->max_statistics_size = 32;
+
+    /* Parse footer + validate it against the user's schema. */
+    parquet_file_metadata_t parsed;
+    int64_t insert_offset = 0;
+    carquet_status_t st = append_parse_existing_footer(
+        writer->file, &writer->arena, &parsed, &insert_offset, error);
+    if (st != CARQUET_OK) { carquet_writer_abort(writer); return NULL; }
+
+    st = append_validate_schema_matches(schema, &parsed, error);
+    if (st != CARQUET_OK) { carquet_writer_abort(writer); return NULL; }
+
+    /* From here on, set up the writer the same way create_file does. The
+     * normal column metadata cache is built from the user's schema (which we
+     * just proved matches), so encodings / paths used by the new row groups
+     * are consistent with existing ones. */
+    st = store_schema_elements(writer, schema);
+    if (st != CARQUET_OK) {
+        carquet_writer_abort(writer);
+        CARQUET_SET_ERROR(error, st, "append: store schema elements");
+        return NULL;
+    }
+    st = build_column_metadata_cache(writer, schema);
+    if (st != CARQUET_OK) {
+        carquet_writer_abort(writer);
+        CARQUET_SET_ERROR(error, st, "append: build column metadata cache");
+        return NULL;
+    }
+    for (int32_t i = 0; i < schema->num_leaves; i++) {
+        int32_t elem_idx = schema->leaf_indices[i];
+        parquet_schema_element_t* elem = &schema->elements[elem_idx];
+        carquet_logical_type_t* lt = elem->has_logical_type ? &elem->logical_type : NULL;
+        st = add_column_internal(writer, elem->name, elem->type, lt,
+            elem->repetition_type, elem->type_length,
+            schema->max_def_levels[i], schema->max_rep_levels[i],
+            leaf_statistics_sort_order_defined(schema, elem_idx));
+        if (st != CARQUET_OK) {
+            carquet_writer_abort(writer);
+            CARQUET_SET_ERROR(error, st, "append: add column from schema");
+            return NULL;
+        }
+    }
+
+    /* Restore the prior row groups + key-value metadata into the writer so
+     * the close-time footer rewrite emits them ahead of the new ones. */
+    st = append_restore_row_groups(writer, &parsed);
+    if (st != CARQUET_OK) {
+        carquet_writer_abort(writer);
+        CARQUET_SET_ERROR(error, st, "append: restore row groups");
+        return NULL;
+    }
+    st = append_restore_kv_metadata(writer, &parsed);
+    if (st != CARQUET_OK) {
+        carquet_writer_abort(writer);
+        CARQUET_SET_ERROR(error, st, "append: restore key-value metadata");
+        return NULL;
+    }
+
+    /* Position the file at the insertion point and mark the header as already
+     * written so the close path does not re-emit PAR1. */
+    if (carquet_fseek64(writer->file, insert_offset, SEEK_SET) != 0) {
+        carquet_writer_abort(writer);
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_SEEK,
+            "append: seek to insertion offset");
+        return NULL;
+    }
+    writer->file_offset = insert_offset;
+    writer->header_written = true;
     return writer;
 }
 
@@ -1931,12 +2382,18 @@ cleanup:
         writer->file = NULL;
     }
 
-    /* Free column definitions */
+    /* Free column definitions. NULL every freed pointer: a buffer writer is
+     * kept alive past close() (see the is_buffer_writer return below) and its
+     * documented lifecycle is close() -> get_buffer() -> abort(). abort()
+     * re-frees these same members, so leaving dangling pointers here causes a
+     * double free / use-after-free. The free_* helpers below already NULL
+     * their own state. */
     if (writer->columns) {
         for (int32_t i = 0; i < writer->num_columns; i++) {
             carquet_mem_free(writer->columns[i].name);
         }
         carquet_mem_free(writer->columns);
+        writer->columns = NULL;
     }
 
     /* Free schema elements */
@@ -1945,20 +2402,27 @@ cleanup:
             carquet_mem_free(writer->schema_elements[i].name);
         }
         carquet_mem_free(writer->schema_elements);
+        writer->schema_elements = NULL;
     }
     if (writer->column_paths) {
         for (int32_t i = 0; i < writer->num_columns; i++) {
             carquet_mem_free(writer->column_paths[i]);
         }
         carquet_mem_free(writer->column_paths);
+        writer->column_paths = NULL;
     }
     carquet_mem_free(writer->column_path_lens);
+    writer->column_path_lens = NULL;
     carquet_mem_free(writer->column_encodings);
+    writer->column_encodings = NULL;
     carquet_mem_free(writer->column_num_encodings);
+    writer->column_num_encodings = NULL;
 
     carquet_mem_free(writer->column_values_written);
+    writer->column_values_written = NULL;
     free_row_groups(writer);
     carquet_mem_free(writer->path);
+    writer->path = NULL;
 
     /* Free key-value metadata */
     free_kv_metadata(writer);
@@ -1989,12 +2453,14 @@ void carquet_writer_abort(carquet_writer_t* writer) {
         writer->current_row_group = NULL;
     }
 
-    /* Close and delete file */
+    /* Close and delete file. For append writers the file existed before we
+     * opened it, so deleting it on abort would destroy the user's data —
+     * close it but leave it on disk untouched. */
     if (writer->owns_file && writer->file) {
         fclose(writer->file);
         writer->file = NULL;
 
-        if (writer->path) {
+        if (writer->path && !writer->is_append) {
             remove(writer->path);
         }
     }
@@ -2123,6 +2589,37 @@ carquet_status_t carquet_writer_set_column_compression(
     writer->column_compression_overrides[column_index] = codec;
     writer->column_compression_levels[column_index] = level;
     writer->column_compression_override_set[column_index] = true;
+    return CARQUET_OK;
+}
+
+carquet_status_t carquet_writer_set_column_page_size(
+    carquet_writer_t* writer,
+    int32_t column_index,
+    int64_t bytes) {
+
+    /* writer is nonnull per API contract */
+    if (column_index < 0 || column_index >= writer->num_columns ||
+        bytes <= 0) {
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    carquet_status_t status = ensure_column_overrides(writer);
+    if (status != CARQUET_OK) return status;
+
+    writer->column_page_size_overrides[column_index] = bytes;
+    writer->column_page_size_override_set[column_index] = true;
+    return CARQUET_OK;
+}
+
+carquet_status_t carquet_writer_set_max_statistics_size(
+    carquet_writer_t* writer,
+    int64_t bytes) {
+
+    /* writer is nonnull per API contract */
+    if (bytes <= 0) {
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+    writer->max_statistics_size = bytes;
     return CARQUET_OK;
 }
 

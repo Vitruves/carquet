@@ -12,6 +12,7 @@
 #include "thrift/parquet_types.h"
 #include "encoding/plain.h"
 #include "encoding/rle.h"
+#include "compression/custom.h"
 #include "core/endian.h"
 #include "core/bitpack.h"
 #include <stdlib.h>
@@ -173,6 +174,16 @@ carquet_status_t carquet_decompress_page(
     uint8_t* decompressed,
     size_t decompressed_capacity,
     size_t* decompressed_size) {
+
+    /* Honor user-registered codec implementations before falling through to
+     * the built-ins, so callers can replace e.g. GZIP with a HW-accelerated
+     * variant or fill the LZO/BROTLI slots that carquet doesn't ship. */
+    carquet_custom_codec_t custom;
+    if (carquet_custom_codec_lookup(codec, &custom)) {
+        return custom.decompress(compressed, compressed_size,
+                                 decompressed, decompressed_capacity,
+                                 decompressed_size, custom.user_data);
+    }
 
     switch (codec) {
         case CARQUET_COMPRESSION_UNCOMPRESSED:
@@ -501,7 +512,15 @@ static carquet_status_t ensure_decoded_page_buffers(
         reader->decoded_rep_levels = NULL;
     }
 
-    if ((size_t)num_values > reader->decoded_capacity) {
+    /* Realloc when the value COUNT grows, or when the per-value byte width
+     * changed. The width can change for the same count when a column reader's
+     * preserve_dictionary flips on (values decoded as 2/8-byte physical values
+     * vs. 4-byte uint32 dictionary indices) — has_dictionary, and therefore
+     * preserve mode, only becomes known after the first page loads. Without
+     * the width check, the count-keyed capacity would reuse a too-small buffer
+     * and the wider decode/copy would overflow it. */
+    if ((size_t)num_values > reader->decoded_capacity ||
+        value_size != reader->decoded_value_size) {
         carquet_mem_free(reader->decoded_values);
         reader->decoded_values = NULL;
         release_decoded_level_buffers(reader);
@@ -516,6 +535,7 @@ static carquet_status_t ensure_decoded_page_buffers(
             reader->decoded_rep_levels = carquet_mem_malloc(sizeof(int16_t) * (size_t)num_values);
         }
         reader->decoded_capacity = (size_t)num_values;
+        reader->decoded_value_size = value_size;
     } else {
         if (need_def_levels && !reader->decoded_def_levels && num_values > 0) {
             reader->decoded_def_levels = carquet_mem_malloc(sizeof(int16_t) * (size_t)num_values);
@@ -655,6 +675,12 @@ carquet_status_t carquet_read_dictionary_page(
     carquet_data_ownership_t ownership,
     carquet_error_t* error) {
 
+    /* Ownership contract: page_data is owned by the CALLER. On error this
+     * function never frees page_data (it only frees its own allocations and
+     * NULLs reader->dictionary_data); the caller frees page_data on a non-OK
+     * return. On success the reader adopts page_data (dictionary_data) and
+     * frees it later via reset/close. Freeing page_data here previously caused
+     * a double free with the caller's error-path free. */
     if (!reader || !page_data || !header) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT, "NULL argument");
         return CARQUET_ERROR_INVALID_ARGUMENT;
@@ -700,10 +726,7 @@ carquet_status_t carquet_read_dictionary_page(
         /* Build offset table for O(1) BYTE_ARRAY lookup */
         reader->dictionary_offsets = carquet_mem_malloc((size_t)header->num_values * sizeof(uint32_t));
         if (!reader->dictionary_offsets) {
-            if (ownership == CARQUET_DATA_OWNED) {
-                carquet_mem_free(reader->dictionary_data);
-            }
-            reader->dictionary_data = NULL;
+            reader->dictionary_data = NULL;  /* caller frees page_data */
             CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate offset table");
             return CARQUET_ERROR_OUT_OF_MEMORY;
         }
@@ -713,11 +736,8 @@ carquet_status_t carquet_read_dictionary_page(
         size_t dict_remaining = page_size;
         for (int32_t i = 0; i < header->num_values; i++) {
             if (dict_remaining < 4) {
-                if (ownership == CARQUET_DATA_OWNED) {
-                    carquet_mem_free(reader->dictionary_data);
-                }
                 carquet_mem_free(reader->dictionary_offsets);
-                reader->dictionary_data = NULL;
+                reader->dictionary_data = NULL;  /* caller frees page_data */
                 reader->dictionary_offsets = NULL;
                 CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Truncated dictionary");
                 return CARQUET_ERROR_DECODE;
@@ -726,11 +746,8 @@ carquet_status_t carquet_read_dictionary_page(
             uint32_t len = carquet_read_u32_le(dict_ptr);
             size_t entry_size = 4 + len;
             if (dict_remaining < entry_size) {
-                if (ownership == CARQUET_DATA_OWNED) {
-                    carquet_mem_free(reader->dictionary_data);
-                }
                 carquet_mem_free(reader->dictionary_offsets);
-                reader->dictionary_data = NULL;
+                reader->dictionary_data = NULL;  /* caller frees page_data */
                 reader->dictionary_offsets = NULL;
                 CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Invalid dictionary entry");
                 return CARQUET_ERROR_DECODE;
@@ -742,16 +759,12 @@ carquet_status_t carquet_read_dictionary_page(
         /* Fixed size values */
         size_t dict_size = 0;
         if (!checked_mul_size(value_size, (size_t)header->num_values, &dict_size)) {
-            if (ownership == CARQUET_DATA_OWNED) {
-                carquet_mem_free(page_data);
-            }
+            /* page_data not yet adopted; caller frees it on this error. */
             CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Dictionary size overflow");
             return CARQUET_ERROR_DECODE;
         }
         if (dict_size > page_size) {
-            if (ownership == CARQUET_DATA_OWNED) {
-                carquet_mem_free(page_data);
-            }
+            /* page_data not yet adopted; caller frees it on this error. */
             CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Truncated dictionary");
             return CARQUET_ERROR_DECODE;
         }
@@ -984,6 +997,18 @@ carquet_status_t carquet_read_data_page_v1(
 
     switch (header->encoding) {
         case CARQUET_ENCODING_PLAIN:
+            /* In dictionary-preserving mode the destination buffer is sized for
+             * uint32_t indices (sizeof(uint32_t) per value). A column chunk that
+             * starts dictionary-encoded but falls back to a PLAIN data page
+             * mid-chunk would have carquet_decode_plain() write full physical
+             * values (e.g. 16-byte carquet_byte_array_t for BYTE_ARRAY) into that
+             * narrow buffer, overrunning the heap. Reject rather than corrupt. */
+            if (reader->preserve_dictionary) {
+                CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ENCODING,
+                    "Cannot preserve dictionary: column chunk falls back to PLAIN "
+                    "encoding mid-chunk (mixed encodings)");
+                return CARQUET_ERROR_INVALID_ENCODING;
+            }
             {
                 int64_t bytes = carquet_decode_plain(
                     ptr, remaining, reader->type, reader->type_length,
@@ -1324,6 +1349,18 @@ carquet_status_t carquet_read_data_page_v2(
 
     switch (header->encoding) {
         case CARQUET_ENCODING_PLAIN:
+            /* In dictionary-preserving mode the destination buffer is sized for
+             * uint32_t indices (sizeof(uint32_t) per value). A column chunk that
+             * starts dictionary-encoded but falls back to a PLAIN data page
+             * mid-chunk would have carquet_decode_plain() write full physical
+             * values (e.g. 16-byte carquet_byte_array_t for BYTE_ARRAY) into that
+             * narrow buffer, overrunning the heap. Reject rather than corrupt. */
+            if (reader->preserve_dictionary) {
+                CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ENCODING,
+                    "Cannot preserve dictionary: column chunk falls back to PLAIN "
+                    "encoding mid-chunk (mixed encodings)");
+                return CARQUET_ERROR_INVALID_ENCODING;
+            }
             {
                 int64_t bytes = carquet_decode_plain(
                     ptr, remaining, reader->type, reader->type_length,
@@ -2450,6 +2487,184 @@ carquet_status_t carquet_column_ensure_page_loaded(
 }
 
 /* ============================================================================
+ * Dictionary Pre-Load (shared between data-page seek and standard read)
+ * ============================================================================
+ */
+
+carquet_status_t carquet_column_ensure_dictionary_loaded(
+    carquet_column_reader_t* reader,
+    carquet_error_t* error) {
+
+    if (!reader || !reader->col_meta) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT, "NULL reader");
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (!reader->col_meta->has_dictionary_page_offset || reader->has_dictionary) {
+        return CARQUET_OK;
+    }
+
+    if (reader->file_reader->mmap_data != NULL) {
+        return load_dictionary_page_mmap(reader, error);
+    }
+    if (reader->file_reader->file == NULL) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_STATE, "No data source");
+        return CARQUET_ERROR_INVALID_STATE;
+    }
+    return load_dictionary_page_fread(reader, error);
+}
+
+/* ============================================================================
+ * Page Seek (used by page-filter row-range iteration)
+ * ============================================================================
+ *
+ * Repositions the reader so that the next page load decodes the data page
+ * at absolute file offset `page_file_offset`. We walk the page headers
+ * between the current position and the target, accumulating num_values so
+ * values_remaining stays consistent — this is robust to OPTIONAL columns
+ * where row count and value count diverge.
+ *
+ * Dictionary state is preserved across the seek; the dictionary is shared
+ * across all data pages in the column chunk.
+ */
+
+static carquet_status_t parse_header_at_offset(
+    carquet_reader_t* file_reader, int64_t offset,
+    parquet_page_header_t* hdr, size_t* hdr_size,
+    carquet_error_t* error) {
+
+    if (offset < 0 || (size_t)offset >= file_reader->file_size) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE,
+            "Page header offset out of file");
+        return CARQUET_ERROR_INVALID_PAGE;
+    }
+
+    if (file_reader->mmap_data != NULL) {
+        size_t max_hdr = file_reader->file_size - (size_t)offset;
+        return parquet_parse_page_header(
+            file_reader->mmap_data + offset, max_hdr, hdr, hdr_size, error);
+    }
+    if (file_reader->file == NULL) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_STATE, "No data source");
+        return CARQUET_ERROR_INVALID_STATE;
+    }
+    return read_and_parse_page_header_fread(
+        file_reader, offset, hdr, hdr_size, error);
+}
+
+carquet_status_t carquet_column_reader_seek_to_data_page(
+    carquet_column_reader_t* reader,
+    int64_t page_file_offset,
+    int64_t values_before_page,
+    carquet_error_t* error) {
+
+    (void)values_before_page;  /* Computed internally via header walk. */
+
+    if (!reader || !reader->col_meta) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT, "NULL reader");
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    /* Ensure dictionary is loaded so data_start_offset is final. */
+    carquet_status_t st = carquet_column_ensure_dictionary_loaded(reader, error);
+    if (st != CARQUET_OK) return st;
+
+    if (page_file_offset < reader->data_start_offset) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT,
+            "Target page offset %lld before chunk data start %lld",
+            (long long)page_file_offset,
+            (long long)reader->data_start_offset);
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    int64_t target_offset = page_file_offset - reader->data_start_offset;
+    int64_t chunk_total_values = reader->col_meta->num_values;
+
+    /* By API contract, the caller has already consumed any prior batch
+     * before seeking. Flush retained BYTE_ARRAY page buffers. */
+    carquet_column_clear_retained_pages(reader);
+
+    /* If a VIEW-owned decoded buffer is held (mmap), release the
+     * reference; owned buffers are kept for reuse. */
+    if (reader->decoded_ownership == CARQUET_DATA_VIEW) {
+        reader->decoded_values = NULL;
+        reader->decoded_capacity = 0;
+        reader->decoded_ownership = CARQUET_DATA_OWNED;
+    }
+
+    /* Always walk from the chunk start so accumulated_values counts every
+     * value in pages before target_offset. Walking only from the current
+     * position would omit pages [0, current_page) on a forward seek (e.g. the
+     * second of two ranges in a page filter), leaving values_remaining too
+     * high; a later unbounded read would then run current_page past the chunk
+     * end and parse the next column's bytes as pages (load_next_page bounds
+     * the offset only by file size, not by the chunk extent). */
+    /* Always walk from the chunk start so accumulated_values counts every
+     * value in pages before target_offset. Walking only from the current
+     * position would omit pages [0, current_page) on a forward seek (e.g. the
+     * second of two ranges in a page filter), leaving values_remaining too
+     * high; a later unbounded read would then run current_page past the chunk
+     * end and parse the next column's bytes as pages (load_next_page bounds
+     * the offset only by file size, not by the chunk extent). */
+    int64_t walk_pos = 0;
+    int64_t accumulated_values = 0;
+
+    /* Clear any mid-page state; values_remaining is recomputed from the walk
+     * below, so the previously-decremented per-page counts no longer apply. */
+    if (reader->page_loaded) {
+        reader->page_loaded = false;
+        reader->page_num_values = 0;
+        reader->page_values_read = 0;
+        reader->page_header_size = 0;
+        reader->page_compressed_size = 0;
+    }
+
+    /* Walk page headers from walk_pos up to (but not including)
+     * target_offset, summing each page's num_values into the
+     * accumulator. */
+    while (walk_pos < target_offset) {
+        int64_t abs_off = reader->data_start_offset + walk_pos;
+        parquet_page_header_t hdr;
+        size_t hdr_size = 0;
+        st = parse_header_at_offset(reader->file_reader, abs_off,
+                                    &hdr, &hdr_size, error);
+        if (st != CARQUET_OK) return st;
+
+        int32_t num_values = 0;
+        if (hdr.type == CARQUET_PAGE_DATA) {
+            num_values = hdr.data_page_header.num_values;
+        } else if (hdr.type == CARQUET_PAGE_DATA_V2) {
+            num_values = hdr.data_page_header_v2.num_values;
+        }
+        /* Dictionary pages between data pages are not expected — we
+         * arrive here only for in-chunk data pages. */
+        if (num_values < 0) num_values = 0;
+        accumulated_values += num_values;
+
+        int64_t advance = (int64_t)hdr_size + (int64_t)hdr.compressed_page_size;
+        if (advance <= 0) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE,
+                "Non-positive page advance during seek walk");
+            return CARQUET_ERROR_INVALID_PAGE;
+        }
+        walk_pos += advance;
+    }
+
+    if (walk_pos != target_offset) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT,
+            "Target page offset %lld does not align with a page boundary "
+            "(walked past to %lld)",
+            (long long)target_offset, (long long)walk_pos);
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    reader->current_page = target_offset;
+    reader->values_remaining = chunk_total_values - accumulated_values;
+    if (reader->values_remaining < 0) reader->values_remaining = 0;
+    return CARQUET_OK;
+}
+
+/* ============================================================================
  * Page Reading Entry Point
  * ============================================================================
  */
@@ -2537,4 +2752,109 @@ carquet_status_t carquet_read_next_page(
     *values_read = to_copy;
 
     return CARQUET_OK;
+}
+
+/* ============================================================================
+ * Skip Values (non-materializing where possible)
+ * ============================================================================
+ *
+ * Advances the reader past up to num_values logical values. Any whole page that
+ * fits entirely within the remaining skip count is advanced by parsing only its
+ * page header — the compressed payload is never read, decompressed, or decoded.
+ * Only a final partial page is decoded (into the reader's reusable decoded
+ * buffer; no caller buffer is needed), and values already decoded in a loaded
+ * page are dropped for free. This keeps offset-index-driven seeks cheap: a skip
+ * of a million rows no longer pays to decode a million values.
+ *
+ * Returns the number of values actually skipped (may be less than requested if
+ * the column chunk is exhausted first).
+ */
+int64_t carquet_column_skip(
+    carquet_column_reader_t* reader,
+    int64_t num_values) {
+
+    /* reader is nonnull per API contract */
+    if (num_values <= 0 || reader->values_remaining <= 0) {
+        return 0;
+    }
+
+    carquet_error_t error = CARQUET_ERROR_INIT;
+
+    /* Finalize data_start_offset (past any dictionary page) so that
+     * current_page == 0 refers to the first data page. */
+    if (carquet_column_ensure_dictionary_loaded(reader, &error) != CARQUET_OK) {
+        return 0;
+    }
+
+    int64_t total_skipped = 0;
+    while (total_skipped < num_values && reader->values_remaining > 0) {
+        /* 1. Values already decoded in the loaded page: dropping them is free. */
+        if (reader->page_loaded &&
+            reader->page_values_read < reader->page_num_values) {
+            int64_t avail = (int64_t)reader->page_num_values -
+                            (int64_t)reader->page_values_read;
+            int64_t want = num_values - total_skipped;
+            int64_t n = avail < want ? avail : want;
+            if (n > reader->values_remaining) n = reader->values_remaining;
+            reader->page_values_read += (int32_t)n;
+            reader->values_remaining -= n;
+            total_skipped += n;
+            continue;
+        }
+
+        /* 2. Loaded page fully consumed: advance past it (no I/O). */
+        if (reader->page_loaded) {
+            reader->current_page += (int64_t)reader->page_header_size +
+                                    (int64_t)reader->page_compressed_size;
+            reader->page_loaded = false;
+            reader->page_num_values = 0;
+            reader->page_values_read = 0;
+            reader->page_header_size = 0;
+            reader->page_compressed_size = 0;
+            continue;
+        }
+
+        /* 3. No page loaded: peek the next page header (no payload read). */
+        int64_t abs_off;
+        if (!checked_add_i64(reader->data_start_offset, reader->current_page,
+                             &abs_off)) {
+            break;
+        }
+        parquet_page_header_t hdr;
+        size_t hdr_size = 0;
+        if (parse_header_at_offset(reader->file_reader, abs_off,
+                                   &hdr, &hdr_size, &error) != CARQUET_OK) {
+            break;  /* End of chunk or malformed: stop, return what we have. */
+        }
+        if (hdr.type != CARQUET_PAGE_DATA && hdr.type != CARQUET_PAGE_DATA_V2) {
+            break;  /* Walked past the chunk's data pages. */
+        }
+        int32_t page_vals = (hdr.type == CARQUET_PAGE_DATA_V2)
+            ? hdr.data_page_header_v2.num_values
+            : hdr.data_page_header.num_values;
+        if (page_vals < 0) page_vals = 0;
+
+        int64_t advance = (int64_t)hdr_size + (int64_t)hdr.compressed_page_size;
+        if (advance <= 0) {
+            break;  /* Defensive: never spin on a degenerate header. */
+        }
+
+        int64_t want = num_values - total_skipped;
+        if ((int64_t)page_vals <= want &&
+            (int64_t)page_vals <= reader->values_remaining) {
+            /* Whole page fits in the skip: advance by header size only. */
+            reader->current_page += advance;
+            reader->values_remaining -= page_vals;
+            total_skipped += page_vals;
+            continue;
+        }
+
+        /* 4. Partial page: decode just this page; iteration 1 drains it. */
+        if (carquet_column_ensure_page_loaded(reader, &error) != CARQUET_OK ||
+            !reader->page_loaded) {
+            break;
+        }
+    }
+
+    return total_skipped;
 }

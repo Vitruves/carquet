@@ -1054,10 +1054,11 @@ void carquet_simd_dispatch_init(void) {
     g_dispatch.checked_gather_float = carquet_neon_checked_gather_float;
     g_dispatch.checked_gather_double = carquet_neon_checked_gather_double;
     /* Byte-stream-split: keep the scalar/compiler path for float (the
-     * auto-vectorized 4-byte transpose beats hand-written NEON on Apple
-     * Silicon), but use NEON for double, where the scalar 8-byte transpose
-     * does not auto-vectorize well. Measured on M3: NEON double encode
-     * ~2.0x, decode ~1.3x faster than scalar, byte-exact identical output. */
+     * auto-vectorized 4-byte transpose matches or beats hand-written NEON on
+     * Apple Silicon, and vld4/vqtbl both regress small in-cache float decode),
+     * but use NEON for double via vld4q_u16/vst4q_u16 structure load-stores.
+     * Measured on M3 vs the prior vqtbl path: double encode +60-100%, decode
+     * +47-69%; vs scalar, decode is +47-86% across cache regimes. Byte-exact. */
     g_dispatch.byte_split_encode_double = carquet_neon_byte_stream_split_encode_double;
     g_dispatch.byte_split_decode_double = carquet_neon_byte_stream_split_decode_double;
     g_dispatch.unpack_bools = carquet_neon_unpack_bools;
@@ -1211,6 +1212,14 @@ bool carquet_dispatch_checked_gather_i32(const int32_t* dict, int32_t dict_count
                                           const uint32_t* indices, int64_t count,
                                           int32_t* output) {
     DISPATCH_ENSURE_INIT();
+    /* No dictionary entries ⇒ every index is out of bounds. Guard here so the
+     * SIMD fast paths never run unchecked: they compute the upper bound as
+     * (uint32_t)dict_count - 1, which underflows to UINT32_MAX when
+     * dict_count == 0, defeating the in-bound check and gathering from
+     * arbitrary offsets. */
+    if (dict_count <= 0) {
+        return count == 0;
+    }
 #if defined(CARQUET_ARCH_ARM)
     if (g_dispatch.checked_gather_i32 &&
         g_dispatch.checked_gather_i32 != scalar_checked_gather_i32) {
@@ -1228,6 +1237,9 @@ bool carquet_dispatch_checked_gather_i64(const int64_t* dict, int32_t dict_count
                                           const uint32_t* indices, int64_t count,
                                           int64_t* output) {
     DISPATCH_ENSURE_INIT();
+    if (dict_count <= 0) {  /* see carquet_dispatch_checked_gather_i32 */
+        return count == 0;
+    }
 #if defined(CARQUET_ARCH_ARM)
     if (g_dispatch.checked_gather_i64 &&
         g_dispatch.checked_gather_i64 != scalar_checked_gather_i64) {
@@ -1245,6 +1257,9 @@ bool carquet_dispatch_checked_gather_float(const float* dict, int32_t dict_count
                                             const uint32_t* indices, int64_t count,
                                             float* output) {
     DISPATCH_ENSURE_INIT();
+    if (dict_count <= 0) {  /* see carquet_dispatch_checked_gather_i32 */
+        return count == 0;
+    }
 #if defined(CARQUET_ARCH_ARM)
     if (g_dispatch.checked_gather_float &&
         g_dispatch.checked_gather_float != scalar_checked_gather_float) {
@@ -1262,6 +1277,9 @@ bool carquet_dispatch_checked_gather_double(const double* dict, int32_t dict_cou
                                              const uint32_t* indices, int64_t count,
                                              double* output) {
     DISPATCH_ENSURE_INIT();
+    if (dict_count <= 0) {  /* see carquet_dispatch_checked_gather_i32 */
+        return count == 0;
+    }
 #if defined(CARQUET_ARCH_ARM)
     if (g_dispatch.checked_gather_double &&
         g_dispatch.checked_gather_double != scalar_checked_gather_double) {

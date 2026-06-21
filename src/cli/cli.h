@@ -23,19 +23,20 @@
 
 int cmd_schema(const char* path);
 int cmd_info(const char* path);
-int cmd_head(const char* path, int64_t n);
-int cmd_tail(const char* path, int64_t n);
-int cmd_count(const char* path);
+int cmd_head(const char* path, int64_t n, const char* filter);
+int cmd_tail(const char* path, int64_t n, const char* filter);
+int cmd_count(const char* path, const char* filter);
 int cmd_columns(const char* path);
 int cmd_stat(const char* path);
 int cmd_validate(const char* path);
-int cmd_sample(const char* path, int64_t n);
+int cmd_sample(const char* path, int64_t n, const char* filter);
 
 /* Options for `cat` and `export` (subset selection + slicing). */
 typedef struct row_select_opts {
     int64_t     offset;    /* rows to skip from the start */
     int64_t     limit;     /* -1 = all remaining */
     const char* columns;   /* comma-separated names; NULL = all columns */
+    const char* filter;    /* page-filter expression, NULL = no filter */
 } row_select_opts_t;
 
 typedef enum export_format {

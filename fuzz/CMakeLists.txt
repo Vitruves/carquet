@@ -59,6 +59,16 @@ add_fuzz_target(fuzz_roundtrip fuzz_roundtrip.c)
 # Writer fuzzer tests schema creation and data writing
 add_fuzz_target(fuzz_writer fuzz_writer.c)
 
+# Page-filter fuzzer (v0.6.0): exercises the page-level predicate evaluator,
+# which compares attacker-controlled column-index/offset-index stats against
+# caller predicate values.
+add_fuzz_target(fuzz_page_filter fuzz_page_filter.c)
+
+# Append fuzzer (v0.6.0): exercises carquet_writer_open_append parsing the
+# trailing footer of an untrusted existing file, schema-match validation, and
+# the close-time footer rewrite over restored row-group metadata.
+add_fuzz_target(fuzz_append fuzz_append.c)
+
 # Create corpus directories
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/corpus_reader)
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/corpus_compression)
@@ -66,3 +76,5 @@ file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/corpus_encodings)
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/corpus_thrift)
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/corpus_roundtrip)
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/corpus_writer)
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/corpus_page_filter)
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/corpus_append)

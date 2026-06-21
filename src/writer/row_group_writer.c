@@ -68,6 +68,8 @@ extern void carquet_column_writer_set_max_rows_per_page(
     carquet_column_writer_internal_t* writer, int64_t max_rows);
 extern void carquet_column_writer_set_write_batch_size(
     carquet_column_writer_internal_t* writer, int64_t batch_size);
+extern void carquet_column_writer_set_target_page_size(
+    carquet_column_writer_internal_t* writer, int64_t bytes);
 extern void carquet_column_writer_enable_page_index(
     carquet_column_writer_internal_t* writer);
 extern void carquet_column_writer_set_file_offset(
@@ -741,6 +743,16 @@ void carquet_row_group_writer_set_column_write_batch_size(
     }
     carquet_column_writer_set_write_batch_size(
         writer->column_writers[column_index], batch_size);
+}
+
+void carquet_row_group_writer_set_column_page_size(
+    carquet_row_group_writer_t* writer,
+    int column_index, int64_t bytes) {
+    if (!writer || column_index < 0 || column_index >= writer->num_columns) {
+        return;
+    }
+    carquet_column_writer_set_target_page_size(
+        writer->column_writers[column_index], bytes);
 }
 
 void carquet_row_group_writer_set_column_data_page_v2(

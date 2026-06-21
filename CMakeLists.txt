@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(carquet VERSION 0.5.1 LANGUAGES C)
+project(carquet VERSION 0.6.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -264,6 +264,7 @@ set(CARQUET_COMPRESSION_SOURCES
     src/compression/snappy.c
     src/compression/zstd.c
     src/compression/gzip.c
+    src/compression/custom.c
 )
 
 # Snappy uses SSSE3 (pshufb) for pattern extension on x86.
@@ -292,6 +293,7 @@ set(CARQUET_READER_SOURCES
     src/reader/column_reader.c
     src/reader/page_reader.c
     src/reader/batch_reader.c
+    src/reader/page_filter.c
     src/reader/statistics.c
     src/reader/mmap_reader.c
     src/reader/worker_pool.c
@@ -590,6 +592,13 @@ if(CARQUET_BUILD_TESTS)
 
     # Wide (SIMD) bit-unpack fast path vs independent oracle
     add_carquet_test(test_bitunpack_wide tests/test_bitunpack_wide.c)
+
+    # Page-level filter (predicate pushdown via column index + offset index)
+    add_carquet_test(test_page_filter tests/test_page_filter.c)
+
+    # Append row groups to an existing file (metadata carryover, bloom/page-index
+    # preservation, nullable + multi-column append, structural-mismatch rejection)
+    add_carquet_test(test_append tests/test_append.c)
 endif()
 
 # Examples
@@ -608,6 +617,9 @@ if(CARQUET_BUILD_EXAMPLES)
     add_carquet_example(example_compression examples/compression_codecs.c)
     add_carquet_example(example_nullable examples/nullable_columns.c)
     add_carquet_example(example_advanced examples/advanced_features.c)
+    add_carquet_example(example_append examples/append_rows.c)
+    add_carquet_example(example_page_filter examples/page_filter.c)
+    add_carquet_example(example_nested examples/nested_data.c)
 endif()
 
 # Benchmarks

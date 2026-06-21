@@ -59,7 +59,14 @@ typedef struct {
     int32_t* leaf_indices;
     int32_t* parent_indices;
     int32_t leaf_idx;
+    bool depth_exceeded;
 } schema_traverse_ctx_t;
+
+/* Cap schema nesting depth to keep the recursive traversal below the call-stack
+ * limit even on threads with small stacks. A crafted file could otherwise nest
+ * up to CARQUET_MAX_SCHEMA_ELEMENTS groups deep and overflow the stack. Real
+ * Parquet schemas are only a handful of levels deep. */
+#define CARQUET_MAX_SCHEMA_DEPTH 100
 
 /**
  * Recursively traverse schema tree and compute definition/repetition levels.
@@ -75,9 +82,16 @@ static int32_t traverse_schema_recursive(
     int32_t element_idx,
     int32_t parent_idx,
     int16_t def_level,
-    int16_t rep_level) {
+    int16_t rep_level,
+    int32_t depth) {
 
     if (element_idx >= ctx->num_elements) {
+        return element_idx;
+    }
+
+    if (depth > CARQUET_MAX_SCHEMA_DEPTH) {
+        /* Refuse to recurse further; compute_levels reports this as an error. */
+        ctx->depth_exceeded = true;
         return element_idx;
     }
 
@@ -122,7 +136,8 @@ static int32_t traverse_schema_recursive(
     /* Group node - recursively process children */
     int32_t next_idx = element_idx + 1;
     for (int32_t child = 0; child < elem->num_children; child++) {
-        next_idx = traverse_schema_recursive(ctx, next_idx, element_idx, this_def, this_rep);
+        next_idx = traverse_schema_recursive(ctx, next_idx, element_idx,
+                                             this_def, this_rep, depth + 1);
     }
 
     return next_idx;
@@ -148,7 +163,7 @@ static int32_t traverse_schema_recursive(
  *       ├── f (required, int32)    -> def=1, rep=1  (from parent e)
  *       └── g (optional, int32)    -> def=2, rep=1  (from e + self)
  */
-static void compute_levels(
+static bool compute_levels(
     const parquet_schema_element_t* elements,
     int32_t num_elements,
     int16_t* max_def,
@@ -157,7 +172,7 @@ static void compute_levels(
     int32_t* parent_indices) {
 
     if (num_elements <= 1) {
-        return;  /* Empty or root-only schema */
+        return true;  /* Empty or root-only schema */
     }
 
     if (parent_indices) {
@@ -171,7 +186,8 @@ static void compute_levels(
         .max_rep = max_rep,
         .leaf_indices = leaf_indices,
         .parent_indices = parent_indices,
-        .leaf_idx = 0
+        .leaf_idx = 0,
+        .depth_exceeded = false
     };
 
     /* Start traversal from root (index 0) with zero levels.
@@ -180,8 +196,10 @@ static void compute_levels(
     const parquet_schema_element_t* root = &elements[0];
     int32_t next_idx = 1;
     for (int32_t child = 0; child < root->num_children; child++) {
-        next_idx = traverse_schema_recursive(&ctx, next_idx, 0, 0, 0);
+        next_idx = traverse_schema_recursive(&ctx, next_idx, 0, 0, 0, 1);
     }
+
+    return !ctx.depth_exceeded;
 }
 
 carquet_schema_t* build_schema(
@@ -211,9 +229,14 @@ carquet_schema_t* build_schema(
         return NULL;
     }
 
-    compute_levels(schema->elements, schema->num_elements,
-                   schema->max_def_levels, schema->max_rep_levels,
-                   schema->leaf_indices, schema->parent_indices);
+    if (!compute_levels(schema->elements, schema->num_elements,
+                        schema->max_def_levels, schema->max_rep_levels,
+                        schema->leaf_indices, schema->parent_indices)) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_SCHEMA,
+                          "Schema nesting exceeds maximum depth of %d",
+                          CARQUET_MAX_SCHEMA_DEPTH);
+        return NULL;
+    }
 
     return schema;
 }
@@ -1159,10 +1182,12 @@ carquet_bloom_filter_t* carquet_reader_get_bloom_filter(
             }
 
             if (wire_type == 5 && num_bytes == 0) {
-                /* i32 (zigzag varint) — this is numBytes */
+                /* i32 (zigzag varint) — this is numBytes. Cap shift at 63: a
+                 * malformed varint with excess continuation bytes would
+                 * otherwise shift a uint64_t by >= 64 (undefined behavior). */
                 uint64_t val = 0;
                 int shift = 0;
-                while (p < end) {
+                while (p < end && shift < 64) {
                     uint8_t b = *p++;
                     val |= (uint64_t)(b & 0x7F) << shift;
                     shift += 7;
@@ -1183,8 +1208,8 @@ carquet_bloom_filter_t* carquet_reader_get_bloom_filter(
                     else if (st == 5) { while (p < end && (*p & 0x80)) p++; if (p < end) p++; }
                     else if (st == 6) { while (p < end && (*p & 0x80)) p++; if (p < end) p++; }
                     else if (st == 8) { uint64_t len = 0; int s = 0;
-                        while (p < end) { uint8_t b = *p++; len |= (uint64_t)(b & 0x7F) << s; s += 7; if (!(b & 0x80)) break; }
-                        p += len; }
+                        while (p < end && s < 64) { uint8_t b = *p++; len |= (uint64_t)(b & 0x7F) << s; s += 7; if (!(b & 0x80)) break; }
+                        if (len > (uint64_t)(end - p)) p = end; else p += len; }
                     else if (st == 1 || st == 2) { /* bool — no extra bytes */ }
                     else if (st == 3) { p++; }
                     else if (st == 7) { p += 8; }
@@ -1199,8 +1224,8 @@ carquet_bloom_filter_t* carquet_reader_get_bloom_filter(
                 else if (wire_type == 1 || wire_type == 2) { /* bool */ }
                 else if (wire_type == 8) {
                     uint64_t len = 0; int s = 0;
-                    while (p < end) { uint8_t b = *p++; len |= (uint64_t)(b & 0x7F) << s; s += 7; if (!(b & 0x80)) break; }
-                    p += len;
+                    while (p < end && s < 64) { uint8_t b = *p++; len |= (uint64_t)(b & 0x7F) << s; s += 7; if (!(b & 0x80)) break; }
+                    if (len > (uint64_t)(end - p)) p = end; else p += len;
                 }
             }
         }

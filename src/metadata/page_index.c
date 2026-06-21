@@ -399,6 +399,20 @@ static carquet_status_t offset_ensure_capacity(carquet_offset_index_builder_t* b
 }
 
 /**
+ * Shift every recorded page offset by `delta`. Used by the column writer
+ * to convert per-column relative offsets (accumulated while values were
+ * being flushed, before the column's absolute file offset was known) into
+ * absolute file offsets at finalize time.
+ */
+void carquet_offset_index_builder_shift_offsets(
+    carquet_offset_index_builder_t* builder, int64_t delta) {
+    if (!builder || delta == 0) return;
+    for (int32_t i = 0; i < builder->num_pages; i++) {
+        builder->offsets[i] += delta;
+    }
+}
+
+/**
  * Add a page's location to the offset index.
  */
 carquet_status_t carquet_offset_index_add_page(
@@ -665,6 +679,7 @@ carquet_column_index_t* carquet_column_index_parse(const uint8_t* data, size_t s
     while (thrift_read_field_begin(&dec, &type, &field_id)) {
         switch (field_id) {
             case 1: { /* null_pages: list<bool> */
+                if (ci->null_pages) { carquet_column_index_free(ci); return NULL; }
                 thrift_type_t elem_type;
                 int32_t count;
                 thrift_read_list_begin(&dec, &elem_type, &count);
@@ -679,6 +694,7 @@ carquet_column_index_t* carquet_column_index_parse(const uint8_t* data, size_t s
                 break;
             }
             case 2: { /* min_values: list<binary> */
+                if (ci->min_values) { carquet_column_index_free(ci); return NULL; }
                 thrift_type_t elem_type;
                 int32_t count;
                 thrift_read_list_begin(&dec, &elem_type, &count);
@@ -706,6 +722,7 @@ carquet_column_index_t* carquet_column_index_parse(const uint8_t* data, size_t s
                 break;
             }
             case 3: { /* max_values: list<binary> */
+                if (ci->max_values) { carquet_column_index_free(ci); return NULL; }
                 thrift_type_t elem_type;
                 int32_t count;
                 thrift_read_list_begin(&dec, &elem_type, &count);
@@ -737,6 +754,7 @@ carquet_column_index_t* carquet_column_index_parse(const uint8_t* data, size_t s
                 break;
             }
             case 5: { /* null_counts: list<i64> */
+                if (ci->null_counts) { carquet_column_index_free(ci); return NULL; }
                 thrift_type_t elem_type;
                 int32_t count;
                 thrift_read_list_begin(&dec, &elem_type, &count);
@@ -812,6 +830,7 @@ carquet_offset_index_t* carquet_offset_index_parse(const uint8_t* data, size_t s
     while (thrift_read_field_begin(&dec, &type, &field_id)) {
         switch (field_id) {
             case 1: { /* page_locations: list<PageLocation> */
+                if (oi->page_locations) { carquet_offset_index_free(oi); return NULL; }
                 thrift_type_t elem_type;
                 int32_t count;
                 thrift_read_list_begin(&dec, &elem_type, &count);
