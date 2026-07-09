@@ -38,10 +38,12 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install ninja ccache pkg-config zstd lz4
 
+      # ccache on Linux/macOS, sccache on Windows (ccache doesn't support MSVC).
+      # sccache caches both the FetchContent codec builds and carquet's objects.
       - name: ccache
-        if: runner.os != 'Windows'
         uses: hendrikmuhs/ccache-action@v1
         with:
+          variant: ${{ runner.os == 'Windows' && 'sccache' || 'ccache' }}
           key: ${{ matrix.os }}-${{ matrix.shared }}
 
       - name: Configure
@@ -51,12 +53,15 @@ jobs:
         run: |
           if [ "$RUNNER_OS" == "Windows" ]; then
             export CC=cl.exe CXX=cl.exe
-            LAUNCHER=""
+            # sccache can't cache MSVC /Zi PDBs, so build Release (no /Zi) here.
+            LAUNCHER="-DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
+            BUILD_TYPE=Release
           else
             LAUNCHER="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+            BUILD_TYPE=RelWithDebInfo
           fi
           cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
             -DCARQUET_BUILD_SHARED=$BUILD_SHARED_LIBS \
             -DCARQUET_BUILD_TESTS=ON \
             $LAUNCHER

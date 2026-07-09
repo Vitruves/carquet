@@ -307,11 +307,14 @@ static inline uint8_t* incremental_copy(const uint8_t* src, uint8_t* op,
                                          uint8_t* const buf_limit) {
     size_t pattern_size = (size_t)(op - src);
 
-#if SNAPPY_HAVE_VECTOR_SHUFFLE
+    /* The pattern_size >= big_pattern block below extends the match with 16-byte
+     * copy128 reads from `src`, so it is only correct once at least 16 valid
+     * pattern bytes precede `op` — i.e. big_pattern must be 16 on every build.
+     * With big_pattern == 8, pattern_size in [8,15] reaches copy128 and reads
+     * 16 - pattern_size bytes past `op` (uninitialised output), corrupting the
+     * result. Those sizes are instead served safely by the scalar doubling/
+     * 8-byte-copy path, which the SIMD build already exercises via its own 16. */
     const int big_pattern = 16;
-#else
-    const int big_pattern = 8;
-#endif
 
     if (pattern_size < (size_t)big_pattern) {
 #if SNAPPY_HAVE_VECTOR_SHUFFLE
