@@ -104,11 +104,16 @@ struct parquet_statistics {
     bool has_distinct_count;
     int64_t distinct_count;
 
-    /* Field 5: max_value */
+    /* Field 5: max_value.
+     * has_max_value records that the field was present, independently of its
+     * length, so that a legitimately empty (zero-length) BYTE_ARRAY min/max is
+     * not mistaken for absent. max_value may be NULL when the value is empty. */
+    bool has_max_value;
     uint8_t* max_value;
     int32_t max_value_len;
 
     /* Field 6: min_value */
+    bool has_min_value;
     uint8_t* min_value;
     int32_t min_value_len;
 

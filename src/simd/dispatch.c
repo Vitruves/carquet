@@ -832,13 +832,44 @@ static void dispatch_set_initialized(void) {
 #endif
 }
 
+/* Serialize the table-population critical section, mirroring carquet_init()'s
+ * lock in detect.c. The acquire/release flag alone only gates the fast path;
+ * without this lock two threads that both observe the flag unset (e.g. on first
+ * SIMD use inside an OpenMP parallel column loop) would race writing the ~90
+ * g_dispatch function pointers. */
+static volatile int g_dispatch_lock = 0;
+
+static void dispatch_lock_acquire(void) {
+#if defined(__GNUC__) || defined(__clang__)
+    while (__atomic_exchange_n(&g_dispatch_lock, 1, __ATOMIC_ACQUIRE)) { /* spin */ }
+#elif defined(_MSC_VER)
+    while (_InterlockedExchange((volatile long*)&g_dispatch_lock, 1)) { /* spin */ }
+#endif
+}
+
+static void dispatch_lock_release(void) {
+#if defined(__GNUC__) || defined(__clang__)
+    __atomic_store_n(&g_dispatch_lock, 0, __ATOMIC_RELEASE);
+#elif defined(_MSC_VER)
+    _InterlockedExchange((volatile long*)&g_dispatch_lock, 0);
+#endif
+}
+
 /* ============================================================================
  * Dispatch Initialization
  * ============================================================================
  */
 
 void carquet_simd_dispatch_init(void) {
+    /* Fast path: already initialized */
     if (dispatch_is_initialized()) {
+        return;
+    }
+
+    dispatch_lock_acquire();
+    /* Re-check under the lock: another thread may have finished while we spun. */
+    if (dispatch_is_initialized()) {
+        dispatch_lock_release();
         return;
     }
 
@@ -1156,6 +1187,7 @@ void carquet_simd_dispatch_init(void) {
 #endif /* ARM */
 
     dispatch_set_initialized();
+    dispatch_lock_release();
 }
 
 /* ============================================================================

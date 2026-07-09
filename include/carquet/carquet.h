@@ -202,10 +202,10 @@ extern "C" {
 #define CARQUET_VERSION_MINOR 6
 
 /** @brief Patch version number */
-#define CARQUET_VERSION_PATCH 0
+#define CARQUET_VERSION_PATCH 1
 
 /** @brief Version string in "MAJOR.MINOR.PATCH" format */
-#define CARQUET_VERSION_STRING "0.6.0"
+#define CARQUET_VERSION_STRING "0.6.1"
 
 /** @brief Numeric version for compile-time comparisons: (MAJOR * 10000 + MINOR * 100 + PATCH) */
 #define CARQUET_VERSION_NUMBER (CARQUET_VERSION_MAJOR * 10000 + CARQUET_VERSION_MINOR * 100 + CARQUET_VERSION_PATCH)
@@ -1519,6 +1519,13 @@ carquet_column_reader_t* carquet_reader_get_column(
  *
  * @note Thread-safe: No (single column reader is not thread-safe)
  *
+ * @note This function collapses every failure mode onto the single sentinel
+ * value -1 and cannot report a page-read failure that truncates a batch after
+ * some values have already been read (it returns the partial count, which is
+ * indistinguishable from a clean short read at end-of-column). When the caller
+ * needs to tell these cases apart, use carquet_column_read_batch_ex(), which
+ * reports a distinct status code and message through a carquet_error_t.
+ *
  * @par Value Buffer Sizing
  * The values buffer must be sized appropriately for the column's physical type:
  * - BOOLEAN: uint8_t (1 byte per value)
@@ -1536,6 +1543,56 @@ int64_t carquet_column_read_batch(
     int64_t max_values,
     int16_t* def_levels,
     int16_t* rep_levels);
+
+/**
+ * @brief Read a batch of values from a column with detailed error reporting.
+ *
+ * Behaves exactly like carquet_column_read_batch() but reports a distinct
+ * status code (and human-readable message) for each failure condition through
+ * the optional @p error out-parameter, which is consistent with the
+ * carquet_error_t convention used elsewhere in the API.
+ *
+ * @param[in]  reader     Column reader
+ * @param[out] values     Output buffer for values (sized for physical type)
+ * @param[in]  max_values Maximum number of values to read
+ * @param[out] def_levels Definition levels buffer (may be NULL if not needed)
+ * @param[out] rep_levels Repetition levels buffer (may be NULL if not needed)
+ * @param[out] error      Error information (may be NULL). Cleared on entry and
+ *                        set only when a failure occurs.
+ * @return Number of values read, or -1 if no values could be read because of an
+ *         error. See the return/error contract below.
+ *
+ * @par Return / error contract
+ * The return value and @p error together distinguish four caller-visible cases:
+ * - <b>ret &gt;= 0 and error unset</b> — clean read. A value smaller than
+ *   @p max_values simply means the end of the column was reached.
+ * - <b>ret &gt; 0 and error set</b> — <em>partial</em> read: the returned values
+ *   are valid, but a page-read failure truncated the batch before @p max_values
+ *   (or end-of-column) was reached. The remaining values were NOT read. The
+ *   caller can salvage the returned data and still detect the failure.
+ * - <b>ret == -1 and error set</b> — hard failure with nothing read. The
+ *   @p error code identifies the cause:
+ *   - #CARQUET_ERROR_INVALID_ARGUMENT — @p max_values &lt; 0
+ *   - #CARQUET_ERROR_TYPE_MISMATCH    — the column's physical type is unknown
+ *   - #CARQUET_ERROR_OUT_OF_MEMORY    — scratch definition-level allocation failed
+ *   - any page/decode/I-O status      — propagated verbatim from the failing page read
+ *
+ * @note Callers that pass NULL for @p error get the same -1 / partial-count
+ * behavior as carquet_column_read_batch(); the extra information is simply
+ * discarded.
+ *
+ * @note Thread-safe: No (single column reader is not thread-safe)
+ *
+ * @see carquet_column_read_batch() for the value-buffer sizing rules.
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1)
+int64_t carquet_column_read_batch_ex(
+    carquet_column_reader_t* reader,
+    void* values,
+    int64_t max_values,
+    int16_t* def_levels,
+    int16_t* rep_levels,
+    carquet_error_t* error);
 
 /**
  * @brief Skip values in a column without reading them.

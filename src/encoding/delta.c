@@ -8,9 +8,11 @@
 #include <carquet/error.h>
 #include <carquet/types.h>
 #include "core/bitpack.h"
+#include "core/allocator.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 
 /* SIMD-dispatched prefix sum functions for delta decoding */
@@ -26,6 +28,12 @@ extern void carquet_dispatch_prefix_sum_i64(int64_t* values, int64_t count, int6
 #define DELTA_MINI_BLOCKS     4
 #define DELTA_MINI_BLOCK_SIZE (DELTA_BLOCK_SIZE / DELTA_MINI_BLOCKS)
 
+/* Upper bound on a header-declared block size, to cap decode-time scratch
+ * allocation from an untrusted page. Real writers use 128; the spec permits any
+ * multiple of 128. 1<<20 gives at most an 8MB mini-block buffer while still
+ * accepting every block size any conformant writer emits in practice. */
+#define DELTA_MAX_BLOCK_SIZE  (1 << 20)
+
 /* ============================================================================
  * Delta Decoder State
  * ============================================================================
@@ -38,21 +46,29 @@ typedef struct {
 
     int32_t block_size;
     int32_t mini_blocks_per_block;
+    int32_t mini_block_size;   /* block_size / mini_blocks_per_block */
     int32_t total_values;
     int32_t values_decoded;
 
     int64_t first_value;
     int64_t last_value;
 
-    /* Current block state */
+    /* Current block state. bit_widths, mini_block_values and unpacked point at
+     * the inline buffers below for the common 128/4 layout, or at heap
+     * allocations sized from the page header for larger spec-valid blocks. */
     int64_t min_delta;
-    uint8_t bit_widths[DELTA_MINI_BLOCKS];
+    uint8_t* bit_widths;
     int32_t current_mini_block;
     int32_t values_in_mini_block;
 
-    /* Mini-block buffer */
-    int64_t mini_block_values[DELTA_MINI_BLOCK_SIZE];
+    int64_t* mini_block_values;
+    uint32_t* unpacked;
     int32_t mini_block_pos;
+
+    bool heap_allocated;
+    uint8_t  bit_widths_inline[DELTA_MINI_BLOCKS];
+    int64_t  mini_block_values_inline[DELTA_MINI_BLOCK_SIZE];
+    uint32_t unpacked_inline[DELTA_MINI_BLOCK_SIZE];
 } delta_decoder_t;
 
 /* ============================================================================
@@ -108,16 +124,42 @@ static carquet_status_t delta_decoder_init(delta_decoder_t* dec,
     dec->mini_blocks_per_block = (int32_t)val;
     dec->pos += bytes;
 
-    /* Validate header values to prevent buffer overflows */
-    if (dec->mini_blocks_per_block <= 0 || dec->mini_blocks_per_block > DELTA_MINI_BLOCKS) {
+    /* Validate header against the Parquet spec: block_size is a positive
+     * multiple of 128, evenly divided into mini_blocks_per_block mini-blocks,
+     * and the resulting mini-block size is a positive multiple of 32. This
+     * accepts every conformant layout (not just the 128/4 that carquet writes)
+     * while the DELTA_MAX_BLOCK_SIZE cap bounds scratch allocation. */
+    if (dec->block_size <= 0 || dec->block_size > DELTA_MAX_BLOCK_SIZE ||
+        dec->block_size % 128 != 0) {
         return CARQUET_ERROR_DECODE;
     }
-    if (dec->block_size <= 0 || dec->block_size > DELTA_BLOCK_SIZE) {
+    if (dec->mini_blocks_per_block <= 0 ||
+        dec->block_size % dec->mini_blocks_per_block != 0) {
         return CARQUET_ERROR_DECODE;
     }
-    /* mini_block_size = block_size / mini_blocks_per_block must fit in buffer */
-    if (dec->block_size / dec->mini_blocks_per_block > DELTA_MINI_BLOCK_SIZE) {
+    dec->mini_block_size = dec->block_size / dec->mini_blocks_per_block;
+    if (dec->mini_block_size <= 0 || dec->mini_block_size % 32 != 0) {
         return CARQUET_ERROR_DECODE;
+    }
+
+    /* Point scratch at the inline buffers for the common 128/4 layout, else
+     * allocate from the header-declared sizes. */
+    if (dec->mini_blocks_per_block <= DELTA_MINI_BLOCKS &&
+        dec->mini_block_size <= DELTA_MINI_BLOCK_SIZE) {
+        dec->bit_widths = dec->bit_widths_inline;
+        dec->mini_block_values = dec->mini_block_values_inline;
+        dec->unpacked = dec->unpacked_inline;
+    } else {
+        dec->bit_widths = carquet_mem_malloc((size_t)dec->mini_blocks_per_block);
+        dec->mini_block_values = carquet_mem_malloc((size_t)dec->mini_block_size * sizeof(int64_t));
+        dec->unpacked = carquet_mem_malloc((size_t)dec->mini_block_size * sizeof(uint32_t));
+        if (!dec->bit_widths || !dec->mini_block_values || !dec->unpacked) {
+            carquet_mem_free(dec->bit_widths);
+            carquet_mem_free(dec->mini_block_values);
+            carquet_mem_free(dec->unpacked);
+            return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
+        dec->heap_allocated = true;
     }
 
     /* Total value count */
@@ -137,6 +179,18 @@ static carquet_status_t delta_decoder_init(delta_decoder_t* dec,
     dec->mini_block_pos = DELTA_MINI_BLOCK_SIZE; /* Force mini-block read */
 
     return CARQUET_OK;
+}
+
+static void delta_decoder_destroy(delta_decoder_t* dec) {
+    if (dec->heap_allocated) {
+        carquet_mem_free(dec->bit_widths);
+        carquet_mem_free(dec->mini_block_values);
+        carquet_mem_free(dec->unpacked);
+        dec->heap_allocated = false;
+    }
+    dec->bit_widths = NULL;
+    dec->mini_block_values = NULL;
+    dec->unpacked = NULL;
 }
 
 static carquet_status_t delta_decoder_read_block(delta_decoder_t* dec) {
@@ -169,7 +223,7 @@ static carquet_status_t delta_decoder_read_mini_block(delta_decoder_t* dec) {
     }
 
     int bit_width = dec->bit_widths[dec->current_mini_block];
-    int mini_block_size = dec->block_size / dec->mini_blocks_per_block;
+    int mini_block_size = dec->mini_block_size;
 
     if (bit_width == 0) {
         /* All deltas are min_delta */
@@ -183,12 +237,11 @@ static carquet_status_t delta_decoder_read_mini_block(delta_decoder_t* dec) {
             return CARQUET_ERROR_DECODE;
         }
 
-        uint32_t unpacked[DELTA_MINI_BLOCK_SIZE];
-        carquet_bitunpack_32(dec->data + dec->pos, mini_block_size, bit_width, unpacked);
+        carquet_bitunpack_32(dec->data + dec->pos, mini_block_size, bit_width, dec->unpacked);
 
         for (int i = 0; i < mini_block_size; i++) {
             /* Use unsigned addition to avoid overflow UB */
-            dec->mini_block_values[i] = (int64_t)((uint64_t)dec->min_delta + (uint64_t)unpacked[i]);
+            dec->mini_block_values[i] = (int64_t)((uint64_t)dec->min_delta + (uint64_t)dec->unpacked[i]);
         }
 
         dec->pos += packed_size;
@@ -239,6 +292,7 @@ carquet_status_t carquet_delta_decode_int32(
 
     if (num_values == 0) {
         if (bytes_consumed) *bytes_consumed = dec.pos;
+        delta_decoder_destroy(&dec);
         return CARQUET_OK;
     }
 
@@ -250,7 +304,10 @@ carquet_status_t carquet_delta_decode_int32(
     for (int32_t i = 1; i < num_values; i++) {
         if (dec.mini_block_pos >= dec.values_in_mini_block) {
             status = delta_decoder_read_mini_block(&dec);
-            if (status != CARQUET_OK) return status;
+            if (status != CARQUET_OK) {
+                delta_decoder_destroy(&dec);
+                return status;
+            }
         }
         values[i] = (int32_t)dec.mini_block_values[dec.mini_block_pos++];
         dec.values_decoded++;
@@ -263,6 +320,7 @@ carquet_status_t carquet_delta_decode_int32(
         *bytes_consumed = dec.pos;
     }
 
+    delta_decoder_destroy(&dec);
     return CARQUET_OK;
 }
 
@@ -281,6 +339,7 @@ carquet_status_t carquet_delta_decode_int64(
 
     if (num_values == 0) {
         if (bytes_consumed) *bytes_consumed = dec.pos;
+        delta_decoder_destroy(&dec);
         return CARQUET_OK;
     }
 
@@ -292,7 +351,10 @@ carquet_status_t carquet_delta_decode_int64(
     for (int32_t i = 1; i < num_values; i++) {
         if (dec.mini_block_pos >= dec.values_in_mini_block) {
             status = delta_decoder_read_mini_block(&dec);
-            if (status != CARQUET_OK) return status;
+            if (status != CARQUET_OK) {
+                delta_decoder_destroy(&dec);
+                return status;
+            }
         }
         values[i] = dec.mini_block_values[dec.mini_block_pos++];
         dec.values_decoded++;
@@ -305,6 +367,7 @@ carquet_status_t carquet_delta_decode_int64(
         *bytes_consumed = dec.pos;
     }
 
+    delta_decoder_destroy(&dec);
     return CARQUET_OK;
 }
 

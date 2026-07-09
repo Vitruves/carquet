@@ -120,6 +120,23 @@ while ((n = carquet_column_read_batch(col, values, 1024, def_levels, NULL)) > 0)
 carquet_column_reader_free(col);
 ```
 
+`carquet_column_read_batch()` returns `-1` for any failure and cannot distinguish a page-read error that truncates a batch after some values were already read from a clean short read at end-of-column — the `n > 0` loop above treats both as "keep going / done". When you need to tell those apart (e.g. so incomplete data is never processed as complete), use `carquet_column_read_batch_ex()`, which reports a distinct status code and message through a `carquet_error_t` out-parameter:
+
+```c
+carquet_error_t err = CARQUET_ERROR_INIT;
+int64_t n = carquet_column_read_batch_ex(col, values, 1024, def_levels, NULL, &err);
+if (n < 0) {
+    /* hard failure, nothing read — err.code / err.message say why */
+} else if (carquet_error_is_set(&err)) {
+    /* n values are valid, but a read error truncated the batch:
+       do NOT treat n as a clean end-of-column result */
+} else {
+    /* clean read of n values (n < requested ⇒ end of column) */
+}
+```
+
+The error out-parameter is cleared on entry, so `err.code == CARQUET_OK` reliably means "no failure", independent of the count. Passing `NULL` for the error makes it behave exactly like `carquet_column_read_batch()`.
+
 Also available:
 
 - `carquet_column_skip()`

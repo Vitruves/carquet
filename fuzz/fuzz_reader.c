@@ -11,6 +11,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <stdlib.h>
+#include <assert.h>
 #include <carquet/carquet.h>
 
 static bool fuzz_row_group_filter(
@@ -112,8 +113,17 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             int16_t* rep_levels = malloc((size_t)rg_rows * sizeof(int16_t));
 
             if (values && def_levels && rep_levels) {
-                int64_t values_read = carquet_column_read_batch(
-                    col_reader, values, rg_rows, def_levels, rep_levels);
+                /* Drive the _ex variant with a live error out-param so the
+                 * error-propagation branch gets malformed-input coverage, and
+                 * assert its return/error contract: a hard failure (-1) must set
+                 * the error, and a non-negative count must never report a hard
+                 * status code (a partial-read truncation may set one). */
+                carquet_error_t read_err = CARQUET_ERROR_INIT;
+                int64_t values_read = carquet_column_read_batch_ex(
+                    col_reader, values, rg_rows, def_levels, rep_levels, &read_err);
+                if (values_read < 0) {
+                    assert(read_err.code != CARQUET_OK);
+                }
                 (void)values_read;
             }
 

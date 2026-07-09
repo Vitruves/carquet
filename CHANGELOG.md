@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.6.1
+
+Security hardening release from a full library audit, plus one small, focused API addition. No breaking API/ABI change; existing symbols and default output bytes are unchanged.
+
+### Packaging & Build
+
+- **Prebuilt binaries on every release**: a new `.github/workflows/release.yml` attaches self-contained static libraries to each `vX.Y.Z` GitHub Release for macOS arm64, Linux x86-64/arm64, and Windows x64 — no source build required. Each holds `include/carquet/`, `lib/libcarquet.a` with **zstd/zlib/lz4 bundled in**, and the CMake package config; consume via `find_package(carquet)` or `-Ilib/include -Llib -lcarquet`. Built on the oldest runner (low glibc floor) and without LTO/OpenMP so it links from any consumer toolchain.
+- **New `CARQUET_BUNDLE_DEPS` CMake option** (default `OFF`): forces fetch + static-bundle of zstd/zlib/lz4 for a portable self-contained archive; the normal build still prefers system libraries.
+- **`find_package(carquet)` now works from an install tree**: `carquetConfig.cmake` is now installed (previously only `carquetTargets.cmake` shipped), static builds export their bundled compression archives in the install link interface (previously dropped → undefined zstd/zlib/lz4 symbols), and the config resolves `Threads`/`OpenMP` via `find_dependency`.
+- **`xmake.lua` build alongside CMake**: carquet can now also be built with [xmake](https://xmake.io), mirroring the same options and test wiring; CMake remains the reference build.
+
+### API
+
+- **New `carquet_column_read_batch_ex()` for detailed read-error reporting** (small, additive, ABI-compatible): `carquet_column_read_batch()` collapsed four distinct failure conditions (invalid `max_values`, unknown physical type, scratch-buffer allocation failure, and page-read failure) onto the single return value `-1`, and could not signal a page-read failure that truncated a batch after some values had already been read — it returned the partial count, indistinguishable from a clean end-of-column short read. The new variant takes a trailing `carquet_error_t*` out-parameter that carries a distinct status code (and message) per failure and, on a mid-batch truncation, reports the error while still returning the salvaged count so the caller can both use the partial data and detect that it is incomplete. `carquet_column_read_batch()` is now a thin wrapper over the new function with identical behavior — no existing call site changes and no ABI break.
+
+### Security / Bug Fixes
+
+- **Reject columns whose chunk-metadata physical type disagrees with the schema** (heap buffer overflow, found by fuzzing): the value width is derived from the schema on the batch-reader path but from the column-chunk metadata on the page-reader path. A crafted file that declared, say, `INT32` in the schema (4 bytes/value) but `BYTE_ARRAY` in the chunk metadata (`sizeof(carquet_byte_array_t)`/value) made the page decode write past the batch reader's output buffer. The column reader now validates the two types match at construction and rejects the file with `CARQUET_ERROR_INVALID_METADATA` when they do not.
+- **Reject malformed dictionary pages that could read out of bounds**: a crafted BYTE_ARRAY dictionary with an oversized entry-length prefix could slip past a size check and expose out-of-bounds bytes when the value was read. Such pages are now rejected.
+- **Reject truncated PLAIN pages on the memory-mapped read path**: a crafted page header could claim more values than its payload actually held, causing an out-of-bounds read when the values were copied out (found by fuzzing). The zero-copy read path now validates the payload size before use, matching the buffered path.
+- **Guard against denial-of-service from crafted footers**: a malformed schema declaring a huge child count could stall the reader in a near-endless loop; oversized footer-length fields on very large files could mis-parse. Both are now bounded and rejected cleanly.
+- **Guard length-array allocations in DELTA byte-array decoders**: value counts from the page header are now range-checked before allocating, preventing a size overflow on 32-bit platforms.
+- **Clear stale error on memory-map fallback**: when a file opened successfully via the buffered fallback after a memory-map attempt failed, a leftover error was left set on the caller's error object. The error is now cleared on success.
+- **Avoid unaligned float/double reads in BYTE_STREAM_SPLIT for FIXED_LEN_BYTE_ARRAY**: the 4-/8-byte BYTE_STREAM_SPLIT fast paths reinterpreted the value buffer as `float*`/`double*`. For FLBA(4)/FLBA(8) that buffer carries no alignment guarantee, so the cast was undefined behavior and could `SIGBUS` on strict-alignment targets. The fast path is now taken only when the buffer is naturally aligned; otherwise the generic byte transpose runs. Output bytes are identical (the aligned FLOAT/DOUBLE paths are unaffected).
+- **Bounds-check the BYTE_ARRAY dictionary fallback scan** (defense-in-depth): the unreachable fallback that scans a dictionary entry-by-entry computed `4 + len` in 32-bit arithmetic with no per-entry bound, so a wrapped length could have walked past the dictionary buffer. The scan is now `size_t`-widened and bounded against the dictionary size. This path is not reachable by current readers (the offset table is always built); the guard prevents future misuse.
+
+### Interoperability
+
+- **Read DELTA_BINARY_PACKED pages from any conformant writer**: the decoder previously accepted only the 128-values-per-block / 4-mini-block layout that carquet itself writes and rejected other spec-valid layouts (e.g. block sizes of 256 or 512). It now accepts any block size that follows the Parquet spec, so DELTA-encoded columns written by Arrow, parquet-mr and others read correctly.
+- **Keep predicate pushdown enabled for empty-string min/max stats**: presence of a column's `min_value`/`max_value` is now tracked from the Thrift field itself rather than inferred from its length, so a foreign file whose BYTE_ARRAY/STRING minimum is the empty string is no longer treated as having no statistics. Previously such a column silently disabled row-group pruning (a missed optimization, never a wrong result). Reader-side only; carquet's own writer output is unchanged.
+
+### Performance
+
+- **Faster decode of wide bit-packed values (~1.8–2.0× on Apple Silicon)**: the general bit-unpacking path for widths of 9–32 bits — used to decode dictionary indices for dictionaries with more than 256 entries, and wide RLE/DELTA runs — was rewritten from a byte-at-a-time loop into a branchless load-shift-mask. Output is byte-for-byte identical.
+
+### Robustness
+
+- **Serialize lazy SIMD dispatch initialization**: the runtime SIMD function table is now populated under a lock (matching the library's other lazy init), removing a data race when the first SIMD use happens concurrently across threads (e.g. parallel column reads).
+- **Prevent SIMD instructions from leaking into portable code paths under LTO** (x86 builds): the AVX/AVX-512 translation units are compiled without LTO so ISA-specific code cannot be inlined into baseline paths that run before the runtime CPU check. `CARQUET_NATIVE_ARCH` is now documented as producing a host-only, non-portable binary.
+- **Remove a data race on the parallel column-read error flag**: the OpenMP column-read loop shared a single `read_error` flag written by every thread. Each column now writes its own error slot, reduced after the parallel region, so there is no shared write (the previous torn-write was benign in practice but a genuine data race).
+
 ## v0.6.0
 
 Source-compatible additive release. Closes the two remaining "small" Arrow-parity gaps. ABI break only in the strict sense that `carquet_writer_options_t` gains a trailing `int32_t` field; existing code that goes through `carquet_writer_options_init()` is unaffected and default output bytes are unchanged.

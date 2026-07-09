@@ -910,6 +910,9 @@ int cmd_head(const char* path, int64_t n, const char* filter) {
 
             int64_t got = carquet_column_read_batch(col, buf, want, def, NULL);
 
+            /* read_batch packs non-null values densely (no slot for nulls),
+             * so buffer addressing advances only on present rows. */
+            int64_t dense = 0;
             for (int64_t i = 0; i < got && rows_read + i < n; i++) {
                 char vbuf[MAX_VALUE_BUF];
                 if (nullable && def && def[i] < max_def) {
@@ -917,11 +920,12 @@ int cmd_head(const char* path, int64_t n, const char* filter) {
                 } else {
                     const void* vp = NULL;
                     if (phys == CARQUET_PHYSICAL_BYTE_ARRAY)
-                        vp = &((carquet_byte_array_t*)buf)[i];
+                        vp = &((carquet_byte_array_t*)buf)[dense];
                     else if (phys == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY)
-                        vp = (uint8_t*)buf + i * tl;
+                        vp = (uint8_t*)buf + dense * tl;
                     else
-                        vp = (uint8_t*)buf + i * elem_size;
+                        vp = (uint8_t*)buf + dense * elem_size;
+                    dense++;
 
                     cli_format_value(phys, vp, tl, lt, vbuf, sizeof(vbuf));
                     table_add_cell(&tbl, rows_read + i, c, vbuf);
@@ -1022,6 +1026,9 @@ int cmd_tail(const char* path, int64_t n, const char* filter) {
 
             int64_t got = carquet_column_read_batch(col, buf, want, def, NULL);
 
+            /* read_batch packs non-null values densely (no slot for nulls),
+             * so buffer addressing advances only on present rows. */
+            int64_t dense = 0;
             for (int64_t i = 0; i < got && rows_output < n; i++) {
                 char vbuf[MAX_VALUE_BUF];
                 if (nullable && def && def[i] < max_def) {
@@ -1029,11 +1036,12 @@ int cmd_tail(const char* path, int64_t n, const char* filter) {
                 } else {
                     const void* vp = NULL;
                     if (phys == CARQUET_PHYSICAL_BYTE_ARRAY)
-                        vp = &((carquet_byte_array_t*)buf)[i];
+                        vp = &((carquet_byte_array_t*)buf)[dense];
                     else if (phys == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY)
-                        vp = (uint8_t*)buf + i * tl;
+                        vp = (uint8_t*)buf + dense * tl;
                     else
-                        vp = (uint8_t*)buf + i * elem_size;
+                        vp = (uint8_t*)buf + dense * elem_size;
+                    dense++;
 
                     cli_format_value(phys, vp, tl, lt, vbuf, sizeof(vbuf));
                     table_add_cell(&tbl, rows_output, c, vbuf);
@@ -1351,6 +1359,9 @@ static int64_t read_column_strings(carquet_reader_t* reader,
 
         int64_t got = carquet_column_read_batch(col, buf, want, def, NULL);
 
+        /* read_batch packs non-null values densely (no slot for nulls),
+         * so buffer addressing advances only on present rows. */
+        int64_t dense = 0;
         for (int64_t i = 0; i < got && rows_output < limit; i++) {
             char vbuf[MAX_VALUE_BUF];
             const char* cell;
@@ -1359,11 +1370,12 @@ static int64_t read_column_strings(carquet_reader_t* reader,
             } else {
                 const void* vp;
                 if (phys == CARQUET_PHYSICAL_BYTE_ARRAY)
-                    vp = &((carquet_byte_array_t*)buf)[i];
+                    vp = &((carquet_byte_array_t*)buf)[dense];
                 else if (phys == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY)
-                    vp = (uint8_t*)buf + i * tl;
+                    vp = (uint8_t*)buf + dense * tl;
                 else
-                    vp = (uint8_t*)buf + i * elem_size;
+                    vp = (uint8_t*)buf + dense * elem_size;
+                dense++;
                 cli_format_value(phys, vp, tl, lt, vbuf, sizeof(vbuf));
                 cell = vbuf;
             }

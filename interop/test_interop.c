@@ -35,6 +35,8 @@ typedef struct {
     int files_failed;
 } test_stats_t;
 
+static int verify_read_batch_ex(carquet_reader_t* reader, int verbose);
+
 /* ── Strict decode (--dir) ──────────────────────────────────────────────────
  *
  * A file passes only if it opens, exposes a schema, and the batch reader
@@ -110,9 +112,114 @@ static int test_file(const char* path, int verbose) {
     }
 
     carquet_batch_reader_free(br);
+
+    /* Cross-writer confirmation of the carquet_column_read_batch_ex() contract. */
+    if (verify_read_batch_ex(reader, verbose) != 0) {
+        rc = 1;
+    }
+
     carquet_reader_close(reader);
 
     if (verbose && rc == 0) printf("  PASS (%lld rows)\n", (long long)num_rows);
+    return rc;
+}
+
+/* ── read_batch_ex contract check ───────────────────────────────────────────
+ *
+ * Confirms carquet_column_read_batch_ex()'s success-path contract holds on
+ * files produced by *other* writers (PyArrow, parquet-mr, DuckDB, ...): a clean
+ * full decode must leave the error out-parameter unset (code == CARQUET_OK) and
+ * must never return a negative count. It also spot-checks that the error channel
+ * is actually wired to real column readers by confirming an invalid argument is
+ * rejected with CARQUET_ERROR_INVALID_ARGUMENT.
+ *
+ * FLBA leaves are skipped here: their per-value width is not exposed through the
+ * public by-leaf-index schema API, and the strict batch-decode pass above
+ * already validates their decode. The _ex contract itself is type-independent,
+ * so covering the fixed-width and BYTE_ARRAY leaves is sufficient.
+ */
+static size_t ex_value_size(carquet_physical_type_t t) {
+    switch (t) {
+        case CARQUET_PHYSICAL_BOOLEAN:              return 1;
+        case CARQUET_PHYSICAL_INT32:
+        case CARQUET_PHYSICAL_FLOAT:                return 4;
+        case CARQUET_PHYSICAL_INT64:
+        case CARQUET_PHYSICAL_DOUBLE:               return 8;
+        case CARQUET_PHYSICAL_INT96:                return 12;
+        case CARQUET_PHYSICAL_BYTE_ARRAY:           return sizeof(carquet_byte_array_t);
+        case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY: return 0; /* width unknown here */
+    }
+    return 0;
+}
+
+static int verify_read_batch_ex(carquet_reader_t* reader, int verbose) {
+    const carquet_schema_t* schema = carquet_reader_schema(reader);
+    int32_t num_cols = carquet_reader_num_columns(reader);
+    int32_t num_rg   = carquet_reader_num_row_groups(reader);
+    const int64_t BATCH = 4096;
+    int rc = 0;
+
+    for (int32_t rg = 0; rg < num_rg; rg++) {
+        for (int32_t c = 0; c < num_cols; c++) {
+            size_t vsz = ex_value_size(carquet_schema_column_type(schema, c));
+            if (vsz == 0) continue;  /* FLBA: covered by the strict batch pass */
+
+            carquet_error_t err = CARQUET_ERROR_INIT;
+            carquet_column_reader_t* col =
+                carquet_reader_get_column(reader, rg, c, &err);
+            if (!col) {
+                if (verbose) printf("  FAIL[ex]: get_column rg=%d c=%d: %s\n",
+                                    rg, c, err.message);
+                rc = 1;
+                continue;
+            }
+
+            void*    vbuf = malloc(vsz * (size_t)BATCH);
+            int16_t* def  = malloc(sizeof(int16_t) * (size_t)BATCH);
+            if (!vbuf || !def) {
+                free(vbuf); free(def);
+                carquet_column_reader_free(col);
+                rc = 1;
+                continue;
+            }
+
+            /* Error channel is live: an invalid argument must return -1 and set
+             * INVALID_ARGUMENT (writer-independent, cheap). */
+            carquet_error_t perr = CARQUET_ERROR_INIT;
+            if (carquet_column_read_batch_ex(col, vbuf, -1, def, NULL, &perr) != -1 ||
+                perr.code != CARQUET_ERROR_INVALID_ARGUMENT) {
+                if (verbose) printf("  FAIL[ex]: invalid-arg not reported rg=%d c=%d\n",
+                                    rg, c);
+                rc = 1;
+            }
+
+            /* Drain the column: every clean read leaves the error unset and
+             * returns a non-negative count. */
+            for (;;) {
+                carquet_error_t rerr = CARQUET_ERROR_INIT;
+                int64_t n = carquet_column_read_batch_ex(col, vbuf, BATCH, def, NULL, &rerr);
+                if (n < 0) {
+                    if (verbose) printf("  FAIL[ex]: read %lld [%s] rg=%d c=%d\n",
+                                        (long long)n, rerr.message, rg, c);
+                    rc = 1;
+                    break;
+                }
+                if (rerr.code != CARQUET_OK) {
+                    if (verbose) printf("  FAIL[ex]: clean read set error [%s] rg=%d c=%d\n",
+                                        rerr.message, rg, c);
+                    rc = 1;
+                    break;
+                }
+                if (n == 0) break;  /* end of column */
+            }
+
+            free(vbuf);
+            free(def);
+            carquet_column_reader_free(col);
+        }
+    }
+
+    if (verbose && rc == 0) printf("  PASS[ex]: read_batch_ex contract holds\n");
     return rc;
 }
 

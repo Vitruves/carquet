@@ -18,6 +18,8 @@
   <img src="https://img.shields.io/badge/SIMD-NEON%20%7C%20SVE-orange" alt="ARM SIMD" />
 </p>
 
+<!-- ────────────────────────────  PRESENTATION  ──────────────────────────── -->
+
 ## Highlights
 
 - **Pure C11** with three external dependencies (zstd, zlib, lz4) -- all auto-fetched by CMake
@@ -31,7 +33,9 @@
 - SIMD-optimized (SSE4.2, AVX2, AVX-512, NEON, SVE) with runtime detection and scalar fallbacks
 - PyArrow, DuckDB, Spark compatible out of the box
 
-## Performance
+<!-- ────────────────────────────  BENCHMARKS  ──────────────────────────── -->
+
+## Benchmarks
 
 At 10M rows (the most representative size); higher ratio = Carquet faster. ARM (Apple M3): Carquet 0.6.0 vs Arrow C++ 24.0.0. x86 (Xeon D-1531): Carquet 0.4.4 vs Arrow C++ 23.0.1.
 
@@ -46,6 +50,8 @@ At 10M rows (the most representative size); higher ratio = Carquet faster. ARM (
 \* Uncompressed reads use mmap zero-copy -- see note below.
 
 Compressed reads involve full decompression and decoding of every value, no shortcuts — and both libraries use the same system lz4/zstd shared libraries, so the raw codec speed is identical. The most meaningful comparison is the **same-file cross-read** table (below), where both libraries read the exact same Parquet file: Carquet reads compressed data **1.5-2.6x faster** than Arrow C++ on that apples-to-apples test.
+
+To run the benchmarks yourself, see [Running Benchmarks](#running-benchmarks).
 
 <details>
 <summary>Benchmark methodology</summary>
@@ -196,25 +202,49 @@ Both libraries read the **same** Parquet file — the fairest apples-to-apples c
 
 </details>
 
-## Building
+<!-- ────────────────────────────  INSTALLATION  ──────────────────────────── -->
+
+## Installation
 
 ### Requirements
 
 - C11 compiler (GCC 4.9+, Clang 3.4+, MSVC 2015+)
-- CMake 3.16+
+- CMake 3.16+ (or [xmake](https://xmake.io) — see [Building with xmake](#building-with-xmake))
 - zstd, zlib, lz4 (auto-fetched if missing)
 - OpenMP (optional, for parallel column reading)
 
-### Quick Start
+### Quick Start (make)
+
+The `make` wrapper drives an optimized CMake build and a `/usr/local` install:
 
 ```bash
 git clone https://github.com/Vitruves/carquet.git
 cd carquet
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+make                              # optimized build (run `make help` to list all targets)
+sudo make install                 # install to /usr/local (override with PREFIX=/opt/carquet)
 ```
 
-### Build Options
+### Full Build & Install (CMake)
+
+Invoke CMake directly when you need specific build options or a custom prefix:
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release   # add options, e.g. -DCARQUET_BUILD_SHARED=ON
+cmake --build build -j$(nproc)
+sudo cmake --install build --prefix /usr/local
+```
+
+Either path installs:
+- `libcarquet.a` (or `.so` / `.dylib` with `-DCARQUET_BUILD_SHARED=ON`)
+- `include/carquet/` headers
+- `carquet` CLI binary
+- `carquet.pc` (pkg-config) and CMake package config for `find_package(carquet)`
+
+After installation, link with `-lcarquet`, or resolve flags via `pkg-config --cflags --libs carquet`.
+
+#### Build Options
+
+Pass these to the CMake configure step:
 
 | Option | Default | Description |
 |--------|---------|-------------|
@@ -245,29 +275,7 @@ All x86 SIMD (SSE, AVX, AVX2, AVX-512) and ARM NEON are auto-detected and enable
 
 </details>
 
-### Installation
-
-```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc)
-sudo cmake --install build
-```
-
-This installs:
-- `libcarquet.a` (or `.so` / `.dylib` with `-DCARQUET_BUILD_SHARED=ON`)
-- `include/carquet/` headers
-- `carquet` CLI binary
-
-After installation, link your project with `-lcarquet`.
-
-You can use the CLI directly if you want to create a file reader:
-
-```bash
-carquet info data.parquet
-carquet codegen -f data.parquet -o reader.c
-```
-
-### Development Build
+#### Development Build
 
 ```bash
 cmake -B build -DCARQUET_BUILD_DEV=ON
@@ -275,79 +283,45 @@ cmake --build build -j$(nproc)
 cd build && ctest --output-on-failure
 ```
 
-## CLI Tool
+### Building with xmake
 
-Carquet ships with a command-line tool for inspecting Parquet files and generating C reader code. Built and installed by default alongside the library.
-
-```
-Commands:
-  schema     Print file schema
-  info       Print detailed file metadata
-  head       Print first N rows
-  tail       Print last N rows
-  cat        Print rows with slicing/column/row filtering
-  count      Print total row count
-  columns    List column names (one per line)
-  stat       Print column statistics
-  validate   Verify file integrity
-  sample     Print N random rows
-  export     Write rows to stdout as CSV
-  codegen    Generate C reader code
-```
+An [xmake](https://xmake.io) build (`xmake.lua`) is provided as an alternative to CMake, with the same options and defaults; zstd/zlib/lz4 are linked statically so binaries are self-contained.
 
 ```bash
-carquet schema data.parquet
-carquet head -n 20 data.parquet
-carquet stat data.parquet
-carquet validate data.parquet
+xmake                    # build the static library + `carquet` CLI (release)
+xmake f --dev=y && xmake # add tests, examples, benchmarks, interop
+xmake test               # run the test suite
 ```
 
-`cat`, `count`, `head`, and `export` accept `-p / --filter EXPR` to push a row predicate down to the page level — only pages whose column-index min/max can match the predicate are decompressed:
+<details>
+<summary>Configure options (<code>xmake f --option=y|n</code>)</summary>
+
+Options mirror the CMake ones (drop the `CARQUET_` prefix, lower-case):
+
+| xmake option | Default | Description |
+|--------------|---------|-------------|
+| `--dev` | n | Build tests, examples, benchmarks and interop |
+| `--tests` / `--examples` / `--benchmarks` / `--interop` | n | Build one group individually |
+| `--cli` | y | Build the `carquet` CLI tool |
+| `--shared` | n | Build a shared library instead of static |
+| `--openmp` | y | OpenMP parallel column reading (auto-disabled if unavailable) |
+| `--native_arch` | n | `-march=native` for max performance (host-only binary) |
+| `--sse` / `--avx` / `--avx2` / `--avx512` / `--neon` | y | SIMD instruction sets (auto-detected) |
+| `--sve` | n | ARM SVE (experimental) |
+| `--fuzz` | n | Build fuzz targets (use `--toolchain=clang`) |
 
 ```bash
-carquet cat -p "price > 100 AND status = 'active'" data.parquet
-carquet count --filter "id >= 1000" data.parquet
-carquet export --filter "ts IS NOT NULL" -c id,ts data.parquet
+xmake f -m release --shared=y            # shared library
+xmake f --dev=y --avx512=n && xmake      # dev build, AVX-512 disabled
 ```
 
-The grammar is `column OP value [AND column OP value]...` with `OP` ∈ {`=`, `==`, `!=`, `<>`, `<`, `<=`, `>`, `>=`}, plus `column IS NULL` / `column IS NOT NULL`. Filtering requires the file to have a page index (`write_page_index = true`).
+</details>
 
-### Code Generation
-
-Generate a complete, compilable C reader from any Parquet file's schema:
-
-```bash
-carquet codegen -f data.parquet -o reader.c
-# Generated: reader.c
-# Compile:   clang -o reader reader.c -I.../include -L.../build -lcarquet ...
-
-./reader                    # reads data.parquet (embedded as default)
-./reader other.parquet      # override with different file
-```
-
-Options:
-
-| Flag | Description |
-|------|-------------|
-| `-f`, `--file FILE` | Parquet file to inspect schema from |
-| `-o`, `--output FILE` | Output source file (default: stdout) |
-| `--mmap` | Use memory-mapped I/O in generated code |
-| `--skeleton` | Generate empty `process_batch` for custom logic |
-| `-c`, `--columns COLS` | Comma-separated column filter |
-| `-b`, `--batch-size N` | Batch size (default: 1024) |
+<!-- ────────────────────────────  C API  ──────────────────────────── -->
 
 ## C API
 
-### Manual
-
-The top-level README is intentionally short. For day-to-day usage, prefer the versioned manual in [`docs/`](docs/README.md):
-
-- [Manual index](docs/README.md)
-- [Reading files](docs/reading.md)
-- [Writing files](docs/writing.md)
-- [Nested and nullable data](docs/nested-data.md)
-- [Performance and tuning](docs/performance.md)
-- [Error handling and type reference](docs/error-handling.md)
+This README stays intentionally short — a Write and a Read example below, then the [manual in `docs/`](docs/README.md) for everything else.
 
 ### Write a Parquet File
 
@@ -427,175 +401,99 @@ int main(void) {
 }
 ```
 
-### Nullable Columns
+### More Recipes
 
-```c
-// Schema with nullable column
-carquet_schema_add_column(schema, "name", CARQUET_PHYSICAL_BYTE_ARRAY,
-                          NULL, CARQUET_REPETITION_OPTIONAL, 0, 0);
+Everything beyond flat read/write lives in the manual — each links to a runnable example:
 
-// Write with definition levels (1 = present, 0 = null)
-carquet_byte_array_t names[] = {{(uint8_t*)"Alice", 5}, {(uint8_t*)"Bob", 3}};
-int16_t def_levels[] = {1, 0, 1};  // Alice, NULL, Bob (3 rows, 2 values)
-carquet_writer_write_batch(writer, col, names, 3, def_levels, NULL);
+| You want to… | See |
+|---|---|
+| Nullable columns, row groups, buffer output | [`docs/writing.md`](docs/writing.md) |
+| Lists, maps, groups, definition/repetition levels | [`docs/nested-data.md`](docs/nested-data.md) |
+| Column projection, statistics, metadata inspection | [`docs/reading.md`](docs/reading.md) |
+| Predicate pushdown, page-level filtering | [`docs/reading.md`](docs/reading.md) |
+| Append row groups to an existing file | [`docs/writing.md`](docs/writing.md#append-to-an-existing-file) |
+| Compression, custom codecs, writer tuning | [`docs/writing.md`](docs/writing.md), [`docs/performance.md`](docs/performance.md) |
+| mmap, zero-copy, prebuffering, I/O coalescing | [`docs/performance.md`](docs/performance.md) |
+| Error codes and recovery hints | [`docs/error-handling.md`](docs/error-handling.md) |
+
+### API Reference
+
+Full API is in [`include/carquet/carquet.h`](include/carquet/carquet.h). Key types:
+
+| Type | Purpose |
+|------|---------|
+| `carquet_reader_t` | File reader (open from path, FILE*, or memory buffer) |
+| `carquet_writer_t` | File writer |
+| `carquet_batch_reader_t` | High-level batch iteration |
+| `carquet_schema_t` | Schema definition and introspection |
+| `carquet_error_t` | Rich error info (code, message, source location, recovery hint) |
+
+Full signatures live in the [header](include/carquet/carquet.h); the [manual](docs/README.md) explains which surface to use when. The source layout and architecture are documented in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+<!-- ────────────────────────────  CLI TOOL  ──────────────────────────── -->
+
+## CLI Tool
+
+Carquet ships with a command-line tool for inspecting Parquet files and generating C reader code. Built and installed by default alongside the library.
+
+```
+Commands:
+  schema     Print file schema
+  info       Print detailed file metadata
+  head       Print first N rows
+  tail       Print last N rows
+  cat        Print rows with slicing/column/row filtering
+  count      Print total row count
+  columns    List column names (one per line)
+  stat       Print column statistics
+  validate   Verify file integrity
+  sample     Print N random rows
+  export     Write rows to stdout as CSV
+  codegen    Generate C reader code
 ```
 
-### Nested Types (Lists, Maps)
-
-```c
-// list<int32>
-int32_t list_leaf = carquet_schema_add_list(
-    schema, "tags", CARQUET_PHYSICAL_INT32, NULL,
-    CARQUET_REPETITION_OPTIONAL, 0, 0);
-
-// map<string, int32>
-int32_t map_val = carquet_schema_add_map(
-    schema, "props",
-    CARQUET_PHYSICAL_BYTE_ARRAY, NULL, 0,   // key: string
-    CARQUET_PHYSICAL_INT32, NULL, 0,         // value: int32
-    CARQUET_REPETITION_OPTIONAL, 0);
-
-// Write list data: row0=[100,200], row1=NULL, row2=[300]
-int32_t vals[] = {100, 200, 300};
-int16_t def[]  = {  3,   3,   0,   3};
-int16_t rep[]  = {  0,   1,   0,   0};
-carquet_writer_write_batch(writer, col, vals, 4, def, rep);
+```bash
+carquet schema data.parquet
+carquet head -n 20 data.parquet
+carquet stat data.parquet
+carquet validate data.parquet
 ```
 
-### Column Projection
+`cat`, `count`, `head`, and `export` accept `-p / --filter EXPR` to push a row predicate down to the page level — only pages whose column-index min/max can match the predicate are decompressed:
 
-```c
-carquet_batch_reader_config_t cfg;
-carquet_batch_reader_config_init(&cfg);
-
-// Read only specific columns
-const char* names[] = {"id", "timestamp"};
-cfg.column_names = names;
-cfg.num_column_names = 2;
+```bash
+carquet cat -p "price > 100 AND status = 'active'" data.parquet
+carquet count --filter "id >= 1000" data.parquet
+carquet export --filter "ts IS NOT NULL" -c id,ts data.parquet
 ```
 
-### Predicate Pushdown
+The grammar is `column OP value [AND column OP value]...` with `OP` ∈ {`=`, `==`, `!=`, `<>`, `<`, `<=`, `>`, `>=`}, plus `column IS NULL` / `column IS NOT NULL`. Filtering requires the file to have a page index (`write_page_index = true`).
 
-Skip entire row groups that cannot match a query, based on column statistics:
+### Code Generation
 
-```c
-// Filter callback: only read row groups where column 0 might have values > threshold
-bool filter_fn(const carquet_reader_t* reader, int32_t rg, void* ctx) {
-    int64_t threshold = *(int64_t*)ctx;
-    bool might_match = true;
-    carquet_reader_row_group_matches(reader, rg, 0,
-        CARQUET_COMPARE_GT, &threshold, sizeof(threshold), &might_match);
-    return might_match;
-}
+Generate a complete, compilable C reader from any Parquet file's schema:
 
-int64_t threshold = 1000;
-cfg.row_group_filter = filter_fn;
-cfg.row_group_filter_ctx = &threshold;
-// Non-matching row groups are skipped with zero I/O
+```bash
+carquet codegen -f data.parquet -o reader.c
+# Generated: reader.c
+# Compile:   clang -o reader reader.c -I.../include -L.../build -lcarquet ...
+
+./reader                    # reads data.parquet (embedded as default)
+./reader other.parquet      # override with different file
 ```
 
-### Page-Level Filtering
+Options:
 
-Push a predicate down to individual data pages: only pages whose column-index min/max range could match are decompressed and decoded. Predicate columns need not be in the projection — when they are not, only their column + offset index is read, never the data pages. Requires the file to be written with `write_page_index = true`.
+| Flag | Description |
+|------|-------------|
+| `-f`, `--file FILE` | Parquet file to inspect schema from |
+| `-o`, `--output FILE` | Output source file (default: stdout) |
+| `--mmap` | Use memory-mapped I/O in generated code |
+| `--skeleton` | Generate empty `process_batch` for custom logic |
+| `-c`, `--columns COLS` | Comma-separated column filter |
+| `-b`, `--batch-size N` | Batch size (default: 1024) |
 
-```c
-carquet_batch_reader_t* br = carquet_batch_reader_create(r, &cfg, &err);
-
-// Conjunction: price > 100 AND status == "active"
-int64_t price = 100;
-const char* status = "active";   // BYTE_ARRAY: raw bytes + length, not carquet_byte_array_t
-carquet_filter_clause_t clauses[] = {
-    { .column_index = 1, .op = CARQUET_FILTER_GT, .value = &price,  .value_size = sizeof(price) },
-    { .column_index = 3, .op = CARQUET_FILTER_EQ, .value = status,  .value_size = 6 },
-};
-carquet_batch_reader_set_page_filter(br, clauses, 2);
-
-// ... iterate as usual; non-matching pages are pruned ...
-int64_t pruned = carquet_batch_reader_rows_skipped(br);
-```
-
-Ops: `EQ` / `NE` / `LT` / `LE` / `GT` / `GE` / `RANGE` / `IN` / `IS_NULL` / `IS_NOT_NULL`. Referencing a column with no page index returns `CARQUET_ERROR_PAGE_INDEX_REQUIRED`.
-
-### Appending Row Groups
-
-Add row groups to an existing file without a read-then-rewrite. The supplied schema must match the file's leaf columns; `close()` rewrites the footer to list the existing row groups followed by the new ones. Existing bloom filters, page indexes, and key-value metadata are preserved.
-
-```c
-carquet_writer_t* w = carquet_writer_open_append("data.parquet", schema, &opts, &err);
-carquet_writer_write_batch(w, 0, more_ids, n, NULL, NULL);
-carquet_writer_close(w);
-```
-
-### I/O Coalescing
-
-Pre-buffer multiple columns in a single read (reduces seeks for fread path, no-op for mmap):
-
-```c
-int32_t cols[] = {0, 2, 5};
-carquet_reader_prebuffer(reader, 0, cols, 3, &err);
-// Subsequent column reads from row group 0 use the cached data
-```
-
-### Compression
-
-| Codec | Enum | Best For |
-|-------|------|----------|
-| ZSTD | `CARQUET_COMPRESSION_ZSTD` | Best overall (great ratio + speed) |
-| LZ4 | `CARQUET_COMPRESSION_LZ4_RAW` | Read-heavy workloads (fastest decompression) |
-| Snappy | `CARQUET_COMPRESSION_SNAPPY` | Wide compatibility |
-| GZIP | `CARQUET_COMPRESSION_GZIP` | Maximum compatibility with older tools |
-
-```c
-opts.compression = CARQUET_COMPRESSION_ZSTD;
-opts.compression_level = 1;  // 0 = codec default; ZSTD: 1-22, GZIP: 1-9
-```
-
-You can also register a custom codec implementation for any slot — to plug in a hardware-accelerated codec or fill the `LZO` / `BROTLI` slots carquet has no built-in for. A registered codec takes priority over the built-in on both read and write; pass `NULL` to unregister:
-
-```c
-carquet_custom_codec_t impl = {
-    .compress       = my_compress,
-    .decompress     = my_decompress,
-    .compress_bound = my_compress_bound,
-    .user_data      = NULL,
-};
-carquet_register_codec(CARQUET_COMPRESSION_BROTLI, &impl);
-```
-
-### Writer Options
-
-```c
-carquet_writer_options_t opts;
-carquet_writer_options_init(&opts);
-opts.compression        = CARQUET_COMPRESSION_ZSTD;
-opts.row_group_size     = 128 * 1024 * 1024;  // 128 MB row groups
-opts.write_statistics   = true;                // min/max for predicate pushdown
-opts.write_crc          = true;                // CRC32 page verification
-opts.write_bloom_filters = true;               // bloom filters per column
-opts.write_page_index   = true;                // column/offset page indexes
-opts.file_format_version = 2;                   // footer version (1 for older readers)
-```
-
-Per-writer overrides refine output further:
-
-```c
-carquet_writer_set_column_page_size(w, col, 16 * 1024);   // per-column page size
-carquet_writer_set_max_statistics_size(w, 64);            // BYTE_ARRAY min/max cap (default 32)
-```
-
-### Error Handling
-
-```c
-carquet_error_t err = CARQUET_ERROR_INIT;
-carquet_reader_t* r = carquet_reader_open("data.parquet", NULL, &err);
-if (!r) {
-    printf("[%s] %s\n", carquet_status_string(err.code), err.message);
-    printf("Hint: %s\n", carquet_error_recovery_hint(err.code));
-    return 1;
-}
-```
-
-All functions return `carquet_status_t` or use `carquet_error_t*` out-parameters. Programming errors (NULL where a valid pointer is required) trigger assertions; runtime errors (bad files, OOM) return error codes.
+<!-- ────────────────────────────  INTEROP & REFERENCE  ──────────────────────────── -->
 
 ## Interoperability
 
@@ -680,80 +578,6 @@ cmake -B build ... -DCARQUET_ARROW_CPP_ROOT=/path/to/arrow-prefix
 The Arrow C++ benchmark uses the low-level `parquet::ParquetFileReader` API (bypassing Arrow Table materialization overhead) with parallel row group readers. The **same-file cross-read** mode has both libraries read the exact same Parquet file, eliminating differences in page sizes, encoding, and row group layout. Both benchmarks use identical data, row group sizing, no dictionary, page checksums, mmap reads, BYTE_STREAM_SPLIT for floats.
 
 </details>
-
-## API Reference
-
-Full API is in [`include/carquet/carquet.h`](include/carquet/carquet.h). Key types:
-
-| Type | Purpose |
-|------|---------|
-| `carquet_reader_t` | File reader (open from path, FILE*, or memory buffer) |
-| `carquet_writer_t` | File writer |
-| `carquet_batch_reader_t` | High-level batch iteration |
-| `carquet_schema_t` | Schema definition and introspection |
-| `carquet_error_t` | Rich error info (code, message, source location, recovery hint) |
-
-<details>
-<summary>Core API functions</summary>
-
-**Reader**
-```c
-carquet_reader_t* carquet_reader_open(const char* path, const carquet_reader_options_t* opts, carquet_error_t* err);
-carquet_reader_t* carquet_reader_open_buffer(const void* buf, size_t size, const carquet_reader_options_t* opts, carquet_error_t* err);
-void              carquet_reader_close(carquet_reader_t* reader);
-int64_t           carquet_reader_num_rows(const carquet_reader_t* reader);
-int32_t           carquet_reader_num_columns(const carquet_reader_t* reader);
-```
-
-**Batch Reader**
-```c
-carquet_batch_reader_t* carquet_batch_reader_create(carquet_reader_t* reader, const carquet_batch_reader_config_t* cfg, carquet_error_t* err);
-carquet_status_t        carquet_batch_reader_next(carquet_batch_reader_t* br, carquet_row_batch_t** batch);
-carquet_status_t        carquet_row_batch_column(const carquet_row_batch_t* batch, int32_t col, const void** data, const uint8_t** nulls, int64_t* n);
-```
-
-**Writer**
-```c
-carquet_writer_t*  carquet_writer_create(const char* path, const carquet_schema_t* schema, const carquet_writer_options_t* opts, carquet_error_t* err);
-carquet_status_t   carquet_writer_write_batch(carquet_writer_t* w, int32_t col, const void* values, int64_t n, const int16_t* def, const int16_t* rep);
-carquet_status_t   carquet_writer_close(carquet_writer_t* w);
-```
-
-**Schema**
-```c
-carquet_schema_t* carquet_schema_create(carquet_error_t* err);
-carquet_status_t  carquet_schema_add_column(carquet_schema_t* s, const char* name, carquet_physical_type_t type, const carquet_logical_type_t* logical, carquet_field_repetition_t rep, int32_t type_len, int32_t parent);
-int32_t           carquet_schema_add_list(carquet_schema_t* s, const char* name, carquet_physical_type_t elem_type, const carquet_logical_type_t* elem_logical, carquet_field_repetition_t rep, int32_t type_len, int32_t parent);
-int32_t           carquet_schema_add_map(carquet_schema_t* s, const char* name, carquet_physical_type_t key_type, const carquet_logical_type_t* key_logical, int32_t key_len, carquet_physical_type_t val_type, const carquet_logical_type_t* val_logical, int32_t val_len, carquet_field_repetition_t rep, int32_t parent);
-```
-
-**Filtering**
-```c
-int32_t carquet_reader_filter_row_groups(const carquet_reader_t* reader, int32_t col, carquet_compare_op_t op, const void* value, int32_t value_size, int32_t* matching, int32_t max);
-```
-
-</details>
-
-## Project Structure
-
-```
-include/carquet/   Public API (carquet.h, types.h, error.h)
-src/
-  core/            Arena allocator, buffer, bitpack, endian
-  encoding/        PLAIN, RLE, DELTA, DICTIONARY, BYTE_STREAM_SPLIT
-  compression/     Snappy (internal), GZIP, ZSTD, LZ4 (wrappers)
-  thrift/          Thrift compact protocol for Parquet metadata
-  simd/            Runtime dispatch + x86 (SSE/AVX2/AVX-512) + ARM (NEON/SVE)
-  reader/          File, row group, column, page, batch readers + mmap
-  writer/          File, row group, column, page writers
-  metadata/        Schema, statistics, bloom filters, page indexes
-  cli/             CLI tool and code generator
-  util/            CRC32, xxHash
-tests/             18 test files
-examples/          basic_write_read, data_types, compression_codecs, nullable_columns,
-                   advanced_features, append_rows, page_filter, nested_data
-benchmark/         Performance benchmarks and comparison tools
-```
 
 ## License
 

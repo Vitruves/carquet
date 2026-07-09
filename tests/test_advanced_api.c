@@ -506,6 +506,163 @@ static int test_lz4_writer_uses_lz4_raw_codec(void) {
 }
 
 /* ======================================================================
+ * Test: carquet_column_read_batch_ex error reporting
+ * ====================================================================== */
+
+static int test_read_batch_ex(void) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t* schema = carquet_schema_create(NULL);
+    carquet_schema_add_column(schema, "x", CARQUET_PHYSICAL_INT32,
+                              NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
+
+    carquet_writer_t* w = carquet_writer_create_buffer(schema, NULL, &err);
+    if (!w) {
+        carquet_schema_free(schema);
+        printf("[SKIP] read_batch_ex: %s\n", err.message);
+        return 0;
+    }
+
+    int32_t data[] = {10, 20, 30, 40, 50};
+    if (carquet_writer_write_batch(w, 0, data, 5, NULL, NULL) != CARQUET_OK)
+        TEST_FAIL("read_batch_ex", "write_batch failed");
+    if (carquet_writer_close(w) != CARQUET_OK)
+        TEST_FAIL("read_batch_ex", "close failed");
+
+    void* buf = NULL;
+    size_t sz = 0;
+    if (carquet_writer_get_buffer(w, &buf, &sz) != CARQUET_OK || !buf || sz == 0)
+        TEST_FAIL("read_batch_ex", "get_buffer failed");
+
+    carquet_reader_t* r = carquet_reader_open_buffer(buf, sz, NULL, &err);
+    if (!r) TEST_FAIL("read_batch_ex", "open_buffer failed");
+    carquet_column_reader_t* col = carquet_reader_get_column(r, 0, 0, NULL);
+    if (!col) TEST_FAIL("read_batch_ex", "get_column failed");
+
+    /* 1) Invalid argument: max_values < 0 -> -1 with INVALID_ARGUMENT set. */
+    carquet_error_t e1 = CARQUET_ERROR_INIT;
+    int32_t vals[5];
+    int64_t n = carquet_column_read_batch_ex(col, vals, -1, NULL, NULL, &e1);
+    if (n != -1)
+        TEST_FAIL("read_batch_ex", "negative max_values should return -1");
+    if (e1.code != CARQUET_ERROR_INVALID_ARGUMENT)
+        TEST_FAIL("read_batch_ex", "negative max_values should set INVALID_ARGUMENT");
+
+    /* 2) Clean read leaves the error untouched (code stays CARQUET_OK). */
+    carquet_error_t e2 = CARQUET_ERROR_INIT;
+    e2.code = CARQUET_ERROR_INTERNAL; /* poison: must be cleared on entry */
+    n = carquet_column_read_batch_ex(col, vals, 5, NULL, NULL, &e2);
+    if (n != 5)
+        TEST_FAIL("read_batch_ex", "clean read should return 5");
+    if (e2.code != CARQUET_OK)
+        TEST_FAIL("read_batch_ex", "clean read must clear the error");
+    for (int i = 0; i < 5; i++) {
+        if (vals[i] != data[i]) TEST_FAIL("read_batch_ex", "value mismatch");
+    }
+
+    /* 3) Clean end-of-column short read: 0 values, no error. */
+    carquet_error_t e3 = CARQUET_ERROR_INIT;
+    n = carquet_column_read_batch_ex(col, vals, 5, NULL, NULL, &e3);
+    if (n != 0)
+        TEST_FAIL("read_batch_ex", "end-of-column read should return 0");
+    if (e3.code != CARQUET_OK)
+        TEST_FAIL("read_batch_ex", "end-of-column read must not set an error");
+
+    /* 4) NULL error out-param behaves exactly like the legacy wrapper. */
+    if (carquet_column_read_batch_ex(col, vals, -1, NULL, NULL, NULL) != -1)
+        TEST_FAIL("read_batch_ex", "NULL error path should still return -1");
+
+    carquet_column_reader_free(col);
+    carquet_reader_close(r);
+    free(buf);
+    carquet_schema_free(schema);
+    TEST_PASS("read_batch_ex");
+    return 0;
+}
+
+/* ======================================================================
+ * Test: reject chunk-metadata physical type that disagrees with schema
+ *
+ * Regression for a fuzzer-found heap-buffer-overflow: the batch reader sizes
+ * its output buffer from the schema element type while the page reader writes
+ * using the column-chunk metadata type. A crafted file where the two disagree
+ * (schema INT32 = 4 B/value, chunk BYTE_ARRAY = sizeof(carquet_byte_array_t))
+ * made the page decode overflow the batch buffer. The column reader must now
+ * reject such files at construction.
+ * ====================================================================== */
+
+static int test_type_mismatch_rejected(void) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t* schema = carquet_schema_create(NULL);
+    carquet_schema_add_column(schema, "x", CARQUET_PHYSICAL_INT32,
+                              NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
+
+    carquet_writer_t* w = carquet_writer_create_buffer(schema, NULL, &err);
+    if (!w) {
+        carquet_schema_free(schema);
+        printf("[SKIP] type_mismatch_rejected: %s\n", err.message);
+        return 0;
+    }
+
+    int32_t data[] = {10, 20, 30, 40, 50};
+    if (carquet_writer_write_batch(w, 0, data, 5, NULL, NULL) != CARQUET_OK)
+        TEST_FAIL("type_mismatch_rejected", "write_batch failed");
+    if (carquet_writer_close(w) != CARQUET_OK)
+        TEST_FAIL("type_mismatch_rejected", "close failed");
+
+    void* src = NULL;
+    size_t sz = 0;
+    if (carquet_writer_get_buffer(w, &src, &sz) != CARQUET_OK || !src || sz == 0)
+        TEST_FAIL("type_mismatch_rejected", "get_buffer failed");
+
+    /* Copy so we can corrupt it. The column-chunk ColumnMetaData.type is a
+     * compact-protocol i32 field 1, encoded INT32(1) as bytes {0x15, 0x02}.
+     * The schema element's type encodes identically and appears earlier in the
+     * footer, so flipping the LAST occurrence to BYTE_ARRAY (zigzag(6)=0x0C)
+     * corrupts only the chunk type, leaving the schema type intact. */
+    unsigned char* b = malloc(sz);
+    if (!b) TEST_FAIL("type_mismatch_rejected", "oom");
+    memcpy(b, src, sz);
+    long idx = -1;
+    for (size_t i = 0; i + 1 < sz; i++)
+        if (b[i] == 0x15 && b[i + 1] == 0x02) idx = (long)i;
+    if (idx < 0) {
+        free(b);
+        carquet_schema_free(schema);
+        printf("[SKIP] type_mismatch_rejected: type field pattern not found "
+               "(writer encoding changed)\n");
+        return 0;
+    }
+    b[idx + 1] = 0x0C;  /* INT32 -> BYTE_ARRAY */
+
+    carquet_error_t oe = CARQUET_ERROR_INIT;
+    carquet_reader_t* r = carquet_reader_open_buffer(b, sz, NULL, &oe);
+    if (r) {
+        /* If the footer still parses, get_column must reject the mismatch
+         * rather than letting a later read overflow. */
+        carquet_error_t ce = CARQUET_ERROR_INIT;
+        carquet_column_reader_t* col = carquet_reader_get_column(r, 0, 0, &ce);
+        if (col) {
+            carquet_column_reader_free(col);
+            carquet_reader_close(r);
+            free(b);
+            TEST_FAIL("type_mismatch_rejected",
+                      "get_column accepted mismatched physical type");
+        }
+        if (ce.code != CARQUET_ERROR_INVALID_METADATA)
+            printf("  note: rejected with %s (expected INVALID_METADATA)\n",
+                   carquet_status_string(ce.code));
+        carquet_reader_close(r);
+    }
+    /* Either outcome (footer rejected on open, or column rejected) is a clean,
+     * crash-free refusal — which is the property under test. */
+
+    free(b);
+    carquet_schema_free(schema);
+    TEST_PASS("type_mismatch_rejected");
+    return 0;
+}
+
+/* ======================================================================
  * Main
  * ====================================================================== */
 
@@ -520,6 +677,8 @@ int main(void) {
     failures += test_buffer_writer();
     failures += test_per_column_options();
     failures += test_lz4_writer_uses_lz4_raw_codec();
+    failures += test_read_batch_ex();
+    failures += test_type_mismatch_rejected();
 
     remove(TEMP_FILE);
 

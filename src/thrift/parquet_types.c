@@ -98,10 +98,17 @@ static void parse_statistics(thrift_decoder_t* dec, carquet_arena_t* arena,
                 stats->distinct_count = thrift_read_i64(dec);
                 break;
             case 5:  /* max_value */
+                /* Presence is recorded from the field itself, independently of
+                 * its length: a zero-length BYTE_ARRAY max (the empty-string
+                 * extreme a foreign writer may emit) is present, not absent.
+                 * arena_bindup_thrift may return NULL for a zero-length value,
+                 * so has_max_value — not the pointer — is the presence signal. */
+                stats->has_max_value = true;
                 stats->max_value = arena_bindup_thrift(arena, dec,
                     &stats->max_value_len);
                 break;
             case 6:  /* min_value */
+                stats->has_min_value = true;
                 stats->min_value = arena_bindup_thrift(arena, dec,
                     &stats->min_value_len);
                 break;

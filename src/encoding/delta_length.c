@@ -71,8 +71,13 @@ carquet_status_t carquet_delta_length_decode(
         return CARQUET_OK;
     }
 
-    /* Allocate buffer for lengths */
-    int32_t* lengths = carquet_mem_malloc(num_values * sizeof(int32_t));
+    /* Allocate buffer for lengths. num_values comes from the (untrusted) page
+     * header; guard the multiply so it cannot overflow size_t and yield an
+     * undersized buffer (only reachable where size_t is 32-bit). */
+    if ((size_t)num_values > SIZE_MAX / sizeof(int32_t)) {
+        return CARQUET_ERROR_DECODE;
+    }
+    int32_t* lengths = carquet_mem_malloc((size_t)num_values * sizeof(int32_t));
     if (!lengths) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }

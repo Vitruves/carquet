@@ -106,9 +106,14 @@ carquet_status_t carquet_delta_strings_decode(
         return CARQUET_OK;
     }
 
-    /* Allocate arrays for prefix and suffix lengths */
-    int32_t* prefix_lengths = carquet_mem_malloc(num_values * sizeof(int32_t));
-    int32_t* suffix_lengths = carquet_mem_malloc(num_values * sizeof(int32_t));
+    /* Allocate arrays for prefix and suffix lengths. num_values comes from the
+     * (untrusted) page header; guard the multiply so it cannot overflow size_t
+     * and yield an undersized buffer (only reachable where size_t is 32-bit). */
+    if ((size_t)num_values > SIZE_MAX / sizeof(int32_t)) {
+        return CARQUET_ERROR_DECODE;
+    }
+    int32_t* prefix_lengths = carquet_mem_malloc((size_t)num_values * sizeof(int32_t));
+    int32_t* suffix_lengths = carquet_mem_malloc((size_t)num_values * sizeof(int32_t));
 
     if (!prefix_lengths || !suffix_lengths) {
         carquet_mem_free(prefix_lengths);

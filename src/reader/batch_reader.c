@@ -2305,10 +2305,22 @@ carquet_status_t carquet_batch_reader_next(
         bool can_par = is_mmap && (num_threads_read > 1) &&
                        (batch_reader->num_projected > 1) && !all_zero_copy_ready;
         if (can_par) {
+            /* Per-column error slots: each thread writes only its own slot, so
+             * the failure flag is never a shared write across threads (no data
+             * race). Reduce into read_error after the region. */
+            bool* col_err = carquet_mem_calloc(
+                (size_t)batch_reader->num_projected, sizeof(bool));
+            if (!col_err) {
+                return CARQUET_ERROR_OUT_OF_MEMORY;
+            }
             #pragma omp parallel for num_threads(num_threads_read) schedule(dynamic, 1)
             for (col_i = 0; col_i < batch_reader->num_projected; col_i++) {
-                read_projected_column(batch_reader, new_batch, col_i, rows_to_read, &read_error);
+                read_projected_column(batch_reader, new_batch, col_i, rows_to_read, &col_err[col_i]);
             }
+            for (col_i = 0; col_i < batch_reader->num_projected; col_i++) {
+                if (col_err[col_i]) read_error = true;
+            }
+            carquet_mem_free(col_err);
         } else {
             for (col_i = 0; col_i < batch_reader->num_projected; col_i++) {
                 read_projected_column(batch_reader, new_batch, col_i, rows_to_read, &read_error);

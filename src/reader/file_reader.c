@@ -136,6 +136,13 @@ static int32_t traverse_schema_recursive(
     /* Group node - recursively process children */
     int32_t next_idx = element_idx + 1;
     for (int32_t child = 0; child < elem->num_children; child++) {
+        /* Stop once the flat element array is exhausted. Without this, a crafted
+         * footer declaring num_children up to INT32_MAX would spin billions of
+         * no-op recursive calls (each returns immediately via the guard at the
+         * top) — a CPU denial-of-service on an otherwise tiny file. */
+        if (next_idx >= ctx->num_elements) {
+            break;
+        }
         next_idx = traverse_schema_recursive(ctx, next_idx, element_idx,
                                              this_def, this_rep, depth + 1);
     }
@@ -324,8 +331,12 @@ static carquet_status_t read_footer(carquet_reader_t* reader, carquet_error_t* e
     const uint8_t* footer_data;
     uint8_t* fallback_buf = NULL;
 
-    if (footer_size + 8 <= spec_size) {
-        /* Fast path: footer fits within the speculative read - no second I/O */
+    if ((size_t)footer_size + 8 <= spec_size) {
+        /* Fast path: footer fits within the speculative read - no second I/O.
+         * The cast to size_t is required: `footer_size + 8` in 32-bit unsigned
+         * arithmetic wraps for footer_size >= 0xFFFFFFF8 (reachable on files
+         * larger than 4GB, which pass the range check above), which would take
+         * this fast path and underflow the pointer computation below. */
         footer_data = spec_buf + spec_size - 8 - footer_size;
     } else {
         /* Slow path: footer is larger than speculative buffer, need second read */
@@ -454,7 +465,11 @@ carquet_reader_t* carquet_reader_open(
 
     /* Try mmap if requested */
     if (reader->options.use_mmap) {
-        carquet_mmap_info_t* mmap_info = carquet_mmap_open(path, error);
+        /* Use a scratch error for the mmap attempt: if mmap fails but the fread
+         * fallback below succeeds, the caller's `error` must not be left holding
+         * the (recovered-from) mmap failure. */
+        carquet_error_t mmap_err = {0};
+        carquet_mmap_info_t* mmap_info = carquet_mmap_open(path, &mmap_err);
         if (mmap_info) {
             reader->mmap_info = mmap_info;
             reader->mmap_data = mmap_info->data;
@@ -879,6 +894,27 @@ carquet_column_reader_t* carquet_reader_get_column(
     /* Get schema info */
     int32_t schema_idx = reader->schema->leaf_indices[column_index];
     const parquet_schema_element_t* schema_elem = &reader->schema->elements[schema_idx];
+
+    /* Guard against malformed metadata whose column-chunk physical type
+     * disagrees with the schema. The value width is derived from two different
+     * sources on two different code paths: the batch reader sizes its output
+     * buffer from the schema element type, while the page reader writes using
+     * this column reader's type (taken from the chunk metadata below). If the
+     * two disagree, the page decode writes past the batch buffer — a
+     * heap-buffer-overflow reachable from untrusted input (e.g. schema INT32,
+     * 4 B/value, vs chunk BYTE_ARRAY, sizeof(carquet_byte_array_t)/value).
+     * Both sides must agree on the type, so reject the file when they do not.
+     * The fallback mirrors the batch reader's handling of a typeless element. */
+    carquet_physical_type_t schema_type =
+        schema_elem->has_type ? schema_elem->type : CARQUET_PHYSICAL_BYTE_ARRAY;
+    if (col_reader->col_meta->type != schema_type) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_METADATA,
+            "Column %d physical type in chunk metadata (%d) does not match "
+            "schema type (%d)", column_index,
+            (int)col_reader->col_meta->type, (int)schema_type);
+        carquet_mem_free(col_reader);
+        return NULL;
+    }
 
     col_reader->max_def_level = reader->schema->max_def_levels[column_index];
     col_reader->max_rep_level = reader->schema->max_rep_levels[column_index];

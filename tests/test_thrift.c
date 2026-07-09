@@ -377,6 +377,109 @@ static int test_logical_type_converted_type_compat(void) {
     return 0;
 }
 
+/*
+ * A foreign file may legitimately carry an empty (zero-length) BYTE_ARRAY
+ * min_value/max_value when the column's extreme value is the empty string.
+ * The parser must record presence from the field itself, not from its length,
+ * so that predicate pushdown stays enabled. carquet's own writer never emits an
+ * empty min/max, so this is hand-encoded to reproduce the foreign-file case.
+ */
+static int test_statistics_empty_min_value_presence(void) {
+    carquet_buffer_t buf;
+    carquet_buffer_init(&buf);
+    thrift_encoder_t enc;
+    thrift_encoder_init(&enc, &buf);
+
+    /* FileMetaData */
+    thrift_write_struct_begin(&enc);
+    thrift_write_field_header(&enc, THRIFT_TYPE_I32, 1);   /* version */
+    thrift_write_i32(&enc, 1);
+    thrift_write_field_header(&enc, THRIFT_TYPE_LIST, 2);  /* schema (empty) */
+    thrift_write_list_begin(&enc, THRIFT_TYPE_STRUCT, 0);
+    thrift_write_field_header(&enc, THRIFT_TYPE_I64, 3);   /* num_rows */
+    thrift_write_i64(&enc, 3);
+    thrift_write_field_header(&enc, THRIFT_TYPE_LIST, 4);  /* row_groups */
+    thrift_write_list_begin(&enc, THRIFT_TYPE_STRUCT, 1);
+    {
+        /* RowGroup */
+        thrift_write_struct_begin(&enc);
+        thrift_write_field_header(&enc, THRIFT_TYPE_LIST, 1);  /* columns */
+        thrift_write_list_begin(&enc, THRIFT_TYPE_STRUCT, 1);
+        {
+            /* ColumnChunk */
+            thrift_write_struct_begin(&enc);
+            thrift_write_field_header(&enc, THRIFT_TYPE_STRUCT, 3);  /* meta_data */
+            {
+                /* ColumnMetaData */
+                thrift_write_struct_begin(&enc);
+                thrift_write_field_header(&enc, THRIFT_TYPE_I32, 1);   /* type */
+                thrift_write_i32(&enc, (int32_t)CARQUET_PHYSICAL_BYTE_ARRAY);
+                thrift_write_field_header(&enc, THRIFT_TYPE_LIST, 2);  /* encodings */
+                thrift_write_list_begin(&enc, THRIFT_TYPE_I32, 0);
+                thrift_write_field_header(&enc, THRIFT_TYPE_LIST, 3);  /* path_in_schema */
+                thrift_write_list_begin(&enc, THRIFT_TYPE_BINARY, 1);
+                thrift_write_string(&enc, "s");
+                thrift_write_field_header(&enc, THRIFT_TYPE_I32, 4);   /* codec */
+                thrift_write_i32(&enc, 0);
+                thrift_write_field_header(&enc, THRIFT_TYPE_I64, 5);   /* num_values */
+                thrift_write_i64(&enc, 3);
+                thrift_write_field_header(&enc, THRIFT_TYPE_I64, 6);   /* total_uncompressed */
+                thrift_write_i64(&enc, 0);
+                thrift_write_field_header(&enc, THRIFT_TYPE_I64, 7);   /* total_compressed */
+                thrift_write_i64(&enc, 0);
+                thrift_write_field_header(&enc, THRIFT_TYPE_I64, 9);   /* data_page_offset */
+                thrift_write_i64(&enc, 4);
+                thrift_write_field_header(&enc, THRIFT_TYPE_STRUCT, 12);  /* statistics */
+                {
+                    /* Statistics with EMPTY min_value and max_value */
+                    thrift_write_struct_begin(&enc);
+                    thrift_write_field_header(&enc, THRIFT_TYPE_I64, 3);  /* null_count */
+                    thrift_write_i64(&enc, 0);
+                    thrift_write_field_header(&enc, THRIFT_TYPE_BINARY, 5);  /* max_value = "" */
+                    thrift_write_binary(&enc, (const uint8_t*)"", 0);
+                    thrift_write_field_header(&enc, THRIFT_TYPE_BINARY, 6);  /* min_value = "" */
+                    thrift_write_binary(&enc, (const uint8_t*)"", 0);
+                    thrift_write_field_stop(&enc);
+                }
+                thrift_write_field_stop(&enc);  /* end ColumnMetaData */
+            }
+            thrift_write_field_stop(&enc);  /* end ColumnChunk */
+        }
+        thrift_write_field_header(&enc, THRIFT_TYPE_I64, 3);  /* RowGroup num_rows */
+        thrift_write_i64(&enc, 3);
+        thrift_write_field_stop(&enc);  /* end RowGroup */
+    }
+    thrift_write_field_stop(&enc);  /* end FileMetaData */
+
+    carquet_arena_t arena;
+    assert(carquet_arena_init_size(&arena, 4096) == CARQUET_OK);
+
+    parquet_file_metadata_t parsed;
+    memset(&parsed, 0, sizeof(parsed));
+    assert(parquet_parse_file_metadata(
+        carquet_buffer_data_const(&buf), carquet_buffer_size(&buf),
+        &arena, &parsed, NULL) == CARQUET_OK);
+
+    assert(parsed.num_row_groups == 1);
+    assert(parsed.row_groups[0].num_columns == 1);
+    const parquet_column_chunk_t* chunk = &parsed.row_groups[0].columns[0];
+    assert(chunk->has_metadata);
+    assert(chunk->metadata.has_statistics);
+    const parquet_statistics_t* st = &chunk->metadata.statistics;
+
+    /* The core assertion: presence is detected from the field, not its length. */
+    assert(st->has_min_value);
+    assert(st->has_max_value);
+    assert(st->min_value_len == 0);
+    assert(st->max_value_len == 0);
+
+    carquet_arena_destroy(&arena);
+    carquet_buffer_destroy(&buf);
+
+    TEST_PASS("statistics_empty_min_value_presence");
+    return 0;
+}
+
 int main(void) {
     int failures = 0;
 
@@ -387,6 +490,7 @@ int main(void) {
     failures += test_thrift_struct();
     failures += test_thrift_list();
     failures += test_logical_type_converted_type_compat();
+    failures += test_statistics_empty_min_value_presence();
 
     printf("\n");
     if (failures == 0) {

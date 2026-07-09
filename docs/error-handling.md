@@ -81,9 +81,21 @@ CARQUET_SUCCEEDED(status);                /* status == CARQUET_OK */
 CARQUET_FAILED(status);                   /* status != CARQUET_OK */
 ```
 
+## Per-Read Error Reporting on the Column Reader
+
+`carquet_column_read_batch()` returns the number of values read, or `-1` on any error — it cannot say *which* error, and it reports a mid-batch read failure that already produced some values by returning that partial count (indistinguishable from a clean end-of-column short read). `carquet_column_read_batch_ex()` takes the same arguments plus a trailing `carquet_error_t*` and follows the out-parameter convention used everywhere else in the API:
+
+| Return | `error` | Meaning |
+|---|---|---|
+| `>= 0` | unset (`CARQUET_OK`) | Clean read; a value below the requested count means end-of-column. |
+| `> 0` | set | Partial read — values are valid but a read error truncated the batch; the rest was not read. |
+| `-1` | set | Hard failure, nothing read (`INVALID_ARGUMENT`, `TYPE_MISMATCH`, `OUT_OF_MEMORY`, or the propagated page/decode/I-O code). |
+
+The error is cleared on entry, so `error->code == CARQUET_OK` is a reliable "no failure" signal regardless of the returned count. Passing `NULL` for `error` reproduces `carquet_column_read_batch()` exactly.
+
 ## Physical Type ↔ C Type Mapping
 
-When calling `carquet_writer_write_batch()` or reading from `carquet_column_read_batch()` / `carquet_row_batch_column()`, the `values` buffer must match the column's physical type:
+When calling `carquet_writer_write_batch()` or reading from `carquet_column_read_batch()` / `carquet_column_read_batch_ex()` / `carquet_row_batch_column()`, the `values` buffer must match the column's physical type:
 
 | Physical Type | C Type | Size | Notes |
 |---|---|---|---|

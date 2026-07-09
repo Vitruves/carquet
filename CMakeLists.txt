@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(carquet VERSION 0.6.0 LANGUAGES C)
+project(carquet VERSION 0.6.1 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -51,26 +51,35 @@ set(CARQUET_ARROW_CPP_ROOT "" CACHE PATH
 # External compression libraries
 include(FetchContent)
 
+# When ON, ignore any system/conda zstd/zlib/lz4 and always fetch + statically
+# bundle them into libcarquet. Produces a self-contained static archive suitable
+# for prebuilt release artifacts (see .github/workflows/release.yml).
+option(CARQUET_BUNDLE_DEPS "Always fetch and static-bundle zstd/zlib/lz4 (portable release artifacts)" OFF)
+
 # Try to find system zstd first, fetch if not found
-# Method 1: Try modern CMake config (works best on Windows/vcpkg/conda)
-find_package(zstd CONFIG QUIET)
-if(zstd_FOUND)
-    message(STATUS "Found zstd via CMake config")
-    # When building a shared library, prefer shared deps to avoid -fPIC issues
-    # with static libraries that weren't compiled with -fPIC.
-    if(CARQUET_BUILD_SHARED AND TARGET zstd::libzstd_shared)
-        set(ZSTD_LIBRARIES zstd::libzstd_shared)
-    elseif(TARGET zstd::libzstd_static)
-        set(ZSTD_LIBRARIES zstd::libzstd_static)
-    elseif(TARGET zstd::libzstd_shared)
-        set(ZSTD_LIBRARIES zstd::libzstd_shared)
-    endif()
-    set(ZSTD_FOUND TRUE)
+if(CARQUET_BUNDLE_DEPS)
+    message(STATUS "CARQUET_BUNDLE_DEPS=ON — forcing bundled static zstd")
 else()
-    # Method 2: Try pkg-config (Linux/macOS)
-    find_package(PkgConfig QUIET)
-    if(PkgConfig_FOUND)
-        pkg_check_modules(ZSTD QUIET libzstd)
+    # Method 1: Try modern CMake config (works best on Windows/vcpkg/conda)
+    find_package(zstd CONFIG QUIET)
+    if(zstd_FOUND)
+        message(STATUS "Found zstd via CMake config")
+        # When building a shared library, prefer shared deps to avoid -fPIC issues
+        # with static libraries that weren't compiled with -fPIC.
+        if(CARQUET_BUILD_SHARED AND TARGET zstd::libzstd_shared)
+            set(ZSTD_LIBRARIES zstd::libzstd_shared)
+        elseif(TARGET zstd::libzstd_static)
+            set(ZSTD_LIBRARIES zstd::libzstd_static)
+        elseif(TARGET zstd::libzstd_shared)
+            set(ZSTD_LIBRARIES zstd::libzstd_shared)
+        endif()
+        set(ZSTD_FOUND TRUE)
+    else()
+        # Method 2: Try pkg-config (Linux/macOS)
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(ZSTD QUIET libzstd)
+        endif()
     endif()
 endif()
 
@@ -95,7 +104,9 @@ else()
 endif()
 
 # Try to find system zlib first, fetch if not found
-find_package(ZLIB QUIET)
+if(NOT CARQUET_BUNDLE_DEPS)
+    find_package(ZLIB QUIET)
+endif()
 if(ZLIB_FOUND)
     message(STATUS "Found system zlib: ${ZLIB_VERSION_STRING}")
 else()
@@ -113,7 +124,9 @@ endif()
 
 # Try to find system lz4 first, fetch if not found
 # Prefer CMake config (gives proper targets with full paths on all platforms)
-find_package(lz4 CONFIG QUIET)
+if(NOT CARQUET_BUNDLE_DEPS)
+    find_package(lz4 CONFIG QUIET)
+endif()
 if(lz4_FOUND)
     message(STATUS "Found lz4 via CMake config")
     if(CARQUET_BUILD_SHARED AND TARGET LZ4::lz4_shared)
@@ -134,7 +147,7 @@ if(lz4_FOUND)
     endif()
 endif()
 
-if(NOT LZ4_FOUND)
+if(NOT LZ4_FOUND AND NOT CARQUET_BUNDLE_DEPS)
     find_package(PkgConfig QUIET)
     if(PkgConfig_FOUND)
         pkg_check_modules(LZ4 QUIET liblz4)
@@ -227,8 +240,15 @@ elseif(CARQUET_COMPILER_MSVC)
 endif()
 
 # Optional native architecture optimization
-option(CARQUET_NATIVE_ARCH "Build with -march=native for maximum performance" OFF)
+option(CARQUET_NATIVE_ARCH "Build with -march=native for maximum performance (produces a HOST-ONLY binary)" OFF)
 if(CARQUET_NATIVE_ARCH AND CARQUET_COMPILER_GCC_LIKE)
+    # -march=native applies to the whole library, including the scalar fallbacks
+    # and the dispatch layer, so the compiler may auto-vectorize "baseline" code
+    # with whatever ISA the build host supports. The resulting binary is NOT
+    # portable to older CPUs and the runtime SIMD dispatch no longer guarantees
+    # it: run it only on hardware matching (or newer than) the build host. Use
+    # it for local benchmarking, not for distributed/packaged builds.
+    message(STATUS "CARQUET_NATIVE_ARCH=ON: building a host-only binary (-march=native); not portable to older CPUs")
     add_compile_options(-march=native)
 endif()
 
@@ -345,11 +365,17 @@ if(CARQUET_ARCH_X86)
 
     set(CARQUET_SIMD_X86_SOURCES "")
 
+    # ISA-specific TUs are compiled with per-file -m<isa> flags. Under LTO the
+    # code generator can inline these functions into baseline callers, emitting
+    # AVX/AVX-512 instructions on paths that run before the runtime CPU-feature
+    # dispatch check -> SIGILL on older CPUs. Compile them with -fno-lto (as
+    # detect.c already is) so ISA-specific code stays in its own object and is
+    # only reached through the dispatch table's function pointers.
     if(CARQUET_ENABLE_SSE)
         list(APPEND CARQUET_SIMD_X86_SOURCES src/simd/x86/sse_ops.c)
         if(CARQUET_COMPILER_GCC_LIKE)
             set_source_files_properties(src/simd/x86/sse_ops.c PROPERTIES
-                COMPILE_FLAGS "-msse4.2")
+                COMPILE_FLAGS "-msse4.2 -fno-lto")
         endif()
     endif()
 
@@ -357,7 +383,7 @@ if(CARQUET_ARCH_X86)
         list(APPEND CARQUET_SIMD_X86_SOURCES src/simd/x86/avx_ops.c)
         if(CARQUET_COMPILER_GCC_LIKE)
             set_source_files_properties(src/simd/x86/avx_ops.c PROPERTIES
-                COMPILE_FLAGS "-mavx -msse4.2")
+                COMPILE_FLAGS "-mavx -msse4.2 -fno-lto")
         elseif(CARQUET_COMPILER_MSVC)
             set_source_files_properties(src/simd/x86/avx_ops.c PROPERTIES
                 COMPILE_FLAGS "/arch:AVX")
@@ -368,7 +394,7 @@ if(CARQUET_ARCH_X86)
         list(APPEND CARQUET_SIMD_X86_SOURCES src/simd/x86/avx2_ops.c)
         if(CARQUET_COMPILER_GCC_LIKE)
             set_source_files_properties(src/simd/x86/avx2_ops.c PROPERTIES
-                COMPILE_FLAGS "-mavx2 -mbmi2")
+                COMPILE_FLAGS "-mavx2 -mbmi2 -fno-lto")
         elseif(CARQUET_COMPILER_MSVC)
             set_source_files_properties(src/simd/x86/avx2_ops.c PROPERTIES
                 COMPILE_FLAGS "/arch:AVX2")
@@ -379,7 +405,7 @@ if(CARQUET_ARCH_X86)
         list(APPEND CARQUET_SIMD_X86_SOURCES src/simd/x86/avx512_ops.c)
         if(CARQUET_COMPILER_GCC_LIKE)
             set_source_files_properties(src/simd/x86/avx512_ops.c PROPERTIES
-                COMPILE_FLAGS "-mavx512f -mavx512bw -mavx512vl")
+                COMPILE_FLAGS "-mavx512f -mavx512bw -mavx512vl -fno-lto")
         elseif(CARQUET_COMPILER_MSVC)
             set_source_files_properties(src/simd/x86/avx512_ops.c PROPERTIES
                 COMPILE_FLAGS "/arch:AVX512")
@@ -461,9 +487,14 @@ function(carquet_private_link_libraries_for_export out_var)
     foreach(_lib IN LISTS ARGN)
         if(TARGET ${_lib})
             get_target_property(_imported ${_lib} IMPORTED)
-            if(NOT _imported)
+            if(NOT _imported AND CARQUET_BUILD_SHARED)
+                # Shared carquet bakes the fetched dep into the .so, so consumers
+                # of the installed library must NOT link it — keep it build-tree only.
                 list(APPEND _result "$<BUILD_INTERFACE:${_lib}>")
             else()
+                # Static carquet: the consumer must link the bundled dep archive.
+                # These fetched targets are added to carquetTargets below, so a
+                # plain reference exports as carquet::<dep> in the install interface.
                 list(APPEND _result ${_lib})
             endif()
         else()
@@ -599,6 +630,16 @@ if(CARQUET_BUILD_TESTS)
     # Append row groups to an existing file (metadata carryover, bloom/page-index
     # preservation, nullable + multi-column append, structural-mismatch rejection)
     add_carquet_test(test_append tests/test_append.c)
+
+    # Unit tests for previously-uncovered internal modules
+    add_carquet_test(test_float16 tests/test_float16.c)          # binary16 -> binary32
+    add_carquet_test(test_geo_wkb tests/test_geo_wkb.c)          # WKB geospatial stats walker
+    add_carquet_test(test_worker_pool tests/test_worker_pool.c)  # persistent reader thread pool
+    add_carquet_test(test_custom_codec tests/test_custom_codec.c) # pluggable compression codec API
+
+    # Full-pipeline "real dataset" regression net: multi-type nullable columns,
+    # several row groups, compression, statistics, predicate pushdown, batch read
+    add_carquet_test(test_real_world tests/test_real_world.c)
 endif()
 
 # Examples
@@ -842,9 +883,57 @@ if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
         COMPATIBILITY SameMajorVersion
     )
 
+    # Record which transitive imported deps the installed target references so
+    # the package config can find_dependency() them for consumers.
+    set(CARQUET_NEEDS_THREADS 0)
+    if(UNIX)
+        set(CARQUET_NEEDS_THREADS 1)
+    endif()
+    set(CARQUET_NEEDS_OPENMP 0)
+    if(OpenMP_C_FOUND)
+        set(CARQUET_NEEDS_OPENMP 1)
+    endif()
+
     configure_package_config_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/carquetConfig.cmake.in"
         "${CMAKE_CURRENT_BINARY_DIR}/carquetConfig.cmake"
         INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/carquet
+    )
+
+    # Install the generated package config so find_package(carquet) works from
+    # an install tree (without this, only carquetTargets.cmake ships and
+    # find_package can't locate the package).
+    install(FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/carquetConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/carquetConfigVersion.cmake"
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/carquet
+    )
+
+    # pkg-config file so non-CMake build systems (Meson, Autotools, plain make)
+    # can consume carquet via `pkg-config --cflags --libs carquet`.
+    # Libs.private lists the transitive static-link deps; it only matters when a
+    # consumer links carquet statically (`pkg-config --static`). The standard
+    # system link names are assumed — correct for system/distro installs, but
+    # not for CARQUET_BUNDLE_DEPS/FetchContent artifacts whose archives carry
+    # mangled names (those are meant for CMake export consumption, not .pc).
+    set(CARQUET_PC_PRIVATE_LIBS "-lzstd -lz -llz4")
+    if(UNIX)
+        string(APPEND CARQUET_PC_PRIVATE_LIBS " -lm")
+    endif()
+    if(CARQUET_NEEDS_THREADS)
+        string(APPEND CARQUET_PC_PRIVATE_LIBS " -lpthread")
+    endif()
+    if(CARQUET_NEEDS_OPENMP AND OpenMP_C_FLAGS)
+        string(APPEND CARQUET_PC_PRIVATE_LIBS " ${OpenMP_C_FLAGS}")
+    endif()
+
+    configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/carquet.pc.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/carquet.pc"
+        @ONLY
+    )
+    install(FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/carquet.pc"
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
     )
 endif()

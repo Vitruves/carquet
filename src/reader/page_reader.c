@@ -744,7 +744,10 @@ carquet_status_t carquet_read_dictionary_page(
             }
             reader->dictionary_offsets[i] = (uint32_t)(dict_ptr - page_data);
             uint32_t len = carquet_read_u32_le(dict_ptr);
-            size_t entry_size = 4 + len;
+            /* Widen to size_t before adding: `4 + len` in 32-bit unsigned
+             * arithmetic wraps for len >= 0xFFFFFFFC, which would defeat the
+             * `dict_remaining < entry_size` bounds check below. */
+            size_t entry_size = (size_t)4 + (size_t)len;
             if (dict_remaining < entry_size) {
                 carquet_mem_free(reader->dictionary_offsets);
                 reader->dictionary_data = NULL;  /* caller frees page_data */
@@ -1098,7 +1101,12 @@ carquet_status_t carquet_read_data_page_v1(
                             out[i].length = (int32_t)len;
                         }
                     } else {
-                        /* Fallback: scan each time (shouldn't happen for new readers) */
+                        /* Fallback: scan each time (shouldn't happen for new readers).
+                         * Bounds-checked and size_t-widened as defense-in-depth: a
+                         * 32-bit `4 + len` could otherwise wrap and walk past the
+                         * dictionary buffer. */
+                        const uint8_t* dict_end =
+                            reader->dictionary_data + reader->dictionary_size;
                         for (int32_t i = 0; i < encoded_count; i++) {
                             int32_t idx = (int32_t)indices[i];
                             if (idx < 0 || idx >= reader->dictionary_count) {
@@ -1107,13 +1115,28 @@ carquet_status_t carquet_read_data_page_v1(
                             }
 
                             const uint8_t* dict_ptr = reader->dictionary_data;
-                            for (int32_t j = 0; j < idx; j++) {
+                            bool oob = false;
+                            for (int32_t j = 0; j <= idx; j++) {
+                                if ((size_t)(dict_end - dict_ptr) < 4) {
+                                    oob = true;
+                                    break;
+                                }
                                 uint32_t len = carquet_read_u32_le(dict_ptr);
-                                dict_ptr += 4 + len;
+                                if ((size_t)(dict_end - dict_ptr) - 4 < (size_t)len) {
+                                    oob = true;
+                                    break;
+                                }
+                                if (j == idx) {
+                                    out[i].data = (uint8_t*)(dict_ptr + 4);
+                                    out[i].length = (int32_t)len;
+                                    break;
+                                }
+                                dict_ptr += (size_t)4 + (size_t)len;
                             }
-                            uint32_t len = carquet_read_u32_le(dict_ptr);
-                            out[i].data = (uint8_t*)(dict_ptr + 4);
-                            out[i].length = (int32_t)len;
+                            if (oob) {
+                                status = CARQUET_ERROR_DECODE;
+                                break;
+                            }
                         }
                     }
                 } else {
@@ -1444,6 +1467,11 @@ carquet_status_t carquet_read_data_page_v2(
                             out[i].length = (int32_t)len;
                         }
                     } else {
+                        /* Fallback scan (unreachable for current readers); bounds-checked
+                         * and size_t-widened as defense-in-depth against a 32-bit
+                         * `4 + len` wrap walking past the dictionary buffer. */
+                        const uint8_t* dict_end =
+                            reader->dictionary_data + reader->dictionary_size;
                         for (int32_t i = 0; i < encoded_count; i++) {
                             int32_t idx = (int32_t)indices[i];
                             if (idx < 0 || idx >= reader->dictionary_count) {
@@ -1451,13 +1479,28 @@ carquet_status_t carquet_read_data_page_v2(
                                 break;
                             }
                             const uint8_t* dict_ptr = reader->dictionary_data;
-                            for (int32_t j = 0; j < idx; j++) {
+                            bool oob = false;
+                            for (int32_t j = 0; j <= idx; j++) {
+                                if ((size_t)(dict_end - dict_ptr) < 4) {
+                                    oob = true;
+                                    break;
+                                }
                                 uint32_t len = carquet_read_u32_le(dict_ptr);
-                                dict_ptr += 4 + len;
+                                if ((size_t)(dict_end - dict_ptr) - 4 < (size_t)len) {
+                                    oob = true;
+                                    break;
+                                }
+                                if (j == idx) {
+                                    out[i].data = (uint8_t*)(dict_ptr + 4);
+                                    out[i].length = (int32_t)len;
+                                    break;
+                                }
+                                dict_ptr += (size_t)4 + (size_t)len;
                             }
-                            uint32_t len = carquet_read_u32_le(dict_ptr);
-                            out[i].data = (uint8_t*)(dict_ptr + 4);
-                            out[i].length = (int32_t)len;
+                            if (oob) {
+                                status = CARQUET_ERROR_DECODE;
+                                break;
+                            }
                         }
                     }
                 } else {
@@ -2105,6 +2148,24 @@ static carquet_status_t load_next_page_mmap(
 
     if (zero_copy_eligible && !has_levels) {
         /* ====== ZERO-COPY PATH ====== */
+
+        /* Validate that the page payload actually holds num_values fixed-width
+         * values before viewing it directly. Without this a crafted header that
+         * declares more values than the payload contains causes an
+         * out-of-bounds read when the batch reader memcpy's num_values *
+         * value_size bytes out of decoded_values (which points straight into
+         * the mapped file). Mirrors the same check on the buffered PLAIN
+         * view-directly paths below. The zero-copy codec is always
+         * uncompressed, so compressed_page_size is the exact payload length. */
+        size_t required_bytes = 0;
+        if (!checked_mul_size(value_size, (size_t)num_values, &required_bytes)) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Page payload size overflow");
+            return CARQUET_ERROR_DECODE;
+        }
+        if ((size_t)page_header.compressed_page_size < required_bytes) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Truncated PLAIN page payload");
+            return CARQUET_ERROR_DECODE;
+        }
 
         /* Free previous owned buffer if any */
         if (reader->decoded_ownership == CARQUET_DATA_OWNED) {

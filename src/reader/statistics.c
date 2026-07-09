@@ -223,9 +223,12 @@ carquet_status_t carquet_reader_column_statistics(
         stats->distinct_count = pstats->distinct_count;
     }
 
-    /* Min/max values - prefer new format, fall back to deprecated */
-    if (pstats->min_value && pstats->min_value_len > 0 &&
-        pstats->max_value && pstats->max_value_len > 0) {
+    /* Min/max values - prefer new format, fall back to deprecated.
+     * Presence is taken from the has_min_value/has_max_value flags rather than
+     * from length, so a BYTE_ARRAY/STRING column whose true minimum is the
+     * empty string still enables predicate pushdown instead of being treated
+     * as having no stats. stat_compare handles a zero-length bound correctly. */
+    if (pstats->has_min_value && pstats->has_max_value) {
         stats->has_min_max = true;
         stats->min_value = pstats->min_value;
         stats->min_value_size = pstats->min_value_len;

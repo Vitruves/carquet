@@ -215,13 +215,19 @@ carquet_status_t carquet_byte_stream_split_encode(
         return CARQUET_ERROR_ENCODE;
     }
 
-    if (type_length == 4) {
+    /* The float/double fast paths reinterpret `values` as float* and double*. That
+     * is only sound when the buffer is naturally aligned. INT32/INT64 callers
+     * pass aligned buffers, but the FIXED_LEN_BYTE_ARRAY(4/8) caller passes a
+     * raw byte buffer with no such guarantee -> UB / SIGBUS on strict-alignment
+     * targets. Gate the fast path on alignment and fall through to the generic
+     * byte transpose otherwise. */
+    if (type_length == 4 && ((uintptr_t)values & 3u) == 0) {
         carquet_dispatch_byte_split_encode_float((const float*)values, count, output);
         *bytes_written = required_size;
         return CARQUET_OK;
     }
 
-    if (type_length == 8) {
+    if (type_length == 8 && ((uintptr_t)values & 7u) == 0) {
         carquet_dispatch_byte_split_encode_double((const double*)values, count, output);
         *bytes_written = required_size;
         return CARQUET_OK;
@@ -254,12 +260,16 @@ carquet_status_t carquet_byte_stream_split_decode(
         return CARQUET_ERROR_DECODE;
     }
 
-    if (type_length == 4) {
+    /* See the encode path: the float/double fast paths reinterpret `values` as
+     * float* and double* and are only sound on a naturally aligned buffer. The
+     * FIXED_LEN_BYTE_ARRAY(4/8) caller passes a raw, possibly-unaligned byte
+     * buffer, so gate on alignment and fall through to the generic transpose. */
+    if (type_length == 4 && ((uintptr_t)values & 3u) == 0) {
         carquet_bss_decode_float_tiled(data, count, (float*)values);
         return CARQUET_OK;
     }
 
-    if (type_length == 8) {
+    if (type_length == 8 && ((uintptr_t)values & 7u) == 0) {
         carquet_bss_decode_double_tiled(data, count, (double*)values);
         return CARQUET_OK;
     }
