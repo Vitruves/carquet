@@ -342,6 +342,15 @@ local function carquet_exe(name, files, opts)
                 target:add("cxflags", undef, {force = true})
             end)
         end
+        -- MSVC gates <stdatomic.h> behind an opt-in flag; tests that use C11
+        -- atomics directly (the library itself avoids them on MSVC) need it.
+        if opts.cl_cflags then
+            on_config(function (target)
+                if target:has_tool("cc", "cl") then
+                    target:add("cflags", opts.cl_cflags, {force = true})
+                end
+            end)
+        end
         if opts.is_test then add_tests("default") end
     target_end()
 end
@@ -364,8 +373,9 @@ if want("tests") then
         "test_real_world",
     }
     for _, t in ipairs(tests) do
-        carquet_exe(t, "tests/" .. t .. ".c",
-            {with_src = true, keep_asserts = true, is_test = true})
+        local exe_opts = {with_src = true, keep_asserts = true, is_test = true}
+        if t == "test_worker_pool" then exe_opts.cl_cflags = "/experimental:c11atomics" end
+        carquet_exe(t, "tests/" .. t .. ".c", exe_opts)
     end
 end
 

@@ -635,6 +635,10 @@ if(CARQUET_BUILD_TESTS)
     add_carquet_test(test_float16 tests/test_float16.c)          # binary16 -> binary32
     add_carquet_test(test_geo_wkb tests/test_geo_wkb.c)          # WKB geospatial stats walker
     add_carquet_test(test_worker_pool tests/test_worker_pool.c)  # persistent reader thread pool
+    # This test uses C11 <stdatomic.h> directly; MSVC only enables it under an opt-in flag.
+    if(MSVC)
+        target_compile_options(test_worker_pool PRIVATE /experimental:c11atomics)
+    endif()
     add_carquet_test(test_custom_codec tests/test_custom_codec.c) # pluggable compression codec API
 
     # Full-pipeline "real dataset" regression net: multi-type nullable columns,
