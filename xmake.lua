@@ -11,7 +11,7 @@
 -- Enable optional pieces individually, e.g. `xmake f --tests=y --fuzz=y`.
 
 set_project("carquet")
-set_version("0.6.1")
+set_version("0.7.0")
 -- gnu11, not strict c11: matches CMake's `set(CMAKE_C_STANDARD 11)` (GNU
 -- extensions stay on by default). Under strict -std=c11 the POSIX feature-test
 -- macros are off, so functions like strdup/posix_memalign aren't declared and
@@ -370,7 +370,8 @@ if want("tests") then
         "test_encoding_roundtrip", "test_writer_extensions", "test_bitunpack_wide",
         "test_page_filter", "test_append",
         "test_float16", "test_geo_wkb", "test_worker_pool", "test_custom_codec",
-        "test_real_world",
+        "test_real_world", "test_arrow_c_data", "test_batch_nested",
+        "test_nested_write", "test_arrow_nested", "test_p2_conformance",
     }
     for _, t in ipairs(tests) do
         local exe_opts = {with_src = true, keep_asserts = true, is_test = true}
@@ -393,6 +394,7 @@ if want("examples") then
         {"example_append",           "examples/append_rows.c"},
         {"example_page_filter",      "examples/page_filter.c"},
         {"example_nested",           "examples/nested_data.c"},
+        {"example_arrow_c_data",     "examples/arrow_c_data.c"},
     }
     for _, e in ipairs(examples) do
         carquet_exe(e[1], e[2])
@@ -487,6 +489,8 @@ if has_config("fuzz") then
     local fuzzers = {
         "fuzz_reader", "fuzz_compression", "fuzz_encodings", "fuzz_thrift",
         "fuzz_roundtrip", "fuzz_writer", "fuzz_page_filter", "fuzz_append",
+        "fuzz_arrow_schema", "fuzz_arrow_c_data", "fuzz_nested_write",
+        "fuzz_arrow_read",
     }
     for _, f in ipairs(fuzzers) do
         target(f)
@@ -509,3 +513,26 @@ if has_config("fuzz") then
         target_end()
     end
 end
+
+--------------------------------------------------------------------------------
+-- Documentation (Doxygen). Run with `xmake docs`. Reuses the checked-in
+-- Doxyfile (output goes to build/docs/html). Doxygen is not required for a
+-- normal build: the task prints a clear hint if it (or graphviz) is missing.
+--------------------------------------------------------------------------------
+
+task("docs")
+    on_run(function ()
+        import("lib.detect.find_tool")
+        local doxygen = find_tool("doxygen")
+        if not doxygen then
+            cprint("${red}doxygen not found${clear} — install it (e.g. `brew install doxygen graphviz`) to build the docs")
+            return
+        end
+        if not find_tool("dot") then
+            cprint("${yellow}graphviz 'dot' not found${clear} — docs will build without diagrams")
+        end
+        os.execv(doxygen.program, {"Doxyfile"}, {curdir = os.projectdir()})
+        cprint("${green}docs generated${clear} -> build/docs/html/index.html")
+    end)
+    set_menu({usage = "xmake docs", description = "Generate API documentation with Doxygen (needs doxygen; graphviz for diagrams)"})
+task_end()

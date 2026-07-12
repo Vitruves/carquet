@@ -174,6 +174,27 @@ carquet_column_reader_free(col);
 
 If you need values presented as native nested types rather than leaves + levels, that reassembly currently lives in the calling application (or a higher-level binding). See `tests/test_nested.c` for end-to-end reconstruction examples.
 
+### Single-Level Lists Through the Batch Reader
+
+For **single-level** repeated columns (`max_rep_level == 1` — i.e. a `LIST<T>` element or a `MAP` key/value leaf), the batch reader reconstructs Arrow's `List<T>` layout for you. When any projected column is repeated, `carquet_batch_reader_next()` reads a whole row group per batch and each repeated column is read via `carquet_row_batch_column_list()` instead of `carquet_row_batch_column()` (which rejects list columns):
+
+```c
+const int32_t* offsets;      /* num_lists + 1 entries */
+int64_t num_lists, num_values;
+const void* values;          /* flattened child (element) array */
+const uint8_t* value_validity;  /* child validity bitmap, or NULL */
+const uint8_t* list_validity;   /* list-level validity bitmap, or NULL */
+
+carquet_row_batch_column_list(batch, col, &offsets, &num_lists,
+                              &values, &value_validity, &num_values, &list_validity);
+
+/* Row i's elements are values[offsets[i] .. offsets[i+1]-1].
+ * Element k is null if value_validity && bit k is clear;
+ * the whole list (row i) is null if list_validity && bit i is clear. */
+```
+
+This is the standard Arrow list encoding (offsets + child array + two validity bitmaps), so it maps directly onto Arrow / a downstream consumer. Deeper nesting (`max_rep_level > 1`, e.g. list-of-list) is not yet materialized this way — `carquet_batch_reader_next()` returns `CARQUET_ERROR_NOT_IMPLEMENTED` — and still needs the manual leaf + levels approach above. Page filters are not combined with repeated-column projections in this release.
+
 ## Predicate Pushdown and Cheap Inspection
 
 Use row-group statistics before you start reading payload pages:
@@ -265,9 +286,11 @@ After reading, `carquet_batch_reader_rows_skipped()` reports the running count o
 int64_t skipped = carquet_batch_reader_rows_skipped(br);
 ```
 
+**Automatic row-group pruning (statistics + bloom filters).** Before any page index is consulted, an installed filter automatically drops whole row groups whose ColumnChunk statistics (min/max/null-count) or — for `EQ`/`IN` clauses — bloom filter prove they cannot match. This needs no user callback and no page index: a predicate that falls outside every row group's range skips the file cleanly (rather than erroring), and a bloom filter drops a row group whose value sits inside the min/max range but is provably absent. It is purely additive to the page-level filtering below; it only ever skips provably-empty row groups. (This supersedes the older manual pattern of calling `carquet_reader_filter_row_groups()` and translating the result into a `row_group_filter` callback.)
+
 **Requirements and semantics**
 
-- The file must have been written with `write_page_index = true` for every column the filter references. Filtering a column without a page index returns `CARQUET_ERROR_PAGE_INDEX_REQUIRED` on the next `carquet_batch_reader_next()` call.
+- Page-*level* filtering (narrowing to row ranges *within* a surviving row group) still requires `write_page_index = true` for every column the filter references. When a row group survives the automatic pruning above but a referenced column has no page index, the next `carquet_batch_reader_next()` returns `CARQUET_ERROR_PAGE_INDEX_REQUIRED`.
 - `INT96` columns have no defined sort order per the Parquet spec and are rejected with `CARQUET_ERROR_INVALID_ARGUMENT` at filter-set time.
 - For BYTE_ARRAY columns with truncated min/max stats, the filter is conservative: a page may be kept even when no row in it actually matches. Filtering is page-granular by design — rows inside a matching page that fail the predicate are still returned and the caller must apply the exact predicate to the batch if needed.
 - Floats whose predicate value is NaN match nothing under ordered ops (`EQ`, `LT`, …), mirroring Arrow semantics.
@@ -278,11 +301,51 @@ int64_t skipped = carquet_batch_reader_rows_skipped(br);
 Carquet exposes the optional metadata structures that many readers hide:
 
 - Key-value footer metadata: `carquet_reader_num_metadata()`, `carquet_reader_get_metadata()`, `carquet_reader_find_metadata()`
+- Per-field metadata (variable labels/descriptions): `carquet_reader_column_num_metadata()`, `carquet_reader_column_get_metadata()`, and `carquet_reader_column_find_metadata(reader, column, "Label")`. These recover Arrow `Field.custom_metadata` from the file's `ARROW:schema` blob (written by carquet — see [Per-Field Metadata](writing.md#per-field-metadata-variable-labels--descriptions) — or by PyArrow / Arrow C++). Returns nothing when the file has no such blob.
+- Arrow type refinements: `carquet_reader_column_arrow_type_refinement(reader, column)` recovers per-leaf Arrow types the Parquet type system alone cannot express — 64-bit-offset `LargeUtf8` / `LargeBinary` — from the `ARROW:schema` blob, returning a `carquet_arrow_type_refinement_t`. The column's values still read exactly as their Parquet physical type; the refinement is informational (e.g. so a caller re-exporting to Arrow can restore the original large-offset type). Returns `CARQUET_ARROW_REFINE_NONE` when absent.
 - Bloom filters: `carquet_reader_get_bloom_filter()` plus `carquet_bloom_filter_check_*()`
 - Page indexes: `carquet_reader_get_column_index()`, `carquet_reader_get_offset_index()`
 - Column chunk metadata: `carquet_reader_column_chunk_metadata()`
 
 Use these when you need diagnostics, custom pruning, or interoperability checks. For a compact end-to-end example, see [`examples/advanced_features.c`](../examples/advanced_features.c).
+
+## Export to Arrow (C Data Interface)
+
+To hand read data to the Arrow ecosystem (PyArrow, DuckDB, nanoarrow, any C Data Interface consumer) without a bespoke copy, export a row batch to a standard `ArrowArray` + `ArrowSchema`:
+
+```c
+struct ArrowSchema aschema;
+struct ArrowArray  aarray;
+const carquet_schema_t* schema = carquet_reader_schema(reader);
+
+if (carquet_arrow_export_batch(batch, schema, &aschema, &aarray, &err) == CARQUET_OK) {
+    /* Hand &aschema / &aarray to any Arrow consumer, then release exactly once: */
+    aarray.release(&aarray);
+    aschema.release(&aschema);
+}
+```
+
+- `carquet_arrow_export_batch()` covers **flat** columns plus **single-level `LIST<T>` and `MAP<K,V>`** from a row batch — a list becomes an Arrow `List` child (offsets + flattened element) and a map an Arrow `Map` child (`entries` struct of key/value). STRUCT and deeper-than-single-level nesting return `CARQUET_ERROR_NOT_IMPLEMENTED` here; use `carquet_reader_read_arrow()` (below) for those. The batch must have been read without column projection (leaf count must match the schema).
+- Every exported buffer is an **independent copy owned by the struct**, so the export stays valid after the source batch is freed or the batch reader advances. The consumer owns it and must call the `release` callback once.
+- `carquet_arrow_export_schema()` exports just the schema (a `"+s"` struct), now **including nested types** — a Parquet LIST becomes Arrow `List<element>`, a MAP becomes `Map<entries: struct<key, value>>`, and a group becomes a `Struct`. BOOLEAN is bit-packed, UTF8/binary get `int32` offset buffers, and validity bitmaps are already Arrow-native (LSB-first, present bit set).
+- The struct definitions are declared inline in `carquet.h` under the standard `ARROW_C_DATA_INTERFACE` guard, so including a real Arrow `abi.h`/`nanoarrow.h` alongside is safe.
+
+### Nested data: `carquet_reader_read_arrow()`
+
+For **arbitrary-depth nesting** (`LIST<LIST<T>>`, `LIST<STRUCT<...>>`, `MAP<K, LIST<V>>`, …), read a whole row group straight into a nested `ArrowArray` tree instead of a flat row batch:
+
+```c
+struct ArrowSchema aschema;
+struct ArrowArray  aarray;
+if (carquet_reader_read_arrow(reader, /*row_group=*/0, &aschema, &aarray, &err) == CARQUET_OK) {
+    /* aarray is a "+s" struct array; its children mirror the file's top-level
+       fields with full struct/list/map nesting. Release once when done. */
+    aarray.release(&aarray);
+    aschema.release(&aschema);
+}
+```
+
+This reassembles the nested structure from the columns' repetition/definition levels (the read-side inverse of `carquet_writer_write_arrow()`). See [`nested-data.md`](./nested-data.md#arbitrary-depth-nesting-via-the-arrow-c-data-interface).
 
 ## Lifetime and Ownership
 

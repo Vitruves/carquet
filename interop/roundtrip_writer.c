@@ -198,6 +198,17 @@ static int write_basic_file(const char* path, basic_cfg_t cfg) {
     carquet_schema_t* schema = make_basic_schema();
     if (!schema) return 1;
 
+    /* When emitting ARROW:schema, attach per-field custom_metadata (variable
+     * labels) so pyarrow reads them back as field metadata. Elements 1..2 are
+     * bool_col / int32_col (root is element 0). */
+    if (cfg.write_arrow_schema) {
+        (void)carquet_schema_set_field_metadata(schema, 1, "Label",
+                                                "Boolean Flag Variable");
+        (void)carquet_schema_set_field_metadata(schema, 2, "Label",
+                                                "Signed 32-bit Measure");
+        (void)carquet_schema_set_field_metadata(schema, 2, "Units", "count");
+    }
+
     carquet_writer_options_t opts;
     carquet_writer_options_init(&opts);
     opts.compression = cfg.codec;
@@ -310,6 +321,9 @@ static int write_nested_file(const char* path) {
     carquet_writer_options_t opts;
     carquet_writer_options_init(&opts);
     opts.compression = CARQUET_COMPRESSION_ZSTD;
+    /* Emit the nested Arrow schema (LIST<int32> + STRUCT) into the footer so a
+     * reader recovers the exact Arrow type tree, not just the Parquet schema. */
+    opts.write_arrow_schema = true;
 
     carquet_writer_t* w = carquet_writer_create(path, schema, &opts, &err);
     if (!w) {
@@ -481,6 +495,71 @@ static void safe_filename(char* out, size_t out_sz, const char* dir, const char*
     snprintf(out, out_sz, "%s/carquet_%s.parquet", dir, clean);
 }
 
+/* ---- Deep-nested file via the generic Arrow shredder (write_arrow) ----
+ * matrix: list<list<int32>> = [[[1,2],[3]], [], [[4]]]  (verifies arbitrary
+ * depth on the wire; read back by PyArrow / DuckDB in run_interop.py). */
+static void nn_rel_schema(struct ArrowSchema* s) {
+    if (!s || !s->release) return;
+    free((void*)s->format); free((void*)s->name);
+    for (int64_t i = 0; i < s->n_children; i++)
+        if (s->children[i]) { if (s->children[i]->release) s->children[i]->release(s->children[i]); free(s->children[i]); }
+    free(s->children); s->release = NULL;
+}
+static void nn_rel_array(struct ArrowArray* a) {
+    if (!a || !a->release) return;
+    if (a->buffers) { for (int64_t i = 0; i < a->n_buffers; i++) free((void*)a->buffers[i]); free(a->buffers); }
+    for (int64_t i = 0; i < a->n_children; i++)
+        if (a->children[i]) { if (a->children[i]->release) a->children[i]->release(a->children[i]); free(a->children[i]); }
+    free(a->children); a->release = NULL;
+}
+static char* nn_dup(const char* s){ char* o=(char*)malloc(strlen(s)+1); strcpy(o,s); return o; }
+static struct ArrowSchema* nn_S(const char* fmt, const char* name, int nullable, int nch){
+    struct ArrowSchema* s=(struct ArrowSchema*)calloc(1,sizeof(*s));
+    s->format=nn_dup(fmt); s->name=nn_dup(name); s->flags=nullable?ARROW_FLAG_NULLABLE:0;
+    s->n_children=nch; s->children=nch?(struct ArrowSchema**)calloc(nch,sizeof(void*)):NULL;
+    s->release=nn_rel_schema; return s;
+}
+static struct ArrowArray* nn_A(int64_t len, int nbuf, int nch){
+    struct ArrowArray* a=(struct ArrowArray*)calloc(1,sizeof(*a));
+    a->length=len; a->null_count=-1; a->n_buffers=nbuf; a->n_children=nch;
+    a->buffers=nbuf?(const void**)calloc(nbuf,sizeof(void*)):NULL;
+    a->children=nch?(struct ArrowArray**)calloc(nch,sizeof(void*)):NULL;
+    a->release=nn_rel_array; return a;
+}
+static int32_t* nn_i32(const int32_t* x, int64_t n){ int32_t* o=(int32_t*)malloc((n?n:1)*4); memcpy(o,x,n*4); return o; }
+
+static struct ArrowSchema* nn_build_schema(void) {
+    struct ArrowSchema* t=nn_S("+s","schema",0,1);
+    t->children[0]=nn_S("+l","matrix",1,1);
+    t->children[0]->children[0]=nn_S("+l","element",1,1);
+    t->children[0]->children[0]->children[0]=nn_S("i","element",0,0);
+    return t;
+}
+
+static int write_deep_nested_file(const char* path) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t* cs = NULL;
+    if (carquet_arrow_import_schema(nn_build_schema(), &cs, &err) != CARQUET_OK) return 1;
+
+    carquet_writer_options_t opts;
+    carquet_writer_options_init(&opts);
+    opts.compression = CARQUET_COMPRESSION_ZSTD;
+    opts.write_arrow_schema = true;
+    carquet_writer_t* w = carquet_writer_create(path, cs, &opts, &err);
+    if (!w) { carquet_schema_free(cs); return 1; }
+
+    int32_t oo[4]={0,2,2,3}, io[4]={0,2,3,4}, iv[4]={1,2,3,4};
+    struct ArrowArray* ii=nn_A(4,2,0); ii->buffers[1]=nn_i32(iv,4);
+    struct ArrowArray* il=nn_A(3,2,1); il->buffers[1]=nn_i32(io,4); il->children[0]=ii;
+    struct ArrowArray* ol=nn_A(3,2,1); ol->buffers[1]=nn_i32(oo,4); ol->children[0]=il;
+    struct ArrowArray* top=nn_A(3,1,1); top->children[0]=ol;
+
+    int rc = carquet_writer_write_arrow(w, top, nn_build_schema(), &err) == CARQUET_OK ? 0 : 1;
+    if (carquet_writer_close(w) != CARQUET_OK) rc = 1;
+    carquet_schema_free(cs);
+    return rc;
+}
+
 int main(int argc, char** argv) {
     const char* output_dir = (argc > 1) ? argv[1] : "/tmp";
 
@@ -497,6 +576,8 @@ int main(int argc, char** argv) {
         {"snappy",       {CARQUET_COMPRESSION_SNAPPY,       ENC_DEFAULT, 1, false, false, 0}},
         {"gzip",         {CARQUET_COMPRESSION_GZIP,         ENC_DEFAULT, 1, false, false, 0}},
         {"lz4_raw",      {CARQUET_COMPRESSION_LZ4_RAW,      ENC_DEFAULT, 1, false, false, 0}},
+        /* v0.7.0: codec 5 (deprecated Hadoop-framed LZ4), distinct from LZ4_RAW. */
+        {"lz4",          {CARQUET_COMPRESSION_LZ4,          ENC_DEFAULT, 1, false, false, 0}},
         {"zstd",         {CARQUET_COMPRESSION_ZSTD,         ENC_DEFAULT, 1, false, false, 0}},
         {"zstd+dict",    {CARQUET_COMPRESSION_ZSTD,         ENC_DICT,    1, false, false, 0}},
         {"zstd+delta",   {CARQUET_COMPRESSION_ZSTD,         ENC_DELTA,   1, false, false, 0}},
@@ -532,6 +613,13 @@ int main(int argc, char** argv) {
         printf("    {\n");
         printf("      \"path\": \"%s\",\n", path);
         printf("      \"compression\": \"%s\",\n", basics[i].tag);
+        if (basics[i].cfg.write_arrow_schema) {
+            /* Expected Arrow per-field custom_metadata (see write_basic_file). */
+            printf("      \"field_metadata\": {\n");
+            printf("        \"bool_col\": {\"Label\": \"Boolean Flag Variable\"},\n");
+            printf("        \"int32_col\": {\"Label\": \"Signed 32-bit Measure\", \"Units\": \"count\"}\n");
+            printf("      },\n");
+        }
         print_basic_columns();
         printf("    }");
     }
@@ -593,6 +681,25 @@ int main(int argc, char** argv) {
             printf("      \"compression\": \"%s\",\n", "nested");
             printf("      \"nested\": true,\n");
             printf("      \"num_rows\": 4,\n");
+            printf("      \"columns\": {}\n");
+            printf("    }");
+        } else {
+            fprintf(stderr, "Failed to write %s\n", path);
+        }
+    }
+
+    /* Deep-nested file (list<list<int32>>) written via the generic shredder. */
+    {
+        char path[512];
+        safe_filename(path, sizeof(path), output_dir, "nested_deep");
+        if (write_deep_nested_file(path) == 0) {
+            if (!first) printf(",\n");
+            first = 0;
+            printf("    {\n");
+            printf("      \"path\": \"%s\",\n", path);
+            printf("      \"compression\": \"%s\",\n", "nested_deep");
+            printf("      \"nested\": true,\n");
+            printf("      \"num_rows\": 3,\n");
             printf("      \"columns\": {}\n");
             printf("    }");
         } else {

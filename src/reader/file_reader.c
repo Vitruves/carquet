@@ -8,11 +8,13 @@
 #include <carquet/carquet.h>
 #include "reader_internal.h"
 #include "thrift/parquet_types.h"
+#include "thrift/thrift_decode.h"
 #include "core/arena.h"
 #include "core/buffer.h"
 #include "core/endian.h"
 #include "encoding/plain.h"
 #include "encoding/rle.h"
+#include "arrow_schema_read.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -203,6 +205,15 @@ static bool compute_levels(
     const parquet_schema_element_t* root = &elements[0];
     int32_t next_idx = 1;
     for (int32_t child = 0; child < root->num_children; child++) {
+        /* Stop once the flat element array is exhausted. A crafted footer
+         * declaring root->num_children up to INT32_MAX would otherwise spin
+         * billions of no-op recursive calls (each returns immediately via the
+         * guard at the top of traverse_schema_recursive) — a CPU denial-of-
+         * service on a tiny file. Mirrors the guard in the recursive inner
+         * loop above. */
+        if (next_idx >= num_elements) {
+            break;
+        }
         next_idx = traverse_schema_recursive(&ctx, next_idx, 0, 0, 0, 1);
     }
 
@@ -243,6 +254,19 @@ carquet_schema_t* build_schema(
                           "Schema nesting exceeds maximum depth of %d",
                           CARQUET_MAX_SCHEMA_DEPTH);
         return NULL;
+    }
+
+    /* Recover Arrow per-field custom_metadata (variable labels/descriptions)
+     * from the "ARROW:schema" footer blob, if present. Best-effort: malformed
+     * blobs are ignored and never fail the open. */
+    for (int32_t i = 0; i < metadata->num_key_value; i++) {
+        const parquet_key_value_t* kv = &metadata->key_value_metadata[i];
+        if (kv->key && kv->value && strcmp(kv->key, "ARROW:schema") == 0) {
+            carquet_apply_arrow_field_metadata(kv->value, schema->elements,
+                                               schema->num_elements,
+                                               schema->parent_indices, arena);
+            break;
+        }
     }
 
     return schema;
@@ -1191,81 +1215,64 @@ carquet_bloom_filter_t* carquet_reader_get_bloom_filter(
         return NULL;
     }
 
-    /* The bloom filter region contains a Thrift BloomFilterHeader followed by
-     * the raw filter bit array.  Parse the header to find numBytes (field 1),
-     * then feed only the raw bit data to carquet_bloom_filter_read. */
+    /* The bloom filter region is a Thrift-compact BloomFilterHeader followed by
+     * the raw filter bit array:
+     *   struct BloomFilterHeader {
+     *     1: required i32 numBytes;
+     *     2: required BloomFilterAlgorithm algorithm;   // BLOCK
+     *     3: required BloomFilterHash hash;             // XXHASH
+     *     4: required BloomFilterCompression compression;
+     *   }
+     * We extract numBytes (field 1) and the compression union tag (field 4) so
+     * that a header declaring anything other than UNCOMPRESSED is rejected
+     * rather than misread as a raw filter. */
     size_t total_len = (size_t)col_meta->bloom_filter_length;
     int32_t num_bytes = 0;
-    size_t header_size = 0;
+    /* Default: field 4 absent => UNCOMPRESSED (tag 1). */
+    int16_t compression_tag = 1;
 
-    {
-        /* Minimal Thrift compact parser for BloomFilterHeader */
-        const uint8_t* p = data;
-        const uint8_t* end = data + total_len;
-
-        /* Read struct fields until STOP */
-        while (p < end) {
-            uint8_t byte = *p++;
-            if (byte == 0) break;  /* STOP */
-            int wire_type = byte & 0x0F;
-            int16_t delta = (byte >> 4) & 0x0F;
-            (void)delta;  /* field id delta — we only care about field 1 */
-
-            if (delta == 0 && p < end) {
-                /* Full field id follows as zigzag varint — skip it */
-                while (p < end && (*p & 0x80)) p++;
-                if (p < end) p++;
+    thrift_decoder_t dec;
+    thrift_decoder_init(&dec, data, total_len);
+    thrift_read_struct_begin(&dec);
+    thrift_type_t ft;
+    int16_t fid;
+    while (thrift_read_field_begin(&dec, &ft, &fid)) {
+        if (fid == 1 && ft == THRIFT_TYPE_I32) {
+            num_bytes = thrift_read_i32(&dec);
+        } else if (fid == 4 && ft == THRIFT_TYPE_STRUCT) {
+            /* BloomFilterCompression union: exactly one field names the set
+             * member (1 = UNCOMPRESSED, the only member the spec defines). */
+            thrift_read_struct_begin(&dec);
+            thrift_type_t ct;
+            int16_t cfid;
+            compression_tag = 0;
+            while (thrift_read_field_begin(&dec, &ct, &cfid)) {
+                if (compression_tag == 0) compression_tag = cfid;
+                thrift_skip(&dec, ct);
             }
-
-            if (wire_type == 5 && num_bytes == 0) {
-                /* i32 (zigzag varint) — this is numBytes. Cap shift at 63: a
-                 * malformed varint with excess continuation bytes would
-                 * otherwise shift a uint64_t by >= 64 (undefined behavior). */
-                uint64_t val = 0;
-                int shift = 0;
-                while (p < end && shift < 64) {
-                    uint8_t b = *p++;
-                    val |= (uint64_t)(b & 0x7F) << shift;
-                    shift += 7;
-                    if (!(b & 0x80)) break;
-                }
-                num_bytes = (int32_t)((val >> 1) ^ -(int64_t)(val & 1));
-            } else if (wire_type == 12) {
-                /* Nested struct — skip by reading until STOP */
-                int depth = 1;
-                while (p < end && depth > 0) {
-                    uint8_t sb = *p++;
-                    if (sb == 0) { depth--; continue; }
-                    int st = sb & 0x0F;
-                    int sd = (sb >> 4) & 0x0F;
-                    if (sd == 0) { while (p < end && (*p & 0x80)) p++; if (p < end) p++; }
-                    /* Skip based on wire type */
-                    if (st == 12) { depth++; }
-                    else if (st == 5) { while (p < end && (*p & 0x80)) p++; if (p < end) p++; }
-                    else if (st == 6) { while (p < end && (*p & 0x80)) p++; if (p < end) p++; }
-                    else if (st == 8) { uint64_t len = 0; int s = 0;
-                        while (p < end && s < 64) { uint8_t b = *p++; len |= (uint64_t)(b & 0x7F) << s; s += 7; if (!(b & 0x80)) break; }
-                        if (len > (uint64_t)(end - p)) p = end; else p += len; }
-                    else if (st == 1 || st == 2) { /* bool — no extra bytes */ }
-                    else if (st == 3) { p++; }
-                    else if (st == 7) { p += 8; }
-                }
-            } else {
-                /* Skip other wire types */
-                if (wire_type == 5 || wire_type == 6) {
-                    while (p < end && (*p & 0x80)) p++;
-                    if (p < end) p++;
-                } else if (wire_type == 7) { p += 8; }
-                else if (wire_type == 3) { p++; }
-                else if (wire_type == 1 || wire_type == 2) { /* bool */ }
-                else if (wire_type == 8) {
-                    uint64_t len = 0; int s = 0;
-                    while (p < end && s < 64) { uint8_t b = *p++; len |= (uint64_t)(b & 0x7F) << s; s += 7; if (!(b & 0x80)) break; }
-                    if (len > (uint64_t)(end - p)) p = end; else p += len;
-                }
-            }
+            thrift_read_struct_end(&dec);
+        } else {
+            thrift_skip(&dec, ft);
         }
-        header_size = (size_t)(p - data);
+    }
+    thrift_read_struct_end(&dec);
+
+    size_t header_size = total_len - thrift_decoder_remaining(&dec);
+
+    if (thrift_decoder_has_error(&dec)) {
+        if (allocated) carquet_mem_free((void*)data);
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_METADATA,
+            "Malformed bloom filter header");
+        return NULL;
+    }
+
+    /* Only UNCOMPRESSED (union tag 1) is defined by the Parquet spec. Reject any
+     * other compression rather than feeding compressed bytes to the reader. */
+    if (compression_tag != 1) {
+        if (allocated) carquet_mem_free((void*)data);
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_UNSUPPORTED_CODEC,
+            "Unsupported bloom filter compression (tag %d)", (int)compression_tag);
+        return NULL;
     }
 
     /* Validate and read the raw filter data after the header */
@@ -1330,6 +1337,62 @@ const char* carquet_reader_find_metadata(
     }
 
     return NULL;
+}
+
+/* Resolve a leaf column index to its schema element, or NULL if out of range. */
+static const parquet_schema_element_t* reader_column_element(
+    const carquet_reader_t* reader, int32_t column_index) {
+    if (!reader->schema || column_index < 0 ||
+        column_index >= reader->schema->num_leaves) {
+        return NULL;
+    }
+    int32_t elem_idx = reader->schema->leaf_indices[column_index];
+    return &reader->schema->elements[elem_idx];
+}
+
+int32_t carquet_reader_column_num_metadata(
+    const carquet_reader_t* reader,
+    int32_t column_index) {
+    const parquet_schema_element_t* e = reader_column_element(reader, column_index);
+    return e ? e->num_field_metadata : 0;
+}
+
+carquet_status_t carquet_reader_column_get_metadata(
+    const carquet_reader_t* reader,
+    int32_t column_index,
+    int32_t index,
+    const char** key,
+    const char** value) {
+    const parquet_schema_element_t* e = reader_column_element(reader, column_index);
+    if (!e || index < 0 || index >= e->num_field_metadata) {
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+    *key = e->field_metadata[index].key;
+    *value = e->field_metadata[index].value;
+    return CARQUET_OK;
+}
+
+const char* carquet_reader_column_find_metadata(
+    const carquet_reader_t* reader,
+    int32_t column_index,
+    const char* key) {
+    const parquet_schema_element_t* e = reader_column_element(reader, column_index);
+    if (!e) return NULL;
+    for (int32_t i = 0; i < e->num_field_metadata; i++) {
+        if (e->field_metadata[i].key &&
+            strcmp(e->field_metadata[i].key, key) == 0) {
+            return e->field_metadata[i].value;
+        }
+    }
+    return NULL;
+}
+
+carquet_arrow_type_refinement_t carquet_reader_column_arrow_type_refinement(
+    const carquet_reader_t* reader,
+    int32_t column_index) {
+    const parquet_schema_element_t* e = reader_column_element(reader, column_index);
+    if (!e) return CARQUET_ARROW_REFINE_NONE;
+    return (carquet_arrow_type_refinement_t)e->arrow_type_refinement;
 }
 
 /* ============================================================================

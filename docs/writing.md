@@ -82,7 +82,7 @@ carquet_schema_free(schema);  /* Safe after writer creation */
 
 Two opt-in options, both off by default so default output bytes are unchanged:
 
-- `write_arrow_schema`: when `true`, embeds the original Arrow schema as a base64-encoded Arrow IPC Schema message under the `ARROW:schema` footer key, so Arrow/PyArrow recover Arrow-specific type information losslessly. Emitted only for flat (non-nested) schemas and only when you have not already set that key yourself.
+- `write_arrow_schema`: when `true`, embeds the original Arrow schema as a base64-encoded Arrow IPC Schema message under the `ARROW:schema` footer key, so Arrow/PyArrow recover Arrow-specific type information losslessly. Both flat and nested schemas are emitted — a Parquet LIST becomes Arrow `List<element>`, a MAP becomes `Map<entries: struct<key, value>>`, and a plain group becomes a `Struct`. Emitted only when you have not already set that key yourself; any element that cannot be faithfully mapped aborts emission so the blob never disagrees with the Parquet schema.
 - `data_page_version`: `2` writes `DATA_PAGE_V2` (repetition/definition levels stored uncompressed and outside the compressed value region, matching parquet-cpp); any other value keeps the default V1 path.
 - `coerce_timestamps` / `coerce_timestamp_unit` / `allow_timestamp_truncation`: when `coerce_timestamps` is true, every `TIMESTAMP` column is rescaled to `coerce_timestamp_unit` (and its metadata emitted at that unit) regardless of the unit declared in the schema — the equivalent of PyArrow's `coerce_timestamps`. A coarser target loses precision and is rejected unless `allow_timestamp_truncation` is true (PyArrow's `allow_truncated_timestamps`).
 - `write_batch_size`: caps how many values are processed per internal chunk before a page flush is considered (PyArrow's `write_batch_size`); `0` keeps the automatic page-size-derived heuristic. This tunes streaming/memory behavior, not the output format.
@@ -92,6 +92,32 @@ Other writer entry points:
 
 - `carquet_writer_create_file(FILE*, ...)`
 - `carquet_writer_create_buffer(...)`
+
+## Per-Field Metadata (Variable Labels / Descriptions)
+
+To attach a human-readable label or description to a column — the kind of
+annotation survey/statistical tools carry — use `carquet_schema_set_field_metadata()`.
+It records Arrow's `Field.custom_metadata`, the standard, reader-agnostic home
+for schema-level annotations (it is *not* the per-row-group
+`ColumnMetaData.key_value_metadata`). With `write_arrow_schema` enabled, the
+pairs are emitted into the file-level `ARROW:schema` footer blob, so PyArrow,
+Parquet viewers, and any Arrow-compatible reader surface them automatically.
+
+```c
+carquet_schema_add_column(schema, "Sex", CARQUET_PHYSICAL_INT32,
+                          NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
+/* Address the column just added by its schema element index. */
+int32_t idx = carquet_schema_num_elements(schema) - 1;
+carquet_schema_set_field_metadata(schema, idx, "Label", "Sex of Respondent");
+
+carquet_writer_options_t opts;
+carquet_writer_options_init(&opts);
+opts.write_arrow_schema = true;   /* required for the labels to be emitted */
+```
+
+Setting the same key twice replaces the value; distinct keys accumulate. Only
+flat top-level fields are emitted, matching the `ARROW:schema` writer. Read the
+labels back with the [reader's column-metadata accessors](reading.md#metadata-bloom-filters-and-page-indexes).
 
 ## Write Required Columns
 
@@ -128,6 +154,21 @@ carquet_writer_write_batch(writer, 2, values, 5, def_levels, NULL);
 
 You can query the required definition level from the schema with `carquet_schema_max_def_level()` when you are generating levels programmatically.
 
+## Write Nested Columns Without Computing Levels
+
+For a single-level `LIST<T>` or `MAP<K,V>` (schemas built with `carquet_schema_add_list()` / `carquet_schema_add_map()`), you do not have to precompute definition/repetition levels. `carquet_writer_write_list_column()` takes the Arrow columnar layout — `int32` offsets plus optional list- and element-level validity bitmaps (Arrow's LSB-first, bit set ⇒ present) — and shreds it internally. It is the write-side inverse of `carquet_row_batch_column_list()`.
+
+```c
+/* Lists: [[10, 20], [], NULL, [30]] on the leaf element column (index 1). */
+int32_t offsets[]      = {0, 2, 2, 2, 3};      /* num_lists + 1 entries       */
+int32_t values[]       = {10, 20, 30};          /* flattened child elements     */
+uint8_t list_validity  = 0x0B;                  /* bits 0,1,3 set; row 2 null   */
+carquet_writer_write_list_column(writer, 1, 4, offsets, &list_validity,
+                                 values, /*value_validity=*/NULL, &err);
+```
+
+For a `MAP<K,V>` call it twice with the *same* `offsets` and `list_validity` — once for the key leaf (`value_validity` NULL; keys are REQUIRED) and once for the value leaf. Offsets must start at 0 and be non-decreasing; a null list requires an OPTIONAL container and a null element an OPTIONAL leaf, else the call returns `CARQUET_ERROR_INVALID_ARGUMENT`. Deeper nesting returns `CARQUET_ERROR_NOT_IMPLEMENTED`. See [`nested-data.md`](./nested-data.md).
+
 ## Row Groups, Metadata, and Per-Column Overrides
 
 Important writer invariants:
@@ -155,13 +196,15 @@ Per-column overrides must be set after writer creation and before writing data.
 
 By default columns use `PLAIN`, with automatic `BYTE_STREAM_SPLIT` for `FLOAT`/`DOUBLE` columns when a compression codec is set. This favors carquet's fast (near zero-copy) read path; it does not dictionary-encode by default.
 
-Opt into another encoding per column with `carquet_writer_set_column_encoding()`: `RLE_DICTIONARY` (emits a `PLAIN` dictionary page plus `RLE_DICTIONARY` data pages, with automatic fallback to `PLAIN` when the dictionary would exceed `dictionary_page_size` or the data is effectively all-unique), `BYTE_STREAM_SPLIT` (FLOAT/DOUBLE/INT32/INT64/FLBA), `DELTA_BINARY_PACKED` (INT32/INT64), or `DELTA_LENGTH_BYTE_ARRAY` / `DELTA_BYTE_ARRAY` (BYTE_ARRAY). Dictionary encoding produces smaller files but is slower to read, so it is a deliberate choice rather than the default.
+Opt into another encoding per column with `carquet_writer_set_column_encoding()`: `RLE_DICTIONARY` (emits a `PLAIN` dictionary page plus `RLE_DICTIONARY` data pages, with automatic fallback to `PLAIN` when the dictionary would exceed `dictionary_page_size` or the data is effectively all-unique; eligible for `INT32`/`INT64`/`FLOAT`/`DOUBLE`/`BYTE_ARRAY`/`FIXED_LEN_BYTE_ARRAY`), `BYTE_STREAM_SPLIT` (FLOAT/DOUBLE/INT32/INT64/FLBA), `DELTA_BINARY_PACKED` (INT32/INT64), `DELTA_LENGTH_BYTE_ARRAY` / `DELTA_BYTE_ARRAY` (BYTE_ARRAY), or `RLE` for `BOOLEAN` (run-length/bit-packed hybrid; efficient for long boolean runs). Dictionary encoding produces smaller files but is slower to read, so it is a deliberate choice rather than the default.
 
 ## Column Statistics
 
-With `opts.write_statistics = true` (the default), the writer records per-row-group min/max and null counts for every primitive type — `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `BOOLEAN`, `BYTE_ARRAY`, and `FIXED_LEN_BYTE_ARRAY`. Stats are aggregated across pages and used by `carquet_reader_filter_row_groups()` for predicate pushdown.
+With `opts.write_statistics = true` (the default), the writer records per-row-group min/max and null counts for every primitive type — `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `BOOLEAN`, `BYTE_ARRAY`, and `FIXED_LEN_BYTE_ARRAY`. Stats are aggregated across pages and used by `carquet_reader_filter_row_groups()` for predicate pushdown. Dictionary-encoded columns additionally carry an exact `distinct_count` (the dictionary size).
 
-`BYTE_ARRAY` min/max are stored using lexicographic order; values longer than 32 bytes are truncated per the Parquet spec (min is truncated to a prefix; max is truncated and incremented so the stored bound is still a valid upper bound).
+The writer also emits **Parquet 2.9 SizeStatistics** (`ColumnMetaData.size_statistics`) where they carry information: `unencoded_byte_array_data_bytes` for `BYTE_ARRAY` columns, and definition/repetition level histograms for nullable / nested / repeated columns. The page index carries the matching per-page level histograms and the spec's `unencoded_byte_array_data_bytes` (OffsetIndex field 2). Flat required non-`BYTE_ARRAY` columns are unaffected.
+
+`BYTE_ARRAY` min/max are stored using lexicographic order; values longer than 32 bytes are truncated per the Parquet spec (min is truncated to a prefix; max is truncated and incremented so the stored bound is still a valid upper bound), and `is_min/max_value_exact` is set to `false` on truncation.
 
 Type-specific statistics behavior, all automatic:
 
@@ -246,6 +289,20 @@ if (carquet_writer_get_buffer(writer, &buffer, &size) == CARQUET_OK) {
 ```
 
 This is useful for RPC payloads, tests, and embedding Parquet output inside a larger container format.
+
+## Import from Arrow (C Data Interface)
+
+To write data that already lives in an Arrow `ArrowArray` (from PyArrow, DuckDB, nanoarrow, any C Data Interface producer) without a manual copy, hand the struct array straight to the writer:
+
+```c
+/* writer schema and Arrow array must have matching columns, in order */
+carquet_status_t st = carquet_writer_write_arrow(writer, &array, &schema, &err);
+/* write_arrow consumes (releases) both `array` and `schema` — do not release again */
+```
+
+- `carquet_writer_write_arrow()` runs a generic Dremel record-shredder over the Arrow array tree, converting validity bitmaps to Parquet definition/repetition levels and compacting values. It handles **arbitrary-depth nesting** — `struct` (`+s`), `list` (`+l`), `large_list` (`+L`) and `map` (`+m`) composed to any depth — mapping each leaf to the corresponding writer column. It follows Arrow "move" semantics: the passed `array` and `schema` are consumed (their `release` callbacks are invoked) on both success and failure. See [`nested-data.md`](./nested-data.md#arbitrary-depth-nesting-via-the-arrow-c-data-interface).
+- `carquet_arrow_import_schema()` turns an Arrow `"+s"` struct schema into a `carquet_schema_t*` you can build a writer from — mapping each child's Arrow `format` string back to a physical + logical type.
+- Nested arrays are supported (see `carquet_writer_write_arrow()` above); sliced arrays (`offset != 0`) and dictionary-encoded children are rejected with a clear error.
 
 ## Failure Path
 

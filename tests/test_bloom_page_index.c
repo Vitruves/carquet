@@ -32,7 +32,9 @@ extern void carquet_column_index_builder_destroy(carquet_column_index_builder_t*
 extern carquet_status_t carquet_column_index_add_page(
     carquet_column_index_builder_t* builder,
     int64_t null_count, const void* min_value, int32_t min_value_len,
-    const void* max_value, int32_t max_value_len, bool is_null_page);
+    const void* max_value, int32_t max_value_len, bool is_null_page,
+    const int64_t* rep_level_hist, int32_t rep_level_hist_len,
+    const int64_t* def_level_hist, int32_t def_level_hist_len);
 extern carquet_status_t carquet_column_index_page_might_match(
     const carquet_column_index_builder_t* builder,
     int32_t page_idx,
@@ -581,7 +583,8 @@ static int test_page_index_unsigned_logical_order(void) {
 
     uint32_t min_v = 1u;
     uint32_t max_v = UINT32_MAX;
-    if (carquet_column_index_add_page(builder, 0, &min_v, 4, &max_v, 4, false) != CARQUET_OK) {
+    if (carquet_column_index_add_page(builder, 0, &min_v, 4, &max_v, 4, false,
+                                      NULL, 0, NULL, 0) != CARQUET_OK) {
         carquet_column_index_builder_destroy(builder);
         TEST_FAIL(tname, "add page failed");
     }

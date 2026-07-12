@@ -86,6 +86,22 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                         batch, col, &indices, &nulls, &count,
                         &dict_data, &dict_count, &dict_offsets);
                 }
+                /* Repeated (LIST) columns: exercise the reconstruction accessor,
+                 * walking every reconstructed offset span. */
+                const int32_t* offsets;
+                int64_t num_lists;
+                const void* values;
+                const uint8_t* vvalid;
+                const uint8_t* lvalid;
+                if (carquet_row_batch_column_list(
+                        batch, col, &offsets, &num_lists, &values,
+                        &vvalid, &count, &lvalid) == CARQUET_OK) {
+                    volatile int64_t acc = 0;
+                    for (int64_t li = 0; li < num_lists; li++) {
+                        acc += (int64_t)offsets[li + 1] - offsets[li];
+                    }
+                    (void)acc;
+                }
             }
             carquet_row_batch_free(batch);
             batch = NULL;

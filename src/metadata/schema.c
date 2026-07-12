@@ -452,6 +452,48 @@ int32_t carquet_schema_add_variant(
     return outer;
 }
 
+carquet_status_t carquet_schema_set_field_metadata(
+    carquet_schema_t* schema,
+    int32_t element_index,
+    const char* key,
+    const char* value) {
+
+    /* schema and key are nonnull per API contract */
+    if (element_index <= 0 || element_index >= schema->num_elements) {
+        /* Index 0 is the root group; field metadata attaches to real fields. */
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    parquet_schema_element_t* elem = &schema->elements[element_index];
+
+    /* Replace on matching key, else append. Strings live in the schema arena. */
+    char* key_copy = carquet_arena_strdup(&schema->arena, key);
+    char* val_copy = value ? carquet_arena_strdup(&schema->arena, value) : NULL;
+    if (!key_copy || (value && !val_copy)) return CARQUET_ERROR_OUT_OF_MEMORY;
+
+    for (int32_t i = 0; i < elem->num_field_metadata; i++) {
+        if (elem->field_metadata[i].key &&
+            strcmp(elem->field_metadata[i].key, key) == 0) {
+            elem->field_metadata[i].value = val_copy;
+            return CARQUET_OK;
+        }
+    }
+
+    parquet_key_value_t* grown = carquet_arena_alloc(
+        &schema->arena,
+        (size_t)(elem->num_field_metadata + 1) * sizeof(parquet_key_value_t));
+    if (!grown) return CARQUET_ERROR_OUT_OF_MEMORY;
+    if (elem->num_field_metadata > 0) {
+        memcpy(grown, elem->field_metadata,
+               (size_t)elem->num_field_metadata * sizeof(parquet_key_value_t));
+    }
+    grown[elem->num_field_metadata].key = key_copy;
+    grown[elem->num_field_metadata].value = val_copy;
+    elem->field_metadata = grown;
+    elem->num_field_metadata++;
+    return CARQUET_OK;
+}
+
 int32_t carquet_schema_num_columns(const carquet_schema_t* schema) {
     /* schema is nonnull per API contract */
     return schema->num_leaves;
@@ -704,6 +746,38 @@ int32_t carquet_schema_add_map(
     if (status != CARQUET_OK) return -1;
 
     return outer;
+}
+
+int32_t carquet_schema_add_list_group(
+    carquet_schema_t* schema,
+    const char* name,
+    carquet_field_repetition_t list_repetition,
+    int32_t parent_index) {
+
+    /* Outer LIST-annotated container. */
+    int32_t outer = carquet_schema_add_group(schema, name, list_repetition, parent_index);
+    if (outer < 0) return -1;
+    schema->elements[outer].has_logical_type = true;
+    schema->elements[outer].logical_type.id = CARQUET_LOGICAL_LIST;
+
+    /* Inner REPEATED "list" group; caller adds the single element child. */
+    return carquet_schema_add_group(schema, "list", CARQUET_REPETITION_REPEATED, outer);
+}
+
+int32_t carquet_schema_add_map_group(
+    carquet_schema_t* schema,
+    const char* name,
+    carquet_field_repetition_t map_repetition,
+    int32_t parent_index) {
+
+    /* Outer MAP-annotated container. */
+    int32_t outer = carquet_schema_add_group(schema, name, map_repetition, parent_index);
+    if (outer < 0) return -1;
+    schema->elements[outer].has_logical_type = true;
+    schema->elements[outer].logical_type.id = CARQUET_LOGICAL_MAP;
+
+    /* Inner REPEATED "key_value" group; caller adds key (required) + value. */
+    return carquet_schema_add_group(schema, "key_value", CARQUET_REPETITION_REPEATED, outer);
 }
 
 /* ============================================================================

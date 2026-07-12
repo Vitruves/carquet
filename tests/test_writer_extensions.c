@@ -207,6 +207,160 @@ static int test_arrow_schema_metadata(void) {
     return 0;
 }
 
+/* Tolerant base64 decode into a heap buffer (test-local). */
+static uint8_t* fm_b64_decode(const char* in, size_t* out_len) {
+    signed char T[256];
+    for (int i = 0; i < 256; i++) T[i] = -1;
+    const char* A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (int i = 0; i < 64; i++) T[(unsigned char)A[i]] = (signed char)i;
+    size_t n = strlen(in);
+    uint8_t* out = (uint8_t*)malloc(n / 4 * 3 + 4);
+    if (!out) return NULL;
+    size_t o = 0; int q[4], qn = 0;
+    for (size_t i = 0; i < n; i++) {
+        int v = T[(unsigned char)in[i]];
+        if (v < 0) continue;
+        q[qn++] = v;
+        if (qn == 4) {
+            out[o++] = (uint8_t)((q[0] << 2) | (q[1] >> 4));
+            out[o++] = (uint8_t)((q[1] << 4) | (q[2] >> 2));
+            out[o++] = (uint8_t)((q[2] << 6) | q[3]);
+            qn = 0;
+        }
+    }
+    if (qn >= 2) { out[o++] = (uint8_t)((q[0] << 2) | (q[1] >> 4));
+        if (qn >= 3) out[o++] = (uint8_t)((q[1] << 4) | (q[2] >> 2)); }
+    *out_len = o;
+    return out;
+}
+
+static int mem_contains(const uint8_t* hay, size_t hn, const char* needle) {
+    size_t nn = strlen(needle);
+    if (nn == 0 || nn > hn) return 0;
+    for (size_t i = 0; i + nn <= hn; i++)
+        if (memcmp(hay + i, needle, nn) == 0) return 1;
+    return 0;
+}
+
+/* ---- Arrow per-field custom_metadata (variable labels) ---- */
+static int test_field_metadata_roundtrip(void) {
+    char path[512]; carquet_test_temp_path(path, sizeof(path), "ext_field_meta");
+    carquet_error_t err = CARQUET_ERROR_INIT;
+
+    carquet_schema_t* s = carquet_schema_create(&err);
+    if (!s) TEST_FAIL("field_metadata", "schema create");
+    if (carquet_schema_add_column(s, "SurveyVar", CARQUET_PHYSICAL_INT32, NULL,
+            CARQUET_REPETITION_OPTIONAL, 0, 0) != CARQUET_OK)
+        { carquet_schema_free(s); TEST_FAIL("field_metadata", "add c0"); }
+    int32_t c0 = carquet_schema_num_elements(s) - 1;
+    if (carquet_schema_set_field_metadata(s, c0, "Label",
+            "Numeric With Labels and Missing") != CARQUET_OK)
+        { carquet_schema_free(s); TEST_FAIL("field_metadata", "set c0 label"); }
+    if (carquet_schema_set_field_metadata(s, c0, "Note", "n1") != CARQUET_OK)
+        { carquet_schema_free(s); TEST_FAIL("field_metadata", "set c0 note"); }
+
+    if (carquet_schema_add_column(s, "Sex", CARQUET_PHYSICAL_INT32, NULL,
+            CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK)
+        { carquet_schema_free(s); TEST_FAIL("field_metadata", "add c1"); }
+    int32_t c1 = carquet_schema_num_elements(s) - 1;
+    /* Set twice with the same key: replace, must not duplicate. */
+    if (carquet_schema_set_field_metadata(s, c1, "Label", "WRONG") != CARQUET_OK ||
+        carquet_schema_set_field_metadata(s, c1, "Label",
+            "Sex of Respondent") != CARQUET_OK)
+        { carquet_schema_free(s); TEST_FAIL("field_metadata", "set c1 label"); }
+
+    /* Third column intentionally has no metadata. */
+    if (carquet_schema_add_column(s, "Name", CARQUET_PHYSICAL_INT32, NULL,
+            CARQUET_REPETITION_OPTIONAL, 0, 0) != CARQUET_OK)
+        { carquet_schema_free(s); TEST_FAIL("field_metadata", "add c2"); }
+
+    carquet_writer_options_t wo; carquet_writer_options_init(&wo);
+    wo.write_arrow_schema = true;
+    carquet_writer_t* w = carquet_writer_create(path, s, &wo, &err);
+    if (!w) { carquet_schema_free(s); TEST_FAIL("field_metadata", "writer"); }
+    int32_t v[3] = { 1, 2, 3 };
+    int16_t def[3] = { 1, 1, 1 };
+    if (carquet_writer_write_batch(w, 0, v, 3, def, NULL) != CARQUET_OK ||
+        carquet_writer_write_batch(w, 1, v, 3, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_write_batch(w, 2, v, 3, def, NULL) != CARQUET_OK)
+        { carquet_writer_close(w); carquet_schema_free(s);
+          TEST_FAIL("field_metadata", "write"); }
+    if (carquet_writer_close(w) != CARQUET_OK)
+        { carquet_schema_free(s); TEST_FAIL("field_metadata", "close"); }
+    carquet_schema_free(s);
+
+    carquet_reader_t* r = carquet_reader_open(path, NULL, &err);
+    if (!r) { carquet_test_cleanup(path); TEST_FAIL("field_metadata", "open"); }
+
+    /* Byte-level: the exact label strings must appear in the decoded blob. */
+    const char* b64 = carquet_reader_find_metadata(r, "ARROW:schema");
+    if (!b64) { carquet_reader_close(r); carquet_test_cleanup(path);
+        TEST_FAIL("field_metadata", "no ARROW:schema"); }
+    size_t rawlen = 0;
+    uint8_t* raw = fm_b64_decode(b64, &rawlen);
+    int bytes_ok = raw &&
+        mem_contains(raw, rawlen, "Label") &&
+        mem_contains(raw, rawlen, "Numeric With Labels and Missing") &&
+        mem_contains(raw, rawlen, "Sex of Respondent") &&
+        !mem_contains(raw, rawlen, "WRONG");
+    free(raw);
+    if (!bytes_ok) { carquet_reader_close(r); carquet_test_cleanup(path);
+        TEST_FAIL("field_metadata", "label bytes missing in ARROW:schema"); }
+
+    /* API round-trip through carquet's own reader. */
+    int api_ok =
+        carquet_reader_column_num_metadata(r, 0) == 2 &&
+        carquet_reader_column_num_metadata(r, 1) == 1 &&
+        carquet_reader_column_num_metadata(r, 2) == 0;
+    const char* l0 = carquet_reader_column_find_metadata(r, 0, "Label");
+    const char* l1 = carquet_reader_column_find_metadata(r, 1, "Label");
+    const char* n0 = carquet_reader_column_find_metadata(r, 0, "Note");
+    api_ok = api_ok && l0 && strcmp(l0, "Numeric With Labels and Missing") == 0;
+    api_ok = api_ok && l1 && strcmp(l1, "Sex of Respondent") == 0;
+    api_ok = api_ok && n0 && strcmp(n0, "n1") == 0;
+    api_ok = api_ok && carquet_reader_column_find_metadata(r, 2, "Label") == NULL;
+    /* get-by-index bounds */
+    const char *k, *val;
+    api_ok = api_ok &&
+        carquet_reader_column_get_metadata(r, 1, 0, &k, &val) == CARQUET_OK &&
+        carquet_reader_column_get_metadata(r, 1, 1, &k, &val) != CARQUET_OK;
+
+    carquet_reader_close(r); carquet_test_cleanup(path);
+    if (!api_ok) TEST_FAIL("field_metadata", "reader API mismatch");
+    TEST_PASS("field_metadata");
+    return 0;
+}
+
+static int test_field_metadata_errors(void) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t* s = carquet_schema_create(&err);
+    if (!s) TEST_FAIL("field_metadata_errors", "schema create");
+    if (carquet_schema_add_column(s, "x", CARQUET_PHYSICAL_INT32, NULL,
+            CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK)
+        { carquet_schema_free(s); TEST_FAIL("field_metadata_errors", "add col"); }
+    int32_t idx = carquet_schema_num_elements(s) - 1;
+
+    int ok = 1;
+    /* Root (index 0) is rejected. */
+    ok = ok && carquet_schema_set_field_metadata(s, 0, "Label", "v")
+               == CARQUET_ERROR_INVALID_ARGUMENT;
+    /* Negative / out-of-range indices rejected. */
+    ok = ok && carquet_schema_set_field_metadata(s, -1, "Label", "v")
+               == CARQUET_ERROR_INVALID_ARGUMENT;
+    ok = ok && carquet_schema_set_field_metadata(s, idx + 5, "Label", "v")
+               == CARQUET_ERROR_INVALID_ARGUMENT;
+    /* Valid element, NULL value permitted; valid key required (NONNULL). */
+    ok = ok && carquet_schema_set_field_metadata(s, idx, "Label", NULL)
+               == CARQUET_OK;
+    ok = ok && carquet_schema_set_field_metadata(s, idx, "Label", "ok")
+               == CARQUET_OK;
+
+    carquet_schema_free(s);
+    if (!ok) TEST_FAIL("field_metadata_errors", "unexpected status");
+    TEST_PASS("field_metadata_errors");
+    return 0;
+}
+
 static int test_arrow_schema_skipped_when_off(void) {
     char path[512]; carquet_test_temp_path(path, sizeof(path), "ext_arrow_off");
     carquet_error_t err = CARQUET_ERROR_INIT;
@@ -229,6 +383,124 @@ static int test_arrow_schema_skipped_when_off(void) {
     carquet_test_cleanup(path);
     if (!ok) TEST_FAIL("arrow_schema_off", "ARROW:schema present when disabled");
     TEST_PASS("arrow_schema_off");
+    return 0;
+}
+
+/* ---- Nested ARROW:schema emission (LIST / STRUCT / MAP) ---- */
+static int test_arrow_schema_nested(void) {
+    char path[512]; carquet_test_temp_path(path, sizeof(path), "ext_arrow_nested");
+    carquet_error_t err = CARQUET_ERROR_INIT;
+
+    carquet_schema_t* s = carquet_schema_create(&err);
+    if (!s) TEST_FAIL("arrow_schema_nested", "schema create");
+    /* id INT64 REQUIRED, tags LIST<int32>, addr STRUCT{street,zip}, props MAP */
+    carquet_schema_add_column(s, "id", CARQUET_PHYSICAL_INT64, NULL,
+                              CARQUET_REPETITION_REQUIRED, 0, 0);
+    carquet_schema_add_list(s, "tags", CARQUET_PHYSICAL_INT32, NULL,
+                            CARQUET_REPETITION_OPTIONAL, 0, 0);
+    int32_t addr = carquet_schema_add_group(s, "addr", CARQUET_REPETITION_OPTIONAL, 0);
+    carquet_logical_type_t str_lt = { .id = CARQUET_LOGICAL_STRING };
+    carquet_schema_add_column(s, "street", CARQUET_PHYSICAL_BYTE_ARRAY, &str_lt,
+                              CARQUET_REPETITION_OPTIONAL, 0, addr);
+    carquet_schema_add_column(s, "zip", CARQUET_PHYSICAL_INT32, NULL,
+                              CARQUET_REPETITION_REQUIRED, 0, addr);
+    carquet_schema_add_map(s, "props", CARQUET_PHYSICAL_INT32, NULL, 0,
+                           CARQUET_PHYSICAL_INT64, NULL, 0,
+                           CARQUET_REPETITION_OPTIONAL, 0);
+
+    carquet_writer_options_t wo; carquet_writer_options_init(&wo);
+    wo.write_arrow_schema = true;
+    carquet_writer_t* w = carquet_writer_create(path, s, &wo, &err);
+    if (!w) { carquet_schema_free(s); TEST_FAIL("arrow_schema_nested", "writer"); }
+    int64_t id = 1;
+    int32_t toff[2] = {0, 2}, tval[2] = {10, 20};
+    carquet_byte_array_t street = { (uint8_t*)"x", 1 };
+    int16_t sdef[1] = {2};
+    int32_t zip = 90210; int16_t zdef[1] = {1};
+    int32_t poff[2] = {0, 1}, keys[1] = {5}; int64_t vals[1] = {500};
+    int ok_w =
+        carquet_writer_write_batch(w, 0, &id, 1, NULL, NULL) == CARQUET_OK &&
+        carquet_writer_write_list_column(w, 1, 1, toff, NULL, tval, NULL, &err) == CARQUET_OK &&
+        carquet_writer_write_batch(w, 2, &street, 1, sdef, NULL) == CARQUET_OK &&
+        carquet_writer_write_batch(w, 3, &zip, 1, zdef, NULL) == CARQUET_OK &&
+        carquet_writer_write_list_column(w, 4, 1, poff, NULL, keys, NULL, &err) == CARQUET_OK &&
+        carquet_writer_write_list_column(w, 5, 1, poff, NULL, vals, NULL, &err) == CARQUET_OK;
+    if (!ok_w || carquet_writer_close(w) != CARQUET_OK)
+        { carquet_schema_free(s); TEST_FAIL("arrow_schema_nested", "write"); }
+    carquet_schema_free(s);
+
+    /* A nested schema now emits ARROW:schema (previously flat-only ⇒ absent).
+     * Verify the encapsulated-message framing survived (base64 "////" prefix). */
+    carquet_reader_t* r = carquet_reader_open(path, NULL, &err);
+    if (!r) { carquet_test_cleanup(path); TEST_FAIL("arrow_schema_nested", "open"); }
+    const char* v = carquet_reader_find_metadata(r, "ARROW:schema");
+    int ok = v && strlen(v) > 8 && strncmp(v, "////", 4) == 0;
+    carquet_reader_close(r); carquet_test_cleanup(path);
+    if (!ok) TEST_FAIL("arrow_schema_nested", "ARROW:schema missing for nested schema");
+    TEST_PASS("arrow_schema_nested");
+    return 0;
+}
+
+/* ---- Read Arrow type refinements (LargeUtf8 / LargeBinary) from ARROW:schema.
+ * Uses a real PyArrow-emitted "ARROW:schema" blob for a table
+ * {ls: large_string, lb: large_binary, reg: string}, injected as file metadata
+ * onto a carquet file whose leaf columns are named to match. On read, carquet
+ * must recover the 64-bit-offset refinement per matched leaf. ---- */
+static int test_arrow_type_refinement_read(void) {
+    /* PyArrow 23 output for pa.table({'ls':large_string,'lb':large_binary,'reg':string}). */
+    static const char* PYARROW_LARGE_BLOB =
+        "/////8AAAAAQAAAAAAAKAAwABgAFAAgACgAAAAABBAAMAAAACAAIAAAABAAIAAAABAAAAAMA"
+        "AABkAAAALAAAAAQAAAC4////AAABBRAAAAAUAAAABAAAAAAAAAADAAAAcmVnAKj////c////"
+        "AAABExAAAAAUAAAABAAAAAAAAAACAAAAbGIAAMz///8QABQACAAGAAcADAAAABAAEAAAAAAA"
+        "ARQQAAAAGAAAAAQAAAAAAAAAAgAAAGxzAAAEAAQABAAAAAAAAAA=";
+
+    char path[512]; carquet_test_temp_path(path, sizeof(path), "ext_arrow_refine");
+    carquet_error_t err = CARQUET_ERROR_INIT;
+
+    carquet_schema_t* s = carquet_schema_create(&err);
+    if (!s) TEST_FAIL("arrow_type_refinement_read", "schema create");
+    carquet_logical_type_t str_lt = { .id = CARQUET_LOGICAL_STRING };
+    /* Names must match the Arrow field names in the blob: ls, lb, reg. */
+    carquet_schema_add_column(s, "ls", CARQUET_PHYSICAL_BYTE_ARRAY, &str_lt,
+                              CARQUET_REPETITION_OPTIONAL, 0, 0);
+    carquet_schema_add_column(s, "lb", CARQUET_PHYSICAL_BYTE_ARRAY, NULL,
+                              CARQUET_REPETITION_OPTIONAL, 0, 0);
+    carquet_schema_add_column(s, "reg", CARQUET_PHYSICAL_BYTE_ARRAY, &str_lt,
+                              CARQUET_REPETITION_OPTIONAL, 0, 0);
+
+    carquet_writer_options_t wo; carquet_writer_options_init(&wo);  /* our own emit OFF */
+    carquet_writer_t* w = carquet_writer_create(path, s, &wo, &err);
+    if (!w) { carquet_schema_free(s); TEST_FAIL("arrow_type_refinement_read", "writer"); }
+    if (carquet_writer_add_metadata(w, "ARROW:schema", PYARROW_LARGE_BLOB) != CARQUET_OK)
+        { carquet_writer_close(w); carquet_schema_free(s);
+          TEST_FAIL("arrow_type_refinement_read", "add_metadata"); }
+    carquet_byte_array_t a = { (uint8_t*)"a", 1 };
+    int16_t d1[1] = {1};
+    int ok_w =
+        carquet_writer_write_batch(w, 0, &a, 1, d1, NULL) == CARQUET_OK &&
+        carquet_writer_write_batch(w, 1, &a, 1, d1, NULL) == CARQUET_OK &&
+        carquet_writer_write_batch(w, 2, &a, 1, d1, NULL) == CARQUET_OK;
+    if (!ok_w || carquet_writer_close(w) != CARQUET_OK)
+        { carquet_schema_free(s); TEST_FAIL("arrow_type_refinement_read", "write"); }
+    carquet_schema_free(s);
+
+    carquet_reader_t* r = carquet_reader_open(path, NULL, &err);
+    if (!r) { carquet_test_cleanup(path); TEST_FAIL("arrow_type_refinement_read", "open"); }
+    carquet_arrow_type_refinement_t ref_ls =
+        carquet_reader_column_arrow_type_refinement(r, 0);
+    carquet_arrow_type_refinement_t ref_lb =
+        carquet_reader_column_arrow_type_refinement(r, 1);
+    carquet_arrow_type_refinement_t ref_reg =
+        carquet_reader_column_arrow_type_refinement(r, 2);
+    carquet_reader_close(r); carquet_test_cleanup(path);
+
+    if (ref_ls != CARQUET_ARROW_REFINE_LARGE_UTF8)
+        TEST_FAIL("arrow_type_refinement_read", "ls not LARGE_UTF8");
+    if (ref_lb != CARQUET_ARROW_REFINE_LARGE_BINARY)
+        TEST_FAIL("arrow_type_refinement_read", "lb not LARGE_BINARY");
+    if (ref_reg != CARQUET_ARROW_REFINE_NONE)
+        TEST_FAIL("arrow_type_refinement_read", "reg should be NONE");
+    TEST_PASS("arrow_type_refinement_read");
     return 0;
 }
 
@@ -455,6 +727,56 @@ static int test_write_batch_size(void) {
     carquet_test_cleanup(path);
     if (!ok) TEST_FAIL("write_batch_size", "value mismatch");
     TEST_PASS("write_batch_size");
+    return 0;
+}
+
+/* ---- Mixing the two bloom-filter APIs ----
+ * Regression: once the ndv/fpp options API is used for ANY column, a column
+ * explicitly enabled through the legacy set_column_bloom_filter() must still
+ * get its bloom filter (it used to be silently dropped). A column left
+ * untouched must NOT gain one from the options API's global-flag side effect. */
+static int test_bloom_api_mix(void) {
+    char path[512]; carquet_test_temp_path(path, sizeof(path), "ext_bloom_mix");
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    enum { M = 200 };
+    static int64_t a[M], b[M], c[M];
+    for (int i = 0; i < M; i++) { a[i] = i; b[i] = i * 2; c[i] = i * 3; }
+
+    carquet_schema_t* s = carquet_schema_create(&err);
+    carquet_schema_add_column(s, "a", CARQUET_PHYSICAL_INT64, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
+    carquet_schema_add_column(s, "b", CARQUET_PHYSICAL_INT64, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
+    carquet_schema_add_column(s, "c", CARQUET_PHYSICAL_INT64, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
+
+    carquet_writer_options_t wo; carquet_writer_options_init(&wo);
+    wo.write_bloom_filters = false;   /* global off; per-column opt-in only */
+    carquet_writer_t* w = carquet_writer_create(path, s, &wo, &err);
+    if (!w) { carquet_schema_free(s); carquet_test_cleanup(path);
+              TEST_FAIL("bloom_api_mix", "writer create"); }
+
+    /* a: legacy per-column enable; b: new options API; c: untouched. */
+    carquet_writer_set_column_bloom_filter(w, 0, true);
+    carquet_writer_set_column_bloom_filter_options(w, 1, true, 1024, 0.01);
+
+    if (carquet_writer_write_batch(w, 0, a, M, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_write_batch(w, 1, b, M, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_write_batch(w, 2, c, M, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_close(w) != CARQUET_OK)
+        { carquet_schema_free(s); carquet_test_cleanup(path);
+          TEST_FAIL("bloom_api_mix", "write failed"); }
+    carquet_schema_free(s);
+
+    carquet_reader_t* r = carquet_reader_open(path, NULL, &err);
+    if (!r) { carquet_test_cleanup(path); TEST_FAIL("bloom_api_mix", "reader open"); }
+    carquet_column_chunk_metadata_t ma, mb, mc;
+    carquet_reader_column_chunk_metadata(r, 0, 0, &ma);
+    carquet_reader_column_chunk_metadata(r, 0, 1, &mb);
+    carquet_reader_column_chunk_metadata(r, 0, 2, &mc);
+    int ok = ma.has_bloom_filter && mb.has_bloom_filter && !mc.has_bloom_filter;
+    carquet_reader_close(r);
+    carquet_test_cleanup(path);
+    if (!ok) TEST_FAIL("bloom_api_mix",
+        "legacy-enabled column lost its bloom, or untouched column gained one");
+    TEST_PASS("bloom_api_mix");
     return 0;
 }
 
@@ -931,7 +1253,11 @@ int main(void) {
     failures += test_data_page_v2(0);
     failures += test_data_page_v2(1);
     failures += test_arrow_schema_metadata();
+    failures += test_field_metadata_roundtrip();
+    failures += test_field_metadata_errors();
     failures += test_arrow_schema_skipped_when_off();
+    failures += test_arrow_schema_nested();
+    failures += test_arrow_type_refinement_read();
     failures += test_float16_stats();
     failures += test_bitpacked_levels();
     failures += test_geospatial_stats();
@@ -941,6 +1267,7 @@ int main(void) {
     failures += test_custom_codec();
     failures += test_column_page_size_override();
     failures += test_max_statistics_size();
+    failures += test_bloom_api_mix();
     failures += test_append_row_groups();
     if (failures) { printf("\n%d test(s) FAILED\n", failures); return 1; }
     printf("\nAll writer-extension tests passed\n");

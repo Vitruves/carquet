@@ -453,55 +453,61 @@ static int test_per_column_options(void) {
     return 0;
 }
 
-static int test_lz4_writer_uses_lz4_raw_codec(void) {
-    carquet_error_t err = CARQUET_ERROR_INIT;
-    carquet_schema_t* schema = carquet_schema_create(&err);
-    if (!schema) TEST_FAIL("lz4_raw_codec", "schema create failed");
-    if (carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT32,
-            NULL, CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK) {
-        carquet_schema_free(schema);
-        TEST_FAIL("lz4_raw_codec", "schema add failed");
-    }
+/* LZ4 (codec 5) and LZ4_RAW (codec 7) are now distinct Parquet codecs: codec 5
+ * is the deprecated Hadoop-framed LZ4, codec 7 is raw LZ4 blocks. The writer
+ * emits each verbatim and both round-trip. */
+static int test_lz4_codecs(void) {
+    const carquet_compression_t codecs[2] = {
+        CARQUET_COMPRESSION_LZ4, CARQUET_COMPRESSION_LZ4_RAW };
+    for (int ci = 0; ci < 2; ci++) {
+        carquet_error_t err = CARQUET_ERROR_INIT;
+        carquet_schema_t* schema = carquet_schema_create(&err);
+        if (!schema) TEST_FAIL("lz4_codecs", "schema create failed");
+        if (carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT32,
+                NULL, CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK) {
+            carquet_schema_free(schema);
+            TEST_FAIL("lz4_codecs", "schema add failed");
+        }
 
-    carquet_writer_options_t opts;
-    carquet_writer_options_init(&opts);
-    opts.compression = CARQUET_COMPRESSION_LZ4;
+        carquet_writer_options_t opts;
+        carquet_writer_options_init(&opts);
+        opts.compression = codecs[ci];
 
-    carquet_writer_t* w = carquet_writer_create(TEMP_FILE, schema, &opts, &err);
-    if (!w) {
-        carquet_schema_free(schema);
-        TEST_FAIL("lz4_raw_codec", "writer create failed");
-    }
+        carquet_writer_t* w = carquet_writer_create(TEMP_FILE, schema, &opts, &err);
+        if (!w) { carquet_schema_free(schema); TEST_FAIL("lz4_codecs", "writer create failed"); }
 
-    int32_t ids[16];
-    for (int i = 0; i < 16; i++) ids[i] = i;
-    if (carquet_writer_write_batch(w, 0, ids, 16, NULL, NULL) != CARQUET_OK ||
-        carquet_writer_close(w) != CARQUET_OK) {
-        carquet_schema_free(schema);
-        TEST_FAIL("lz4_raw_codec", "write failed");
-    }
+        int32_t ids[64], out[64];
+        for (int i = 0; i < 64; i++) ids[i] = (i / 3) * 7;  /* compressible */
+        if (carquet_writer_write_batch(w, 0, ids, 64, NULL, NULL) != CARQUET_OK ||
+            carquet_writer_close(w) != CARQUET_OK) {
+            carquet_schema_free(schema);
+            TEST_FAIL("lz4_codecs", "write failed");
+        }
 
-    carquet_reader_t* r = carquet_reader_open(TEMP_FILE, NULL, &err);
-    if (!r) {
-        carquet_schema_free(schema);
-        TEST_FAIL("lz4_raw_codec", "reader open failed");
-    }
+        carquet_reader_t* r = carquet_reader_open(TEMP_FILE, NULL, &err);
+        if (!r) { carquet_schema_free(schema); TEST_FAIL("lz4_codecs", "reader open failed"); }
 
-    carquet_column_chunk_metadata_t meta;
-    if (carquet_reader_column_chunk_metadata(r, 0, 0, &meta) != CARQUET_OK) {
+        carquet_column_chunk_metadata_t meta;
+        if (carquet_reader_column_chunk_metadata(r, 0, 0, &meta) != CARQUET_OK) {
+            carquet_reader_close(r); carquet_schema_free(schema);
+            TEST_FAIL("lz4_codecs", "metadata failed");
+        }
+        /* The requested codec is preserved verbatim (no LZ4 -> LZ4_RAW alias). */
+        if (meta.codec != codecs[ci]) {
+            carquet_reader_close(r); carquet_schema_free(schema);
+            TEST_FAIL("lz4_codecs", "codec not preserved");
+        }
+        /* Data round-trips through the matching framing. */
+        carquet_column_reader_t* c = carquet_reader_get_column(r, 0, 0, &err);
+        int64_t n = c ? carquet_column_read_batch(c, out, 64, NULL, NULL) : -1;
+        int ok = (n == 64) && (memcmp(ids, out, sizeof(ids)) == 0);
+        carquet_column_reader_free(c);
         carquet_reader_close(r);
         carquet_schema_free(schema);
-        TEST_FAIL("lz4_raw_codec", "metadata failed");
+        if (!ok) TEST_FAIL("lz4_codecs", "value round-trip mismatch");
     }
 
-    carquet_reader_close(r);
-    carquet_schema_free(schema);
-
-    if (meta.codec != CARQUET_COMPRESSION_LZ4_RAW) {
-        TEST_FAIL("lz4_raw_codec", "writer did not normalize LZ4 to LZ4_RAW");
-    }
-
-    TEST_PASS("lz4_raw_codec");
+    TEST_PASS("lz4_codecs");
     return 0;
 }
 
@@ -627,6 +633,7 @@ static int test_type_mismatch_rejected(void) {
         if (b[i] == 0x15 && b[i + 1] == 0x02) idx = (long)i;
     if (idx < 0) {
         free(b);
+        free(src);   /* get_buffer transferred ownership of the writer's buffer */
         carquet_schema_free(schema);
         printf("[SKIP] type_mismatch_rejected: type field pattern not found "
                "(writer encoding changed)\n");
@@ -657,6 +664,7 @@ static int test_type_mismatch_rejected(void) {
      * crash-free refusal — which is the property under test. */
 
     free(b);
+    free(src);   /* get_buffer transferred ownership of the writer's buffer */
     carquet_schema_free(schema);
     TEST_PASS("type_mismatch_rejected");
     return 0;
@@ -676,7 +684,7 @@ int main(void) {
     failures += test_page_index();
     failures += test_buffer_writer();
     failures += test_per_column_options();
-    failures += test_lz4_writer_uses_lz4_raw_codec();
+    failures += test_lz4_codecs();
     failures += test_read_batch_ex();
     failures += test_type_mismatch_rejected();
 

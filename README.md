@@ -32,6 +32,7 @@
 - Full Parquet spec: all types, encodings, compression codecs, nested schemas, bloom filters, page indexes
 - SIMD-optimized (SSE4.2, AVX2, AVX-512, NEON, SVE) with runtime detection and scalar fallbacks
 - PyArrow, DuckDB, Spark compatible out of the box
+- [Arrow C Data Interface](docs/reading.md#export-to-arrow-c-data-interface) bridge (`carquet_arrow_export_*` / `carquet_arrow_import_*` / `carquet_writer_write_arrow` / `carquet_reader_read_arrow`) for zero-dependency, copy-light interchange with the Arrow ecosystem, with **arbitrary-depth nested read/write** (struct/list/map at any depth)
 
 <!-- ────────────────────────────  BENCHMARKS  ──────────────────────────── -->
 
@@ -267,6 +268,7 @@ All x86 SIMD (SSE, AVX, AVX2, AVX-512) and ARM NEON are auto-detected and enable
 | `CARQUET_BUILD_ARROW_CPP_BENCHMARK` | OFF | Optional Arrow C++ comparison benchmark |
 | `CARQUET_BUILD_INTEROP` | OFF | Build interoperability tests |
 | `CARQUET_BUILD_FUZZ` | OFF | Build fuzz targets |
+| `CARQUET_BUILD_DOCS` | OFF | Add a `docs` target (needs Doxygen) |
 | `CARQUET_ENABLE_SSE` | ON | SSE optimizations (x86, auto-detected) |
 | `CARQUET_ENABLE_AVX` | ON | AVX optimizations (x86, auto-detected) |
 | `CARQUET_ENABLE_AVX2` | ON | AVX2 optimizations (x86, auto-detected) |
@@ -316,6 +318,21 @@ xmake f --dev=y --avx512=n && xmake      # dev build, AVX-512 disabled
 ```
 
 </details>
+
+### API Documentation
+
+The public headers are annotated with [Doxygen](https://www.doxygen.nl) comments. Generating the HTML reference needs `doxygen` installed (plus optional `graphviz` for include/dependency diagrams); neither is required for a normal build.
+
+```bash
+# CMake — enable the target at configure time, then build it
+cmake -B build -DCARQUET_BUILD_DOCS=ON
+cmake --build build --target docs
+
+# xmake — a standalone task, no configure flag needed
+xmake docs
+```
+
+Both write to `build/docs/html/index.html`. If Doxygen is not installed the target/task simply reports that and does nothing.
 
 <!-- ────────────────────────────  C API  ──────────────────────────── -->
 
@@ -415,6 +432,10 @@ Everything beyond flat read/write lives in the manual — each links to a runnab
 | Compression, custom codecs, writer tuning | [`docs/writing.md`](docs/writing.md), [`docs/performance.md`](docs/performance.md) |
 | mmap, zero-copy, prebuffering, I/O coalescing | [`docs/performance.md`](docs/performance.md) |
 | Error codes and recovery hints | [`docs/error-handling.md`](docs/error-handling.md) |
+
+### Example application
+
+[`mocklib/`](mocklib/) is **MetricStore** — a complete, self-contained example application built on top of carquet, useful both as a reference for real-world usage and as an end-to-end integration test of the public API. It models a time-series telemetry store (ingest events, then introspect and query them) and, in doing so, exercises **114 of carquet's 128 public functions (~89%)**: schema construction with logical types, per-column encoding/compression/bloom tuning, page indexes and statistics on the write side; column projection, predicate pushdown, page-level filtering, bloom membership, the Arrow C Data Interface bridge, nested `LIST` reconstruction, buffer/append I/O and metadata introspection on the read side. It links carquet the way any downstream project would (`find_package(carquet)` / `add_subdirectory`), ships a self-checking round-trip test, and its `write_sample` binary emits a file for external inspection. See [`mocklib/README.md`](mocklib/README.md).
 
 ### API Reference
 
@@ -524,15 +545,16 @@ python3 interop/run_interop.py
 | Logical types | STRING, DATE, TIME, TIMESTAMP, DECIMAL, UUID, JSON, INTERVAL, FLOAT16, VARIANT, GEOMETRY, GEOGRAPHY |
 | Encodings | PLAIN, RLE, DICTIONARY, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT (read + write) |
 | Data Page versions | V1 (default) and V2 (read + write) |
-| Compression | UNCOMPRESSED, SNAPPY, GZIP, LZ4, ZSTD |
-| Nested schemas | Groups, lists, maps with definition/repetition levels |
-| Bloom filters | Read, write, and query (`carquet_bloom_filter_check_*`) |
+| Compression | UNCOMPRESSED, SNAPPY, GZIP, LZ4 (Hadoop-framed, codec 5), LZ4_RAW (codec 7), ZSTD |
+| Nested schemas | Groups, lists, maps with definition/repetition levels; single-level LIST/MAP auto-shredding on write (`carquet_writer_write_list_column`) and List reconstruction on read; nested `ARROW:schema` emission |
+| Bloom filters | Read, write, and query (`carquet_bloom_filter_check_*`); consulted automatically for row-group pruning |
 | Page indexes | Column index + offset index (read + write + per-page stats access) |
-| Statistics | Min/max/null count per column chunk |
-| Predicate pushdown | Row group filtering via statistics; page-level filtering via column index (`carquet_batch_reader_set_page_filter`) |
+| Statistics | Min/max/null count per column chunk; exact `distinct_count` for dictionary columns; Parquet 2.9 SizeStatistics (unencoded byte-array bytes + level histograms) |
+| Predicate pushdown | Automatic row-group pruning via statistics + bloom filters (no callback needed); page-level filtering via column index (`carquet_batch_reader_set_page_filter`) |
 | Append | Add row groups to an existing file (`carquet_writer_open_append`) |
 | Custom codecs | Register a custom compress/decompress impl per codec slot (`carquet_register_codec`) |
 | Key-value metadata | Read and write arbitrary footer metadata |
+| Per-field metadata | Arrow `Field.custom_metadata` (variable labels/descriptions) via `ARROW:schema` (read + write) |
 | Per-column options | Per-column encoding, compression, statistics, bloom filter |
 | Buffer writer | Write Parquet to in-memory buffer |
 | CRC32 | Page-level verification (HW-accelerated on ARM) |

@@ -173,23 +173,32 @@ const char* cli_format_value(carquet_physical_type_t type,
         time_t secs;
         int frac = 0;
         const char* frac_fmt = "";
+        int64_t divisor = 1;
         switch (logical->params.timestamp.unit) {
             case CARQUET_TIME_UNIT_MILLIS:
-                secs = (time_t)(val / 1000);
-                frac = (int)(val % 1000);
+                divisor = 1000;
                 frac_fmt = ".%03d";
                 break;
             case CARQUET_TIME_UNIT_MICROS:
-                secs = (time_t)(val / 1000000);
-                frac = (int)(val % 1000000);
+                divisor = 1000000;
                 frac_fmt = ".%06d";
                 break;
             case CARQUET_TIME_UNIT_NANOS:
-                secs = (time_t)(val / 1000000000LL);
-                frac = (int)(val % 1000000000LL);
+                divisor = 1000000000LL;
                 frac_fmt = ".%09d";
                 break;
         }
+        /* Floor division so pre-epoch (negative) values split correctly:
+         * truncating division would push secs up by one and make frac negative
+         * (e.g. -999 ms -> secs 0, frac -999 instead of secs -1, frac 1). */
+        int64_t sec_val = val / divisor;
+        int64_t frac_val = val % divisor;
+        if (frac_val < 0) {
+            frac_val += divisor;
+            sec_val -= 1;
+        }
+        secs = (time_t)sec_val;
+        frac = (int)frac_val;
         struct tm tm;
 #ifdef _WIN32
         gmtime_s(&tm, &secs);

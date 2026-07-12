@@ -28,6 +28,7 @@ python3 interop/run_interop.py -v
 - [ ] **Fuzz ≥60s per reachable target**, zero crashes. Extend/add the fuzzer if the change opens a new path (`fuzz/run_fuzzer.py list` for targets); a new target goes in `fuzz/CMakeLists.txt`, the `fuzzers` list in `xmake.lua`, and `run_fuzzer.py`.
 - [ ] **Docs updated** — `docs/`, public-header doc comments, CLAUDE.md, examples, and the component README that owns the area (`fuzz/README.md`, `docs/README.md`, `profiling/README.md`). Update the **main `README.md`** only for user-visible changes, keep it concise, and **link out** rather than pasting big chunks.
 - [ ] **CHANGELOG bullet** in the top unreleased section (right heading; note ABI/default-bytes impact).
+- [ ] xmake.lua updated
 - [ ] **Interop passes** + new case added in `roundtrip_writer.c` if a new wire feature landed.
 - [ ] **CI green** on every platform (macOS, Windows/MSVC, Ubuntu x86-64, Ubuntu ARM, Rocky 9; shared + static).
 - [ ] **Benchmark vs Arrow C++** if a hot path (encoding/compression/SIMD/bitpack/reader-writer loops) was touched — no regression, numbers in the PR:
@@ -36,6 +37,8 @@ python3 interop/run_interop.py -v
     -DCARQUET_BUILD_ARROW_CPP_BENCHMARK=ON -DCARQUET_NATIVE_ARCH=ON && cmake --build build
   python3 benchmark/run_benchmark.py --quick
   ```
+
+One note: codebase contains fuzz/external/parquet-testing with good and malformed apache arrow reference tests files. Might be useful for testing.
 
 ## Before tagging a release
 

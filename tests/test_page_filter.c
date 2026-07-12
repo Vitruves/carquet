@@ -3076,6 +3076,232 @@ static int test_skip_does_not_decompress(void) {
  * main
  * ============================================================================ */
 
+/* ============================================================================
+ * Automatic row-group skipping: statistics (no page index) and bloom filter.
+ *
+ * These exercise the row-group-level pruning that runs before the page index
+ * is consulted. When it proves a whole row group cannot match, the group is
+ * skipped without a user callback — and, crucially, without a page index.
+ * ============================================================================ */
+
+/* Write three row groups of INT32 with disjoint value ranges. Optionally
+ * enables the page index and/or a bloom filter on the single column. */
+static carquet_status_t write_three_rg_int32(
+    const char* path, bool page_index, bool bloom,
+    const int32_t* rg0, const int32_t* rg1, const int32_t* rg2, int64_t n) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t* schema = carquet_schema_create(&err);
+    if (!schema) return CARQUET_ERROR_INTERNAL;
+    carquet_status_t st = carquet_schema_add_column(
+        schema, "v", CARQUET_PHYSICAL_INT32, NULL,
+        CARQUET_REPETITION_REQUIRED, 0, 0);
+    if (st != CARQUET_OK) { carquet_schema_free(schema); return st; }
+
+    carquet_writer_options_t opts;
+    carquet_writer_options_init(&opts);
+    opts.write_page_index = page_index;
+    opts.write_statistics = true;
+    opts.write_bloom_filters = bloom;
+    opts.compression = CARQUET_COMPRESSION_UNCOMPRESSED;
+    opts.dictionary_encoding = CARQUET_ENCODING_PLAIN;
+
+    carquet_writer_t* w = carquet_writer_create(path, schema, &opts, &err);
+    if (!w) { carquet_schema_free(schema); return CARQUET_ERROR_INTERNAL; }
+    st = carquet_writer_set_column_encoding(w, 0, CARQUET_ENCODING_PLAIN);
+    if (st != CARQUET_OK) goto cleanup;
+    if (bloom) {
+        st = carquet_writer_set_column_bloom_filter(w, 0, true);
+        if (st != CARQUET_OK) goto cleanup;
+    }
+    st = carquet_writer_write_batch(w, 0, rg0, n, NULL, NULL);
+    if (st != CARQUET_OK) goto cleanup;
+    st = carquet_writer_new_row_group(w);
+    if (st != CARQUET_OK) goto cleanup;
+    st = carquet_writer_write_batch(w, 0, rg1, n, NULL, NULL);
+    if (st != CARQUET_OK) goto cleanup;
+    st = carquet_writer_new_row_group(w);
+    if (st != CARQUET_OK) goto cleanup;
+    st = carquet_writer_write_batch(w, 0, rg2, n, NULL, NULL);
+    if (st != CARQUET_OK) goto cleanup;
+    st = carquet_writer_close(w);
+    w = NULL;
+cleanup:
+    if (w) carquet_writer_close(w);
+    carquet_schema_free(schema);
+    return st;
+}
+
+/* #7: statistics-based skipping drops whole row groups with no page index and
+ * no user callback. A predicate out of every row group's [min,max] must
+ * yield a clean end-of-data (not PAGE_INDEX_REQUIRED) and credit every row. */
+static int test_rg_stats_skip_no_page_index(void) {
+    g_current_test = "rg_stats_skip_no_page_index";
+    char path[512];
+    carquet_test_temp_path(path, sizeof(path), "pf_rg_stats");
+
+    const int64_t N = 100;
+    int32_t rg0[100], rg1[100], rg2[100];
+    for (int i = 0; i < N; i++) {
+        rg0[i] = i;             /* [0, 99]      */
+        rg1[i] = 1000 + i;      /* [1000, 1099] */
+        rg2[i] = 2000 + i;      /* [2000, 2099] */
+    }
+    ASSERT_OK(write_three_rg_int32(path, /*page_index=*/false, /*bloom=*/false,
+                                   rg0, rg1, rg2, N));
+
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_reader_t* r = carquet_reader_open(path, NULL, &err);
+    ASSERT_TRUE(r != NULL);
+    ASSERT_EQ_I64(carquet_reader_num_row_groups(r), 3);
+    carquet_batch_reader_config_t cfg;
+    carquet_batch_reader_config_init(&cfg);
+    carquet_batch_reader_t* br = carquet_batch_reader_create(r, &cfg, &err);
+    ASSERT_TRUE(br != NULL);
+
+    int32_t target = 5000;  /* Not in any row group. */
+    carquet_filter_clause_t clause = {0};
+    clause.column_index = 0;
+    clause.op = CARQUET_FILTER_EQ;
+    clause.value = &target;
+    clause.value_size = sizeof(target);
+    ASSERT_OK(carquet_batch_reader_set_page_filter(br, &clause, 1));
+
+    carquet_row_batch_t* batch = NULL;
+    carquet_status_t st = carquet_batch_reader_next(br, &batch);
+    /* All three row groups pruned by stats before the (absent) page index is
+     * ever consulted: no PAGE_INDEX_REQUIRED error, all rows accounted for. */
+    ASSERT_TRUE(st == CARQUET_ERROR_END_OF_DATA ||
+                (st == CARQUET_OK && batch == NULL));
+    ASSERT_EQ_I64(carquet_batch_reader_rows_skipped(br), 3 * N);
+
+    carquet_batch_reader_free(br);
+    carquet_reader_close(r);
+    remove(path);
+    TEST_PASS(g_current_test);
+    return 0;
+}
+
+/* #7: with a page index present, only the row group whose stats overlap the
+ * predicate is read; the others are skipped and their rows credited. */
+static int test_rg_stats_skip_with_page_index(void) {
+    g_current_test = "rg_stats_skip_with_page_index";
+    char path[512];
+    carquet_test_temp_path(path, sizeof(path), "pf_rg_stats_pi");
+
+    const int64_t N = 100;
+    int32_t rg0[100], rg1[100], rg2[100];
+    for (int i = 0; i < N; i++) {
+        rg0[i] = i;
+        rg1[i] = 1000 + i;
+        rg2[i] = 2000 + i;
+    }
+    ASSERT_OK(write_three_rg_int32(path, /*page_index=*/true, /*bloom=*/false,
+                                   rg0, rg1, rg2, N));
+
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_reader_t* r = carquet_reader_open(path, NULL, &err);
+    ASSERT_TRUE(r != NULL);
+    carquet_batch_reader_config_t cfg;
+    carquet_batch_reader_config_init(&cfg);
+    carquet_batch_reader_t* br = carquet_batch_reader_create(r, &cfg, &err);
+    ASSERT_TRUE(br != NULL);
+
+    int32_t target = 1050;  /* Only present in the middle row group. */
+    carquet_filter_clause_t clause = {0};
+    clause.column_index = 0;
+    clause.op = CARQUET_FILTER_EQ;
+    clause.value = &target;
+    clause.value_size = sizeof(target);
+    ASSERT_OK(carquet_batch_reader_set_page_filter(br, &clause, 1));
+
+    int64_t total = 0;
+    bool saw_target = false;
+    carquet_row_batch_t* batch = NULL;
+    while (carquet_batch_reader_next(br, &batch) == CARQUET_OK && batch) {
+        const void* data; const uint8_t* nb; int64_t n;
+        ASSERT_OK(carquet_row_batch_column(batch, 0, &data, &nb, &n));
+        const int32_t* v = (const int32_t*)data;
+        for (int64_t k = 0; k < n; k++) if (v[k] == target) saw_target = true;
+        total += n;
+        carquet_row_batch_free(batch);
+        batch = NULL;
+    }
+    ASSERT_TRUE(saw_target);
+    ASSERT_EQ_I64(total, N);  /* Only the middle row group is read. */
+    /* Two full row groups (rg0, rg2) skipped by row-group stats. */
+    ASSERT_EQ_I64(carquet_batch_reader_rows_skipped(br), 2 * N);
+
+    carquet_batch_reader_free(br);
+    carquet_reader_close(r);
+    remove(path);
+    TEST_PASS(g_current_test);
+    return 0;
+}
+
+/* #6: a bloom filter drops a row group whose statistics say "might match"
+ * (the target is inside [min,max]) but whose values do not actually include
+ * the target. Without the bloom filter (no page index) this would raise
+ * PAGE_INDEX_REQUIRED; with it the group is pruned cleanly. */
+static int test_rg_bloom_skip(void) {
+    g_current_test = "rg_bloom_skip";
+    char path[512];
+    carquet_test_temp_path(path, sizeof(path), "pf_rg_bloom");
+
+    /* One row group of even values [0, 198]: any odd value in that range is
+     * absent yet passes the min/max test, isolating the bloom-filter path. */
+    const int64_t N = 100;
+    int32_t evens[100], dummy_hi[100], dummy_lo[100];
+    for (int i = 0; i < N; i++) {
+        evens[i] = 2 * i;             /* [0, 198], evens only */
+        dummy_lo[i] = -100000 - i;    /* far below, pruned by stats */
+        dummy_hi[i] = 100000 + i;     /* far above, pruned by stats */
+    }
+    ASSERT_OK(write_three_rg_int32(path, /*page_index=*/false, /*bloom=*/true,
+                                   dummy_lo, evens, dummy_hi, N));
+
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_reader_t* r = carquet_reader_open(path, NULL, &err);
+    ASSERT_TRUE(r != NULL);
+
+    /* Pick an odd target the bloom filter reports absent (deterministic per
+     * file, but robust against the codec's exact hash/sizing). Confirm an
+     * inserted even value reads present as a sanity check. */
+    carquet_bloom_filter_t* bf = carquet_reader_get_bloom_filter(r, 1, 0, &err);
+    ASSERT_TRUE(bf != NULL);
+    ASSERT_TRUE(carquet_bloom_filter_check_i32(bf, 100));  /* even, present */
+    int32_t target = -1;
+    for (int32_t cand = 1; cand < 198; cand += 2) {
+        if (!carquet_bloom_filter_check_i32(bf, cand)) { target = cand; break; }
+    }
+    carquet_bloom_filter_destroy(bf);
+    ASSERT_TRUE(target > 0);  /* Some odd value must read absent. */
+
+    carquet_batch_reader_config_t cfg;
+    carquet_batch_reader_config_init(&cfg);
+    carquet_batch_reader_t* br = carquet_batch_reader_create(r, &cfg, &err);
+    ASSERT_TRUE(br != NULL);
+
+    carquet_filter_clause_t clause = {0};
+    clause.column_index = 0;
+    clause.op = CARQUET_FILTER_EQ;
+    clause.value = &target;
+    clause.value_size = sizeof(target);
+    ASSERT_OK(carquet_batch_reader_set_page_filter(br, &clause, 1));
+
+    carquet_row_batch_t* batch = NULL;
+    carquet_status_t st = carquet_batch_reader_next(br, &batch);
+    /* rg0/rg2 pruned by stats, rg1 pruned by the bloom filter — clean EOD. */
+    ASSERT_TRUE(st == CARQUET_ERROR_END_OF_DATA ||
+                (st == CARQUET_OK && batch == NULL));
+    ASSERT_EQ_I64(carquet_batch_reader_rows_skipped(br), 3 * N);
+
+    carquet_batch_reader_free(br);
+    carquet_reader_close(r);
+    remove(path);
+    TEST_PASS(g_current_test);
+    return 0;
+}
+
 int main(void) {
     int failures = 0;
     failures += test_eq_int32_single_page();
@@ -3089,6 +3315,9 @@ int main(void) {
     failures += test_in_int64();
     failures += test_filter_clear();
     failures += test_no_page_index_error();
+    failures += test_rg_stats_skip_no_page_index();
+    failures += test_rg_stats_skip_with_page_index();
+    failures += test_rg_bloom_skip();
     failures += test_int96_rejected();
     failures += test_aligned_range();
     failures += test_whole_rg();

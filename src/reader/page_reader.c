@@ -59,6 +59,9 @@ extern void carquet_dispatch_fill_def_levels(int16_t* def_levels, int64_t count,
 extern carquet_status_t carquet_lz4_decompress(
     const uint8_t* src, size_t src_size,
     uint8_t* dst, size_t dst_capacity, size_t* dst_size);
+extern carquet_status_t carquet_lz4_hadoop_decompress(
+    const uint8_t* src, size_t src_size,
+    uint8_t* dst, size_t dst_capacity, size_t* dst_size);
 extern carquet_status_t carquet_snappy_decompress(
     const uint8_t* src, size_t src_size,
     uint8_t* dst, size_t dst_capacity, size_t* dst_size);
@@ -200,6 +203,11 @@ carquet_status_t carquet_decompress_page(
                 decompressed, decompressed_capacity, decompressed_size);
 
         case CARQUET_COMPRESSION_LZ4:
+            /* Codec 5 is the deprecated Hadoop-framed LZ4. */
+            return carquet_lz4_hadoop_decompress(
+                compressed, compressed_size,
+                decompressed, decompressed_capacity, decompressed_size);
+
         case CARQUET_COMPRESSION_LZ4_RAW:
             return carquet_lz4_decompress(
                 compressed, compressed_size,
@@ -928,6 +936,54 @@ static carquet_status_t decode_phase3_values(
                     CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ENCODING,
                         "BYTE_STREAM_SPLIT unsupported type");
                     return CARQUET_ERROR_INVALID_ENCODING;
+            }
+
+        case CARQUET_ENCODING_RLE:
+            /* RLE as a value encoding is defined only for BOOLEAN. Layout: a
+             * 4-byte little-endian length prefix followed by the RLE/bit-packed
+             * hybrid at bit width 1. */
+            if (reader->type != CARQUET_PHYSICAL_BOOLEAN) {
+                CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ENCODING,
+                    "RLE value encoding requires BOOLEAN");
+                return CARQUET_ERROR_INVALID_ENCODING;
+            }
+            if (non_null_count <= 0) {
+                return CARQUET_OK;
+            }
+            if (remaining < 4) {
+                CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
+                    "RLE boolean: truncated length prefix");
+                return CARQUET_ERROR_DECODE;
+            }
+            {
+                uint32_t rle_len = (uint32_t)ptr[0] | ((uint32_t)ptr[1] << 8) |
+                                   ((uint32_t)ptr[2] << 16) | ((uint32_t)ptr[3] << 24);
+                if ((size_t)rle_len > remaining - 4) {
+                    CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
+                        "RLE boolean: data length exceeds page");
+                    return CARQUET_ERROR_DECODE;
+                }
+                uint32_t* tmp = carquet_mem_malloc(
+                    (size_t)non_null_count * sizeof(uint32_t));
+                if (!tmp) {
+                    CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY,
+                        "RLE boolean scratch allocation failed");
+                    return CARQUET_ERROR_OUT_OF_MEMORY;
+                }
+                int64_t decoded = carquet_rle_decode_all(
+                    ptr + 4, rle_len, 1, tmp, non_null_count);
+                if (decoded != non_null_count) {
+                    carquet_mem_free(tmp);
+                    CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
+                        "RLE boolean: decoded count mismatch");
+                    return CARQUET_ERROR_DECODE;
+                }
+                uint8_t* out = (uint8_t*)values;
+                for (int64_t i = 0; i < non_null_count; i++) {
+                    out[i] = (uint8_t)(tmp[i] & 1u);
+                }
+                carquet_mem_free(tmp);
+                return CARQUET_OK;
             }
 
         default:

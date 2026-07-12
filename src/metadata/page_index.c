@@ -90,6 +90,16 @@ struct carquet_column_index_builder {
     bool* null_pages;
 
     int32_t boundary_order;
+
+    /* Per-page level histograms (Parquet 2.9), flattened page-major:
+     * rep_level_histograms[page * rep_hist_len + level]. Allocated lazily on the
+     * first add_page that supplies histograms; lengths come from the max
+     * rep/def levels (max_level + 1). track_histograms gates emission. */
+    bool track_histograms;
+    int32_t rep_hist_len;
+    int32_t def_hist_len;
+    int64_t* rep_level_histograms;
+    int64_t* def_level_histograms;
 };
 
 /**
@@ -151,6 +161,8 @@ void carquet_column_index_builder_destroy(carquet_column_index_builder_t* builde
     carquet_mem_free(builder->min_value_lens);
     carquet_mem_free(builder->max_value_lens);
     carquet_mem_free(builder->null_pages);
+    carquet_mem_free(builder->rep_level_histograms);
+    carquet_mem_free(builder->def_level_histograms);
     carquet_mem_free(builder);
 }
 
@@ -182,6 +194,24 @@ static carquet_status_t ensure_capacity(carquet_column_index_builder_t* builder)
     builder->max_values = new_max_values;
     builder->max_value_lens = new_max_lens;
     builder->null_pages = new_null_pages;
+
+    /* Grow the flattened histogram arrays. The layout is page-major and
+     * contiguous, so the existing num_pages*len prefix survives the realloc. */
+    if (builder->track_histograms) {
+        if (builder->rep_hist_len > 0) {
+            int64_t* rh = carquet_mem_realloc(builder->rep_level_histograms,
+                (size_t)new_cap * builder->rep_hist_len * sizeof(int64_t));
+            if (!rh) return CARQUET_ERROR_OUT_OF_MEMORY;
+            builder->rep_level_histograms = rh;
+        }
+        if (builder->def_hist_len > 0) {
+            int64_t* dh = carquet_mem_realloc(builder->def_level_histograms,
+                (size_t)new_cap * builder->def_hist_len * sizeof(int64_t));
+            if (!dh) return CARQUET_ERROR_OUT_OF_MEMORY;
+            builder->def_level_histograms = dh;
+        }
+    }
+
     builder->capacity = new_cap;
 
     /* Initialize new entries */
@@ -207,10 +237,44 @@ carquet_status_t carquet_column_index_add_page(
     int32_t min_value_len,
     const void* max_value,
     int32_t max_value_len,
-    bool is_null_page) {
+    bool is_null_page,
+    const int64_t* rep_level_hist,
+    int32_t rep_level_hist_len,
+    const int64_t* def_level_hist,
+    int32_t def_level_hist_len) {
 
     if (!builder) {
         return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    /* Histogram lengths are max_rep/def_level + 1 (Parquet nesting is shallow).
+     * Guard against an out-of-range length so a caller bug can never drive a
+     * runaway allocation below. */
+    #define CARQUET_MAX_LEVEL_HIST_LEN 4096
+    if (rep_level_hist_len < 0 || rep_level_hist_len > CARQUET_MAX_LEVEL_HIST_LEN) {
+        rep_level_hist = NULL;
+    }
+    if (def_level_hist_len < 0 || def_level_hist_len > CARQUET_MAX_LEVEL_HIST_LEN) {
+        def_level_hist = NULL;
+    }
+    #undef CARQUET_MAX_LEVEL_HIST_LEN
+
+    /* Latch histogram tracking on the first page that supplies them. Lengths
+     * are fixed for the whole column (derived from max rep/def levels). */
+    if (!builder->track_histograms && (rep_level_hist || def_level_hist)) {
+        builder->track_histograms = true;
+        builder->rep_hist_len = rep_level_hist ? rep_level_hist_len : 0;
+        builder->def_hist_len = def_level_hist ? def_level_hist_len : 0;
+        if (builder->rep_hist_len > 0) {
+            builder->rep_level_histograms = carquet_mem_calloc(
+                (size_t)builder->capacity * builder->rep_hist_len, sizeof(int64_t));
+            if (!builder->rep_level_histograms) return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
+        if (builder->def_hist_len > 0) {
+            builder->def_level_histograms = carquet_mem_calloc(
+                (size_t)builder->capacity * builder->def_hist_len, sizeof(int64_t));
+            if (!builder->def_level_histograms) return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
     }
 
     carquet_status_t status = ensure_capacity(builder);
@@ -220,6 +284,29 @@ carquet_status_t carquet_column_index_add_page(
 
     builder->null_counts[idx] = null_count;
     builder->null_pages[idx] = is_null_page;
+
+    if (builder->track_histograms) {
+        if (builder->rep_hist_len > 0) {
+            int64_t* dst = builder->rep_level_histograms +
+                           (size_t)idx * builder->rep_hist_len;
+            if (rep_level_hist && rep_level_hist_len == builder->rep_hist_len) {
+                memcpy(dst, rep_level_hist,
+                       (size_t)builder->rep_hist_len * sizeof(int64_t));
+            } else {
+                memset(dst, 0, (size_t)builder->rep_hist_len * sizeof(int64_t));
+            }
+        }
+        if (builder->def_hist_len > 0) {
+            int64_t* dst = builder->def_level_histograms +
+                           (size_t)idx * builder->def_hist_len;
+            if (def_level_hist && def_level_hist_len == builder->def_hist_len) {
+                memcpy(dst, def_level_hist,
+                       (size_t)builder->def_hist_len * sizeof(int64_t));
+            } else {
+                memset(dst, 0, (size_t)builder->def_hist_len * sizeof(int64_t));
+            }
+        }
+    }
 
     /* Copy min value */
     if (min_value && min_value_len > 0) {
@@ -318,32 +405,34 @@ struct carquet_offset_index_builder {
     int64_t* offsets;
     int32_t* compressed_sizes;
     int64_t* first_row_indices;
-    int32_t* uncompressed_sizes;  /* Optional */
-    bool track_uncompressed;
+    /* OffsetIndex field 2: unencoded_byte_array_data_bytes (Parquet 2.9),
+     * list<i64>, one per page. Tracked only for BYTE_ARRAY columns. */
+    int64_t* unencoded_bytes;
+    bool track_unencoded;
 };
 
 /**
  * Create an offset index builder.
  */
 carquet_offset_index_builder_t* carquet_offset_index_builder_create(
-    bool track_uncompressed) {
+    bool track_unencoded) {
 
     carquet_offset_index_builder_t* builder = carquet_mem_calloc(1, sizeof(*builder));
     if (!builder) return NULL;
 
     builder->capacity = 16;
-    builder->track_uncompressed = track_uncompressed;
+    builder->track_unencoded = track_unencoded;
 
     builder->offsets = carquet_mem_calloc(builder->capacity, sizeof(int64_t));
     builder->compressed_sizes = carquet_mem_calloc(builder->capacity, sizeof(int32_t));
     builder->first_row_indices = carquet_mem_calloc(builder->capacity, sizeof(int64_t));
 
-    if (track_uncompressed) {
-        builder->uncompressed_sizes = carquet_mem_calloc(builder->capacity, sizeof(int32_t));
+    if (track_unencoded) {
+        builder->unencoded_bytes = carquet_mem_calloc(builder->capacity, sizeof(int64_t));
     }
 
     if (!builder->offsets || !builder->compressed_sizes || !builder->first_row_indices ||
-        (track_uncompressed && !builder->uncompressed_sizes)) {
+        (track_unencoded && !builder->unencoded_bytes)) {
         carquet_offset_index_builder_destroy(builder);
         return NULL;
     }
@@ -360,7 +449,7 @@ void carquet_offset_index_builder_destroy(carquet_offset_index_builder_t* builde
     carquet_mem_free(builder->offsets);
     carquet_mem_free(builder->compressed_sizes);
     carquet_mem_free(builder->first_row_indices);
-    carquet_mem_free(builder->uncompressed_sizes);
+    carquet_mem_free(builder->unencoded_bytes);
     carquet_mem_free(builder);
 }
 
@@ -386,12 +475,12 @@ static carquet_status_t offset_ensure_capacity(carquet_offset_index_builder_t* b
     builder->compressed_sizes = new_compressed;
     builder->first_row_indices = new_first_rows;
 
-    if (builder->track_uncompressed) {
-        int32_t* new_uncompressed = carquet_mem_realloc(builder->uncompressed_sizes, new_cap * sizeof(int32_t));
-        if (!new_uncompressed) {
+    if (builder->track_unencoded) {
+        int64_t* new_unencoded = carquet_mem_realloc(builder->unencoded_bytes, new_cap * sizeof(int64_t));
+        if (!new_unencoded) {
             return CARQUET_ERROR_OUT_OF_MEMORY;
         }
-        builder->uncompressed_sizes = new_uncompressed;
+        builder->unencoded_bytes = new_unencoded;
     }
 
     builder->capacity = new_cap;
@@ -420,7 +509,7 @@ carquet_status_t carquet_offset_index_add_page(
     int64_t offset,
     int32_t compressed_size,
     int64_t first_row_index,
-    int32_t uncompressed_size) {
+    int64_t unencoded_byte_array_bytes) {
 
     if (!builder) {
         return CARQUET_ERROR_INVALID_ARGUMENT;
@@ -435,8 +524,8 @@ carquet_status_t carquet_offset_index_add_page(
     builder->compressed_sizes[idx] = compressed_size;
     builder->first_row_indices[idx] = first_row_index;
 
-    if (builder->track_uncompressed) {
-        builder->uncompressed_sizes[idx] = uncompressed_size;
+    if (builder->track_unencoded) {
+        builder->unencoded_bytes[idx] = unencoded_byte_array_bytes;
     }
 
     builder->num_pages++;
@@ -504,6 +593,33 @@ carquet_status_t carquet_column_index_serialize(
         thrift_write_i64(&enc, builder->null_counts[i]);
     }
 
+    /* Field 6: repetition_level_histograms (list<i64>) - optional, Parquet 2.9.
+     * Flattened page-major: for each page, (max_rep_level+1) buckets. Only
+     * emitted for repeated columns (rep_hist_len > 1) since a flat column's
+     * histogram is trivially [num_values] and carries no information. */
+    if (builder->track_histograms && builder->rep_hist_len > 1 &&
+        builder->rep_level_histograms) {
+        int32_t total = builder->num_pages * builder->rep_hist_len;
+        thrift_write_field_header(&enc, THRIFT_TYPE_LIST, 6);
+        thrift_write_list_begin(&enc, THRIFT_TYPE_I64, total);
+        for (int32_t i = 0; i < total; i++) {
+            thrift_write_i64(&enc, builder->rep_level_histograms[i]);
+        }
+    }
+
+    /* Field 7: definition_level_histograms (list<i64>) - optional, Parquet 2.9.
+     * Emitted when the column has definition levels (def_hist_len > 1), i.e.
+     * it is nullable or nested; the histogram then encodes the null structure. */
+    if (builder->track_histograms && builder->def_hist_len > 1 &&
+        builder->def_level_histograms) {
+        int32_t total = builder->num_pages * builder->def_hist_len;
+        thrift_write_field_header(&enc, THRIFT_TYPE_LIST, 7);
+        thrift_write_list_begin(&enc, THRIFT_TYPE_I64, total);
+        for (int32_t i = 0; i < total; i++) {
+            thrift_write_i64(&enc, builder->def_level_histograms[i]);
+        }
+    }
+
     thrift_write_struct_end(&enc);
     return CARQUET_OK;
 }
@@ -546,12 +662,14 @@ carquet_status_t carquet_offset_index_serialize(
         thrift_write_struct_end(&enc);
     }
 
-    /* Field 2: uncompressed_page_sizes (list<i32>) - optional */
-    if (builder->track_uncompressed && builder->uncompressed_sizes) {
+    /* Field 2: unencoded_byte_array_data_bytes (list<i64>) - optional,
+     * Parquet 2.9. Per-page total of BYTE_ARRAY value bytes assuming no
+     * encoding (length prefixes excluded). Emitted only for BYTE_ARRAY. */
+    if (builder->track_unencoded && builder->unencoded_bytes) {
         thrift_write_field_header(&enc, THRIFT_TYPE_LIST, 2);
-        thrift_write_list_begin(&enc, THRIFT_TYPE_I32, builder->num_pages);
+        thrift_write_list_begin(&enc, THRIFT_TYPE_I64, builder->num_pages);
         for (int32_t i = 0; i < builder->num_pages; i++) {
-            thrift_write_i32(&enc, builder->uncompressed_sizes[i]);
+            thrift_write_i64(&enc, builder->unencoded_bytes[i]);
         }
     }
 

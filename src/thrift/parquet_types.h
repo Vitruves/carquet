@@ -80,6 +80,23 @@ struct parquet_schema_element {
     /* Field 10: logicalType (modern logical type) */
     bool has_logical_type;
     carquet_logical_type_t logical_type;
+
+    /* Carquet extension (NOT part of the Parquet SchemaElement wire format):
+     * per-field key/value metadata mirroring Arrow's Field.custom_metadata,
+     * used for variable labels/descriptions. Emitted only into the
+     * "ARROW:schema" footer blob; never written to the Parquet schema itself.
+     * Owned by whoever populates it (see carquet_schema_set_field_metadata /
+     * store_schema_elements). NULL / 0 when the field carries no metadata. */
+    int32_t num_field_metadata;
+    parquet_key_value_t* field_metadata;
+
+    /* Carquet extension: an Arrow type refinement recovered from the
+     * "ARROW:schema" footer blob that the Parquet type system alone cannot
+     * express (e.g. 64-bit-offset LargeUtf8 / LargeBinary / LargeList).
+     * 0 (== CARQUET_ARROW_REFINE_NONE) when no refinement was recovered.
+     * Values mirror carquet_arrow_type_refinement_t. Read-only: never written
+     * to the Parquet schema. */
+    int32_t arrow_type_refinement;
 };
 
 /* ============================================================================
@@ -151,6 +168,30 @@ struct parquet_geospatial_statistics {
 typedef struct parquet_geospatial_statistics parquet_geospatial_statistics_t;
 
 /* ============================================================================
+ * Size Statistics (Parquet 2.9)
+ * ============================================================================
+ *
+ * ColumnMetaData field 16. Histograms are heap/arena-allocated; a length of 0
+ * means the corresponding optional list is absent.
+ */
+
+struct parquet_size_statistics {
+    /* Field 1: total unencoded BYTE_ARRAY value bytes (length prefixes
+     * excluded). Only meaningful for BYTE_ARRAY columns. */
+    bool has_unencoded_byte_array_data_bytes;
+    int64_t unencoded_byte_array_data_bytes;
+
+    /* Field 2: repetition_level_histogram (length max_rep_level + 1). */
+    int64_t* repetition_level_histogram;
+    int32_t repetition_level_histogram_len;
+
+    /* Field 3: definition_level_histogram (length max_def_level + 1). */
+    int64_t* definition_level_histogram;
+    int32_t definition_level_histogram_len;
+};
+typedef struct parquet_size_statistics parquet_size_statistics_t;
+
+/* ============================================================================
  * Page Encoding Stats
  * ============================================================================
  */
@@ -220,6 +261,10 @@ struct parquet_column_metadata {
     /* Field 15: bloom_filter_length */
     bool has_bloom_filter_length;
     int32_t bloom_filter_length;
+
+    /* Field 16: size_statistics (Parquet 2.9) */
+    bool has_size_statistics;
+    parquet_size_statistics_t size_statistics;
 
     /* Field 17: geospatial_statistics (GEOMETRY / GEOGRAPHY) */
     bool has_geospatial_statistics;
@@ -339,8 +384,12 @@ struct parquet_file_metadata {
     /* Field 6: created_by */
     char* created_by;
 
-    /* Field 7: column_orders (TYPE_ORDER entries) */
+    /* Field 7: column_orders (one ColumnOrder union per column).
+     * column_order_types[i] holds the set union member's Thrift field id
+     * (1 = TypeDefinedOrder, the only member the spec defines). NULL when the
+     * footer omitted field 7; then only num_column_orders is meaningful. */
     int32_t num_column_orders;
+    int16_t* column_order_types;
 
     /* Field 8: encryption_algorithm (we skip for now) */
 

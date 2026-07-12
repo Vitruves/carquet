@@ -17,12 +17,14 @@
 /* ---- Arrow flatbuf constants (format/Message.fbs, Schema.fbs, Type.fbs) -- */
 enum { ARROW_METADATA_V5 = 4 };
 enum { MSG_HEADER_SCHEMA = 1 };
-/* Type union tags */
+/* Type union tags (format/Type.fbs) */
 enum {
     AT_NULL = 1, AT_INT = 2, AT_FLOAT = 3, AT_BINARY = 4, AT_UTF8 = 5,
     AT_BOOL = 6, AT_DECIMAL = 7, AT_DATE = 8, AT_TIME = 9, AT_TIMESTAMP = 10,
-    AT_FIXEDSIZEBINARY = 15
+    AT_LIST = 12, AT_STRUCT = 13, AT_FIXEDSIZEBINARY = 15, AT_MAP = 17
 };
+/* Deepest schema nesting the builder will emit (guards runaway recursion). */
+enum { ARROW_MAX_NEST_DEPTH = 100 };
 /* TimeUnit: SEC=0 MILLI=1 MICRO=2 NANO=3 ; DateUnit DAY=0 ; Precision DOUBLE=2 SINGLE=1 */
 
 /* ============================================================================
@@ -317,6 +319,212 @@ static int build_arrow_type(fbb* b, const parquet_schema_element_t* e,
     }
 }
 
+/* Build the Arrow Field.custom_metadata [KeyValue] vector for one field.
+ * Returns the vector offset, or 0 when the field has no metadata (the caller
+ * then leaves slot 6 unset). Sets b->oom on allocation failure. */
+static size_t build_field_metadata(fbb* b, const parquet_key_value_t* kv,
+                                   int32_t n) {
+    if (n <= 0 || !kv) return 0;
+    size_t* kv_offs = (size_t*)carquet_mem_malloc((size_t)n * sizeof(size_t));
+    if (!kv_offs) { b->oom = 1; return 0; }
+    for (int32_t i = 0; i < n; i++) {
+        /* Strings/tables are built before the vector that references them. */
+        size_t key_off = fbb_create_string(b, kv[i].key ? kv[i].key : "");
+        size_t val_off = kv[i].value ? fbb_create_string(b, kv[i].value) : 0;
+        fbb_start_table(b, 2);              /* KeyValue { key, value } */
+        fbb_add_uoffset(b, 0, key_off);
+        if (val_off) fbb_add_uoffset(b, 1, val_off);
+        kv_offs[i] = fbb_end_table(b);
+    }
+    fbb_start_vector(b, 4, (size_t)n, 4);
+    for (int32_t i = n - 1; i >= 0; i--) fbb_prepend_uoffset(b, kv_offs[i]);
+    size_t vec = fbb_end_vector(b, (size_t)n);
+    carquet_mem_free(kv_offs);
+    return vec;
+}
+
+/* ============================================================================
+ * Recursive Field emission (nested LIST / MAP / STRUCT)
+ * ============================================================================
+ *
+ * The Parquet schema arrives flattened in depth-first pre-order; the tree is
+ * reconstructed from each element's num_children (via a precomputed parent[]
+ * map). We walk it and emit Arrow Fields, collapsing the intermediate levels
+ * that Arrow does not model: a Parquet 3-level LIST becomes Arrow List<child>,
+ * and a Parquet MAP becomes Arrow Map<entries:struct<key,value>>.
+ */
+
+/* Fill out[] with the direct children of `node` (ascending index == Parquet
+ * declaration order == Arrow field order). Returns the child count. */
+static int32_t collect_children(const int32_t* parent, int32_t num_elements,
+                                int32_t node, int32_t* out, int32_t max_out) {
+    int32_t n = 0;
+    for (int32_t j = 0; j < num_elements; j++) {
+        if (parent[j] == node) {
+            if (n < max_out) out[n] = j;
+            n++;
+        }
+    }
+    return n;
+}
+
+/* Emit the trailing slots common to every group Field: the (empty or single-
+ * slot) type table plus name and custom_metadata, then the Field table with
+ * its children vector. Assumes the children vector `kids_vec` is already
+ * built. `type_ntab_slots` is the number of slots in the union type table. */
+static size_t emit_group_field(fbb* b, const parquet_schema_element_t* e,
+                               uint8_t type_tag, int type_tab_slots,
+                               size_t kids_vec, int nullable, int* ok) {
+    fbb_start_table(b, type_tab_slots);
+    size_t type_off = fbb_end_table(b);  /* List/Struct/Map: no set fields */
+    size_t name_off = e->name ? fbb_create_string(b, e->name) : 0;
+    size_t meta_off = build_field_metadata(b, e->field_metadata,
+                                           e->num_field_metadata);
+    if (b->oom) { *ok = 0; return 0; }
+
+    fbb_start_table(b, 7);
+    if (name_off) fbb_add_uoffset(b, 0, name_off);
+    if (nullable) fbb_add_u8(b, 1, 1);
+    fbb_add_u8(b, 2, type_tag);
+    fbb_add_uoffset(b, 3, type_off);
+    fbb_add_uoffset(b, 5, kids_vec);          /* Field.children */
+    if (meta_off) fbb_add_uoffset(b, 6, meta_off);
+    return fbb_end_table(b);
+}
+
+/* Build one Arrow Field for schema element `idx` and return its offset.
+ * `force_nonnull` overrides nullability (Arrow map keys / entries structs must
+ * be non-nullable). Sets *ok = 0 and returns 0 on any unsupported shape. */
+static size_t build_field(fbb* b, const parquet_schema_element_t* schema,
+                          int32_t num_elements, const int32_t* parent,
+                          int32_t idx, int force_nonnull, int depth, int* ok) {
+    if (depth > ARROW_MAX_NEST_DEPTH) { *ok = 0; return 0; }
+    const parquet_schema_element_t* e = &schema[idx];
+
+    int32_t kids[64];
+    int32_t nk = collect_children(parent, num_elements, idx, kids, 64);
+    int nullable = force_nonnull ? 0
+        : !(e->has_repetition && e->repetition_type == CARQUET_REPETITION_REQUIRED);
+
+    if (nk == 0) {
+        /* Primitive leaf — identical to the historical flat emission. */
+        uint8_t tag = 0; size_t toff = 0;
+        if (!build_arrow_type(b, e, &tag, &toff)) { *ok = 0; return 0; }
+        size_t name_off = e->name ? fbb_create_string(b, e->name) : 0;
+        size_t meta_off = build_field_metadata(b, e->field_metadata,
+                                               e->num_field_metadata);
+        if (b->oom) { *ok = 0; return 0; }
+        fbb_start_table(b, 7);
+        if (name_off) fbb_add_uoffset(b, 0, name_off);
+        if (nullable) fbb_add_u8(b, 1, 1);
+        fbb_add_u8(b, 2, tag);
+        fbb_add_uoffset(b, 3, toff);
+        if (meta_off) fbb_add_uoffset(b, 6, meta_off);
+        return fbb_end_table(b);
+    }
+
+    int is_list = (e->has_logical_type && e->logical_type.id == CARQUET_LOGICAL_LIST) ||
+                  (e->has_converted_type && e->converted_type == CARQUET_CONVERTED_LIST);
+    int is_map = (e->has_logical_type && e->logical_type.id == CARQUET_LOGICAL_MAP) ||
+                 (e->has_converted_type &&
+                  (e->converted_type == CARQUET_CONVERTED_MAP ||
+                   e->converted_type == CARQUET_CONVERTED_MAP_KEY_VALUE));
+
+    if (is_list) {
+        /* group(LIST) → repeated group → element. Arrow List<element>. */
+        if (nk != 1) { *ok = 0; return 0; }
+        int32_t elem_kids[4];
+        int32_t nek = collect_children(parent, num_elements, kids[0], elem_kids, 4);
+        if (nek != 1) { *ok = 0; return 0; }
+        size_t elem_off = build_field(b, schema, num_elements, parent,
+                                      elem_kids[0], 0, depth + 1, ok);
+        if (!*ok) return 0;
+        fbb_start_vector(b, 4, 1, 4);
+        fbb_prepend_uoffset(b, elem_off);
+        size_t kids_vec = fbb_end_vector(b, 1);
+        return emit_group_field(b, e, AT_LIST, 0, kids_vec, nullable, ok);
+    }
+
+    if (is_map) {
+        /* group(MAP) → repeated key_value → {key, value?}.
+         * Arrow Map<entries: struct<key, value>> (entries non-nullable). */
+        if (nk != 1) { *ok = 0; return 0; }
+        int32_t kv = kids[0];
+        int32_t kv_kids[4];
+        int32_t nkv = collect_children(parent, num_elements, kv, kv_kids, 4);
+        if (nkv < 1 || nkv > 2) { *ok = 0; return 0; }
+        size_t key_off = build_field(b, schema, num_elements, parent,
+                                     kv_kids[0], 1, depth + 1, ok);
+        if (!*ok) return 0;
+        size_t val_off = 0;
+        if (nkv == 2) {
+            val_off = build_field(b, schema, num_elements, parent,
+                                  kv_kids[1], 0, depth + 1, ok);
+            if (!*ok) return 0;
+        }
+        /* entries struct children vector [key(, value)] */
+        fbb_start_vector(b, 4, (size_t)nkv, 4);
+        if (nkv == 2) fbb_prepend_uoffset(b, val_off);
+        fbb_prepend_uoffset(b, key_off);
+        size_t struct_kids = fbb_end_vector(b, (size_t)nkv);
+        /* entries struct field (non-nullable), named after the key_value group */
+        const parquet_schema_element_t* kve = &schema[kv];
+        fbb_start_table(b, 0);
+        size_t struct_type = fbb_end_table(b);
+        size_t entries_name = fbb_create_string(b, kve->name ? kve->name : "key_value");
+        if (b->oom) { *ok = 0; return 0; }
+        fbb_start_table(b, 7);
+        fbb_add_uoffset(b, 0, entries_name);
+        fbb_add_u8(b, 2, AT_STRUCT);
+        fbb_add_uoffset(b, 3, struct_type);
+        fbb_add_uoffset(b, 5, struct_kids);
+        size_t entries_off = fbb_end_table(b);
+        /* Map field children vector [entries]. */
+        fbb_start_vector(b, 4, 1, 4);
+        fbb_prepend_uoffset(b, entries_off);
+        size_t map_kids = fbb_end_vector(b, 1);
+        /* Map type table carries a keysSorted bool (slot 0, default false). */
+        return emit_group_field(b, e, AT_MAP, 1, map_kids, nullable, ok);
+    }
+
+    /* Plain STRUCT group. */
+    {
+        size_t* coffs = (size_t*)carquet_mem_malloc((size_t)nk * sizeof(size_t));
+        if (!coffs) { b->oom = 1; *ok = 0; return 0; }
+        for (int32_t i = 0; i < nk; i++) {
+            coffs[i] = build_field(b, schema, num_elements, parent,
+                                   kids[i], 0, depth + 1, ok);
+            if (!*ok) { carquet_mem_free(coffs); return 0; }
+        }
+        fbb_start_vector(b, 4, (size_t)nk, 4);
+        for (int32_t i = nk - 1; i >= 0; i--) fbb_prepend_uoffset(b, coffs[i]);
+        size_t kids_vec = fbb_end_vector(b, (size_t)nk);
+        carquet_mem_free(coffs);
+        return emit_group_field(b, e, AT_STRUCT, 0, kids_vec, nullable, ok);
+    }
+}
+
+/* Compute parent[i] for every element from the flattened num_children layout
+ * (depth-first pre-order). Returns 0 on allocation failure. */
+static int compute_parents(const parquet_schema_element_t* schema,
+                           int32_t num_elements, int32_t* parent) {
+    int32_t* st_idx = (int32_t*)carquet_mem_malloc((size_t)num_elements * sizeof(int32_t));
+    int32_t* st_rem = (int32_t*)carquet_mem_malloc((size_t)num_elements * sizeof(int32_t));
+    if (!st_idx || !st_rem) { carquet_mem_free(st_idx); carquet_mem_free(st_rem); return 0; }
+    int sp = 0;
+    for (int32_t i = 0; i < num_elements; i++) {
+        while (sp > 0 && st_rem[sp - 1] == 0) sp--;
+        if (sp > 0) { parent[i] = st_idx[sp - 1]; st_rem[sp - 1]--; }
+        else parent[i] = -1;
+        if (schema[i].num_children > 0) {
+            st_idx[sp] = i; st_rem[sp] = schema[i].num_children; sp++;
+        }
+    }
+    carquet_mem_free(st_idx);
+    carquet_mem_free(st_rem);
+    return 1;
+}
+
 /* ============================================================================
  * base64
  * ============================================================================
@@ -353,41 +561,36 @@ char* carquet_build_arrow_schema_b64(
 
     if (!schema || num_elements < 2) return NULL;
 
-    /* Flat-only: every element after the root must be a primitive leaf with
-     * REQUIRED/OPTIONAL repetition. Anything nested aborts (return NULL) so we
-     * never emit a schema that disagrees with the Parquet schema. */
-    int32_t nfields = num_elements - 1;
-    for (int32_t i = 1; i < num_elements; i++) {
-        const parquet_schema_element_t* e = &schema[i];
-        if (!e->has_type || e->num_children != 0 || !e->name) return NULL;
-        if (e->has_repetition &&
-            e->repetition_type == CARQUET_REPETITION_REPEATED) return NULL;
+    /* Reconstruct the tree (parent per element) from the flattened layout. */
+    int32_t* parent = (int32_t*)carquet_mem_malloc((size_t)num_elements * sizeof(int32_t));
+    if (!parent) return NULL;
+    if (!compute_parents(schema, num_elements, parent)) {
+        carquet_mem_free(parent);
+        return NULL;
     }
 
-    fbb b;
-    if (!fbb_init(&b)) return NULL;
+    /* Top-level fields are the root's direct children. */
+    int32_t* top = (int32_t*)carquet_mem_malloc((size_t)num_elements * sizeof(int32_t));
+    if (!top) { carquet_mem_free(parent); return NULL; }
+    int32_t nfields = collect_children(parent, num_elements, 0, top, num_elements);
+    if (nfields < 1) { carquet_mem_free(top); carquet_mem_free(parent); return NULL; }
 
-    /* Build each Field (leaves first is automatic: type, name, then table). */
+    fbb b;
+    if (!fbb_init(&b)) { carquet_mem_free(top); carquet_mem_free(parent); return NULL; }
+
+    /* Build each top-level Field (recursively descending into nested groups).
+     * Any element we cannot faithfully map to Arrow aborts the whole emission
+     * (return NULL) so we never write a schema that disagrees with Parquet. */
     size_t* field_offs = (size_t*)carquet_mem_malloc((size_t)nfields * sizeof(size_t));
-    if (!field_offs) { fbb_free(&b); return NULL; }
+    if (!field_offs) { fbb_free(&b); carquet_mem_free(top); carquet_mem_free(parent); return NULL; }
 
     int ok = 1;
     for (int32_t i = 0; i < nfields && ok; i++) {
-        const parquet_schema_element_t* e = &schema[i + 1];
-        uint8_t type_tag = 0;
-        size_t type_off = 0;
-        if (!build_arrow_type(&b, e, &type_tag, &type_off)) { ok = 0; break; }
-        size_t name_off = fbb_create_string(&b, e->name);
-        int nullable = !(e->has_repetition &&
-                         e->repetition_type == CARQUET_REPETITION_REQUIRED);
-
-        fbb_start_table(&b, 7);
-        fbb_add_uoffset(&b, 0, name_off);
-        if (nullable) fbb_add_u8(&b, 1, 1);
-        fbb_add_u8(&b, 2, type_tag);
-        fbb_add_uoffset(&b, 3, type_off);
-        field_offs[i] = fbb_end_table(&b);
+        field_offs[i] = build_field(&b, schema, num_elements, parent,
+                                    top[i], 0, 0, &ok);
     }
+    carquet_mem_free(top);
+    carquet_mem_free(parent);
     if (!ok || b.oom) { carquet_mem_free(field_offs); fbb_free(&b); return NULL; }
 
     /* fields vector */

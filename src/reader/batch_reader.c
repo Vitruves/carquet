@@ -59,6 +59,17 @@ typedef struct carquet_column_data {
     const uint8_t* dictionary_data; /* Pointer to dictionary bytes (view, not owned) */
     int32_t dictionary_count;       /* Number of dictionary entries */
     const uint32_t* dictionary_offsets; /* Offset table for BYTE_ARRAY (view) */
+
+    /* Nested (single-level LIST/MAP-leaf) reconstruction. When list_offsets is
+     * non-NULL this column is a list: `data`/`null_bitmap`/`num_values` describe
+     * the flattened child (element) array (Arrow child layout — values with a
+     * validity bitmap), and list_offsets[i]..list_offsets[i+1] delimit list i in
+     * that child array. list_validity (may be NULL) is the list-level null
+     * bitmap. num_lists is the logical row count. */
+    int32_t* list_offsets;      /* [num_lists + 1] Arrow list offsets, or NULL */
+    uint8_t* list_validity;     /* list-level validity bitmap (LSB, present=1), or NULL */
+    int64_t  num_lists;         /* number of logical rows (lists) */
+    int16_t  max_rep_level;     /* > 0 marks a repeated (list) column */
 } carquet_column_data_t;
 
 /* Pre-allocated column buffer pool for reuse across batches */
@@ -69,6 +80,13 @@ typedef struct carquet_column_pool {
     size_t bitmap_capacity;     /* Capacity in bytes */
     int16_t* def_levels;        /* Pre-allocated def levels buffer */
     size_t def_levels_capacity; /* Capacity in elements */
+    /* Nested (list) reconstruction scratch/output buffers */
+    int16_t* rep_levels;        /* Pre-allocated rep levels buffer */
+    size_t rep_levels_capacity; /* Capacity in elements */
+    int32_t* list_offsets;      /* Pre-allocated list offsets buffer */
+    size_t list_offsets_capacity; /* Capacity in elements */
+    uint8_t* list_validity;     /* Pre-allocated list-level validity bitmap */
+    size_t list_validity_capacity; /* Capacity in bytes */
 } carquet_column_pool_t;
 
 struct carquet_row_batch {
@@ -164,7 +182,9 @@ struct carquet_batch_reader {
     carquet_physical_type_t* projected_types;
     int32_t* projected_type_lengths;
     int16_t* projected_max_defs;
+    int16_t* projected_max_reps;
     size_t* projected_value_sizes;
+    bool has_repeated;           /* true if any projected column has max_rep > 0 */
 
     /* Reading state */
     int32_t current_row_group;
@@ -305,6 +325,37 @@ static int16_t* pool_ensure_def_levels(carquet_column_pool_t* pool, size_t count
     return pool->def_levels;
 }
 
+static int16_t* pool_ensure_rep_levels(carquet_column_pool_t* pool, size_t count) {
+    if (count <= pool->rep_levels_capacity) {
+        return pool->rep_levels;
+    }
+    carquet_mem_free(pool->rep_levels);
+    pool->rep_levels = carquet_mem_malloc(sizeof(int16_t) * count);
+    pool->rep_levels_capacity = pool->rep_levels ? count : 0;
+    return pool->rep_levels;
+}
+
+static int32_t* pool_ensure_list_offsets(carquet_column_pool_t* pool, size_t count) {
+    if (count <= pool->list_offsets_capacity) {
+        return pool->list_offsets;
+    }
+    carquet_mem_free(pool->list_offsets);
+    pool->list_offsets = carquet_mem_malloc(sizeof(int32_t) * count);
+    pool->list_offsets_capacity = pool->list_offsets ? count : 0;
+    return pool->list_offsets;
+}
+
+static uint8_t* pool_ensure_list_validity(carquet_column_pool_t* pool, size_t bytes) {
+    if (bytes <= pool->list_validity_capacity) {
+        memset(pool->list_validity, 0, bytes);
+        return pool->list_validity;
+    }
+    carquet_mem_free(pool->list_validity);
+    pool->list_validity = carquet_mem_calloc(1, bytes);
+    pool->list_validity_capacity = pool->list_validity ? bytes : 0;
+    return pool->list_validity;
+}
+
 static bool column_can_zero_copy_batch(
     const carquet_column_reader_t* col_reader,
     carquet_physical_type_t type,
@@ -394,6 +445,7 @@ static void read_projected_column(
     carquet_row_batch_t* new_batch,
     int32_t col_i,
     int64_t rows_to_read,
+    bool allow_zero_copy,
     bool* read_error) {
 
     if (*read_error) {
@@ -427,7 +479,8 @@ static void read_projected_column(
      * - Entire page slice fits in this batch
      * - Not in dictionary-preserve mode (indices layout differs)
      */
-    bool try_zero_copy = (max_def == 0) &&
+    bool try_zero_copy = allow_zero_copy &&
+                         (max_def == 0) &&
                          (!col_reader->page_loaded) &&
                          !use_dict_preserve;
 
@@ -438,7 +491,7 @@ static void read_projected_column(
         (void)dummy_read;
     }
 
-    bool use_zero_copy = !use_dict_preserve &&
+    bool use_zero_copy = allow_zero_copy && !use_dict_preserve &&
                          column_can_zero_copy_batch(
                              col_reader, col_data->type, max_def, rows_to_read);
 
@@ -548,6 +601,165 @@ static void read_projected_column(
     if (def_levels && col_data->null_bitmap) {
         carquet_dispatch_build_null_bitmap(def_levels, values_read,
                                            max_def, col_data->null_bitmap);
+    }
+}
+
+/* ============================================================================
+ * Nested (single-level LIST) reconstruction
+ * ============================================================================
+ * Reconstructs an Arrow List<T> layout for a repeated column (max_rep == 1) by
+ * reading the entire column chunk's leaf slots (values + def/rep levels) and
+ * folding them into: a flattened child (element) array, its validity bitmap,
+ * a list-offsets buffer, and a list-level validity bitmap.
+ *
+ * This handles the shapes produced by carquet_schema_add_list (and each MAP
+ * leaf), i.e. a single repeated ancestor. Deeper nesting (max_rep > 1) is not
+ * supported and sets *read_error.
+ *
+ * Definition-level bands for a single-level list (max_def = D):
+ *   - a slot is an *element* of its list when def >= elem_exists (D-1 if the
+ *     element leaf is OPTIONAL, else D);
+ *   - the element's value is *present* when def == D (else it is a null element);
+ *   - a rep==0 slot with def == 0 is a *null list* (only reachable when an
+ *     optional ancestor sits above the repeated group).
+ */
+static void read_nested_list_column(
+    carquet_batch_reader_t* batch_reader,
+    carquet_row_batch_t* new_batch,
+    int32_t col_i,
+    int64_t expected_rows,
+    bool* read_error) {
+
+    if (*read_error) {
+        return;
+    }
+
+    carquet_column_reader_t* col_reader = batch_reader->col_readers[col_i];
+    carquet_column_data_t* col_data = &new_batch->columns[col_i];
+    carquet_column_pool_t* pool = &batch_reader->col_pools[col_i];
+    size_t value_size = batch_reader->projected_value_sizes[col_i];
+    int16_t max_def = batch_reader->projected_max_defs[col_i];
+    int16_t max_rep = batch_reader->projected_max_reps[col_i];
+
+    col_data->type = batch_reader->projected_types[col_i];
+    col_data->type_length = batch_reader->projected_type_lengths[col_i];
+    col_data->max_rep_level = max_rep;
+
+    /* Only single-level lists are supported in this release. */
+    if (max_rep != 1 || value_size == 0 || max_def < 1) {
+        *read_error = true;
+        return;
+    }
+
+    /* Element-optional flag from the leaf node's own repetition. */
+    const carquet_schema_t* schema = batch_reader->reader->schema;
+    int32_t file_col = batch_reader->projected_columns[col_i];
+    const parquet_schema_element_t* leaf = &schema->elements[schema->leaf_indices[file_col]];
+    bool elem_optional = (leaf->repetition_type == CARQUET_REPETITION_OPTIONAL);
+    int16_t elem_exists = elem_optional ? (int16_t)(max_def - 1) : max_def;
+
+    /* Total leaf slots in this chunk = number of (def, rep) entries. */
+    int64_t total_slots = carquet_column_remaining(col_reader);
+    if (total_slots < 0) { *read_error = true; return; }
+
+    /* Bound allocations. */
+    if (total_slots > 0 &&
+        value_size > CARQUET_MAX_BATCH_ALLOC / (size_t)total_slots) {
+        *read_error = true;
+        return;
+    }
+
+    size_t slots_alloc = total_slots > 0 ? (size_t)total_slots : 1;
+    void* data = pool_ensure_data(pool, value_size * slots_alloc);
+    int16_t* def_levels = pool_ensure_def_levels(pool, slots_alloc);
+    int16_t* rep_levels = pool_ensure_rep_levels(pool, slots_alloc);
+    if (!data || !def_levels || !rep_levels) { *read_error = true; return; }
+
+    int64_t slots = carquet_column_read_batch(
+        col_reader, data, total_slots, def_levels, rep_levels);
+    if (slots < 0) { *read_error = true; return; }
+
+    /* Pass 1: count lists (rep==0), child elements (def >= elem_exists). */
+    int64_t num_lists = 0, child_count = 0;
+    for (int64_t j = 0; j < slots; j++) {
+        if (rep_levels[j] == 0) num_lists++;
+        if (def_levels[j] >= elem_exists) child_count++;
+    }
+    if (num_lists > INT32_MAX || child_count > INT32_MAX) {
+        *read_error = true;
+        return;
+    }
+    (void)expected_rows;  /* num_lists is authoritative; equals the RG row count */
+
+    col_data->data = data;
+    col_data->data_capacity = value_size * slots_alloc;
+    col_data->ownership = CARQUET_DATA_VIEW;
+    col_data->num_values = child_count;
+    col_data->num_lists = num_lists;
+
+    /* Offsets buffer (num_lists + 1). */
+    int32_t* offsets = pool_ensure_list_offsets(pool, (size_t)num_lists + 1);
+    if (!offsets) { *read_error = true; return; }
+    col_data->list_offsets = offsets;
+
+    /* List-level validity: only materialized if some list is null. */
+    uint8_t* list_valid = pool_ensure_list_validity(pool, ((size_t)num_lists + 7) / 8 + 1);
+    if (!list_valid) { *read_error = true; return; }
+
+    /* Child-element validity: only needed when the element can be null. */
+    uint8_t* child_valid = NULL;
+    if (elem_optional) {
+        child_valid = pool_ensure_bitmap(pool, ((size_t)child_count + 7) / 8 + 1);
+        if (!child_valid) { *read_error = true; return; }
+    }
+    col_data->null_bitmap = child_valid;
+
+    /* Pass 2: build offsets + list validity. */
+    int64_t li = -1, cc = 0;
+    bool any_list_null = false;
+    for (int64_t j = 0; j < slots; j++) {
+        if (rep_levels[j] == 0) {
+            li++;
+            offsets[li] = (int32_t)cc;
+            if (def_levels[j] > 0) {
+                list_valid[li >> 3] |= (uint8_t)(1u << (li & 7));
+            } else {
+                any_list_null = true;
+            }
+        }
+        if (def_levels[j] >= elem_exists) cc++;
+    }
+    offsets[num_lists] = (int32_t)cc;
+    col_data->list_validity = any_list_null ? list_valid : NULL;
+
+    /* Pass 3: expand dense (present-only) values into child-slot positions,
+     * back-to-front so it can run in place, and build child validity. The
+     * reader wrote `child_present` dense values at the front of `data`. */
+    if (child_count > 0) {
+        int64_t child_present = 0;
+        for (int64_t j = 0; j < slots; j++) {
+            if (def_levels[j] == max_def) child_present++;
+        }
+        uint8_t* bytes = (uint8_t*)data;
+        /* child index for each element slot, walked back-to-front */
+        int64_t ci = child_count - 1;
+        int64_t src = child_present - 1;
+        for (int64_t j = slots - 1; j >= 0; j--) {
+            if (def_levels[j] < elem_exists) continue;  /* not an element */
+            bool present = (def_levels[j] == max_def);
+            uint8_t* dp = bytes + (size_t)ci * value_size;
+            if (present) {
+                uint8_t* sp = bytes + (size_t)src * value_size;
+                if (sp != dp) memmove(dp, sp, value_size);
+                src--;
+                if (child_valid) {
+                    child_valid[ci >> 3] |= (uint8_t)(1u << (ci & 7));
+                }
+            } else {
+                memset(dp, 0, value_size);
+            }
+            ci--;
+        }
     }
 }
 
@@ -723,11 +935,15 @@ carquet_batch_reader_t* carquet_batch_reader_create(
                                                   (size_t)batch_reader->num_projected);
     batch_reader->projected_max_defs = carquet_mem_malloc(sizeof(int16_t) *
                                               (size_t)batch_reader->num_projected);
+    batch_reader->projected_max_reps = carquet_mem_malloc(sizeof(int16_t) *
+                                              (size_t)batch_reader->num_projected);
     batch_reader->projected_value_sizes = carquet_mem_malloc(sizeof(size_t) *
                                                  (size_t)batch_reader->num_projected);
     if (!batch_reader->projected_types || !batch_reader->projected_type_lengths ||
-        !batch_reader->projected_max_defs || !batch_reader->projected_value_sizes) {
+        !batch_reader->projected_max_defs || !batch_reader->projected_max_reps ||
+        !batch_reader->projected_value_sizes) {
         carquet_mem_free(batch_reader->projected_value_sizes);
+        carquet_mem_free(batch_reader->projected_max_reps);
         carquet_mem_free(batch_reader->projected_max_defs);
         carquet_mem_free(batch_reader->projected_type_lengths);
         carquet_mem_free(batch_reader->projected_types);
@@ -740,6 +956,7 @@ carquet_batch_reader_t* carquet_batch_reader_create(
 
     {
         const carquet_schema_t* schema = carquet_reader_schema(reader);
+        batch_reader->has_repeated = false;
         for (int32_t i = 0; i < batch_reader->num_projected; i++) {
             int32_t file_col_idx = batch_reader->projected_columns[i];
             int32_t schema_idx = schema->leaf_indices[file_col_idx];
@@ -749,6 +966,10 @@ carquet_batch_reader_t* carquet_batch_reader_create(
                 elem->has_type ? elem->type : CARQUET_PHYSICAL_BYTE_ARRAY;
             batch_reader->projected_type_lengths[i] = elem->type_length;
             batch_reader->projected_max_defs[i] = schema->max_def_levels[file_col_idx];
+            batch_reader->projected_max_reps[i] = schema->max_rep_levels[file_col_idx];
+            if (batch_reader->projected_max_reps[i] > 0) {
+                batch_reader->has_repeated = true;
+            }
             batch_reader->projected_value_sizes[i] = get_type_size(
                 batch_reader->projected_types[i],
                 batch_reader->projected_type_lengths[i]);
@@ -760,6 +981,7 @@ carquet_batch_reader_t* carquet_batch_reader_create(
                                       sizeof(carquet_column_pool_t));
     if (!batch_reader->col_pools) {
         carquet_mem_free(batch_reader->projected_value_sizes);
+        carquet_mem_free(batch_reader->projected_max_reps);
         carquet_mem_free(batch_reader->projected_max_defs);
         carquet_mem_free(batch_reader->projected_type_lengths);
         carquet_mem_free(batch_reader->projected_types);
@@ -1913,7 +2135,7 @@ static carquet_status_t batch_reader_next_filtered(
 
     bool read_error = false;
     for (int32_t i = 0; i < br->num_projected; i++) {
-        read_projected_column(br, new_batch, i, rows_to_read, &read_error);
+        read_projected_column(br, new_batch, i, rows_to_read, true, &read_error);
     }
     if (read_error) {
         return CARQUET_ERROR_DECODE;
@@ -2002,12 +2224,142 @@ int64_t carquet_batch_reader_rows_skipped(
     return reader->rows_skipped;
 }
 
+/* ============================================================================
+ * Nested batch driver
+ * ============================================================================
+ * Used when any projected column is repeated (max_rep > 0). Reads a whole row
+ * group per batch (the natural granularity that avoids splitting a logical row
+ * across batches) and reconstructs list columns via read_nested_list_column().
+ * Flat columns in the same projection are read normally. Page filters are not
+ * combined with nested reads in this release.
+ */
+static carquet_status_t batch_reader_next_nested(
+    carquet_batch_reader_t* batch_reader,
+    carquet_row_batch_t** batch) {
+
+    carquet_error_t err = CARQUET_ERROR_INIT;
+
+    /* Advance to the next row group when the current one is exhausted.
+     *
+     * Repeated columns are read a whole row group at a time, so a page filter
+     * is composed at ROW-GROUP granularity: a row group whose statistics prove
+     * no row can match is skipped entirely; a row group with any match is read
+     * in full (sub-row-group page ranges are not applied to repeated leaves,
+     * whose slot counts do not align with logical row ranges). The user-level
+     * row_group_filter callback is honoured the same way. */
+    bool have_page_filter = batch_reader->filter_clauses &&
+                            batch_reader->filter_clause_count > 0;
+    if (batch_reader->current_row_group < 0 ||
+        !carquet_column_has_next(batch_reader->col_readers[0])) {
+
+        int32_t num_row_groups = carquet_reader_num_row_groups(batch_reader->reader);
+        for (;;) {
+            batch_reader->current_row_group++;
+            if (batch_reader->current_row_group >= num_row_groups) {
+                *batch = NULL;
+                return CARQUET_ERROR_END_OF_DATA;
+            }
+            if (batch_reader->config.row_group_filter &&
+                !batch_reader->config.row_group_filter(
+                    batch_reader->reader, batch_reader->current_row_group,
+                    batch_reader->config.row_group_filter_ctx)) {
+                continue;
+            }
+            if (have_page_filter) {
+                carquet_row_range_list_t ranges;
+                carquet_row_range_list_init(&ranges);
+                carquet_status_t fst = carquet_page_filter_eval_row_group(
+                    batch_reader->reader, batch_reader->current_row_group,
+                    batch_reader->filter_clauses, batch_reader->filter_clause_count,
+                    &ranges, &err);
+                if (fst != CARQUET_OK) {
+                    carquet_row_range_list_destroy(&ranges);
+                    return fst;
+                }
+                int64_t matched = ranges.total_rows;
+                carquet_row_range_list_destroy(&ranges);
+                if (matched == 0) {
+                    continue;  /* statistics prove the row group has no match */
+                }
+            }
+            break;
+        }
+        carquet_status_t status = open_row_group_readers(
+            batch_reader, batch_reader->current_row_group, &err);
+        if (status != CARQUET_OK) {
+            return status;
+        }
+    }
+
+    /* Reuse or allocate batch struct. */
+    carquet_row_batch_t* new_batch = batch_reader->cached_batch;
+    if (!new_batch) {
+        new_batch = carquet_mem_calloc(1, sizeof(carquet_row_batch_t));
+        if (!new_batch) return CARQUET_ERROR_OUT_OF_MEMORY;
+        if (carquet_arena_init(&new_batch->arena) != CARQUET_OK) {
+            carquet_mem_free(new_batch);
+            return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
+        new_batch->columns = carquet_arena_calloc(&new_batch->arena,
+            batch_reader->num_projected, sizeof(carquet_column_data_t));
+        if (!new_batch->columns) {
+            carquet_arena_destroy(&new_batch->arena);
+            carquet_mem_free(new_batch);
+            return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
+        new_batch->pooled = true;
+        batch_reader->cached_batch = new_batch;
+    }
+
+    memset(new_batch->columns, 0,
+           sizeof(carquet_column_data_t) * batch_reader->num_projected);
+    new_batch->num_columns = batch_reader->num_projected;
+
+    int64_t rg_rows =
+        batch_reader->reader->metadata.row_groups[batch_reader->current_row_group].num_rows;
+    if (rg_rows <= 0) {
+        new_batch->num_rows = 0;
+        *batch = new_batch;
+        return CARQUET_OK;
+    }
+
+    bool read_error = false;
+    for (int32_t i = 0; i < batch_reader->num_projected; i++) {
+        if (batch_reader->projected_max_reps[i] == 0) {
+            read_projected_column(batch_reader, new_batch, i, rg_rows, false, &read_error);
+        } else if (batch_reader->projected_max_reps[i] == 1) {
+            read_nested_list_column(batch_reader, new_batch, i, rg_rows, &read_error);
+        } else {
+            CARQUET_SET_ERROR(&err, CARQUET_ERROR_NOT_IMPLEMENTED,
+                "Batch reader: nested column depth > 1 (max_rep=%d) not supported",
+                batch_reader->projected_max_reps[i]);
+            return CARQUET_ERROR_NOT_IMPLEMENTED;
+        }
+        if (read_error) {
+            CARQUET_SET_ERROR(&err, CARQUET_ERROR_INTERNAL,
+                "Batch reader: failed to read nested column %d", i);
+            return CARQUET_ERROR_INTERNAL;
+        }
+    }
+
+    new_batch->num_rows = rg_rows;
+    batch_reader->total_rows_read += rg_rows;
+    *batch = new_batch;
+    return CARQUET_OK;
+}
+
 carquet_status_t carquet_batch_reader_next(
     carquet_batch_reader_t* batch_reader,
     carquet_row_batch_t** batch) {
 
     /* batch_reader and batch are nonnull per API contract */
     carquet_error_t err = CARQUET_ERROR_INIT;
+
+    /* Repeated (LIST/MAP-leaf) columns use the dedicated nested driver, which
+     * reconstructs Arrow list layout a whole row group at a time. */
+    if (batch_reader->has_repeated) {
+        return batch_reader_next_nested(batch_reader, batch);
+    }
 
     /* ====================================================================
      * FILTERED + SEQUENTIAL PATH (page filter active, pipeline disabled)
@@ -2315,7 +2667,7 @@ carquet_status_t carquet_batch_reader_next(
             }
             #pragma omp parallel for num_threads(num_threads_read) schedule(dynamic, 1)
             for (col_i = 0; col_i < batch_reader->num_projected; col_i++) {
-                read_projected_column(batch_reader, new_batch, col_i, rows_to_read, &col_err[col_i]);
+                read_projected_column(batch_reader, new_batch, col_i, rows_to_read, true, &col_err[col_i]);
             }
             for (col_i = 0; col_i < batch_reader->num_projected; col_i++) {
                 if (col_err[col_i]) read_error = true;
@@ -2323,13 +2675,13 @@ carquet_status_t carquet_batch_reader_next(
             carquet_mem_free(col_err);
         } else {
             for (col_i = 0; col_i < batch_reader->num_projected; col_i++) {
-                read_projected_column(batch_reader, new_batch, col_i, rows_to_read, &read_error);
+                read_projected_column(batch_reader, new_batch, col_i, rows_to_read, true, &read_error);
             }
         }
     }
 #else
     for (col_i = 0; col_i < batch_reader->num_projected; col_i++) {
-        read_projected_column(batch_reader, new_batch, col_i, rows_to_read, &read_error);
+        read_projected_column(batch_reader, new_batch, col_i, rows_to_read, true, &read_error);
     }
 #endif
 
@@ -2410,6 +2762,9 @@ void carquet_batch_reader_free(carquet_batch_reader_t* batch_reader) {
             carquet_mem_free(batch_reader->col_pools[i].data);
             carquet_mem_free(batch_reader->col_pools[i].null_bitmap);
             carquet_mem_free(batch_reader->col_pools[i].def_levels);
+            carquet_mem_free(batch_reader->col_pools[i].rep_levels);
+            carquet_mem_free(batch_reader->col_pools[i].list_offsets);
+            carquet_mem_free(batch_reader->col_pools[i].list_validity);
         }
         carquet_mem_free(batch_reader->col_pools);
     }
@@ -2427,6 +2782,7 @@ void carquet_batch_reader_free(carquet_batch_reader_t* batch_reader) {
 
     carquet_mem_free(batch_reader->rg_order);
     carquet_mem_free(batch_reader->projected_value_sizes);
+    carquet_mem_free(batch_reader->projected_max_reps);
     carquet_mem_free(batch_reader->projected_max_defs);
     carquet_mem_free(batch_reader->projected_type_lengths);
     carquet_mem_free(batch_reader->projected_types);
@@ -2492,10 +2848,46 @@ carquet_status_t carquet_row_batch_column(
         return CARQUET_ERROR_INVALID_ARGUMENT;
     }
 
+    /* List (repeated) columns must be read via carquet_row_batch_column_list();
+     * returning the flattened child through the flat accessor would silently
+     * drop the list structure. */
+    if (col->list_offsets) {
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
     *data = col->data;
     *null_bitmap = col->null_bitmap;
     *num_values = col->num_values;
 
+    return CARQUET_OK;
+}
+
+carquet_status_t carquet_row_batch_column_list(
+    const carquet_row_batch_t* batch,
+    int32_t column_index,
+    const int32_t** offsets,
+    int64_t* num_lists,
+    const void** values,
+    const uint8_t** value_validity,
+    int64_t* num_values,
+    const uint8_t** list_validity) {
+
+    if (column_index < 0 || column_index >= batch->num_columns) {
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+    const carquet_column_data_t* col = &batch->columns[column_index];
+    if (!col->list_offsets) {
+        return CARQUET_ERROR_INVALID_ARGUMENT;  /* not a list column */
+    }
+
+    *offsets = col->list_offsets;
+    *num_lists = col->num_lists;
+    *values = col->data;
+    *value_validity = col->null_bitmap;
+    *num_values = col->num_values;
+    if (list_validity) {
+        *list_validity = col->list_validity;
+    }
     return CARQUET_OK;
 }
 

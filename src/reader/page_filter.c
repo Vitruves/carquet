@@ -614,6 +614,113 @@ static bool page_matches_clause(const column_type_info_t* ti,
 }
 
 /* ============================================================================
+ * Row-group-level pruning (statistics + bloom filter)
+ *
+ * Before touching the page index, cheaply try to drop a whole row group
+ * using the ColumnChunk-level statistics and, for equality-style clauses,
+ * the column's bloom filter. This is purely additive to the page-level
+ * range derivation below: it can only turn a provably-empty row group into
+ * an empty range list (which the caller intersects to "skip"); it never
+ * rescues a row group that the page path would otherwise reject, and it
+ * works even for files that carry no page index. Every decision is
+ * conservative — anything not provably empty is kept.
+ * ============================================================================ */
+
+/**
+ * Decide whether a row group may match one clause given its ColumnChunk
+ * statistics. Reuses page_matches_clause() with a synthesized page-stats
+ * view over the whole row group. Returns true when the group may match
+ * (including when the stats are missing or untrustworthy).
+ */
+static bool rg_stats_might_match(const column_type_info_t* ti,
+                                 const carquet_filter_clause_t* clause,
+                                 const carquet_column_statistics_t* s,
+                                 int64_t rg_rows) {
+    bool null_op = (clause->op == CARQUET_FILTER_IS_NULL ||
+                    clause->op == CARQUET_FILTER_IS_NOT_NULL);
+    /* Null-presence pruning is only sound when we actually know the null
+     * count; a missing null_count must not be read as "zero nulls". */
+    if (null_op && !s->has_null_count) return true;
+
+    carquet_page_stats_t ps;
+    ps.null_count = s->has_null_count ? s->null_count : 0;
+    ps.min_value = s->has_min_max ? s->min_value : NULL;
+    ps.min_value_size = s->has_min_max ? s->min_value_size : 0;
+    ps.max_value = s->has_min_max ? s->max_value : NULL;
+    ps.max_value_size = s->has_min_max ? s->max_value_size : 0;
+    ps.is_null_page = false;
+
+    /* page_matches_clause() uses page_num_rows only for its all-null
+     * short-circuit (null_count >= page_num_rows). That is only meaningful
+     * when the null count is trustworthy; pass 0 otherwise to disable it. */
+    int64_t nrows = s->has_null_count ? rg_rows : 0;
+    return page_matches_clause(ti, &ps, clause, 0, nrows);
+}
+
+/** Query one value against a bloom filter, dispatching on physical type. */
+static bool bloom_check_value(const carquet_bloom_filter_t* bf,
+                              const column_type_info_t* ti,
+                              const void* v, int32_t vlen) {
+    switch (ti->physical_type) {
+        case CARQUET_PHYSICAL_INT32: {
+            int32_t x; memcpy(&x, v, sizeof(x));
+            return carquet_bloom_filter_check_i32(bf, x);
+        }
+        case CARQUET_PHYSICAL_INT64: {
+            int64_t x; memcpy(&x, v, sizeof(x));
+            return carquet_bloom_filter_check_i64(bf, x);
+        }
+        case CARQUET_PHYSICAL_FLOAT: {
+            float x; memcpy(&x, v, sizeof(x));
+            return carquet_bloom_filter_check_float(bf, x);
+        }
+        case CARQUET_PHYSICAL_DOUBLE: {
+            double x; memcpy(&x, v, sizeof(x));
+            return carquet_bloom_filter_check_double(bf, x);
+        }
+        case CARQUET_PHYSICAL_BYTE_ARRAY:
+        case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY:
+            return carquet_bloom_filter_check_bytes(bf, (const uint8_t*)v,
+                                                    (size_t)vlen);
+        default:
+            /* INT96 / BOOLEAN: no bloom pruning. */
+            return true;
+    }
+}
+
+/**
+ * For equality-style clauses (EQ / IN), consult the column's bloom filter.
+ * Returns false only when the filter proves every candidate value absent.
+ * A missing filter, an unsupported type, or any read error yields true.
+ */
+static bool rg_bloom_might_contain(carquet_reader_t* file_reader,
+                                   int32_t row_group_index,
+                                   const carquet_filter_clause_t* clause,
+                                   const column_type_info_t* ti) {
+    if (clause->op != CARQUET_FILTER_EQ && clause->op != CARQUET_FILTER_IN) {
+        return true;
+    }
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_bloom_filter_t* bf = carquet_reader_get_bloom_filter(
+        file_reader, row_group_index, clause->column_index, &err);
+    if (!bf) return true;  /* No bloom filter for this column ⇒ can't prune. */
+
+    bool any = false;
+    if (clause->op == CARQUET_FILTER_EQ) {
+        any = bloom_check_value(bf, ti, clause->value, clause->value_size);
+    } else {  /* CARQUET_FILTER_IN: keep if ANY listed value might be present. */
+        for (int32_t i = 0; i < clause->value_count; i++) {
+            const uint8_t* v = NULL;
+            int32_t vlen = 0;
+            in_value_at(ti, clause, i, &v, &vlen);
+            if (v && bloom_check_value(bf, ti, v, vlen)) { any = true; break; }
+        }
+    }
+    carquet_bloom_filter_destroy(bf);
+    return any;
+}
+
+/* ============================================================================
  * Per-clause row-range derivation
  * ============================================================================ */
 
@@ -629,6 +736,23 @@ static carquet_status_t eval_clause_to_ranges(
     carquet_status_t st = lookup_column_type(file_reader,
         clause->column_index, &ti, error);
     if (st != CARQUET_OK) return st;
+
+    /* Row-group-level pruning first: if the ColumnChunk statistics or the
+     * bloom filter prove this row group cannot satisfy the clause, return an
+     * empty range list. The caller intersects per-clause lists, so an empty
+     * list skips the whole row group — with no page-index access at all. */
+    carquet_column_statistics_t rg_stats;
+    if (carquet_reader_column_statistics(file_reader, row_group_index,
+            clause->column_index, &rg_stats) == CARQUET_OK) {
+        if (!rg_stats_might_match(&ti, clause, &rg_stats, row_group_num_rows)) {
+            carquet_row_range_list_clear(out);
+            return CARQUET_OK;
+        }
+    }
+    if (!rg_bloom_might_contain(file_reader, row_group_index, clause, &ti)) {
+        carquet_row_range_list_clear(out);
+        return CARQUET_OK;
+    }
 
     carquet_column_index_t* ci = carquet_reader_get_column_index(
         file_reader, row_group_index, clause->column_index, error);

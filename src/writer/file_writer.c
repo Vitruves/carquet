@@ -58,6 +58,16 @@ typedef struct column_chunk_info {
     /* GeospatialStatistics (mirrors row_group_writer.c). */
     bool has_geo_stats;
     parquet_geospatial_statistics_t geo_stats;
+    /* Exact distinct non-null count (mirrors row_group_writer.c). */
+    bool has_distinct_count;
+    int64_t distinct_count;
+    /* SizeStatistics (mirrors row_group_writer.c); histogram pointers alias the
+     * column writer's buffers, copied out immediately below. */
+    int64_t unencoded_ba_bytes;
+    const int64_t* rep_level_hist;
+    int32_t rep_hist_len;
+    const int64_t* def_level_hist;
+    int32_t def_hist_len;
 } column_chunk_info_t;
 
 extern carquet_row_group_writer_t* carquet_row_group_writer_create(
@@ -216,6 +226,17 @@ typedef struct row_group_column_info {
     /* GeospatialStatistics (GEOMETRY/GEOGRAPHY) */
     bool has_geo_stats;
     parquet_geospatial_statistics_t geo_stats;
+    /* Exact distinct non-null count, when known (dictionary-encoded chunks). */
+    bool has_distinct_count;
+    int64_t distinct_count;
+    /* SizeStatistics (Parquet 2.9); owned copies, freed with this info.
+     * unencoded_ba_bytes is -1 for non-BYTE_ARRAY columns. */
+    bool has_size_statistics;
+    int64_t unencoded_ba_bytes;
+    int64_t* rep_level_hist;
+    int32_t rep_hist_len;
+    int64_t* def_level_hist;
+    int32_t def_hist_len;
 } row_group_column_info_t;
 
 typedef struct row_group_info {
@@ -304,6 +325,11 @@ struct carquet_writer {
     int64_t* column_bloom_ndv_overrides;
     double* column_bloom_fpp_overrides;
     bool* column_bloom_options_set;
+    /* Set when the user explicitly called carquet_writer_set_column_bloom_filter
+       for this column (as opposed to the value merely defaulting to the global
+       flag). Lets the finalize path keep an explicit legacy enable even after
+       the newer ndv/fpp options API takes per-column control. */
+    bool* column_bloom_explicit;
     /* Per-column page-size override (target bytes). 0 / unset means use
        options.page_size. */
     int64_t* column_page_size_overrides;
@@ -404,11 +430,19 @@ static int64_t estimate_column_batch_bytes(
             break;
         case CARQUET_PHYSICAL_BYTE_ARRAY: {
             const carquet_byte_array_t* arrays = (const carquet_byte_array_t*)values;
+            /* For nullable columns `values` holds only the packed non-null
+             * entries, so iterate the present count — not num_values (the
+             * logical row count) — to avoid reading past the array. */
+            int64_t value_count = num_values;
+            if (def_levels && column->max_def_level > 0) {
+                value_count = carquet_dispatch_count_non_nulls(
+                    def_levels, num_values, column->max_def_level);
+            }
             /* Accumulate in a local with a single saturation check at the end:
-             * each length is <= UINT32_MAX, so num_values entries cannot overflow
-             * uint64_t until ~2^32 values, which num_values (int64_t) cannot reach. */
+             * each length is <= UINT32_MAX, so value_count entries cannot overflow
+             * uint64_t until ~2^32 values, which cannot be reached here. */
             uint64_t chunk_total = 0;
-            for (int64_t i = 0; i < num_values; i++) {
+            for (int64_t i = 0; i < value_count; i++) {
                 chunk_total += (uint64_t)sizeof(uint32_t) + arrays[i].length;
             }
             total = (chunk_total > (uint64_t)INT64_MAX)
@@ -532,6 +566,21 @@ static carquet_status_t add_column_internal(
 }
 
 /* Store the full schema elements (including groups) for metadata serialization */
+/* Free the heap-owned per-field metadata deep-copied by store_schema_elements. */
+static void free_schema_field_metadata(parquet_schema_element_t* elements,
+                                       int32_t num_elements) {
+    if (!elements) return;
+    for (int32_t i = 0; i < num_elements; i++) {
+        for (int32_t j = 0; j < elements[i].num_field_metadata; j++) {
+            carquet_mem_free(elements[i].field_metadata[j].key);
+            carquet_mem_free(elements[i].field_metadata[j].value);
+        }
+        carquet_mem_free(elements[i].field_metadata);
+        elements[i].field_metadata = NULL;
+        elements[i].num_field_metadata = 0;
+    }
+}
+
 static carquet_status_t store_schema_elements(
     carquet_writer_t* writer,
     const carquet_schema_t* schema) {
@@ -552,6 +601,33 @@ static carquet_status_t store_schema_elements(
             if (!writer->schema_elements[i].name) {
                 return CARQUET_ERROR_OUT_OF_MEMORY;
             }
+        }
+
+        /* Deep-copy per-field metadata (Arrow custom_metadata) into heap the
+         * writer owns, so it survives even if the caller frees the schema. The
+         * copy is released in the writer teardown alongside name. */
+        writer->schema_elements[i].field_metadata = NULL;
+        writer->schema_elements[i].num_field_metadata = 0;
+        int32_t nmeta = schema->elements[i].num_field_metadata;
+        if (nmeta > 0 && schema->elements[i].field_metadata) {
+            parquet_key_value_t* dst = carquet_mem_calloc(
+                (size_t)nmeta, sizeof(parquet_key_value_t));
+            if (!dst) return CARQUET_ERROR_OUT_OF_MEMORY;
+            for (int32_t j = 0; j < nmeta; j++) {
+                const parquet_key_value_t* src = &schema->elements[i].field_metadata[j];
+                dst[j].key = src->key ? carquet_heap_strdup(src->key) : NULL;
+                dst[j].value = src->value ? carquet_heap_strdup(src->value) : NULL;
+                if ((src->key && !dst[j].key) || (src->value && !dst[j].value)) {
+                    for (int32_t k = 0; k <= j; k++) {
+                        carquet_mem_free(dst[k].key);
+                        carquet_mem_free(dst[k].value);
+                    }
+                    carquet_mem_free(dst);
+                    return CARQUET_ERROR_OUT_OF_MEMORY;
+                }
+            }
+            writer->schema_elements[i].field_metadata = dst;
+            writer->schema_elements[i].num_field_metadata = nmeta;
         }
 
         /* Coerce TIMESTAMP units in the emitted schema so file metadata
@@ -675,6 +751,7 @@ static carquet_status_t ensure_column_overrides(carquet_writer_t* writer) {
     writer->column_bloom_ndv_overrides = carquet_mem_calloc(n, sizeof(int64_t));
     writer->column_bloom_fpp_overrides = carquet_mem_calloc(n, sizeof(double));
     writer->column_bloom_options_set = carquet_mem_calloc(n, sizeof(bool));
+    writer->column_bloom_explicit = carquet_mem_calloc(n, sizeof(bool));
     writer->column_page_size_overrides = carquet_mem_calloc(n, sizeof(int64_t));
     writer->column_page_size_override_set = carquet_mem_calloc(n, sizeof(bool));
     if (!writer->column_encoding_overrides || !writer->column_encoding_override_set ||
@@ -682,7 +759,7 @@ static carquet_status_t ensure_column_overrides(carquet_writer_t* writer) {
         !writer->column_compression_override_set ||
         !writer->column_statistics_overrides || !writer->column_bloom_filter_overrides ||
         !writer->column_bloom_ndv_overrides || !writer->column_bloom_fpp_overrides ||
-        !writer->column_bloom_options_set ||
+        !writer->column_bloom_options_set || !writer->column_bloom_explicit ||
         !writer->column_page_size_overrides || !writer->column_page_size_override_set) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
@@ -705,6 +782,7 @@ static void free_column_overrides(carquet_writer_t* writer) {
     carquet_mem_free(writer->column_bloom_ndv_overrides);
     carquet_mem_free(writer->column_bloom_fpp_overrides);
     carquet_mem_free(writer->column_bloom_options_set);
+    carquet_mem_free(writer->column_bloom_explicit);
     carquet_mem_free(writer->column_page_size_overrides);
     carquet_mem_free(writer->column_page_size_override_set);
     writer->column_encoding_overrides = NULL;
@@ -717,6 +795,7 @@ static void free_column_overrides(carquet_writer_t* writer) {
     writer->column_bloom_ndv_overrides = NULL;
     writer->column_bloom_fpp_overrides = NULL;
     writer->column_bloom_options_set = NULL;
+    writer->column_bloom_explicit = NULL;
     writer->column_page_size_overrides = NULL;
     writer->column_page_size_override_set = NULL;
     writer->column_overrides_allocated = false;
@@ -742,9 +821,11 @@ static carquet_compression_t effective_column_compression(
         codec = writer->options.compression;
     }
 
-    /* carquet writes raw LZ4 blocks, which are represented by the LZ4_RAW
-     * Parquet codec. The legacy LZ4 enum has a different deprecated framing. */
-    return codec == CARQUET_COMPRESSION_LZ4 ? CARQUET_COMPRESSION_LZ4_RAW : codec;
+    /* LZ4 (codec 5) and LZ4_RAW (codec 7) are distinct Parquet codecs: codec 5
+     * is the deprecated Hadoop-framed LZ4 (length-prefixed blocks), codec 7 is
+     * raw LZ4 blocks. carquet honours the requested codec directly; the page
+     * writer applies the matching framing. */
+    return codec;
 }
 
 static int32_t effective_column_compression_level(
@@ -838,7 +919,11 @@ static bool writer_encoding_supported(
                    type == CARQUET_PHYSICAL_INT64 ||
                    type == CARQUET_PHYSICAL_FLOAT ||
                    type == CARQUET_PHYSICAL_DOUBLE ||
-                   type == CARQUET_PHYSICAL_BYTE_ARRAY;
+                   type == CARQUET_PHYSICAL_BYTE_ARRAY ||
+                   type == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY;
+        case CARQUET_ENCODING_RLE:
+            /* RLE as a value encoding is defined only for BOOLEAN. */
+            return type == CARQUET_PHYSICAL_BOOLEAN;
         default:
             return false;
     }
@@ -852,6 +937,8 @@ static void free_row_groups(carquet_writer_t* writer) {
             for (int32_t j = 0; j < rg->num_columns; j++) {
                 carquet_mem_free(rg->columns[j].min_value);
                 carquet_mem_free(rg->columns[j].max_value);
+                carquet_mem_free(rg->columns[j].rep_level_hist);
+                carquet_mem_free(rg->columns[j].def_level_hist);
             }
             carquet_mem_free(rg->columns);
         }
@@ -981,9 +1068,18 @@ static carquet_status_t ensure_row_group(carquet_writer_t* writer) {
         if (writer->column_overrides_allocated &&
             writer->column_bloom_options_set &&
             any_column_bloom_options_set(writer)) {
-            bool col_enabled = writer->column_bloom_options_set[i]
-                ? writer->column_bloom_filter_overrides[i]
-                : false;
+            /* A column keeps its bloom filter if it opted in through the newer
+               ndv/fpp options API, OR was explicitly enabled/disabled through
+               the legacy per-column setter. Columns that are true only because
+               the global flag got flipped on (by the options API's side effect)
+               are still suppressed, so they do not silently gain a default
+               bloom the user never asked for. */
+            bool col_enabled;
+            if (writer->column_bloom_options_set[i] || writer->column_bloom_explicit[i]) {
+                col_enabled = writer->column_bloom_filter_overrides[i];
+            } else {
+                col_enabled = false;
+            }
             int64_t col_ndv = writer->column_bloom_options_set[i]
                 ? writer->column_bloom_ndv_overrides[i] : 0;
             double col_fpp = writer->column_bloom_options_set[i]
@@ -1078,6 +1174,30 @@ static carquet_status_t flush_row_group(carquet_writer_t* writer) {
             chunk->geo_stats = col_info->geo_stats;
         }
 
+        /* Copy SizeStatistics (Parquet 2.9) out of the column writer's aliased
+         * histogram buffers into owned storage that lives with the file's row
+         * group list. Independent of write_statistics (emitted below only when
+         * it carries information). */
+        chunk->unencoded_ba_bytes = col_info->unencoded_ba_bytes;
+        if (col_info->rep_level_hist && col_info->rep_hist_len > 0) {
+            chunk->rep_level_hist = carquet_mem_malloc(
+                (size_t)col_info->rep_hist_len * sizeof(int64_t));
+            if (chunk->rep_level_hist) {
+                memcpy(chunk->rep_level_hist, col_info->rep_level_hist,
+                       (size_t)col_info->rep_hist_len * sizeof(int64_t));
+                chunk->rep_hist_len = col_info->rep_hist_len;
+            }
+        }
+        if (col_info->def_level_hist && col_info->def_hist_len > 0) {
+            chunk->def_level_hist = carquet_mem_malloc(
+                (size_t)col_info->def_hist_len * sizeof(int64_t));
+            if (chunk->def_level_hist) {
+                memcpy(chunk->def_level_hist, col_info->def_level_hist,
+                       (size_t)col_info->def_hist_len * sizeof(int64_t));
+                chunk->def_hist_len = col_info->def_hist_len;
+            }
+        }
+
         /* Derive the per-chunk encodings list from whether this chunk actually
          * emitted a dictionary page. The static refresh_column_encodings_cache
          * is computed from the configured encoding before finalize knows about
@@ -1115,11 +1235,26 @@ static carquet_status_t flush_row_group(carquet_writer_t* writer) {
             emit_stats = false;
         }
 
+        /* SizeStatistics emission is gated on the write-statistics option but,
+         * unlike min/max, NOT on sort-order definedness: the level histograms
+         * are most valuable exactly for nested/repeated columns whose sort
+         * order is undefined. Emit only when it carries information (BYTE_ARRAY
+         * unencoded bytes, or a non-trivial rep/def histogram) so flat required
+         * numeric columns stay byte-identical to before. */
+        bool size_stats_enabled = writer->column_overrides_allocated && i < writer->num_columns
+            ? writer->column_statistics_overrides[i]
+            : writer->options.write_statistics;
+        chunk->has_size_statistics = size_stats_enabled &&
+            (chunk->type == CARQUET_PHYSICAL_BYTE_ARRAY ||
+             chunk->rep_hist_len > 1 || chunk->def_hist_len > 1);
+
         if (emit_stats && (col_info->has_min_max || col_info->has_null_count)) {
             chunk->has_statistics = true;
             chunk->has_min_max = col_info->has_min_max;
             chunk->has_null_count = col_info->has_null_count;
             chunk->null_count = col_info->null_count;
+            chunk->has_distinct_count = col_info->has_distinct_count;
+            chunk->distinct_count = col_info->distinct_count;
             if (col_info->has_min_max &&
                 col_info->min_value_size > 0 &&
                 col_info->max_value_size > 0) {
@@ -1447,6 +1582,27 @@ static carquet_status_t build_file_metadata(
                 meta->geospatial_statistics = src_col->geo_stats;
             }
 
+            if (src_col->has_size_statistics) {
+                meta->has_size_statistics = true;
+                parquet_size_statistics_t* ss = &meta->size_statistics;
+                memset(ss, 0, sizeof(*ss));
+                if (src_col->type == CARQUET_PHYSICAL_BYTE_ARRAY &&
+                    src_col->unencoded_ba_bytes >= 0) {
+                    ss->has_unencoded_byte_array_data_bytes = true;
+                    ss->unencoded_byte_array_data_bytes = src_col->unencoded_ba_bytes;
+                }
+                /* Emit histograms only when they carry information: rep for
+                 * repeated columns, def for nullable/nested ones. */
+                if (src_col->rep_hist_len > 1) {
+                    ss->repetition_level_histogram = src_col->rep_level_hist;
+                    ss->repetition_level_histogram_len = src_col->rep_hist_len;
+                }
+                if (src_col->def_hist_len > 1) {
+                    ss->definition_level_histogram = src_col->def_level_hist;
+                    ss->definition_level_histogram_len = src_col->def_hist_len;
+                }
+            }
+
             if (src_col->has_statistics) {
                 meta->has_statistics = true;
                 parquet_statistics_t* stats = &meta->statistics;
@@ -1455,6 +1611,11 @@ static carquet_status_t build_file_metadata(
                 if (src_col->has_null_count) {
                     stats->has_null_count = true;
                     stats->null_count = src_col->null_count;
+                }
+
+                if (src_col->has_distinct_count) {
+                    stats->has_distinct_count = true;
+                    stats->distinct_count = src_col->distinct_count;
                 }
 
                 if (src_col->has_min_max &&
@@ -1914,12 +2075,43 @@ static carquet_status_t append_restore_column_chunk(
         dst->geo_stats = m->geospatial_statistics;
     }
 
+    /* Preserve SizeStatistics (Parquet 2.9) across append by copying the parsed
+     * histograms into owned storage. */
+    if (m->has_size_statistics) {
+        const parquet_size_statistics_t* ss = &m->size_statistics;
+        dst->has_size_statistics = true;
+        dst->unencoded_ba_bytes = ss->has_unencoded_byte_array_data_bytes
+            ? ss->unencoded_byte_array_data_bytes : -1;
+        if (ss->repetition_level_histogram && ss->repetition_level_histogram_len > 0) {
+            dst->rep_level_hist = carquet_mem_malloc(
+                (size_t)ss->repetition_level_histogram_len * sizeof(int64_t));
+            if (dst->rep_level_hist) {
+                memcpy(dst->rep_level_hist, ss->repetition_level_histogram,
+                       (size_t)ss->repetition_level_histogram_len * sizeof(int64_t));
+                dst->rep_hist_len = ss->repetition_level_histogram_len;
+            }
+        }
+        if (ss->definition_level_histogram && ss->definition_level_histogram_len > 0) {
+            dst->def_level_hist = carquet_mem_malloc(
+                (size_t)ss->definition_level_histogram_len * sizeof(int64_t));
+            if (dst->def_level_hist) {
+                memcpy(dst->def_level_hist, ss->definition_level_histogram,
+                       (size_t)ss->definition_level_histogram_len * sizeof(int64_t));
+                dst->def_hist_len = ss->definition_level_histogram_len;
+            }
+        }
+    }
+
     if (m->has_statistics) {
         dst->has_statistics = true;
         const parquet_statistics_t* s = &m->statistics;
         if (s->has_null_count) {
             dst->has_null_count = true;
             dst->null_count = s->null_count;
+        }
+        if (s->has_distinct_count) {
+            dst->has_distinct_count = true;
+            dst->distinct_count = s->distinct_count;
         }
         if (s->min_value && s->min_value_len > 0 &&
             s->max_value && s->max_value_len > 0) {
@@ -2271,6 +2463,191 @@ carquet_status_t carquet_writer_write_batch(
     return CARQUET_OK;
 }
 
+/* ============================================================================
+ * Nested write helper (single-level LIST / MAP auto-shredding)
+ * ============================================================================ */
+
+/* Byte width of one packed value for a leaf column. */
+static size_t leaf_value_size(const writer_column_def_t* c) {
+    switch (c->physical_type) {
+        case CARQUET_PHYSICAL_BOOLEAN:              return sizeof(uint8_t);
+        case CARQUET_PHYSICAL_INT32:                return sizeof(int32_t);
+        case CARQUET_PHYSICAL_INT64:                return sizeof(int64_t);
+        case CARQUET_PHYSICAL_INT96:                return 12;
+        case CARQUET_PHYSICAL_FLOAT:                return sizeof(float);
+        case CARQUET_PHYSICAL_DOUBLE:               return sizeof(double);
+        case CARQUET_PHYSICAL_BYTE_ARRAY:           return sizeof(carquet_byte_array_t);
+        case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY: return (size_t)c->type_length;
+        default:                                    return 0;
+    }
+}
+
+/* Arrow-style (LSB-first) validity bit: 1 = valid/present. */
+static inline bool validity_bit(const uint8_t* bm, int64_t i) {
+    return (bm[i >> 3] >> (i & 7)) & 1u;
+}
+
+carquet_status_t carquet_writer_write_list_column(
+    carquet_writer_t* writer,
+    int32_t column_index,
+    int64_t num_lists,
+    const int32_t* offsets,
+    const uint8_t* list_validity,
+    const void* values,
+    const uint8_t* value_validity,
+    carquet_error_t* error) {
+
+    if (column_index < 0 || column_index >= writer->num_columns) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT,
+            "column_index %d out of range [0, %d)", column_index,
+            writer->num_columns);
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+    if (num_lists < 0) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT,
+            "num_lists must be non-negative");
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    const writer_column_def_t* col = &writer->columns[column_index];
+
+    /* This front-end shreds the standard single-level LIST/MAP encoding only:
+     * a repeated group with exactly one repetition level, an optional or
+     * required container above it, and an optional or required leaf below it.
+     * That covers every column produced by carquet_schema_add_list() and
+     * carquet_schema_add_map(). Deeper nesting is out of scope. */
+    if (col->max_rep_level != 1) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_NOT_IMPLEMENTED,
+            "column %d is not a single-level repeated column "
+            "(max_rep_level=%d)", column_index, (int)col->max_rep_level);
+        return CARQUET_ERROR_NOT_IMPLEMENTED;
+    }
+    bool leaf_optional = (col->repetition == CARQUET_REPETITION_OPTIONAL);
+    int16_t max_def = col->max_def_level;
+    /* max_def = container_optional + 1 (repeated) + leaf_optional. */
+    int container_optional = (int)max_def - 1 - (leaf_optional ? 1 : 0);
+    if (container_optional != 0 && container_optional != 1) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_NOT_IMPLEMENTED,
+            "column %d has an unsupported nested shape "
+            "(max_def_level=%d)", column_index, (int)max_def);
+        return CARQUET_ERROR_NOT_IMPLEMENTED;
+    }
+    int16_t def_present = max_def;
+    int16_t def_null_elem = (int16_t)(container_optional + 1);
+    int16_t def_empty = (int16_t)container_optional;
+
+    if (num_lists > 0 && offsets == NULL) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT,
+            "offsets must be non-NULL when num_lists > 0");
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+    if (num_lists == 0) {
+        return CARQUET_OK;  /* Nothing to write. */
+    }
+    if (offsets[0] != 0) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT,
+            "offsets[0] must be 0 (sliced arrays are not supported)");
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+    /* Validate monotonic offsets and derive the child count. */
+    for (int64_t i = 0; i < num_lists; i++) {
+        if (offsets[i + 1] < offsets[i]) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT,
+                "offsets must be non-decreasing (offsets[%lld]=%d < offsets[%lld]=%d)",
+                (long long)(i + 1), offsets[i + 1], (long long)i, offsets[i]);
+            return CARQUET_ERROR_INVALID_ARGUMENT;
+        }
+    }
+    int64_t total_children = offsets[num_lists];
+
+    /* Upper bounds: one level per null/empty list plus one per child. */
+    if (total_children > INT64_MAX - num_lists) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT,
+            "list column too large");
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+    int64_t level_cap = num_lists + total_children;
+
+    size_t vsize = leaf_value_size(col);
+    if (vsize == 0) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT,
+            "unsupported leaf physical type for column %d", column_index);
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    int16_t* def_levels = carquet_mem_malloc((size_t)level_cap * sizeof(int16_t));
+    int16_t* rep_levels = carquet_mem_malloc((size_t)level_cap * sizeof(int16_t));
+    uint8_t* packed = (total_children > 0)
+        ? carquet_mem_malloc((size_t)total_children * vsize) : NULL;
+    if (!def_levels || !rep_levels || (total_children > 0 && !packed)) {
+        carquet_mem_free(def_levels);
+        carquet_mem_free(rep_levels);
+        carquet_mem_free(packed);
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY,
+            "Failed to allocate shredding buffers");
+        return CARQUET_ERROR_OUT_OF_MEMORY;
+    }
+
+    const uint8_t* vbytes = (const uint8_t*)values;
+    int64_t nlevels = 0;
+    int64_t npacked = 0;
+    carquet_status_t st = CARQUET_OK;
+
+    for (int64_t i = 0; i < num_lists; i++) {
+        bool present = list_validity ? validity_bit(list_validity, i) : true;
+        if (!present) {
+            if (!container_optional) {
+                st = CARQUET_ERROR_INVALID_ARGUMENT;
+                CARQUET_SET_ERROR(error, st,
+                    "null list at row %lld but the container is REQUIRED",
+                    (long long)i);
+                goto done;
+            }
+            def_levels[nlevels] = 0;      /* null container */
+            rep_levels[nlevels] = 0;
+            nlevels++;
+            continue;
+        }
+        int32_t start = offsets[i];
+        int32_t end = offsets[i + 1];
+        if (start == end) {
+            def_levels[nlevels] = def_empty;  /* present but empty list */
+            rep_levels[nlevels] = 0;
+            nlevels++;
+            continue;
+        }
+        for (int32_t j = start; j < end; j++) {
+            rep_levels[nlevels] = (j == start) ? 0 : 1;
+            bool vpresent = value_validity ? validity_bit(value_validity, j) : true;
+            if (vpresent) {
+                def_levels[nlevels] = def_present;
+                memcpy(packed + (size_t)npacked * vsize,
+                       vbytes + (size_t)j * vsize, vsize);
+                npacked++;
+            } else {
+                if (!leaf_optional) {
+                    st = CARQUET_ERROR_INVALID_ARGUMENT;
+                    CARQUET_SET_ERROR(error, st,
+                        "null element at child %d but the leaf is REQUIRED", j);
+                    goto done;
+                }
+                def_levels[nlevels] = def_null_elem;
+            }
+            nlevels++;
+        }
+    }
+
+    st = carquet_writer_write_batch(writer, column_index,
+        packed ? (const void*)packed : (const void*)vbytes,
+        nlevels, def_levels, rep_levels);
+
+done:
+    carquet_mem_free(def_levels);
+    carquet_mem_free(rep_levels);
+    carquet_mem_free(packed);
+    return st;
+}
+
 carquet_status_t carquet_writer_new_row_group(carquet_writer_t* writer) {
     /* writer is nonnull per API contract */
     /* Ensure header is written */
@@ -2281,6 +2658,11 @@ carquet_status_t carquet_writer_new_row_group(carquet_writer_t* writer) {
 
     /* Flush current row group if any */
     return flush_row_group(writer);
+}
+
+int32_t carquet_writer_num_columns(const carquet_writer_t* writer) {
+    /* writer is nonnull per API contract */
+    return writer->num_columns;
 }
 
 carquet_status_t carquet_writer_close(carquet_writer_t* writer) {
@@ -2398,6 +2780,7 @@ cleanup:
 
     /* Free schema elements */
     if (writer->schema_elements) {
+        free_schema_field_metadata(writer->schema_elements, writer->num_schema_elements);
         for (int32_t i = 0; i < writer->num_schema_elements; i++) {
             carquet_mem_free(writer->schema_elements[i].name);
         }
@@ -2475,6 +2858,7 @@ void carquet_writer_abort(carquet_writer_t* writer) {
 
     /* Free schema elements */
     if (writer->schema_elements) {
+        free_schema_field_metadata(writer->schema_elements, writer->num_schema_elements);
         for (int32_t i = 0; i < writer->num_schema_elements; i++) {
             carquet_mem_free(writer->schema_elements[i].name);
         }
@@ -2654,6 +3038,7 @@ carquet_status_t carquet_writer_set_column_bloom_filter(
     if (status != CARQUET_OK) return status;
 
     writer->column_bloom_filter_overrides[column_index] = enabled;
+    writer->column_bloom_explicit[column_index] = true;
     return CARQUET_OK;
 }
 

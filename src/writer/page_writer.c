@@ -36,6 +36,10 @@ extern carquet_status_t carquet_lz4_compress(const uint8_t* src, size_t src_size
                                               uint8_t* dst, size_t dst_capacity,
                                               size_t* dst_size);
 extern size_t carquet_lz4_compress_bound(size_t src_size);
+extern carquet_status_t carquet_lz4_hadoop_compress(const uint8_t* src, size_t src_size,
+                                                    uint8_t* dst, size_t dst_capacity,
+                                                    size_t* dst_size);
+extern size_t carquet_lz4_hadoop_compress_bound(size_t src_size);
 
 extern int carquet_gzip_compress(const uint8_t* src, size_t src_size,
                                   uint8_t* dst, size_t dst_capacity,
@@ -122,6 +126,17 @@ typedef struct carquet_page_writer {
     int64_t num_values;
     int64_t num_nulls;
     int64_t num_rows;        /* Logical rows (rep_level==0); used by V2 only */
+    /* Sum of the lengths of all non-null BYTE_ARRAY values in the current
+     * page, exclusive of the length prefixes. This is the Parquet 2.9
+     * "unencoded_byte_array_data_bytes" quantity (OffsetIndex field 2 /
+     * SizeStatistics). Zero for non-BYTE_ARRAY columns. Reset per page. */
+    int64_t byte_array_data_bytes;
+    /* Per-page repetition/definition level histograms (Parquet 2.9). Entry i
+     * counts values in the current page whose level == i; lengths are
+     * max_rep_level+1 and max_def_level+1. Allocated at create, reset per page.
+     * Feed both SizeStatistics (chunk sum) and ColumnIndex (per page). */
+    int64_t* rep_level_hist;
+    int64_t* def_level_hist;
 
     bool data_page_v2;       /* Emit DATA_PAGE_V2 instead of DATA_PAGE */
 
@@ -265,6 +280,15 @@ carquet_page_writer_t* carquet_page_writer_create(
     writer->write_crc = true;         /* Enable CRC by default for integrity */
     writer->write_statistics = stats_order_defined_for_logical(logical_type);
 
+    writer->def_level_hist =
+        carquet_mem_calloc((size_t)max_def_level + 1, sizeof(int64_t));
+    writer->rep_level_hist =
+        carquet_mem_calloc((size_t)max_rep_level + 1, sizeof(int64_t));
+    if (!writer->def_level_hist || !writer->rep_level_hist) {
+        carquet_page_writer_destroy(writer);
+        return NULL;
+    }
+
     return writer;
 }
 
@@ -278,6 +302,8 @@ void carquet_page_writer_destroy(carquet_page_writer_t* writer) {
         carquet_buffer_destroy(&writer->compress_buffer);
         carquet_mem_free(writer->min_value);
         carquet_mem_free(writer->max_value);
+        carquet_mem_free(writer->def_level_hist);
+        carquet_mem_free(writer->rep_level_hist);
         carquet_mem_free(writer);
     }
 }
@@ -292,6 +318,15 @@ void carquet_page_writer_reset(carquet_page_writer_t* writer) {
     writer->num_values = 0;
     writer->num_nulls = 0;
     writer->num_rows = 0;
+    writer->byte_array_data_bytes = 0;
+    if (writer->def_level_hist) {
+        memset(writer->def_level_hist, 0,
+               ((size_t)writer->max_def_level + 1) * sizeof(int64_t));
+    }
+    if (writer->rep_level_hist) {
+        memset(writer->rep_level_hist, 0,
+               ((size_t)writer->max_rep_level + 1) * sizeof(int64_t));
+    }
     writer->has_min_max = false;
     writer->min_max_size = 0;
     writer->bool_seen_false = false;
@@ -1098,8 +1133,39 @@ carquet_status_t carquet_page_writer_add_values(
     switch (writer->type) {
         case CARQUET_PHYSICAL_BOOLEAN: {
             const uint8_t* bools = (const uint8_t*)values;
-            status = carquet_encode_plain_boolean(bools, num_non_null,
-                                                   &writer->values_buffer);
+            if (writer->encoding == CARQUET_ENCODING_RLE) {
+                /* RLE value encoding for BOOLEAN: a 4-byte little-endian length
+                 * prefix followed by the RLE/bit-packed hybrid at bit width 1
+                 * (matches parquet-mr's RunLengthBitPackingHybridValuesWriter). */
+                uint32_t* tmp = NULL;
+                if (num_non_null > 0) {
+                    tmp = carquet_mem_malloc((size_t)num_non_null * sizeof(uint32_t));
+                    if (!tmp) { status = CARQUET_ERROR_OUT_OF_MEMORY; break; }
+                    for (int64_t i = 0; i < num_non_null; i++)
+                        tmp[i] = bools[i] ? 1u : 0u;
+                }
+                carquet_buffer_t rle;
+                carquet_buffer_init(&rle);
+                status = num_non_null > 0
+                    ? carquet_rle_encode_all(tmp, num_non_null, 1, &rle)
+                    : CARQUET_OK;
+                carquet_mem_free(tmp);
+                if (status == CARQUET_OK) {
+                    uint32_t rlen = (uint32_t)rle.size;
+                    uint8_t len_le[4] = {
+                        (uint8_t)rlen, (uint8_t)(rlen >> 8),
+                        (uint8_t)(rlen >> 16), (uint8_t)(rlen >> 24) };
+                    status = carquet_buffer_append(&writer->values_buffer, len_le, 4);
+                    if (status == CARQUET_OK && rle.size > 0) {
+                        status = carquet_buffer_append(&writer->values_buffer,
+                                                       rle.data, rle.size);
+                    }
+                }
+                carquet_buffer_destroy(&rle);
+            } else {
+                status = carquet_encode_plain_boolean(bools, num_non_null,
+                                                       &writer->values_buffer);
+            }
             if (status == CARQUET_OK && writer->write_statistics) {
                 update_statistics_boolean(writer, bools, num_non_null);
             }
@@ -1165,6 +1231,14 @@ carquet_status_t carquet_page_writer_add_values(
         case CARQUET_PHYSICAL_BYTE_ARRAY: {
             const carquet_byte_array_t* arrays = (const carquet_byte_array_t*)values;
             status = encode_byte_array_values(writer, arrays, num_non_null);
+            if (status == CARQUET_OK) {
+                /* Accumulate unencoded (length-prefix-exclusive) value bytes for
+                 * OffsetIndex field 2 / SizeStatistics, independent of the
+                 * write_statistics flag which only gates min/max. */
+                for (int64_t bi = 0; bi < num_non_null; bi++) {
+                    writer->byte_array_data_bytes += arrays[bi].length;
+                }
+            }
             if (status == CARQUET_OK && writer->write_statistics) {
                 update_statistics_byte_array(writer, arrays, num_non_null);
             }
@@ -1254,6 +1328,27 @@ carquet_status_t carquet_page_writer_add_values(
             writer->num_rows += num_values;
         }
     }
+
+    /* Accumulate per-page level histograms (Parquet 2.9). A NULL def_levels on
+     * an OPTIONAL column means every value is present (level == max_def_level);
+     * a NULL rep_levels means level 0. When max_def/rep_level == 0 the single
+     * bucket is index 0, which is exactly what these fall-through paths hit. */
+    if (writer->max_def_level > 0 && def_levels) {
+        for (int64_t i = 0; i < num_values; i++) {
+            int16_t d = def_levels[i];
+            if (d >= 0 && d <= writer->max_def_level) writer->def_level_hist[d]++;
+        }
+    } else {
+        writer->def_level_hist[writer->max_def_level] += num_values;
+    }
+    if (writer->max_rep_level > 0 && rep_levels) {
+        for (int64_t i = 0; i < num_values; i++) {
+            int16_t r = rep_levels[i];
+            if (r >= 0 && r <= writer->max_rep_level) writer->rep_level_hist[r]++;
+        }
+    } else {
+        writer->rep_level_hist[0] += num_values;
+    }
     return status;
 
 fail:
@@ -1318,6 +1413,8 @@ static carquet_status_t compress_data(
                 bound = carquet_snappy_compress_bound(input_size);
                 break;
             case CARQUET_COMPRESSION_LZ4:
+                bound = carquet_lz4_hadoop_compress_bound(input_size);
+                break;
             case CARQUET_COMPRESSION_LZ4_RAW:
                 bound = carquet_lz4_compress_bound(input_size);
                 break;
@@ -1355,6 +1452,9 @@ static carquet_status_t compress_data(
                                                   compressed, bound, &local_compressed_size);
                 break;
             case CARQUET_COMPRESSION_LZ4:
+                status = carquet_lz4_hadoop_compress(input, input_size,
+                                               compressed, bound, &local_compressed_size);
+                break;
             case CARQUET_COMPRESSION_LZ4_RAW:
                 status = carquet_lz4_compress(input, input_size,
                                                compressed, bound, &local_compressed_size);
@@ -1979,6 +2079,25 @@ carquet_status_t carquet_page_writer_add_dictionary_indices(
             writer->num_rows += num_values_total;
         }
     }
+
+    /* Per-page level histograms for the single RLE_DICTIONARY data page
+     * (see the matching logic in carquet_page_writer_add_values). */
+    if (writer->max_def_level > 0 && def_levels) {
+        for (int64_t i = 0; i < num_values_total; i++) {
+            int16_t d = def_levels[i];
+            if (d >= 0 && d <= writer->max_def_level) writer->def_level_hist[d]++;
+        }
+    } else {
+        writer->def_level_hist[writer->max_def_level] += num_values_total;
+    }
+    if (writer->max_rep_level > 0 && rep_levels) {
+        for (int64_t i = 0; i < num_values_total; i++) {
+            int16_t r = rep_levels[i];
+            if (r >= 0 && r <= writer->max_rep_level) writer->rep_level_hist[r]++;
+        }
+    } else {
+        writer->rep_level_hist[0] += num_values_total;
+    }
     return CARQUET_OK;
 }
 
@@ -2028,6 +2147,38 @@ size_t carquet_page_writer_estimated_size(const carquet_page_writer_t* writer) {
 
 int64_t carquet_page_writer_num_values(const carquet_page_writer_t* writer) {
     return writer ? writer->num_values : 0;
+}
+
+/* Unencoded BYTE_ARRAY value bytes accumulated for the current (not-yet-flushed)
+ * page. Meaningful only for BYTE_ARRAY columns; 0 otherwise. */
+int64_t carquet_page_writer_byte_array_bytes(const carquet_page_writer_t* writer) {
+    return writer ? writer->byte_array_data_bytes : 0;
+}
+
+/* Per-page level histograms for the current (not-yet-flushed) page. The
+ * returned pointers are owned by the page writer and valid until the next
+ * reset; lengths are max_def_level+1 / max_rep_level+1. */
+const int64_t* carquet_page_writer_def_level_histogram(
+    const carquet_page_writer_t* writer, int32_t* len) {
+    if (!writer) { if (len) *len = 0; return NULL; }
+    if (len) *len = (int32_t)writer->max_def_level + 1;
+    return writer->def_level_hist;
+}
+
+const int64_t* carquet_page_writer_rep_level_histogram(
+    const carquet_page_writer_t* writer, int32_t* len) {
+    if (!writer) { if (len) *len = 0; return NULL; }
+    if (len) *len = (int32_t)writer->max_rep_level + 1;
+    return writer->rep_level_hist;
+}
+
+/* Override the accumulated BYTE_ARRAY byte count. The dictionary path stages a
+ * data page from RLE indices rather than raw values (so the accumulator never
+ * sees the byte arrays), and injects the chunk total computed from the unique
+ * dictionary values here before the page is flushed. */
+void carquet_page_writer_set_byte_array_bytes(carquet_page_writer_t* writer,
+                                              int64_t bytes) {
+    if (writer) writer->byte_array_data_bytes = bytes;
 }
 
 /* ============================================================================

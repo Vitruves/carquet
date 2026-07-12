@@ -5,9 +5,15 @@
  * PyArrow / Arrow C++ store the original Arrow schema in the Parquet footer
  * under the key "ARROW:schema" as a base64-encoded, encapsulated Arrow IPC
  * Schema message. Emitting it lets Arrow round-trip Arrow-specific type
- * information losslessly. This is opt-in (writer option) and only produced
- * for flat (non-nested) schemas; nested schemas return NULL so we never write
- * a schema that disagrees with the Parquet schema.
+ * information losslessly. This is opt-in (writer option).
+ *
+ * Both flat and nested schemas are emitted: the Parquet schema tree is walked
+ * recursively and mapped to Arrow Fields, collapsing the intermediate levels
+ * Arrow does not model — a Parquet 3-level LIST becomes Arrow `List<element>`,
+ * a Parquet MAP becomes `Map<entries: struct<key, value>>`, and a plain group
+ * becomes a `Struct`. Any element that cannot be faithfully mapped aborts the
+ * whole emission (returns NULL) so we never write a schema that disagrees with
+ * the Parquet schema.
  */
 #ifndef CARQUET_ARROW_SCHEMA_H
 #define CARQUET_ARROW_SCHEMA_H

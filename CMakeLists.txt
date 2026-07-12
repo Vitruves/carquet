@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(carquet VERSION 0.6.1 LANGUAGES C)
+project(carquet VERSION 0.7.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -315,6 +315,9 @@ endif()
 
 set(CARQUET_READER_SOURCES
     src/reader/file_reader.c
+    src/reader/arrow_schema_read.c
+    src/reader/arrow_c_export.c
+    src/reader/arrow_c_read.c
     src/reader/row_group_reader.c
     src/reader/column_reader.c
     src/reader/page_reader.c
@@ -331,11 +334,11 @@ set(CARQUET_WRITER_SOURCES
     src/writer/column_writer.c
     src/writer/page_writer.c
     src/writer/arrow_schema.c
+    src/writer/arrow_c_import.c
 )
 
 set(CARQUET_METADATA_SOURCES
     src/metadata/schema.c
-    src/metadata/statistics.c
     src/metadata/bloom_filter.c
     src/metadata/page_index.c
 )
@@ -627,6 +630,17 @@ if(CARQUET_BUILD_TESTS)
     # INT96 writing, opt-in Data Page V2, ARROW:schema metadata
     add_carquet_test(test_writer_extensions tests/test_writer_extensions.c)
 
+    # Arrow C Data Interface export/import bridge
+    add_carquet_test(test_arrow_c_data tests/test_arrow_c_data.c)
+    add_carquet_test(test_arrow_nested tests/test_arrow_nested.c)
+    add_carquet_test(test_p2_conformance tests/test_p2_conformance.c)
+
+    # LIST reconstruction in the batch reader (Arrow offsets + child buffers)
+    add_carquet_test(test_batch_nested tests/test_batch_nested.c)
+
+    # Nested write helper: auto-shredding LIST/MAP from offsets + validity
+    add_carquet_test(test_nested_write tests/test_nested_write.c)
+
     # Wide (SIMD) bit-unpack fast path vs independent oracle
     add_carquet_test(test_bitunpack_wide tests/test_bitunpack_wide.c)
 
@@ -671,6 +685,7 @@ if(CARQUET_BUILD_EXAMPLES)
     add_carquet_example(example_append examples/append_rows.c)
     add_carquet_example(example_page_filter examples/page_filter.c)
     add_carquet_example(example_nested examples/nested_data.c)
+    add_carquet_example(example_arrow_c_data examples/arrow_c_data.c)
 endif()
 
 # Benchmarks
@@ -800,6 +815,34 @@ endif()
 option(CARQUET_BUILD_FUZZ "Build fuzz targets" OFF)
 if(CARQUET_BUILD_FUZZ)
     add_subdirectory(fuzz)
+endif()
+
+# Documentation (Doxygen) — optional; the `docs` target only exists when
+# Doxygen is actually installed, so a plain build never requires it.
+option(CARQUET_BUILD_DOCS "Build API documentation with Doxygen (needs doxygen; graphviz for diagrams)" OFF)
+if(CARQUET_BUILD_DOCS AND CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+    find_package(Doxygen OPTIONAL_COMPONENTS dot)
+    if(DOXYGEN_FOUND)
+        set(_carquet_docs_out ${CMAKE_CURRENT_BINARY_DIR}/docs)
+        # Reuse the checked-in Doxyfile verbatim, only redirecting its output
+        # into the build tree. @INCLUDE pulls in the real config; the trailing
+        # override wins because Doxygen applies later settings last.
+        set(_carquet_doxyfile ${CMAKE_CURRENT_BINARY_DIR}/Doxyfile.docs)
+        file(WRITE ${_carquet_doxyfile}
+            "@INCLUDE_PATH = ${CMAKE_CURRENT_SOURCE_DIR}\n"
+            "@INCLUDE      = Doxyfile\n"
+            "OUTPUT_DIRECTORY = ${_carquet_docs_out}\n")
+        add_custom_target(docs
+            COMMAND ${DOXYGEN_EXECUTABLE} ${_carquet_doxyfile}
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}  # so INPUT/IMAGE_PATH resolve
+            COMMENT "Generating API docs -> ${_carquet_docs_out}/html/index.html"
+            VERBATIM)
+        if(NOT TARGET Doxygen::dot)
+            message(STATUS "Doxygen found but graphviz 'dot' is missing: docs will build without diagrams")
+        endif()
+    else()
+        message(WARNING "CARQUET_BUILD_DOCS=ON but Doxygen was not found; the 'docs' target is unavailable")
+    endif()
 endif()
 
 # CLI tool

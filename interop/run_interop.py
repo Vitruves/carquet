@@ -483,6 +483,20 @@ def verify_pyarrow(path, expected, file_info):
         except Exception:
             pass
 
+    # Verify Arrow per-field custom_metadata (variable labels) recovered from
+    # the ARROW:schema footer blob.
+    for fname, want in file_info.get("field_metadata", {}).items():
+        try:
+            field = table.schema.field(fname)
+        except Exception as e:
+            errors.append(f"field_metadata {fname}: field missing ({e})")
+            continue
+        md = {k.decode(): v.decode() for k, v in (field.metadata or {}).items()}
+        for k, v in want.items():
+            if md.get(k) != v:
+                errors.append(
+                    f"field_metadata {fname}[{k}]: {md.get(k)!r} != {v!r}")
+
     return errors
 
 
@@ -579,8 +593,12 @@ def _norm_struct(v):
     return v
 
 
+_NESTED_DEEP_MATRIX = [[[1, 2], [3]], [], [[4]]]  # list<list<int32>>
+
+
 def verify_nested_pyarrow(path):
     try:
+        import pyarrow as pa
         import pyarrow.parquet as pq
         t = pq.read_table(path)
     except ImportError:
@@ -588,6 +606,18 @@ def verify_nested_pyarrow(path):
     except Exception as e:
         return [f"Failed to read: {e}"]
     errors = []
+    # Deep-nested file (list<list<int32>>) written via carquet_writer_write_arrow.
+    if "matrix" in t.schema.names:
+        try:
+            got = t.column("matrix").to_pylist()
+            if got != _NESTED_DEEP_MATRIX:
+                errors.append(f"matrix {got} != {_NESTED_DEEP_MATRIX}")
+            mt = t.schema.field("matrix").type
+            if not (pa.types.is_list(mt) and pa.types.is_list(mt.value_type)):
+                errors.append(f"matrix not list<list>: {mt}")
+        except Exception as e:
+            errors.append(str(e))
+        return errors
     try:
         if t.column("id").to_pylist() != _NESTED_ID:
             errors.append("id mismatch")
@@ -596,6 +626,17 @@ def verify_nested_pyarrow(path):
         info = [_norm_struct(v) for v in t.column("info").to_pylist()]
         if info != _NESTED_INFO:
             errors.append(f"info {info} != {_NESTED_INFO}")
+        # carquet now emits ARROW:schema for nested schemas: the raw footer must
+        # carry the blob (PyArrow consumes it into schema types, so check the
+        # raw file metadata) and PyArrow must read the correct nested types.
+        raw_meta = pq.read_metadata(path).metadata or {}
+        if b"ARROW:schema" not in raw_meta:
+            errors.append("ARROW:schema blob missing for nested file")
+        import pyarrow as pa
+        if not pa.types.is_list(t.schema.field("tags").type):
+            errors.append(f"tags not list: {t.schema.field('tags').type}")
+        if not pa.types.is_struct(t.schema.field("info").type):
+            errors.append(f"info not struct: {t.schema.field('info').type}")
     except Exception as e:
         errors.append(str(e))
     return errors
@@ -609,6 +650,15 @@ def verify_nested_duckdb(path):
     conn = None
     try:
         conn = duckdb.connect()
+        cols = [d[0] for d in conn.execute(
+            "SELECT * FROM read_parquet(?) LIMIT 0", [path]).description]
+        if "matrix" in cols:
+            rows = conn.execute(
+                "SELECT matrix FROM read_parquet(?)", [path]).fetchall()
+            got = [r[0] for r in rows]
+            if got != _NESTED_DEEP_MATRIX:
+                return [f"matrix {got} != {_NESTED_DEEP_MATRIX}"]
+            return []
         rows = conn.execute(
             "SELECT id, tags, info FROM read_parquet(?) ORDER BY id", [path]
         ).fetchall()
@@ -671,9 +721,14 @@ def run_write_tests(roundtrip_bin, verbose):
                 entry["pyarrow"] = "PASS"
                 pa_status = f"{GRN}OK{RST}"
 
-            # DuckDB verification
-            db_errors = (verify_nested_duckdb(path) if is_nested
-                         else verify_duckdb(path, expected, file_info))
+            # DuckDB verification. DuckDB does not support the deprecated
+            # Hadoop-framed LZ4 (Parquet codec 5); PyArrow does, which is the
+            # interop proof for that wire format.
+            if compression == "lz4":
+                db_errors = ["duckdb not available"]  # treated as SKIP below
+            else:
+                db_errors = (verify_nested_duckdb(path) if is_nested
+                             else verify_duckdb(path, expected, file_info))
             if db_errors and db_errors != ["duckdb not available"]:
                 entry["duckdb"] = "FAIL"
                 db_status = f"{RED}FAIL{RST}"

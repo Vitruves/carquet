@@ -42,16 +42,18 @@ extern void carquet_column_index_builder_destroy(carquet_column_index_builder_t*
 extern carquet_status_t carquet_column_index_add_page(
     carquet_column_index_builder_t* builder,
     int64_t null_count, const void* min_value, int32_t min_value_len,
-    const void* max_value, int32_t max_value_len, bool is_null_page);
+    const void* max_value, int32_t max_value_len, bool is_null_page,
+    const int64_t* rep_level_hist, int32_t rep_level_hist_len,
+    const int64_t* def_level_hist, int32_t def_level_hist_len);
 extern carquet_status_t carquet_column_index_serialize(
     const carquet_column_index_builder_t* builder, carquet_buffer_t* output);
 
-extern carquet_offset_index_builder_t* carquet_offset_index_builder_create(bool track_uncompressed);
+extern carquet_offset_index_builder_t* carquet_offset_index_builder_create(bool track_unencoded);
 extern void carquet_offset_index_builder_destroy(carquet_offset_index_builder_t* builder);
 extern carquet_status_t carquet_offset_index_add_page(
     carquet_offset_index_builder_t* builder,
     int64_t offset, int32_t compressed_size,
-    int64_t first_row_index, int32_t uncompressed_size);
+    int64_t first_row_index, int64_t unencoded_byte_array_bytes);
 extern carquet_status_t carquet_offset_index_serialize(
     const carquet_offset_index_builder_t* builder, carquet_buffer_t* output);
 extern void carquet_offset_index_builder_shift_offsets(
@@ -95,6 +97,13 @@ extern carquet_status_t carquet_page_writer_finalize_to_buffer(
 
 extern size_t carquet_page_writer_estimated_size(const carquet_page_writer_t* writer);
 extern int64_t carquet_page_writer_num_values(const carquet_page_writer_t* writer);
+extern int64_t carquet_page_writer_byte_array_bytes(const carquet_page_writer_t* writer);
+extern void carquet_page_writer_set_byte_array_bytes(
+    carquet_page_writer_t* writer, int64_t bytes);
+extern const int64_t* carquet_page_writer_def_level_histogram(
+    const carquet_page_writer_t* writer, int32_t* len);
+extern const int64_t* carquet_page_writer_rep_level_histogram(
+    const carquet_page_writer_t* writer, int32_t* len);
 extern void carquet_page_writer_set_crc(carquet_page_writer_t* writer, bool enabled);
 extern void carquet_page_writer_set_statistics(carquet_page_writer_t* writer, bool enabled);
 extern void carquet_page_writer_set_data_page_v2(carquet_page_writer_t* writer, bool enabled);
@@ -221,6 +230,18 @@ typedef struct carquet_column_writer_internal {
     int64_t dict_total_nulls;
     bool has_dictionary_page;           /* Set when a dict page was emitted */
     int64_t dictionary_page_size_bytes; /* Size of the emitted dict page */
+    /* Exact distinct non-null value count for this chunk. Set only when the
+     * dictionary was built and kept (num_unique); on PLAIN / dict-fallback we
+     * cannot count distincts cheaply, so it stays unset and Statistics omits
+     * distinct_count. */
+    bool has_distinct_count;
+    int64_t distinct_count;
+    /* Chunk-level SizeStatistics accumulators (Parquet 2.9), summed over pages
+     * in flush_current_page. Histograms are sized max_def/rep_level + 1;
+     * chunk_unencoded_ba_bytes is meaningful only for BYTE_ARRAY columns. */
+    int64_t chunk_unencoded_ba_bytes;
+    int64_t* chunk_def_hist;
+    int64_t* chunk_rep_hist;
 
     /* Deferred-encode state. For non-dictionary, compressed, fixed-stride
      * columns in a parallel-capable row group, write_batch stashes the raw
@@ -244,6 +265,8 @@ typedef struct carquet_column_writer_internal {
  * Column Writer Lifecycle
  * ============================================================================
  */
+
+void carquet_column_writer_destroy(carquet_column_writer_internal_t* writer);
 
 carquet_column_writer_internal_t* carquet_column_writer_create(
     carquet_physical_type_t type,
@@ -283,14 +306,16 @@ carquet_column_writer_internal_t* carquet_column_writer_create(
     writer->max_page_size = writer->target_page_size * 2;
 
     /* Dictionary encoding is used when the requested encoding is a dictionary
-     * encoding AND the physical type is eligible. INT96, BOOLEAN and
-     * FIXED_LEN_BYTE_ARRAY have no dictionary encoder, so they keep PLAIN. */
+     * encoding AND the physical type is eligible. INT96 and BOOLEAN have no
+     * dictionary encoder, so they keep PLAIN. FIXED_LEN_BYTE_ARRAY is encoded
+     * as a fixed-width dictionary (stride == type_length). */
     bool dict_eligible_type =
         type == CARQUET_PHYSICAL_INT32 ||
         type == CARQUET_PHYSICAL_INT64 ||
         type == CARQUET_PHYSICAL_FLOAT ||
         type == CARQUET_PHYSICAL_DOUBLE ||
-        type == CARQUET_PHYSICAL_BYTE_ARRAY;
+        type == CARQUET_PHYSICAL_BYTE_ARRAY ||
+        (type == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY && type_length > 0);
     writer->use_dictionary = dict_eligible_type &&
         (encoding == CARQUET_ENCODING_RLE_DICTIONARY ||
          encoding == CARQUET_ENCODING_PLAIN_DICTIONARY);
@@ -298,6 +323,15 @@ carquet_column_writer_internal_t* carquet_column_writer_create(
     carquet_buffer_init(&writer->dict_values);
     carquet_buffer_init(&writer->dict_ba_storage);
     carquet_buffer_init(&writer->deferred_values);
+
+    writer->chunk_def_hist =
+        carquet_mem_calloc((size_t)max_def_level + 1, sizeof(int64_t));
+    writer->chunk_rep_hist =
+        carquet_mem_calloc((size_t)max_rep_level + 1, sizeof(int64_t));
+    if (!writer->chunk_def_hist || !writer->chunk_rep_hist) {
+        carquet_column_writer_destroy(writer);
+        return NULL;
+    }
 
     return writer;
 }
@@ -318,6 +352,8 @@ void carquet_column_writer_destroy(carquet_column_writer_internal_t* writer) {
         carquet_mem_free(writer->dict_ba);
         carquet_mem_free(writer->dict_def_levels);
         carquet_mem_free(writer->dict_rep_levels);
+        carquet_mem_free(writer->chunk_def_hist);
+        carquet_mem_free(writer->chunk_rep_hist);
 
         /* Free path strings */
         if (writer->path_in_schema) {
@@ -413,6 +449,17 @@ void carquet_column_writer_reset(carquet_column_writer_internal_t* writer) {
     writer->dict_total_nulls = 0;
     writer->has_dictionary_page = false;
     writer->dictionary_page_size_bytes = 0;
+    writer->has_distinct_count = false;
+    writer->distinct_count = 0;
+    writer->chunk_unencoded_ba_bytes = 0;
+    if (writer->chunk_def_hist) {
+        memset(writer->chunk_def_hist, 0,
+               ((size_t)writer->max_def_level + 1) * sizeof(int64_t));
+    }
+    if (writer->chunk_rep_hist) {
+        memset(writer->chunk_rep_hist, 0,
+               ((size_t)writer->max_rep_level + 1) * sizeof(int64_t));
+    }
 
     if (writer->bloom_filter) {
         carquet_bloom_filter_destroy(writer->bloom_filter);
@@ -436,7 +483,8 @@ void carquet_column_writer_reset(carquet_column_writer_internal_t* writer) {
     if (writer->page_index_enabled) {
         writer->column_index = carquet_column_index_builder_create(
             writer->type, &writer->logical_type, writer->type_length);
-        writer->offset_index = carquet_offset_index_builder_create(true);
+        writer->offset_index = carquet_offset_index_builder_create(
+            writer->type == CARQUET_PHYSICAL_BYTE_ARRAY);
     }
 }
 
@@ -624,6 +672,25 @@ static carquet_status_t flush_current_page(carquet_column_writer_internal_t* wri
         return status;
     }
 
+    /* Per-page level histograms + unencoded BYTE_ARRAY bytes, still live on the
+     * page writer (reset happens below). Fold them into the chunk-level
+     * SizeStatistics accumulators regardless of whether a page index is built. */
+    int32_t rep_hist_len = 0, def_hist_len = 0;
+    const int64_t* rep_hist = carquet_page_writer_rep_level_histogram(
+        writer->page_writer, &rep_hist_len);
+    const int64_t* def_hist = carquet_page_writer_def_level_histogram(
+        writer->page_writer, &def_hist_len);
+    if (rep_hist && rep_hist_len == writer->max_rep_level + 1) {
+        for (int32_t i = 0; i < rep_hist_len; i++) writer->chunk_rep_hist[i] += rep_hist[i];
+    }
+    if (def_hist && def_hist_len == writer->max_def_level + 1) {
+        for (int32_t i = 0; i < def_hist_len; i++) writer->chunk_def_hist[i] += def_hist[i];
+    }
+    if (writer->type == CARQUET_PHYSICAL_BYTE_ARRAY) {
+        writer->chunk_unencoded_ba_bytes +=
+            carquet_page_writer_byte_array_bytes(writer->page_writer);
+    }
+
     /* Record page index entries before appending */
     if (writer->column_index) {
         bool is_null_page = !has_stats;
@@ -632,7 +699,8 @@ static carquet_status_t flush_current_page(carquet_column_writer_internal_t* wri
             page_null_count,
             has_stats ? page_min : NULL, has_stats ? (int32_t)min_size : 0,
             has_stats ? page_max : NULL, has_stats ? (int32_t)max_size : 0,
-            is_null_page);
+            is_null_page,
+            rep_hist, rep_hist_len, def_hist, def_hist_len);
     }
 
     if (writer->offset_index) {
@@ -649,7 +717,7 @@ static carquet_status_t flush_current_page(carquet_column_writer_internal_t* wri
             page_offset_relative,
             (int32_t)page_size,
             writer->page_row_offset,
-            uncompressed_size);
+            carquet_page_writer_byte_array_bytes(writer->page_writer));
         writer->page_row_offset += carquet_page_writer_num_values(writer->page_writer);
     }
 
@@ -1251,6 +1319,12 @@ static carquet_status_t finalize_dictionary(
     int32_t num_unique = dict_entry_count(writer->type, writer->type_length,
                                           dict_out.data, dict_out.size);
 
+    /* num_unique is the exact number of distinct non-null values in this chunk
+     * (it stays correct whether the dictionary is kept below or falls back to
+     * PLAIN for being all-unique), so record it for Statistics.distinct_count. */
+    writer->has_distinct_count = true;
+    writer->distinct_count = num_unique;
+
     /* The dictionary fit under the size budget, but if it is effectively
      * all-unique it provides no benefit, so fall back to PLAIN. (This path
      * completed a full cheap pass; only the catastrophic high-cardinality
@@ -1301,6 +1375,18 @@ static carquet_status_t finalize_dictionary(
         status = carquet_page_writer_set_min_max(writer->page_writer,
                                                  mn, mn_len, mx, mx_len);
         if (status != CARQUET_OK) return status;
+    }
+
+    /* The RLE_DICTIONARY data page stages indices, not raw values, so the page
+     * writer never accumulated the unencoded BYTE_ARRAY byte total. Compute it
+     * from the (non-deduplicated) accumulated values and inject it so the
+     * OffsetIndex reports the correct unencoded_byte_array_data_bytes. */
+    if (writer->type == CARQUET_PHYSICAL_BYTE_ARRAY) {
+        int64_t ba_bytes = 0;
+        for (int64_t i = 0; i < writer->dict_value_count; i++) {
+            ba_bytes += writer->dict_ba[i].length;
+        }
+        carquet_page_writer_set_byte_array_bytes(writer->page_writer, ba_bytes);
     }
 
     /* flush_current_page reads stats off the page writer, finalizes the data
@@ -1397,6 +1483,36 @@ int64_t carquet_column_writer_num_values(const carquet_column_writer_internal_t*
     return writer ? writer->total_values : 0;
 }
 
+/* Exact distinct non-null value count for the finalized chunk, available only
+ * when a dictionary was built (see finalize_dictionary). Returns false and
+ * leaves *count untouched otherwise. */
+bool carquet_column_writer_get_distinct_count(
+    const carquet_column_writer_internal_t* writer, int64_t* count) {
+    if (!writer || !writer->has_distinct_count) return false;
+    if (count) *count = writer->distinct_count;
+    return true;
+}
+
+/* Chunk-level SizeStatistics (Parquet 2.9). Returns the accumulated per-level
+ * histograms (owned by the writer, valid until reset/destroy) and the total
+ * unencoded BYTE_ARRAY byte count. Histogram lengths are max_rep/def_level + 1. */
+void carquet_column_writer_get_size_statistics(
+    const carquet_column_writer_internal_t* writer,
+    int64_t* unencoded_byte_array_bytes,
+    const int64_t** rep_level_hist, int32_t* rep_len,
+    const int64_t** def_level_hist, int32_t* def_len) {
+    if (!writer) return;
+    if (unencoded_byte_array_bytes) {
+        *unencoded_byte_array_bytes =
+            writer->type == CARQUET_PHYSICAL_BYTE_ARRAY
+                ? writer->chunk_unencoded_ba_bytes : -1;
+    }
+    if (rep_level_hist) *rep_level_hist = writer->chunk_rep_hist;
+    if (rep_len) *rep_len = (int32_t)writer->max_rep_level + 1;
+    if (def_level_hist) *def_level_hist = writer->chunk_def_hist;
+    if (def_len) *def_len = (int32_t)writer->max_def_level + 1;
+}
+
 bool carquet_column_writer_has_dictionary_page(
     const carquet_column_writer_internal_t* writer) {
     return writer && writer->has_dictionary_page;
@@ -1489,7 +1605,8 @@ void carquet_column_writer_enable_page_index(
             writer->type, &writer->logical_type, writer->type_length);
     }
     if (!writer->offset_index) {
-        writer->offset_index = carquet_offset_index_builder_create(true);
+        writer->offset_index = carquet_offset_index_builder_create(
+            writer->type == CARQUET_PHYSICAL_BYTE_ARRAY);
     }
 }
 

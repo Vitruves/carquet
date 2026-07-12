@@ -585,6 +585,45 @@ static void parse_column_metadata(thrift_decoder_t* dec, carquet_arena_t* arena,
                 meta->has_bloom_filter_length = true;
                 meta->bloom_filter_length = thrift_read_i32(dec);
                 break;
+            case 16: {  /* size_statistics (Parquet 2.9) */
+                meta->has_size_statistics = true;
+                parquet_size_statistics_t* ss = &meta->size_statistics;
+                memset(ss, 0, sizeof(*ss));
+                thrift_read_struct_begin(dec);
+                thrift_type_t st;
+                int16_t sfid;
+                while (thrift_read_field_begin(dec, &st, &sfid)) {
+                    if (sfid == 1) {  /* unencoded_byte_array_data_bytes */
+                        ss->has_unencoded_byte_array_data_bytes = true;
+                        ss->unencoded_byte_array_data_bytes = thrift_read_i64(dec);
+                    } else if (sfid == 2 || sfid == 3) {  /* level histograms */
+                        thrift_type_t et;
+                        int32_t count;
+                        thrift_read_list_begin(dec, &et, &count);
+                        /* Bounded to guard against malformed files; real level
+                         * histograms are tiny (max_level + 1). */
+                        VALIDATE_COUNT(count, CARQUET_MAX_SCHEMA_ELEMENTS, dec);
+                        int64_t* hist = count > 0
+                            ? carquet_arena_calloc(arena, count, sizeof(int64_t))
+                            : NULL;
+                        for (int32_t i = 0; i < count; i++) {
+                            int64_t v = thrift_read_i64(dec);
+                            if (hist) hist[i] = v;
+                        }
+                        if (sfid == 2) {
+                            ss->repetition_level_histogram = hist;
+                            ss->repetition_level_histogram_len = count;
+                        } else {
+                            ss->definition_level_histogram = hist;
+                            ss->definition_level_histogram_len = count;
+                        }
+                    } else {
+                        thrift_skip(dec, st);
+                    }
+                }
+                thrift_read_struct_end(dec);
+                break;
+            }
             case 17: {  /* geospatial_statistics */
                 meta->has_geospatial_statistics = true;
                 parquet_geospatial_statistics_t* g = &meta->geospatial_statistics;
@@ -868,14 +907,33 @@ carquet_status_t parquet_parse_file_metadata(
             case 6:  /* created_by */
                 metadata->created_by = arena_strdup_thrift(arena, &dec);
                 break;
-            case 7: {  /* column_orders */
+            case 7: {  /* column_orders: list<ColumnOrder> (union) */
                 thrift_type_t elem_type;
                 int32_t count;
                 thrift_read_list_begin(&dec, &elem_type, &count);
                 VALIDATE_COUNT_STATUS(count, CARQUET_MAX_COLUMNS_PER_RG, error);
                 metadata->num_column_orders = count;
+                if (count > 0) {
+                    metadata->column_order_types = carquet_arena_alloc(
+                        arena, (size_t)count * sizeof(int16_t));
+                }
                 for (int32_t i = 0; i < count; i++) {
-                    thrift_skip(&dec, elem_type);
+                    /* Each element is a ColumnOrder union struct: a single
+                     * field header names the set member, then STOP. Record the
+                     * member's field id (1 = TypeDefinedOrder) so the content
+                     * round-trips instead of only the count. */
+                    thrift_read_struct_begin(&dec);
+                    thrift_type_t ft;
+                    int16_t fid;
+                    int16_t tag = 0;
+                    while (thrift_read_field_begin(&dec, &ft, &fid)) {
+                        if (tag == 0) tag = fid;
+                        thrift_skip(&dec, ft);
+                    }
+                    thrift_read_struct_end(&dec);
+                    if (metadata->column_order_types) {
+                        metadata->column_order_types[i] = tag;
+                    }
                 }
                 break;
             }
@@ -1550,6 +1608,39 @@ static void write_column_metadata(thrift_encoder_t* enc, const parquet_column_me
     if (meta->has_bloom_filter_length) {
         thrift_write_field_header(enc, THRIFT_TYPE_I32, 15);
         thrift_write_i32(enc, meta->bloom_filter_length);
+    }
+
+    /* Field 16: size_statistics (optional, Parquet 2.9) */
+    if (meta->has_size_statistics) {
+        const parquet_size_statistics_t* ss = &meta->size_statistics;
+        thrift_write_field_header(enc, THRIFT_TYPE_STRUCT, 16);
+        thrift_write_struct_begin(enc);
+        /* Field 1: unencoded_byte_array_data_bytes (i64) */
+        if (ss->has_unencoded_byte_array_data_bytes) {
+            thrift_write_field_header(enc, THRIFT_TYPE_I64, 1);
+            thrift_write_i64(enc, ss->unencoded_byte_array_data_bytes);
+        }
+        /* Field 2: repetition_level_histogram (list<i64>) */
+        if (ss->repetition_level_histogram &&
+            ss->repetition_level_histogram_len > 0) {
+            thrift_write_field_header(enc, THRIFT_TYPE_LIST, 2);
+            thrift_write_list_begin(enc, THRIFT_TYPE_I64,
+                                    ss->repetition_level_histogram_len);
+            for (int32_t i = 0; i < ss->repetition_level_histogram_len; i++) {
+                thrift_write_i64(enc, ss->repetition_level_histogram[i]);
+            }
+        }
+        /* Field 3: definition_level_histogram (list<i64>) */
+        if (ss->definition_level_histogram &&
+            ss->definition_level_histogram_len > 0) {
+            thrift_write_field_header(enc, THRIFT_TYPE_LIST, 3);
+            thrift_write_list_begin(enc, THRIFT_TYPE_I64,
+                                    ss->definition_level_histogram_len);
+            for (int32_t i = 0; i < ss->definition_level_histogram_len; i++) {
+                thrift_write_i64(enc, ss->definition_level_histogram[i]);
+            }
+        }
+        thrift_write_struct_end(enc);
     }
 
     /* Field 17: geospatial_statistics (optional) */

@@ -83,6 +83,13 @@ extern bool carquet_column_writer_get_statistics(
     const uint8_t** min_value, size_t* min_size,
     const uint8_t** max_value, size_t* max_size,
     int64_t* null_count);
+extern bool carquet_column_writer_get_distinct_count(
+    const carquet_column_writer_internal_t* writer, int64_t* count);
+extern void carquet_column_writer_get_size_statistics(
+    const carquet_column_writer_internal_t* writer,
+    int64_t* unencoded_byte_array_bytes,
+    const int64_t** rep_level_hist, int32_t* rep_len,
+    const int64_t** def_level_hist, int32_t* def_len);
 extern void carquet_column_writer_set_crc(
     carquet_column_writer_internal_t* writer, bool enabled);
 extern void carquet_column_writer_set_data_page_v2(
@@ -138,6 +145,18 @@ typedef struct column_chunk_info {
     /* GeospatialStatistics (GEOMETRY/GEOGRAPHY); cumulative over the chunk. */
     bool has_geo_stats;
     parquet_geospatial_statistics_t geo_stats;
+    /* Exact distinct non-null count (dictionary-encoded chunks only). */
+    bool has_distinct_count;
+    int64_t distinct_count;
+    /* SizeStatistics (Parquet 2.9). Histogram pointers alias the column
+     * writer's buffers and stay valid until it is reset/destroyed; the file
+     * writer copies them out immediately after finalize. unencoded_ba_bytes is
+     * -1 for non-BYTE_ARRAY columns. */
+    int64_t unencoded_ba_bytes;
+    const int64_t* rep_level_hist;
+    int32_t rep_hist_len;
+    const int64_t* def_level_hist;
+    int32_t def_hist_len;
 } column_chunk_info_t;
 
 /* ============================================================================
@@ -241,6 +260,12 @@ static void capture_dictionary_info(carquet_row_group_writer_t* writer, int i) {
         carquet_column_writer_has_dictionary_page(writer->column_writers[i]);
     info->dictionary_page_size =
         carquet_column_writer_dictionary_page_size(writer->column_writers[i]);
+    info->has_distinct_count = carquet_column_writer_get_distinct_count(
+        writer->column_writers[i], &info->distinct_count);
+    carquet_column_writer_get_size_statistics(
+        writer->column_writers[i], &info->unencoded_ba_bytes,
+        &info->rep_level_hist, &info->rep_hist_len,
+        &info->def_level_hist, &info->def_hist_len);
 }
 
 static bool can_parallel_finalize(const carquet_row_group_writer_t* writer) {

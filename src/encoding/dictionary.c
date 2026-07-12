@@ -491,7 +491,6 @@ carquet_status_t carquet_dictionary_encode_capped(
 
     if (abandoned) *abandoned = false;
     if (count <= 0) return CARQUET_ERROR_INVALID_ARGUMENT;
-    (void)type_length;
 
     size_t value_size;
     bool var_len = false;
@@ -501,6 +500,10 @@ carquet_status_t carquet_dictionary_encode_capped(
         case CARQUET_PHYSICAL_INT64:
         case CARQUET_PHYSICAL_DOUBLE: value_size = 8; break;
         case CARQUET_PHYSICAL_BYTE_ARRAY: value_size = 0; var_len = true; break;
+        case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY:
+            if (type_length <= 0) return CARQUET_ERROR_INVALID_ARGUMENT;
+            value_size = (size_t)type_length;
+            break;
         default: return CARQUET_ERROR_NOT_IMPLEMENTED;
     }
 
@@ -536,6 +539,11 @@ carquet_status_t carquet_dictionary_encode_capped(
                 status = dict_builder_add(&builder, le, 8);
                 break;
             }
+            case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY:
+                status = dict_builder_add(&builder,
+                    (const uint8_t*)fixed_values + (size_t)i * value_size,
+                    value_size);
+                break;
             default:  /* BYTE_ARRAY */
                 status = dict_builder_add(&builder, ba_values[i].data,
                                           (size_t)ba_values[i].length);
