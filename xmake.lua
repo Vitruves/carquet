@@ -11,7 +11,7 @@
 -- Enable optional pieces individually, e.g. `xmake f --tests=y --fuzz=y`.
 
 set_project("carquet")
-set_version("0.7.0")
+set_version("0.7.1")
 -- gnu11, not strict c11: matches CMake's `set(CMAKE_C_STANDARD 11)` (GNU
 -- extensions stay on by default). Under strict -std=c11 the POSIX feature-test
 -- macros are off, so functions like strdup/posix_memalign aren't declared and
@@ -368,15 +368,26 @@ if want("tests") then
         "test_edge_boundaries", "test_edge_io", "test_nested",
         "test_bloom_page_index", "test_mmap", "test_advanced_api",
         "test_encoding_roundtrip", "test_writer_extensions", "test_bitunpack_wide",
-        "test_page_filter", "test_append",
+        "test_page_filter", "test_append", "test_row_range", "test_dict_decode",
+        "test_decimal_stats", "test_arrow_dictionary",
         "test_float16", "test_geo_wkb", "test_worker_pool", "test_custom_codec",
         "test_real_world", "test_arrow_c_data", "test_batch_nested",
         "test_nested_write", "test_arrow_nested", "test_p2_conformance",
+        "test_cli_format",
+    }
+    -- Tests that link extra non-library sources (the CLI helpers live in the
+    -- carquet_cli target, not in libcarquet).
+    local test_extra_files = {
+        test_cli_format = {"src/cli/commands.c"},
     }
     for _, t in ipairs(tests) do
         local exe_opts = {with_src = true, keep_asserts = true, is_test = true}
         if t == "test_worker_pool" then exe_opts.cl_cflags = "/experimental:c11atomics" end
-        carquet_exe(t, "tests/" .. t .. ".c", exe_opts)
+        local files = {"tests/" .. t .. ".c"}
+        for _, extra in ipairs(test_extra_files[t] or {}) do
+            table.insert(files, extra)
+        end
+        carquet_exe(t, files, exe_opts)
     end
 end
 

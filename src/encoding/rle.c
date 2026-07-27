@@ -36,56 +36,61 @@ static int read_varint(const uint8_t* data, size_t size, size_t* pos, uint32_t* 
 }
 
 static bool start_new_run(carquet_rle_decoder_t* dec) {
-    if (dec->pos >= dec->size) {
-        return false;
-    }
-
-    /* Read header */
-    uint32_t header;
-    if (read_varint(dec->data, dec->size, &dec->pos, &header) < 0) {
-        dec->status = CARQUET_ERROR_INVALID_RLE;
-        return false;
-    }
-
-    if ((header & 1) == 0) {
-        /* RLE run */
-        dec->in_rle_run = true;
-        dec->run_remaining = (int64_t)(header >> 1);
-
-        if (dec->run_remaining == 0) {
-            /* Empty run, try next */
-            return start_new_run(dec);
+    /* Loop rather than tail-recurse over empty runs: a hostile page can be a
+     * long run of zero-length-run headers, which would otherwise recurse one
+     * C stack frame per header (only elided under optimization/TCO). */
+    for (;;) {
+        if (dec->pos >= dec->size) {
+            return false;
         }
 
-        /* Read the repeated value (ceil(bit_width/8) bytes) */
-        int value_bytes = (dec->bit_width + 7) / 8;
-        if (dec->pos + (size_t)value_bytes > dec->size) {
+        /* Read header */
+        uint32_t header;
+        if (read_varint(dec->data, dec->size, &dec->pos, &header) < 0) {
             dec->status = CARQUET_ERROR_INVALID_RLE;
             return false;
         }
 
-        dec->rle_value = 0;
-        for (int i = 0; i < value_bytes; i++) {
-            dec->rle_value |= (uint32_t)dec->data[dec->pos++] << (i * 8);
+        if ((header & 1) == 0) {
+            /* RLE run */
+            dec->in_rle_run = true;
+            dec->run_remaining = (int64_t)(header >> 1);
+
+            if (dec->run_remaining == 0) {
+                /* Empty run, try next */
+                continue;
+            }
+
+            /* Read the repeated value (ceil(bit_width/8) bytes) */
+            int value_bytes = (dec->bit_width + 7) / 8;
+            if (dec->pos + (size_t)value_bytes > dec->size) {
+                dec->status = CARQUET_ERROR_INVALID_RLE;
+                return false;
+            }
+
+            dec->rle_value = 0;
+            for (int i = 0; i < value_bytes; i++) {
+                dec->rle_value |= (uint32_t)dec->data[dec->pos++] << (i * 8);
+            }
+            dec->rle_value &= dec->value_mask;
+
+        } else {
+            /* Bit-packed run */
+            dec->in_rle_run = false;
+            int num_groups = (int)(header >> 1);  /* Number of 8-value groups */
+            dec->run_remaining = (int64_t)num_groups * 8;
+
+            if (dec->run_remaining == 0) {
+                continue;
+            }
+
+            /* We'll decode 8 values at a time into the buffer */
+            dec->bitpack_pos = 0;
+            dec->bitpack_count = 0;
         }
-        dec->rle_value &= dec->value_mask;
 
-    } else {
-        /* Bit-packed run */
-        dec->in_rle_run = false;
-        int num_groups = (int)(header >> 1);  /* Number of 8-value groups */
-        dec->run_remaining = (int64_t)num_groups * 8;
-
-        if (dec->run_remaining == 0) {
-            return start_new_run(dec);
-        }
-
-        /* We'll decode 8 values at a time into the buffer */
-        dec->bitpack_pos = 0;
-        dec->bitpack_count = 0;
+        return true;
     }
-
-    return true;
 }
 
 static bool fill_bitpack_buffer(carquet_rle_decoder_t* dec) {
@@ -757,9 +762,12 @@ int64_t carquet_rle_decode_levels_prefixed(
         return -1;
     }
 
-    /* Read 4-byte length prefix (little-endian) */
+    /* Read 4-byte length prefix (little-endian). Widen to 64-bit before adding
+     * the 4-byte prefix: `4 + rle_length` in 32-bit wraps when rle_length is
+     * near UINT32_MAX (e.g. 0xFFFFFFFF -> 3), which would pass this check and
+     * hand ~4 GB to the decoder over a tiny buffer. */
     uint32_t rle_length = carquet_read_u32_le(input);
-    if (4 + rle_length > input_size) {
+    if ((uint64_t)rle_length + 4 > (uint64_t)input_size) {
         if (bytes_consumed) *bytes_consumed = 0;
         return -1;
     }

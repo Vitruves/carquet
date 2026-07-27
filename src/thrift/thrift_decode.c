@@ -412,9 +412,21 @@ void thrift_skip(thrift_decoder_t* dec, thrift_type_t type) {
             thrift_type_t elem_type;
             int32_t count;
             thrift_read_list_begin(dec, &elem_type, &count);
+            /* Bound recursion depth: a malformed footer can nest LIST/SET/MAP
+             * containers arbitrarily (one C stack frame per level), which is not
+             * covered by the STRUCT-only nesting cap. Charge each container
+             * level against nesting_level so a hostile file cannot exhaust the
+             * stack. read_struct_begin's own >= cap check keeps last_field_id[]
+             * indexing in range even when the depth was spent on containers. */
+            if (dec->nesting_level >= THRIFT_MAX_NESTING) {
+                set_error(dec, CARQUET_ERROR_THRIFT_DECODE, "Thrift nesting too deep");
+                break;
+            }
+            dec->nesting_level++;
             for (int32_t i = 0; i < count && dec->status == CARQUET_OK; i++) {
                 thrift_skip(dec, elem_type);
             }
+            dec->nesting_level--;
             break;
         }
 
@@ -422,10 +434,16 @@ void thrift_skip(thrift_decoder_t* dec, thrift_type_t type) {
             thrift_type_t key_type, value_type;
             int32_t count;
             thrift_read_map_begin(dec, &key_type, &value_type, &count);
+            if (dec->nesting_level >= THRIFT_MAX_NESTING) {
+                set_error(dec, CARQUET_ERROR_THRIFT_DECODE, "Thrift nesting too deep");
+                break;
+            }
+            dec->nesting_level++;
             for (int32_t i = 0; i < count && dec->status == CARQUET_OK; i++) {
                 thrift_skip(dec, key_type);
                 thrift_skip(dec, value_type);
             }
+            dec->nesting_level--;
             break;
         }
 

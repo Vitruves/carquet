@@ -156,6 +156,36 @@ void carquet_bitunpack8_8bit(const uint8_t* input, uint32_t* values) {
  * ============================================================================
  */
 
+/* General unpack of 8 values for bit widths 9-32 (no specialized/SIMD kernel).
+ *
+ * Each of the 8 values starts at bit offset i*bit_width and spans at most
+ * ceil((7 + 32)/8) = 5 bytes, so it can be extracted with a single
+ * little-endian load, a shift and a mask — no per-byte inner loop. For a group
+ * of 8 values the highest byte touched is (8*bit_width - 1)/8 = bit_width - 1,
+ * i.e. strictly inside the bit_width bytes the group occupies, so this reads no
+ * further than the original loop. The 64-bit mask keeps bit_width == 32
+ * well-defined. This branchless form is markedly faster than the old
+ * bit-at-a-time assembly (matters most for dictionary index decode, whose index
+ * width is 9-32 bits for >256-entry dictionaries) and auto-vectorizes cleanly. */
+static void carquet_bitunpack8_general(const uint8_t* input, int bit_width,
+                                       uint32_t* values) {
+    uint64_t mask = (1ULL << bit_width) - 1;
+
+    for (int i = 0; i < 8; i++) {
+        int bit_off = i * bit_width;
+        int byte_off = bit_off >> 3;
+        int shift = bit_off & 7;
+        int nbytes = (shift + bit_width + 7) >> 3;   /* 1..5 */
+
+        uint64_t bits = 0;
+        for (int b = 0; b < nbytes; b++) {
+            bits |= (uint64_t)input[byte_off + b] << (b * 8);
+        }
+
+        values[i] = (uint32_t)((bits >> shift) & mask);
+    }
+}
+
 void carquet_bitunpack8_32(const uint8_t* input, int bit_width, uint32_t* values) {
     if (bit_width == 0) {
         memset(values, 0, 8 * sizeof(uint32_t));
@@ -180,33 +210,7 @@ void carquet_bitunpack8_32(const uint8_t* input, int bit_width, uint32_t* values
         case 8: carquet_bitunpack8_8bit(input, values); return;
     }
 
-    /* General case for 9-32 bits.
-     *
-     * Each of the 8 values starts at bit offset i*bit_width and spans at most
-     * ceil((7 + 32)/8) = 5 bytes, so it can be extracted with a single
-     * little-endian load, a shift and a mask — no per-byte inner loop. For a
-     * group of 8 values the highest byte touched is (8*bit_width - 1)/8 =
-     * bit_width - 1, i.e. strictly inside the bit_width bytes the group
-     * occupies, so this reads no further than the original loop. The 64-bit
-     * mask keeps bit_width == 32 well-defined. This branchless form is markedly
-     * faster than the old bit-at-a-time assembly (matters most for dictionary
-     * index decode, whose index width is 9-32 bits for >256-entry dictionaries)
-     * and auto-vectorizes cleanly. */
-    uint64_t mask = (1ULL << bit_width) - 1;
-
-    for (int i = 0; i < 8; i++) {
-        int bit_off = i * bit_width;
-        int byte_off = bit_off >> 3;
-        int shift = bit_off & 7;
-        int nbytes = (shift + bit_width + 7) >> 3;   /* 1..5 */
-
-        uint64_t bits = 0;
-        for (int b = 0; b < nbytes; b++) {
-            bits |= (uint64_t)input[byte_off + b] << (b * 8);
-        }
-
-        values[i] = (uint32_t)((bits >> shift) & mask);
-    }
+    carquet_bitunpack8_general(input, bit_width, values);
 }
 
 size_t carquet_bitunpack_32(const uint8_t* input, size_t count,
@@ -235,10 +239,21 @@ size_t carquet_bitunpack_32(const uint8_t* input, size_t count,
         }
     }
 
-    /* Process groups of 8 */
-    for (; i + 8 <= count; i += 8) {
-        carquet_bitunpack8_32(input + bytes_consumed, bit_width, values + i);
-        bytes_consumed += bit_width;  /* 8 values * bit_width bits = bit_width bytes */
+    /* Process groups of 8. Resolve the per-group kernel ONCE outside the loop
+     * instead of re-running SIMD dispatch on every group: for widths 1-8 that
+     * is the specialized/SIMD function; for 9-32 there is no kernel, so call the
+     * general unpack directly and skip the dispatch entirely. */
+    carquet_bitunpack8_fn fn8 = carquet_get_bitunpack8_fn(bit_width);  /* 1-8 only */
+    if (fn8 != NULL) {
+        for (; i + 8 <= count; i += 8) {
+            fn8(input + bytes_consumed, values + i);
+            bytes_consumed += bit_width;
+        }
+    } else {
+        for (; i + 8 <= count; i += 8) {
+            carquet_bitunpack8_general(input + bytes_consumed, bit_width, values + i);
+            bytes_consumed += bit_width;  /* 8 values * bit_width bits = bit_width bytes */
+        }
     }
 
     /* Handle remaining values (< 8) with a zero-padded buffer to avoid
@@ -276,36 +291,31 @@ void carquet_bitpack8_32(const uint32_t* values, int bit_width, uint8_t* output)
         return;
     }
 
-    /* General packing */
-    memset(output, 0, bit_width);
-
-    /* Use 64-bit shift to avoid UB when bit_width=32 */
-    uint32_t mask = (uint32_t)((1ULL << bit_width) - 1);
-    int bit_pos = 0;
+    /* General packing (1-32 bits, excluding the 8-bit fast path above).
+     *
+     * A group of 8 values spans exactly 8*bit_width bits == bit_width bytes,
+     * always a whole number of bytes. Stream the values through a 64-bit
+     * accumulator, flushing whole bytes as they fill. This is a single pass
+     * with no per-value inner byte loop and no separate output zeroing memset
+     * (each output byte is written exactly once, fully), which the old
+     * bit-at-a-time form required. The 64-bit mask keeps bit_width == 32
+     * well-defined; the accumulator holds at most 7 carried bits + 32 new bits
+     * = 39 bits before each flush, so no overflow. */
+    uint64_t mask = (1ULL << bit_width) - 1;
+    uint64_t acc = 0;
+    int acc_bits = 0;
+    int out_pos = 0;
 
     for (int i = 0; i < 8; i++) {
-        uint32_t val = values[i] & mask;
-        int byte_pos = bit_pos / 8;
-        int bit_offset = bit_pos % 8;
-
-        /* Write value across bytes */
-        output[byte_pos] |= (uint8_t)(val << bit_offset);
-
-        int bits_written = 8 - bit_offset;
-        if (bits_written < bit_width) {
-            val >>= bits_written;
-            byte_pos++;
-
-            while (bits_written < bit_width) {
-                output[byte_pos] |= (uint8_t)val;
-                val >>= 8;
-                bits_written += 8;
-                byte_pos++;
-            }
+        acc |= (uint64_t)(values[i] & mask) << acc_bits;
+        acc_bits += bit_width;
+        while (acc_bits >= 8) {
+            output[out_pos++] = (uint8_t)acc;
+            acc >>= 8;
+            acc_bits -= 8;
         }
-
-        bit_pos += bit_width;
     }
+    /* 8*bit_width is a multiple of 8, so acc_bits == 0 here — nothing left. */
 }
 
 size_t carquet_bitpack_32(const uint32_t* values, size_t count,

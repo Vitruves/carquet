@@ -10,6 +10,7 @@
 #include <carquet/carquet.h>
 #include "reader_internal.h"
 #include "thrift/parquet_types.h"
+#include "core/decimal_cmp.h"
 #include "core/float16.h"
 #include <string.h>
 
@@ -33,6 +34,7 @@ typedef enum {
     CMP_DOUBLE,
     CMP_BOOL,
     CMP_FLOAT16,
+    CMP_DECIMAL_BE,  /* DECIMAL(FLBA/BYTE_ARRAY): signed big-endian two's comp. */
     CMP_BYTES
 } cmp_kind_t;
 
@@ -113,6 +115,10 @@ static bool stat_compare(cmp_kind_t kind,
             *out = CMP3(a, b);
             return true;
         }
+        case CMP_DECIMAL_BE: {
+            *out = carquet_compare_decimal_be(val, val_len, st, st_len);
+            return true;
+        }
         case CMP_BYTES:
         default: {
             size_t min_len = val_len < st_len ? val_len : st_len;
@@ -148,6 +154,13 @@ static cmp_kind_t get_cmp_kind(const parquet_schema_element_t* elem,
         }
     }
 
+    /* DECIMAL backed by a byte physical type is ordered as signed big-endian
+     * two's complement, not unsigned-lexicographic. INT32/INT64-backed DECIMAL
+     * falls through to the native signed integer comparison. */
+    bool is_decimal =
+        (elem->has_logical_type && elem->logical_type.id == CARQUET_LOGICAL_DECIMAL) ||
+        (elem->has_converted_type && elem->converted_type == CARQUET_CONVERTED_DECIMAL);
+
     switch (type) {
         case CARQUET_PHYSICAL_BOOLEAN:
             return CMP_BOOL;
@@ -164,9 +177,9 @@ static cmp_kind_t get_cmp_kind(const parquet_schema_element_t* elem,
                 elem->logical_type.id == CARQUET_LOGICAL_FLOAT16) {
                 return CMP_FLOAT16;
             }
-            return CMP_BYTES;
+            return is_decimal ? CMP_DECIMAL_BE : CMP_BYTES;
         default:
-            return CMP_BYTES;
+            return is_decimal ? CMP_DECIMAL_BE : CMP_BYTES;
     }
 }
 

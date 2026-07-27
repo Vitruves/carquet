@@ -10,6 +10,10 @@
 #include <carquet/carquet.h>
 #include <carquet/error.h>
 #include "core/buffer.h"
+#include "core/decimal_cmp.h"
+#include "core/endian.h"      /* defines CARQUET_LITTLE_ENDIAN: enables the SIMD
+                              * fused copy+min/max fast path in the plain
+                              * INT32/INT64/FLOAT/DOUBLE encoders below */
 #include "core/float16.h"
 #include "core/geo_wkb.h"
 #include "encoding/plain.h"
@@ -212,7 +216,9 @@ static carquet_status_t stats_set_min(carquet_page_writer_t* w,
                                        const void* src, size_t size) {
     carquet_status_t s = stats_grow(&w->min_value, &w->min_value_capacity, size);
     if (s != CARQUET_OK) return s;
-    memcpy(w->min_value, src, size);
+    /* size == 0 (empty BYTE_ARRAY value) leaves min_value possibly NULL; a
+     * zero-length memcpy with a NULL dest/src is undefined behavior in C11. */
+    if (size > 0) memcpy(w->min_value, src, size);
     w->min_value_size = size;
     return CARQUET_OK;
 }
@@ -221,7 +227,7 @@ static carquet_status_t stats_set_max(carquet_page_writer_t* w,
                                        const void* src, size_t size) {
     carquet_status_t s = stats_grow(&w->max_value, &w->max_value_capacity, size);
     if (s != CARQUET_OK) return s;
-    memcpy(w->max_value, src, size);
+    if (size > 0) memcpy(w->max_value, src, size);
     w->max_value_size = size;
     return CARQUET_OK;
 }
@@ -629,7 +635,9 @@ static void update_statistics_boolean(carquet_page_writer_t* writer,
 static int lex_compare(const uint8_t* a, size_t alen,
                        const uint8_t* b, size_t blen) {
     size_t n = alen < blen ? alen : blen;
-    int c = memcmp(a, b, n);
+    /* n == 0 can pair with a NULL pointer (an empty BYTE_ARRAY min/max); memcmp
+     * with NULL is UB even for zero length, so short-circuit on the prefix. */
+    int c = n ? memcmp(a, b, n) : 0;
     if (c != 0) return c;
     if (alen < blen) return -1;
     if (alen > blen) return 1;
@@ -639,6 +647,9 @@ static int lex_compare(const uint8_t* a, size_t alen,
 static void update_statistics_byte_array(carquet_page_writer_t* writer,
                                           const carquet_byte_array_t* values,
                                           int64_t count) {
+    /* DECIMAL(BYTE_ARRAY) is ordered as signed big-endian two's complement, not
+     * unsigned lexicographic; the values may also differ in length. */
+    bool is_decimal = writer->logical_type.id == CARQUET_LOGICAL_DECIMAL;
     for (int64_t i = 0; i < count; i++) {
         const uint8_t* v = values[i].data;
         size_t vlen = (size_t)values[i].length;
@@ -651,12 +662,16 @@ static void update_statistics_byte_array(carquet_page_writer_t* writer,
             continue;
         }
 
-        if (lex_compare(v, vlen,
-                        writer->min_value, writer->min_value_size) < 0) {
+        int cmin = is_decimal
+            ? carquet_compare_decimal_be(v, vlen, writer->min_value, writer->min_value_size)
+            : lex_compare(v, vlen, writer->min_value, writer->min_value_size);
+        if (cmin < 0) {
             if (stats_set_min(writer, v, vlen) != CARQUET_OK) return;
         }
-        if (lex_compare(v, vlen,
-                        writer->max_value, writer->max_value_size) > 0) {
+        int cmax = is_decimal
+            ? carquet_compare_decimal_be(v, vlen, writer->max_value, writer->max_value_size)
+            : lex_compare(v, vlen, writer->max_value, writer->max_value_size);
+        if (cmax > 0) {
             if (stats_set_max(writer, v, vlen) != CARQUET_OK) return;
         }
     }
@@ -711,6 +726,10 @@ static void update_statistics_flba(carquet_page_writer_t* writer,
         update_statistics_float16(writer, values, count);
         return;
     }
+    /* DECIMAL(FLBA) is ordered as signed big-endian two's complement, not
+     * unsigned lexicographic — otherwise a negative value (leading 0xFF…)
+     * records as the max and inverts the recorded min/max. */
+    bool is_decimal = writer->logical_type.id == CARQUET_LOGICAL_DECIMAL;
     size_t tl = (size_t)type_length;
     for (int64_t i = 0; i < count; i++) {
         const uint8_t* v = values + i * tl;
@@ -721,10 +740,16 @@ static void update_statistics_flba(carquet_page_writer_t* writer,
             writer->min_max_size = tl;
             continue;
         }
-        if (memcmp(v, writer->min_value, tl) < 0) {
+        int cmin = is_decimal
+            ? carquet_compare_decimal_be(v, tl, writer->min_value, tl)
+            : memcmp(v, writer->min_value, tl);
+        if (cmin < 0) {
             memcpy(writer->min_value, v, tl);
         }
-        if (memcmp(v, writer->max_value, tl) > 0) {
+        int cmax = is_decimal
+            ? carquet_compare_decimal_be(v, tl, writer->max_value, tl)
+            : memcmp(v, writer->max_value, tl);
+        if (cmax > 0) {
             memcpy(writer->max_value, v, tl);
         }
     }
@@ -734,6 +759,10 @@ static carquet_status_t encode_plain_i32_with_stats(
     carquet_page_writer_t* writer,
     const int32_t* values,
     int64_t count) {
+    /* No present values (e.g. an all-null page): nothing to encode or record.
+     * The SIMD fast path below asks carquet_buffer_advance() for 0 bytes, which
+     * returns NULL and would be misread as OOM. */
+    if (count <= 0) return CARQUET_OK;
 #if CARQUET_LITTLE_ENDIAN && !defined(CARQUET_STRICT_ALIGN)
     size_t bytes_needed = (size_t)count * sizeof(int32_t);
     uint8_t* dest = carquet_buffer_advance(&writer->values_buffer, bytes_needed);
@@ -769,6 +798,7 @@ static carquet_status_t encode_plain_i64_with_stats(
     carquet_page_writer_t* writer,
     const int64_t* values,
     int64_t count) {
+    if (count <= 0) return CARQUET_OK;  /* all-null page: nothing to encode */
 #if CARQUET_LITTLE_ENDIAN && !defined(CARQUET_STRICT_ALIGN)
     size_t bytes_needed = (size_t)count * sizeof(int64_t);
     uint8_t* dest = carquet_buffer_advance(&writer->values_buffer, bytes_needed);
@@ -803,6 +833,7 @@ static carquet_status_t encode_plain_float_with_stats(
     carquet_page_writer_t* writer,
     const float* values,
     int64_t count) {
+    if (count <= 0) return CARQUET_OK;  /* all-null page: nothing to encode */
 #if CARQUET_LITTLE_ENDIAN && !defined(CARQUET_STRICT_ALIGN)
     size_t bytes_needed = (size_t)count * sizeof(float);
     uint8_t* dest = carquet_buffer_advance(&writer->values_buffer, bytes_needed);
@@ -842,6 +873,7 @@ static carquet_status_t encode_plain_double_with_stats(
     carquet_page_writer_t* writer,
     const double* values,
     int64_t count) {
+    if (count <= 0) return CARQUET_OK;  /* all-null page: nothing to encode */
 #if CARQUET_LITTLE_ENDIAN && !defined(CARQUET_STRICT_ALIGN)
     size_t bytes_needed = (size_t)count * sizeof(double);
     uint8_t* dest = carquet_buffer_advance(&writer->values_buffer, bytes_needed);

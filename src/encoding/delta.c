@@ -101,6 +101,8 @@ static int64_t zigzag_decode64(uint64_t n) {
  * ============================================================================
  */
 
+static void delta_decoder_destroy(delta_decoder_t* dec);
+
 static carquet_status_t delta_decoder_init(delta_decoder_t* dec,
                                             const uint8_t* data, size_t size) {
     memset(dec, 0, sizeof(*dec));
@@ -162,15 +164,17 @@ static carquet_status_t delta_decoder_init(delta_decoder_t* dec,
         dec->heap_allocated = true;
     }
 
-    /* Total value count */
+    /* Total value count. Past this point the scratch buffers may be heap
+     * allocated, so header-decode failures must free them (delta_decoder_destroy
+     * is a no-op for the inline-buffer case) rather than leak. */
     bytes = read_uleb128(data + dec->pos, size - dec->pos, &val);
-    if (bytes == 0) return CARQUET_ERROR_DECODE;
+    if (bytes == 0) { delta_decoder_destroy(dec); return CARQUET_ERROR_DECODE; }
     dec->total_values = (int32_t)val;
     dec->pos += bytes;
 
     /* First value (zigzag encoded) */
     bytes = read_uleb128(data + dec->pos, size - dec->pos, &val);
-    if (bytes == 0) return CARQUET_ERROR_DECODE;
+    if (bytes == 0) { delta_decoder_destroy(dec); return CARQUET_ERROR_DECODE; }
     dec->first_value = zigzag_decode64(val);
     dec->pos += bytes;
 

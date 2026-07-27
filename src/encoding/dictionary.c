@@ -854,3 +854,147 @@ carquet_status_t carquet_dictionary_decode_double(
     carquet_mem_free(indices);
     return CARQUET_OK;
 }
+
+/* Decode a BYTE_ARRAY dictionary page + RLE index stream into an array of
+ * carquet_byte_array_t. Each output value points into dict_data (the caller
+ * must keep the dictionary buffer alive for as long as the output is used).
+ * The dictionary uses PLAIN BYTE_ARRAY layout: dict_count records of a 4-byte
+ * little-endian length prefix followed by that many payload bytes. Every
+ * length is validated against dict_size and every index against dict_count. */
+carquet_status_t carquet_dictionary_decode_byte_array(
+    const uint8_t* dict_data,
+    size_t dict_size,
+    int32_t dict_count,
+    const uint8_t* indices_data,
+    size_t indices_size,
+    carquet_byte_array_t* output,
+    int64_t output_count) {
+
+    if (output_count <= 0) {
+        return CARQUET_OK;
+    }
+    if (dict_count <= 0 || dict_data == NULL || output == NULL) {
+        return CARQUET_ERROR_DECODE;
+    }
+    if (indices_size < 1) {
+        return CARQUET_ERROR_DECODE;
+    }
+
+    /* Build an offset/length table over the length-prefixed dictionary,
+     * validating that every entry stays within dict_size. */
+    typedef struct { const uint8_t* data; int32_t length; } ba_entry_t;
+    ba_entry_t* entries =
+        carquet_mem_malloc((size_t)dict_count * sizeof(ba_entry_t));
+    if (!entries) {
+        return CARQUET_ERROR_OUT_OF_MEMORY;
+    }
+
+    size_t pos = 0;
+    for (int32_t i = 0; i < dict_count; i++) {
+        if (pos + 4 > dict_size) {
+            carquet_mem_free(entries);
+            return CARQUET_ERROR_DECODE;
+        }
+        uint32_t len = carquet_read_u32_le(dict_data + pos);
+        pos += 4;
+        /* len bytes must remain; guard against overflow and truncation. */
+        if (len > dict_size - pos || len > (uint32_t)INT32_MAX) {
+            carquet_mem_free(entries);
+            return CARQUET_ERROR_DECODE;
+        }
+        entries[i].data = dict_data + pos;
+        entries[i].length = (int32_t)len;
+        pos += len;
+    }
+
+    int bit_width = indices_data[0];
+    uint32_t* indices =
+        carquet_mem_malloc((size_t)output_count * sizeof(uint32_t));
+    if (!indices) {
+        carquet_mem_free(entries);
+        return CARQUET_ERROR_OUT_OF_MEMORY;
+    }
+
+    int64_t decoded = carquet_rle_decode_all(
+        indices_data + 1, indices_size - 1, bit_width, indices, output_count);
+    if (decoded < 0 || decoded < output_count) {
+        carquet_mem_free(indices);
+        carquet_mem_free(entries);
+        return CARQUET_ERROR_DECODE;
+    }
+
+    for (int64_t i = 0; i < output_count; i++) {
+        uint32_t idx = indices[i];
+        if (idx >= (uint32_t)dict_count) {
+            carquet_mem_free(indices);
+            carquet_mem_free(entries);
+            return CARQUET_ERROR_DECODE;
+        }
+        /* Cast away const: output is a view into the caller's dictionary. */
+        output[i].data = (uint8_t*)entries[idx].data;
+        output[i].length = entries[idx].length;
+    }
+
+    carquet_mem_free(indices);
+    carquet_mem_free(entries);
+    return CARQUET_OK;
+}
+
+/* Decode a FIXED_LEN_BYTE_ARRAY dictionary page + RLE index stream into a
+ * contiguous output buffer of output_count * type_length bytes (PLAIN FLBA
+ * layout). The dictionary is dict_count fixed-width values concatenated. */
+carquet_status_t carquet_dictionary_decode_fixed_len_byte_array(
+    const uint8_t* dict_data,
+    size_t dict_size,
+    int32_t dict_count,
+    int32_t type_length,
+    const uint8_t* indices_data,
+    size_t indices_size,
+    uint8_t* output,
+    int64_t output_count) {
+
+    if (output_count <= 0) {
+        return CARQUET_OK;
+    }
+    if (dict_count <= 0 || dict_data == NULL || output == NULL) {
+        return CARQUET_ERROR_DECODE;
+    }
+    if (type_length <= 0) {
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+    if (indices_size < 1) {
+        return CARQUET_ERROR_DECODE;
+    }
+
+    size_t tl = (size_t)type_length;
+    /* dict_size must hold dict_count fixed-width values (overflow-safe). */
+    if ((size_t)dict_count > dict_size / tl) {
+        return CARQUET_ERROR_DECODE;
+    }
+
+    int bit_width = indices_data[0];
+    uint32_t* indices =
+        carquet_mem_malloc((size_t)output_count * sizeof(uint32_t));
+    if (!indices) {
+        return CARQUET_ERROR_OUT_OF_MEMORY;
+    }
+
+    int64_t decoded = carquet_rle_decode_all(
+        indices_data + 1, indices_size - 1, bit_width, indices, output_count);
+    if (decoded < 0 || decoded < output_count) {
+        carquet_mem_free(indices);
+        return CARQUET_ERROR_DECODE;
+    }
+
+    for (int64_t i = 0; i < output_count; i++) {
+        uint32_t idx = indices[i];
+        if (idx >= (uint32_t)dict_count) {
+            carquet_mem_free(indices);
+            return CARQUET_ERROR_DECODE;
+        }
+        memcpy(output + (size_t)i * tl, dict_data + (size_t)idx * tl, tl);
+    }
+
+    carquet_mem_free(indices);
+    return CARQUET_OK;
+}

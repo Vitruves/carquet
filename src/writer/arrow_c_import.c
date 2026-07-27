@@ -285,15 +285,33 @@ static carquet_status_t import_field(
                             depth + 1, error);
     }
     case ANODE_PRIMITIVE: {
+        /* Dictionary-encoded array (e.g. a pandas categorical): `s->format` is
+         * only the integer index type; the column's real type is the dictionary
+         * value type in `s->dictionary`. Resolve to the value type so the
+         * indices are materialized to values on write instead of being written
+         * verbatim as an integer column. Only primitive dictionary values are
+         * supported (nested dictionaries are rare and would be silent data loss
+         * otherwise). */
+        const char* value_format = s->format;
+        if (s->dictionary) {
+            if (!s->dictionary->format ||
+                classify(s->dictionary->format) != ANODE_PRIMITIVE) {
+                CARQUET_SET_ERROR(error, CARQUET_ERROR_NOT_IMPLEMENTED,
+                    "Arrow import: only primitive dictionary values are supported "
+                    "for field \"%s\"", name);
+                return CARQUET_ERROR_NOT_IMPLEMENTED;
+            }
+            value_format = s->dictionary->format;
+        }
         carquet_physical_type_t pt;
         carquet_logical_type_t lt;
         bool has_lt;
         int32_t tlen;
-        carquet_status_t rc = parse_arrow_format(s->format, &pt, &lt, &has_lt, &tlen);
+        carquet_status_t rc = parse_arrow_format(value_format, &pt, &lt, &has_lt, &tlen);
         if (rc != CARQUET_OK) {
             CARQUET_SET_ERROR(error, rc,
                 "Arrow import: unsupported format \"%s\" for field \"%s\"",
-                s->format, name);
+                value_format, name);
             return rc;
         }
         rc = carquet_schema_add_column(cs, name, pt, has_lt ? &lt : NULL, rep, tlen,
@@ -477,6 +495,27 @@ static void emit_value(shred_ctx_t* ctx, leaf_acc_t* acc,
     acc->fixed_bytes += (int64_t)acc->stride;
 }
 
+/* Read the dictionary index at position `i` from a dictionary-encoded array's
+ * index buffer (buffers[1]), widening it to int64. `index_fmt` is the Arrow
+ * format of the index type (a single-character signed/unsigned integer code).
+ * Returns false on an unsupported index type or a missing buffer. */
+static bool read_dict_index(const char* index_fmt, const struct ArrowArray* a,
+                            int64_t i, int64_t* out) {
+    const void* buf = (a->n_buffers >= 2) ? a->buffers[1] : NULL;
+    if (!buf || !index_fmt || !index_fmt[0] || index_fmt[1] != '\0') return false;
+    switch (index_fmt[0]) {
+    case 'c': *out = ((const int8_t*)buf)[i];             return true;  /* int8  */
+    case 'C': *out = ((const uint8_t*)buf)[i];            return true;  /* uint8 */
+    case 's': *out = ((const int16_t*)buf)[i];            return true;  /* int16 */
+    case 'S': *out = ((const uint16_t*)buf)[i];           return true;  /* uint16 */
+    case 'i': *out = ((const int32_t*)buf)[i];            return true;  /* int32 */
+    case 'I': *out = ((const uint32_t*)buf)[i];           return true;  /* uint32 */
+    case 'l': *out = ((const int64_t*)buf)[i];            return true;  /* int64 */
+    case 'L': *out = (int64_t)((const uint64_t*)buf)[i];  return true;  /* uint64 */
+    default:  return false;
+    }
+}
+
 /* Emit one absent/empty placeholder entry (rep, def) for every leaf covered by
  * a subtree spanning columns [base, base+count). */
 static void emit_placeholder_range(shred_ctx_t* ctx, int32_t base, int64_t count,
@@ -485,6 +524,72 @@ static void emit_placeholder_range(shred_ctx_t* ctx, int32_t base, int64_t count
         append_level(&ctx->accs[base + c], rep, def);
         if (ctx->accs[base + c].oom) ctx->rc = CARQUET_ERROR_OUT_OF_MEMORY;
     }
+}
+
+/*
+ * Fast path for the overwhelmingly common case: a top-level, non-nested,
+ * non-dictionary, fixed-width primitive leaf (a flat column of a flat table).
+ * Instead of recursing once per row through visit()/emit_value() — a function
+ * call plus a capacity check plus a 4/8-byte memcpy per element — bulk-copy the
+ * contiguous Arrow values buffer and fill the definition levels in one pass.
+ *
+ * Returns false if (s, a) is not eligible, leaving the accumulator untouched so
+ * the caller falls back to the generic row-by-row shredder. When it returns
+ * true it has fully handled the column; the caller must then check ctx->rc for
+ * an out-of-memory condition.
+ */
+static bool shred_flat_fast(shred_ctx_t* ctx, leaf_acc_t* acc,
+                            const struct ArrowSchema* s,
+                            const struct ArrowArray* a) {
+    if (classify(s->format) != ANODE_PRIMITIVE) return false;
+    if (s->dictionary) return false;                 /* indices need resolving  */
+    if (acc->max_rep != 0) return false;             /* top-level (flat) only   */
+    if (acc->is_bool || acc->is_bytearray) return false;  /* fixed-width only   */
+    if (acc->stride == 0) return false;
+    if (a->offset != 0) return false;                /* matches visit()'s guard */
+    const uint8_t* d = (a->n_buffers >= 2) ? (const uint8_t*)a->buffers[1] : NULL;
+    if (!d) return false;
+
+    int64_t n = a->length;
+    if (n <= 0) return true;                         /* eligible, nothing to do */
+    size_t stride = acc->stride;
+    bool nullable = (s->flags & ARROW_FLAG_NULLABLE) != 0;
+    const uint8_t* valid = (nullable && a->n_buffers >= 1)
+                               ? (const uint8_t*)a->buffers[0] : NULL;
+
+    if (!grow_levels(acc, n)) { ctx->rc = CARQUET_ERROR_OUT_OF_MEMORY; return true; }
+    if (!grow_fixed(acc, n * (int64_t)stride)) { ctx->rc = CARQUET_ERROR_OUT_OF_MEMORY; return true; }
+
+    int16_t* def = acc->def;
+    int64_t lv = acc->nlevels;
+    uint8_t* dst = acc->fixed + acc->fixed_bytes;
+    /* rep is left untouched: max_rep == 0 means write_batch is passed rep = NULL. */
+
+    if (!valid) {
+        /* No validity bitmap -> every row present: one bulk copy. */
+        memcpy(dst, d, (size_t)n * stride);
+        acc->fixed_bytes += n * (int64_t)stride;
+        int16_t defp = acc->max_def;                 /* 0 (REQUIRED) or 1 (OPTIONAL) */
+        if (defp != 0) {
+            for (int64_t r = 0; r < n; r++) def[lv + r] = defp;
+        }
+    } else {
+        /* Mixed nulls: copy present values densely, def = present ? 1 : 0.
+         * `valid` non-NULL implies nullable, hence max_def >= 1 and a real def
+         * array is written. */
+        int64_t nb = 0;
+        for (int64_t r = 0; r < n; r++) {
+            int present = (int)ARROW_VALID(valid, r);
+            def[lv + r] = (int16_t)present;
+            if (present) {
+                memcpy(dst + (size_t)nb * stride, d + (size_t)r * stride, stride);
+                nb++;
+            }
+        }
+        acc->fixed_bytes += nb * (int64_t)stride;
+    }
+    acc->nlevels = lv + n;
+    return true;
 }
 
 /*
@@ -521,7 +626,22 @@ static void visit(shred_ctx_t* ctx, const struct ArrowSchema* s,
         leaf_acc_t* acc = &ctx->accs[base];
         append_level(acc, rep_in, def_present);
         if (acc->oom) { ctx->rc = CARQUET_ERROR_OUT_OF_MEMORY; return; }
-        emit_value(ctx, acc, a, idx);
+        if (s->dictionary) {
+            /* Dictionary-encoded: `a` holds indices, `a->dictionary` the values.
+             * `acc` is configured for the (resolved) value type, so emit the
+             * looked-up value. Null entries were already handled above via the
+             * index array's validity bitmap. */
+            const struct ArrowArray* dict = a->dictionary;
+            int64_t k;
+            if (!dict || !read_dict_index(s->format, a, idx, &k) ||
+                k < 0 || k >= dict->length) {
+                ctx->rc = CARQUET_ERROR_INVALID_ARGUMENT;
+                return;
+            }
+            emit_value(ctx, acc, dict, k);
+        } else {
+            emit_value(ctx, acc, a, idx);
+        }
         return;
     }
     case ANODE_STRUCT: {
@@ -595,20 +715,29 @@ static carquet_status_t assign_leaves(const struct ArrowSchema* s, int32_t* next
                 "Arrow import: more leaves than writer columns");
             return CARQUET_ERROR_INVALID_ARGUMENT;
         }
+        /* Dictionary-encoded leaf: configure the accumulator for the dictionary
+         * VALUE type (indices are resolved to values during shredding), matching
+         * the column type import_field() derived from the same dictionary. */
+        const char* value_format = s->dictionary ? s->dictionary->format : s->format;
+        if (s->dictionary && (!value_format || classify(value_format) != ANODE_PRIMITIVE)) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_NOT_IMPLEMENTED,
+                "Arrow import: only primitive dictionary values are supported");
+            return CARQUET_ERROR_NOT_IMPLEMENTED;
+        }
         carquet_physical_type_t pt;
         carquet_logical_type_t lt;
         bool has_lt;
         int32_t tlen;
-        carquet_status_t rc = parse_arrow_format(s->format, &pt, &lt, &has_lt, &tlen);
+        carquet_status_t rc = parse_arrow_format(value_format, &pt, &lt, &has_lt, &tlen);
         if (rc != CARQUET_OK) {
-            CARQUET_SET_ERROR(error, rc, "Arrow import: unsupported format \"%s\"", s->format);
+            CARQUET_SET_ERROR(error, rc, "Arrow import: unsupported format \"%s\"", value_format);
             return rc;
         }
         leaf_acc_t* acc = &accs[*next_col];
         acc->pt = pt;
         acc->is_bool = (pt == CARQUET_PHYSICAL_BOOLEAN);
         acc->is_bytearray = (pt == CARQUET_PHYSICAL_BYTE_ARRAY);
-        acc->off64 = (s->format[0] == 'U' || s->format[0] == 'Z');
+        acc->off64 = (value_format[0] == 'U' || value_format[0] == 'Z');
         acc->stride = fixed_stride(pt, tlen);
         acc->max_def = (int16_t)(cur_def + (nullable ? 1 : 0));
         acc->max_rep = cur_rep;
@@ -711,14 +840,17 @@ carquet_status_t carquet_writer_write_arrow(
                     (long long)i, (long long)carray->length, (long long)array->length);
                 rc = CARQUET_ERROR_INVALID_ARGUMENT; goto done;
             }
-            for (int64_t r = 0; r < array->length; r++) {
-                visit(&ctx, cschema, carray, r, 0, 0, 0, base, 0);
-                if (ctx.rc != CARQUET_OK) {
-                    rc = ctx.rc;
-                    CARQUET_SET_ERROR(error, rc,
-                        "Arrow import: shredding failed for field %lld", (long long)i);
-                    goto done;
+            if (!shred_flat_fast(&ctx, &accs[base], cschema, carray)) {
+                for (int64_t r = 0; r < array->length; r++) {
+                    visit(&ctx, cschema, carray, r, 0, 0, 0, base, 0);
+                    if (ctx.rc != CARQUET_OK) break;
                 }
+            }
+            if (ctx.rc != CARQUET_OK) {
+                rc = ctx.rc;
+                CARQUET_SET_ERROR(error, rc,
+                    "Arrow import: shredding failed for field %lld", (long long)i);
+                goto done;
             }
             base += (int32_t)arrow_leaf_count(cschema);
         }

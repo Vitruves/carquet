@@ -202,10 +202,10 @@ extern "C" {
 #define CARQUET_VERSION_MINOR 7
 
 /** @brief Patch version number */
-#define CARQUET_VERSION_PATCH 0
+#define CARQUET_VERSION_PATCH 1
 
 /** @brief Version string in "MAJOR.MINOR.PATCH" format */
-#define CARQUET_VERSION_STRING "0.7.0"
+#define CARQUET_VERSION_STRING "0.7.1"
 
 /** @brief Numeric version for compile-time comparisons: (MAJOR * 10000 + MINOR * 100 + PATCH) */
 #define CARQUET_VERSION_NUMBER (CARQUET_VERSION_MAJOR * 10000 + CARQUET_VERSION_MINOR * 100 + CARQUET_VERSION_PATCH)
@@ -3154,6 +3154,46 @@ carquet_status_t carquet_batch_reader_set_page_filter(
  */
 CARQUET_API CARQUET_PURE CARQUET_NONNULL(1)
 int64_t carquet_batch_reader_rows_skipped(const carquet_batch_reader_t* reader);
+
+/**
+ * @brief Restrict the batch reader to an arbitrary [offset, offset+limit) row
+ *        range, independent of any predicate.
+ *
+ * After this call, carquet_batch_reader_next() yields only the requested
+ * logical rows, in order, across as many batches as needed (each still clipped
+ * to config.batch_size). Row groups entirely outside the window are skipped
+ * without I/O; the leading rows of a partially-selected row group are skipped
+ * via the offset index when present, otherwise by read-and-discard.
+ *
+ * @param[in] reader  Batch reader
+ * @param[in] offset  Zero-based index of the first row to return (>= 0).
+ * @param[in] limit   Number of rows to return, or a negative value for "all
+ *                    remaining rows from @p offset to end of file".
+ *
+ * Semantics:
+ *   - offset == 0 && limit < 0 clears any active range (full sequential read).
+ *   - limit == 0 selects zero rows (the first next() returns
+ *     CARQUET_ERROR_END_OF_DATA).
+ *   - An offset at or beyond the total row count yields no rows.
+ *
+ * Calling this resets iteration to the start of the file, so it may be used to
+ * re-position a reader that has already produced batches.
+ *
+ * @return CARQUET_OK on success;
+ *         CARQUET_ERROR_INVALID_ARGUMENT if offset < 0, or if a page filter is
+ *         currently installed (the two features are mutually exclusive).
+ *
+ * @note A row range is not combined with repeated (nested/LIST/MAP) columns:
+ *       next() returns CARQUET_ERROR_NOT_IMPLEMENTED for such a projection.
+ * @note A row range and a page filter are mutually exclusive; installing one
+ *       while the other is active returns CARQUET_ERROR_INVALID_ARGUMENT.
+ * @note Thread-safe: No
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1)
+carquet_status_t carquet_batch_reader_set_row_range(
+    carquet_batch_reader_t* reader,
+    int64_t offset,
+    int64_t limit);
 
 /* ============================================================================
  * Key-Value Metadata API

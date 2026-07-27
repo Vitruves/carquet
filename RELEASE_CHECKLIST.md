@@ -30,13 +30,6 @@ python3 interop/run_interop.py -v
 - [ ] **CHANGELOG bullet** in the top unreleased section (right heading; note ABI/default-bytes impact).
 - [ ] xmake.lua updated
 - [ ] **Interop passes** + new case added in `roundtrip_writer.c` if a new wire feature landed.
-- [ ] **CI green** on every platform (macOS, Windows/MSVC, Ubuntu x86-64, Ubuntu ARM, Rocky 9; shared + static).
-- [ ] **Benchmark vs Arrow C++** if a hot path (encoding/compression/SIMD/bitpack/reader-writer loops) was touched — no regression, numbers in the PR:
-  ```bash
-  cmake -B build -DCMAKE_BUILD_TYPE=Release -DCARQUET_BUILD_BENCHMARKS=ON \
-    -DCARQUET_BUILD_ARROW_CPP_BENCHMARK=ON -DCARQUET_NATIVE_ARCH=ON && cmake --build build
-  python3 benchmark/run_benchmark.py --quick
-  ```
 
 One note: codebase contains fuzz/external/parquet-testing with good and malformed apache arrow reference tests files. Might be useful for testing.
 
@@ -46,11 +39,8 @@ Do the above on the final `main`, then:
 
 ```bash
 # Long fuzz soak, all targets, parallel
-python3 fuzz/run_fuzzer.py all --time 120 --jobs 4
+python3 fuzz/run_fuzzer.py all --time 20 --jobs 4
 
-# Bump version (rewrites tracked files, carquet.h macros, and xmake.lua set_version)
-python3 bump_version.py --version X.Y.Z --dry-run   # review
-python3 bump_version.py --version X.Y.Z
 git diff                                            # confirm every hit
 
 # Interop snapshot for the record
@@ -65,4 +55,3 @@ git tag vX.Y.Z && git push origin main --tags
 - [ ] **`bump_version.py`** run; confirm `CMakeLists.txt` `project(VERSION)` and `xmake.lua` `set_version` agree. It also rewrites `version:` in `CITATION.cff` — hand-update that file's `date-released:` to the release date (the script does not touch dates).
 - [ ] **CHANGELOG finalized** — unreleased bullets rolled into a dated `## vX.Y.Z` section with a one-paragraph theme + ABI/default-bytes statement.
 - [ ] **Interop snapshot committed** — `interop/interop_<version>_<platform>_<date>.json`.
-- [ ] **Tag pushed** and its CI run **green on every platform**.

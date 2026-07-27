@@ -168,7 +168,36 @@ const char* cli_format_value(carquet_physical_type_t type,
         return buf;
     }
 
-    if (logical && logical->id == CARQUET_LOGICAL_TIMESTAMP) {
+    /* TIME is a time-of-day offset from midnight: MILLIS is INT32-backed,
+     * MICROS/NANOS are INT64-backed. Rendered as HH:MM:SS.frac with the
+     * fractional part always at the unit's full precision. */
+    if (logical && logical->id == CARQUET_LOGICAL_TIME &&
+        (type == CARQUET_PHYSICAL_INT32 || type == CARQUET_PHYSICAL_INT64)) {
+        int64_t val = (type == CARQUET_PHYSICAL_INT32)
+                          ? (int64_t)*(const int32_t*)value
+                          : *(const int64_t*)value;
+        uint64_t divisor = 1000;
+        int frac_digits = 3;
+        switch (logical->params.time.unit) {
+            case CARQUET_TIME_UNIT_MILLIS: divisor = 1000ULL;       frac_digits = 3; break;
+            case CARQUET_TIME_UNIT_MICROS: divisor = 1000000ULL;    frac_digits = 6; break;
+            case CARQUET_TIME_UNIT_NANOS:  divisor = 1000000000ULL; frac_digits = 9; break;
+        }
+        /* Spec-valid values are in [0, 24h); out-of-range ones still print
+         * readably (a sign and/or an hour field past 23) instead of wrapping.
+         * Negation goes through the magnitude to stay INT64_MIN-safe. */
+        bool neg = val < 0;
+        uint64_t mag = neg ? (uint64_t)(-(val + 1)) + 1ULL : (uint64_t)val;
+        uint64_t secs = mag / divisor;
+        uint32_t frac = (uint32_t)(mag % divisor);
+        snprintf(buf, buf_size, "%s%02" PRIu64 ":%02" PRIu64 ":%02" PRIu64 ".%0*" PRIu32,
+                 neg ? "-" : "", secs / 3600, (secs / 60) % 60, secs % 60,
+                 frac_digits, frac);
+        return buf;
+    }
+
+    if (logical && logical->id == CARQUET_LOGICAL_TIMESTAMP &&
+        type == CARQUET_PHYSICAL_INT64) {
         int64_t val = *(const int64_t*)value;
         time_t secs;
         int frac = 0;

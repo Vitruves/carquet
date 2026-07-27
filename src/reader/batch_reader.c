@@ -32,6 +32,8 @@
 /* SIMD dispatch function for null bitmap construction */
 extern void carquet_dispatch_build_null_bitmap(const int16_t* def_levels, int64_t count,
                                                 int16_t max_def_level, uint8_t* null_bitmap);
+extern int64_t carquet_dispatch_count_non_nulls(const int16_t* def_levels, int64_t count,
+                                                int16_t max_def_level);
 
 #define CARQUET_MAX_PAGE_PAYLOAD_SIZE (256ULL * 1024 * 1024)
 
@@ -244,6 +246,21 @@ struct carquet_batch_reader {
      * Loaded lazily on first range positioning, freed on RG transition. */
     carquet_offset_index_t** projected_offset_indexes;
     int32_t projected_oi_rg;        /* -1 when cache is empty */
+
+    /* ====================================================================
+     * Row-range read state ([offset, limit) independent of any predicate).
+     * Set via carquet_batch_reader_set_row_range(). Mutually exclusive with
+     * the page filter and with repeated (nested) columns. Drives the
+     * dedicated sequential batch_reader_next_row_range() path, bypassing the
+     * pipeline. ==================================================================== */
+    bool     row_range_active;
+    int64_t  row_range_start;       /* global first row, inclusive */
+    int64_t  row_range_end;         /* global exclusive end (INT64_MAX = to EOF) */
+    int64_t  rr_rg_global_start;    /* global row index of current_row_group's row 0 */
+    int64_t  rr_local_lo;           /* RG-local first row of the current window */
+    int64_t  rr_local_hi;           /* RG-local exclusive end of the current window */
+    int64_t  rr_emitted;            /* rows already emitted from the current window */
+    bool     rr_rg_open;            /* readers opened + positioned for current window */
 };
 
 /* ============================================================================
@@ -576,10 +593,10 @@ static void read_projected_column(
      * logical row i, with null slots zeroed.  Expand in-place (back-to-front)
      * so the data and null bitmap are consistent. */
     if (def_levels && max_def > 0 && values_read > 0) {
-        int64_t non_null = 0;
-        for (int64_t k = 0; k < values_read; k++) {
-            if (def_levels[k] == max_def) non_null++;
-        }
+        /* SIMD-dispatched count (same reduction used on the write side) rather
+         * than a scalar sweep over the level array. */
+        int64_t non_null =
+            carquet_dispatch_count_non_nulls(def_levels, values_read, max_def);
 
         if (non_null < values_read) {
             uint8_t* data = (uint8_t*)col_data->data;
@@ -800,9 +817,17 @@ static void reset_column_reader_for_row_group(
      * Pages are pre-loaded (and decoded/sized) ahead of the read phase, so the
      * decode width (physical value vs. 4-byte index) must be fixed now; keying
      * off has_dictionary instead would only flip after the first load and
-     * desync the buffer width from the copy width. */
+     * desync the buffer width from the copy width.
+     *
+     * Never preserve for repeated (nested) columns: the nested reconstruction
+     * path (read_nested_list_column) and the list/dictionary public APIs only
+     * understand materialized physical values, not the 4-byte preserved index
+     * stream. Leaving it on would make that path read 16-byte carquet_byte_array_t
+     * structs out of a buffer holding uint32_t indices — wild pointers and an
+     * out-of-bounds read on export. */
     col_reader->preserve_dictionary =
-        preserve_dictionaries && col_reader->col_meta->has_dictionary_page_offset;
+        preserve_dictionaries && col_reader->col_meta->has_dictionary_page_offset &&
+        col_reader->max_rep_level == 0;
 
     /* Reset reading state */
     col_reader->values_remaining = col_reader->col_meta->num_values;
@@ -1228,7 +1253,8 @@ static carquet_status_t open_row_group_readers(
          * now rather than at read time. */
         carquet_column_reader_t* cr = batch_reader->col_readers[i];
         cr->preserve_dictionary = batch_reader->config.preserve_dictionaries &&
-            cr->col_meta && cr->col_meta->has_dictionary_page_offset;
+            cr->col_meta && cr->col_meta->has_dictionary_page_offset &&
+            cr->max_rep_level == 0;  /* nested columns can't expose preserved indices */
     }
 
     batch_reader->current_row_group = row_group_index;
@@ -2156,6 +2182,199 @@ static carquet_status_t batch_reader_next_filtered(
 }
 
 /* ============================================================================
+ * Row-range read ([offset, limit))
+ * ============================================================================
+ * A predicate-independent slice of the logical row space. The global window
+ * [row_range_start, row_range_end) is mapped onto each row group's local row
+ * space; row groups entirely outside the window are skipped without I/O, and
+ * the surviving prefix of a row group is skipped via the offset index (or a
+ * read-and-discard fallback) before reading exactly the matching rows.
+ */
+
+/* Reuse or allocate the reader's cached batch struct. Returns NULL on OOM. */
+static carquet_row_batch_t* ensure_cached_batch(carquet_batch_reader_t* br) {
+    carquet_row_batch_t* b = br->cached_batch;
+    if (!b) {
+        b = carquet_mem_calloc(1, sizeof(carquet_row_batch_t));
+        if (!b) return NULL;
+        if (carquet_arena_init(&b->arena) != CARQUET_OK) {
+            carquet_mem_free(b);
+            return NULL;
+        }
+        b->columns = carquet_arena_calloc(&b->arena,
+            br->num_projected, sizeof(carquet_column_data_t));
+        if (!b->columns) {
+            carquet_arena_destroy(&b->arena);
+            carquet_mem_free(b);
+            return NULL;
+        }
+        b->pooled = true;
+        br->cached_batch = b;
+    }
+    memset(b->columns, 0, sizeof(carquet_column_data_t) * br->num_projected);
+    b->num_columns = br->num_projected;
+    return b;
+}
+
+/* Advance current_row_group to the next row group that intersects the active
+ * [start,end) window; compute the RG-local window and open + position the
+ * projected column readers at its first row. Returns CARQUET_ERROR_END_OF_DATA
+ * when the window is exhausted. */
+static carquet_status_t row_range_advance(
+    carquet_batch_reader_t* br, carquet_error_t* error) {
+
+    int32_t num_rg = carquet_reader_num_row_groups(br->reader);
+    for (;;) {
+        if (br->current_row_group < 0) {
+            br->current_row_group = 0;
+            br->rr_rg_global_start = 0;
+        } else {
+            int64_t prev_rows =
+                br->reader->metadata.row_groups[br->current_row_group].num_rows;
+            if (prev_rows > 0) br->rr_rg_global_start += prev_rows;
+            br->current_row_group++;
+        }
+        if (br->current_row_group >= num_rg) {
+            return CARQUET_ERROR_END_OF_DATA;
+        }
+
+        int64_t rg_rows =
+            br->reader->metadata.row_groups[br->current_row_group].num_rows;
+        if (rg_rows <= 0) continue;
+
+        int64_t rg_gstart = br->rr_rg_global_start;
+        int64_t rg_gend = rg_gstart + rg_rows;
+
+        /* Past the window ⇒ no more rows can match. */
+        if (rg_gstart >= br->row_range_end) {
+            return CARQUET_ERROR_END_OF_DATA;
+        }
+        /* Entirely before the window ⇒ skip without any I/O. */
+        if (rg_gend <= br->row_range_start) {
+            continue;
+        }
+        /* Honour the user's row-group filter, if any. */
+        if (br->config.row_group_filter &&
+            !br->config.row_group_filter(br->reader, br->current_row_group,
+                                         br->config.row_group_filter_ctx)) {
+            continue;
+        }
+
+        int64_t lo = br->row_range_start - rg_gstart;
+        if (lo < 0) lo = 0;
+        int64_t hi = br->row_range_end - rg_gstart;
+        if (hi > rg_rows) hi = rg_rows;
+        if (lo >= hi) continue;  /* defensive: empty intersection */
+
+        br->rr_local_lo = lo;
+        br->rr_local_hi = hi;
+        br->rr_emitted = 0;
+
+        carquet_status_t st =
+            open_row_group_readers(br, br->current_row_group, error);
+        if (st != CARQUET_OK) return st;
+        st = filter_load_offset_indexes(br, br->current_row_group, error);
+        if (st != CARQUET_OK) return st;
+
+        for (int32_t i = 0; i < br->num_projected; i++) {
+            st = position_projected_column(br, i, lo, error);
+            if (st != CARQUET_OK) return st;
+        }
+        br->rr_rg_open = true;
+        return CARQUET_OK;
+    }
+}
+
+/* next() driver for an active row range. Reads one window slice (clipped to
+ * batch_size) per call, advancing across row groups as windows are consumed. */
+static carquet_status_t batch_reader_next_row_range(
+    carquet_batch_reader_t* br, carquet_row_batch_t** batch) {
+
+    carquet_error_t err = CARQUET_ERROR_INIT;
+
+    if (!br->rr_rg_open ||
+        br->rr_emitted >= (br->rr_local_hi - br->rr_local_lo)) {
+        carquet_status_t st = row_range_advance(br, &err);
+        if (st != CARQUET_OK) { *batch = NULL; return st; }
+    }
+
+    int64_t window = br->rr_local_hi - br->rr_local_lo;
+    int64_t remaining = window - br->rr_emitted;
+    int64_t batch_size = br->config.batch_size;
+    if (batch_size <= 0) batch_size = 65536;
+    int64_t rows_to_read = remaining < batch_size ? remaining : batch_size;
+
+    carquet_row_batch_t* new_batch = ensure_cached_batch(br);
+    if (!new_batch) return CARQUET_ERROR_OUT_OF_MEMORY;
+
+    bool read_error = false;
+    for (int32_t i = 0; i < br->num_projected; i++) {
+        read_projected_column(br, new_batch, i, rows_to_read, true, &read_error);
+    }
+    if (read_error) return CARQUET_ERROR_DECODE;
+
+    new_batch->num_rows = new_batch->columns[0].num_values;
+    if (new_batch->num_rows <= 0) {
+        /* No forward progress: treat as end to avoid spinning. */
+        *batch = NULL;
+        return CARQUET_ERROR_END_OF_DATA;
+    }
+    br->total_rows_read += new_batch->num_rows;
+    br->rr_emitted += new_batch->num_rows;
+    if (br->rr_emitted >= window) {
+        br->rr_rg_open = false;  /* advance to the next window on the next call */
+    }
+
+    *batch = new_batch;
+    return CARQUET_OK;
+}
+
+carquet_status_t carquet_batch_reader_set_row_range(
+    carquet_batch_reader_t* reader, int64_t offset, int64_t limit) {
+
+    /* reader is nonnull per API contract. */
+
+    /* offset==0 && limit<0 clears any active range (full sequential read). */
+    if (offset == 0 && limit < 0) {
+        reader->row_range_active = false;
+        reader->rr_rg_open = false;
+        reader->current_row_group = -1;
+        reader->rows_read_in_group = 0;
+        return CARQUET_OK;
+    }
+
+    if (offset < 0) {
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+    /* Mutually exclusive with the page filter (untested interactions). */
+    if (reader->filter_clauses && reader->filter_clause_count > 0) {
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    int64_t end;
+    if (limit < 0) {
+        end = INT64_MAX;                 /* to end of file */
+    } else if (offset > INT64_MAX - limit) {
+        end = INT64_MAX;                 /* saturate on overflow */
+    } else {
+        end = offset + limit;
+    }
+
+    reader->row_range_active = true;
+    reader->row_range_start = offset;
+    reader->row_range_end = end;
+
+    /* Restart iteration from the beginning: the window may precede where a
+     * prior read already advanced to. */
+    reader->rr_rg_open = false;
+    reader->rr_emitted = 0;
+    reader->rr_rg_global_start = 0;
+    reader->current_row_group = -1;
+    reader->rows_read_in_group = 0;
+    return CARQUET_OK;
+}
+
+/* ============================================================================
  * Page Filter — public API
  * ============================================================================ */
 
@@ -2176,6 +2395,11 @@ carquet_status_t carquet_batch_reader_set_page_filter(
         reader->range_positioned = false;
         filter_release_offset_indexes(reader);
         return CARQUET_OK;
+    }
+
+    /* Mutually exclusive with an active row range (untested interactions). */
+    if (reader->row_range_active) {
+        return CARQUET_ERROR_INVALID_ARGUMENT;
     }
 
     /* Validate every clause up front. */
@@ -2354,6 +2578,18 @@ carquet_status_t carquet_batch_reader_next(
 
     /* batch_reader and batch are nonnull per API contract */
     carquet_error_t err = CARQUET_ERROR_INIT;
+
+    /* Row-range read ([offset,limit)) drives its own sequential path and is
+     * not combined with repeated columns in this release. */
+    if (batch_reader->row_range_active) {
+        if (batch_reader->has_repeated) {
+            CARQUET_SET_ERROR(&err, CARQUET_ERROR_NOT_IMPLEMENTED,
+                "Row-range read is not supported for repeated (nested) columns");
+            *batch = NULL;
+            return CARQUET_ERROR_NOT_IMPLEMENTED;
+        }
+        return batch_reader_next_row_range(batch_reader, batch);
+    }
 
     /* Repeated (LIST/MAP-leaf) columns use the dedicated nested driver, which
      * reconstructs Arrow list layout a whole row group at a time. */

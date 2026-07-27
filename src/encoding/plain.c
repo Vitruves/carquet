@@ -359,15 +359,38 @@ carquet_status_t carquet_encode_plain_byte_array(
     if (!input || !output || count < 0) {
         return CARQUET_ERROR_INVALID_ARGUMENT;
     }
+    if (count == 0) return CARQUET_OK;
+
+    /* Sum the total encoded size (4-byte length prefix + payload per value) so
+     * the output can be grown once instead of two capacity checks per value.
+     * `total` is 64-bit; count and each length are bounded by page limits so
+     * the sum cannot realistically overflow, but guard the reservation cast. */
+    uint64_t total = 0;
+    for (int64_t i = 0; i < count; i++) {
+        total += 4u + (uint64_t)input[i].length;
+    }
+    if (total > SIZE_MAX - output->size) return CARQUET_ERROR_OUT_OF_MEMORY;
+
+    uint8_t* p = carquet_buffer_advance(output, (size_t)total);
+    if (!p) return CARQUET_ERROR_OUT_OF_MEMORY;
 
     for (int64_t i = 0; i < count; i++) {
-        carquet_status_t status = carquet_buffer_append_u32_le(output, (uint32_t)input[i].length);
-        if (status != CARQUET_OK) return status;
-
-        if (input[i].length > 0 && input[i].data) {
-            status = carquet_buffer_append(output, input[i].data, (size_t)input[i].length);
-            if (status != CARQUET_OK) return status;
+        uint32_t len = (uint32_t)input[i].length;
+        p[0] = (uint8_t)(len);
+        p[1] = (uint8_t)(len >> 8);
+        p[2] = (uint8_t)(len >> 16);
+        p[3] = (uint8_t)(len >> 24);
+        p += 4;
+        if (len > 0) {
+            if (input[i].data) {
+                memcpy(p, input[i].data, len);
+            } else {
+                /* Malformed input (length > 0, NULL data): zero-fill rather than
+                 * leak the reserved-but-unwritten bytes into the output. */
+                memset(p, 0, len);
+            }
         }
+        p += len;
     }
 
     return CARQUET_OK;

@@ -22,6 +22,7 @@
 
 #include "page_filter.h"
 #include "core/allocator.h"
+#include "core/decimal_cmp.h"
 #include "reader_internal.h"
 #include "thrift/parquet_types.h"
 #include <carquet/error.h>
@@ -94,6 +95,7 @@ typedef struct {
     int32_t type_length;
     bool is_unsigned;
     bool is_float16;
+    bool is_decimal;  /* DECIMAL backed by FLBA/BYTE_ARRAY: signed big-endian order */
 } column_type_info_t;
 
 static carquet_status_t lookup_column_type(
@@ -118,6 +120,7 @@ static carquet_status_t lookup_column_type(
     out->type_length = elem->type_length;
     out->is_unsigned = false;
     out->is_float16 = false;
+    out->is_decimal = false;
 
     if (elem->has_logical_type) {
         if (elem->logical_type.id == CARQUET_LOGICAL_INTEGER &&
@@ -125,6 +128,12 @@ static carquet_status_t lookup_column_type(
             out->is_unsigned = true;
         } else if (elem->logical_type.id == CARQUET_LOGICAL_FLOAT16) {
             out->is_float16 = true;
+        } else if (elem->logical_type.id == CARQUET_LOGICAL_DECIMAL &&
+                   (out->physical_type == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY ||
+                    out->physical_type == CARQUET_PHYSICAL_BYTE_ARRAY)) {
+            /* INT32/INT64-backed DECIMAL is ordered by the native signed
+             * integer path; only the byte backings need signed big-endian. */
+            out->is_decimal = true;
         }
     }
     if (elem->has_converted_type) {
@@ -134,6 +143,12 @@ static carquet_status_t lookup_column_type(
             case CARQUET_CONVERTED_UINT_32:
             case CARQUET_CONVERTED_UINT_64:
                 out->is_unsigned = true;
+                break;
+            case CARQUET_CONVERTED_DECIMAL:
+                if (out->physical_type == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY ||
+                    out->physical_type == CARQUET_PHYSICAL_BYTE_ARRAY) {
+                    out->is_decimal = true;
+                }
                 break;
             default:
                 break;
@@ -268,8 +283,14 @@ static int compare_typed(const column_type_info_t* ti,
                 float bv = decode_float16(b);
                 return (av < bv) ? -1 : (av > bv ? 1 : 0);
             }
+            if (ti->is_decimal) {
+                return carquet_compare_decimal_be(a, (size_t)alen, b, (size_t)blen);
+            }
             return cmp_bytes_lex(a, alen, b, blen);
         case CARQUET_PHYSICAL_BYTE_ARRAY:
+            if (ti->is_decimal) {
+                return carquet_compare_decimal_be(a, (size_t)alen, b, (size_t)blen);
+            }
             return cmp_bytes_lex(a, alen, b, blen);
         default:
             return 0;

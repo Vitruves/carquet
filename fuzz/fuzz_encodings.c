@@ -40,6 +40,17 @@ carquet_status_t carquet_dictionary_decode_float(
     const uint8_t* dict_data, size_t dict_size, int32_t dict_count,
     const uint8_t* indices_data, size_t indices_size,
     float* output, int64_t output_count);
+carquet_status_t carquet_dictionary_decode_byte_array(
+    const uint8_t* dict_data, size_t dict_size, int32_t dict_count,
+    const uint8_t* indices_data, size_t indices_size,
+    carquet_byte_array_t* output, int64_t output_count);
+
+carquet_status_t carquet_dictionary_decode_fixed_len_byte_array(
+    const uint8_t* dict_data, size_t dict_size, int32_t dict_count,
+    int32_t type_length,
+    const uint8_t* indices_data, size_t indices_size,
+    uint8_t* output, int64_t output_count);
+
 carquet_status_t carquet_dictionary_decode_double(
     const uint8_t* dict_data, size_t dict_size, int32_t dict_count,
     const uint8_t* indices_data, size_t indices_size,
@@ -85,7 +96,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     void* output = malloc((size_t)max_values * 16);
     if (!output) return 0;
 
-    switch (encoding % 18) {
+    switch (encoding % 20) {
         case 0: {
             /* RLE decode — variable bit width */
             int bit_width = (param % 32) + 1;
@@ -289,6 +300,41 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                 }
                 free(arrays);
             }
+            break;
+        }
+        case 18: {
+            /* Dictionary BYTE_ARRAY — length-prefixed dict + RLE indices */
+            if (payload_size < 8) break;
+            int32_t dict_count = (param % 64) + 1;
+            /* Carve an arbitrary dict/indices split from the payload. */
+            size_t dict_size = ((size_t)param * 7 + 3) % payload_size;
+            if (dict_size == 0 || dict_size >= payload_size) break;
+            size_t indices_size = payload_size - dict_size;
+            int64_t num_values = (param % 200) + 1;
+            if (num_values > max_values) num_values = max_values;
+            (void)carquet_dictionary_decode_byte_array(
+                payload, dict_size, dict_count,
+                payload + dict_size, indices_size,
+                (carquet_byte_array_t*)output, num_values);
+            break;
+        }
+        case 19: {
+            /* Dictionary FIXED_LEN_BYTE_ARRAY */
+            if (payload_size < 8) break;
+            int32_t type_length = (param % 16) + 1;
+            int32_t dict_count = (param % 64) + 1;
+            size_t dict_size = (size_t)dict_count * (size_t)type_length;
+            if (dict_size >= payload_size) break;
+            size_t indices_size = payload_size - dict_size;
+            int64_t num_values = (param % 200) + 1;
+            /* output holds max_values*16 bytes; cap so num_values*tl fits. */
+            int64_t cap = (max_values * 16) / type_length;
+            if (num_values > cap) num_values = cap;
+            if (num_values <= 0) break;
+            (void)carquet_dictionary_decode_fixed_len_byte_array(
+                payload, dict_size, dict_count, type_length,
+                payload + dict_size, indices_size,
+                (uint8_t*)output, num_values);
             break;
         }
     }

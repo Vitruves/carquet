@@ -103,11 +103,50 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                     (void)acc;
                 }
             }
+            /* Drive the Arrow C Data export over the whole batch. This walks the
+             * flattened leaf/list/map children — including BYTE_ARRAY value
+             * buffers — so it dereferences reconstructed value pointers that the
+             * column accessors above only count. Release consumes what it built. */
+            if (schema) {
+                struct ArrowSchema as;
+                struct ArrowArray aa;
+                memset(&as, 0, sizeof(as));
+                memset(&aa, 0, sizeof(aa));
+                if (carquet_arrow_export_batch(batch, schema, &as, &aa, NULL)
+                        == CARQUET_OK) {
+                    if (aa.release) aa.release(&aa);
+                    if (as.release) as.release(&as);
+                }
+            }
             carquet_row_batch_free(batch);
             batch = NULL;
             batch_count++;
         }
         carquet_batch_reader_free(batch_reader);
+    }
+
+    /* Row-range read: drive the [offset, limit) driver with attacker-derived
+     * bounds over the (possibly malformed) file metadata. */
+    carquet_batch_reader_t* rr = carquet_batch_reader_create(reader, &config, &err);
+    if (rr) {
+        int64_t off = (int64_t)((uint32_t)data[3] | ((uint32_t)data[4] << 8));
+        int64_t lim = (data[5] & 1) ? -1
+                    : (int64_t)((uint32_t)data[6] | ((uint32_t)data[7] << 8));
+        if (carquet_batch_reader_set_row_range(rr, off, lim) == CARQUET_OK) {
+            carquet_row_batch_t* batch = NULL;
+            int batch_count = 0;
+            while (batch_count < 10 &&
+                   carquet_batch_reader_next(rr, &batch) == CARQUET_OK && batch) {
+                for (int32_t col = 0; col < num_cols && col < 100; col++) {
+                    const void* dptr; const uint8_t* nulls; int64_t count;
+                    (void)carquet_row_batch_column(batch, col, &dptr, &nulls, &count);
+                }
+                carquet_row_batch_free(batch);
+                batch = NULL;
+                batch_count++;
+            }
+        }
+        carquet_batch_reader_free(rr);
     }
 
     /* Low-level column reader API */

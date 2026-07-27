@@ -10,6 +10,7 @@
 #include <carquet/carquet.h>
 #include <carquet/error.h>
 #include "core/buffer.h"
+#include "core/decimal_cmp.h"
 #include "core/float16.h"
 #include "thrift/thrift_encode.h"
 #include "thrift/parquet_types.h"
@@ -509,10 +510,24 @@ static bool logical_integer_is_unsigned(const carquet_logical_type_t* lt) {
            !lt->params.integer.is_signed;
 }
 
+/* True for a DECIMAL logical type backed by a byte physical type, whose stats
+ * are ordered as signed big-endian two's complement rather than unsigned lex. */
+static bool logical_is_byte_backed_decimal(carquet_physical_type_t type,
+                                           const carquet_logical_type_t* lt) {
+    return lt && lt->id == CARQUET_LOGICAL_DECIMAL &&
+           (type == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY ||
+            type == CARQUET_PHYSICAL_BYTE_ARRAY);
+}
+
 static int compare_stat_values(carquet_physical_type_t type,
                                const carquet_logical_type_t* logical_type,
                                const uint8_t* a, size_t alen,
                                const uint8_t* b, size_t blen) {
+    /* Byte-backed DECIMAL: signed big-endian order (may differ in length for
+     * BYTE_ARRAY), checked before the equal-length numeric switch. */
+    if (logical_is_byte_backed_decimal(type, logical_type)) {
+        return carquet_compare_decimal_be(a, alen, b, blen);
+    }
     if (alen == blen) {
         switch (type) {
             case CARQUET_PHYSICAL_INT32: {

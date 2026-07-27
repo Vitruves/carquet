@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(carquet VERSION 0.7.0 LANGUAGES C)
+project(carquet VERSION 0.7.1 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -646,6 +646,21 @@ if(CARQUET_BUILD_TESTS)
 
     # Page-level filter (predicate pushdown via column index + offset index)
     add_carquet_test(test_page_filter tests/test_page_filter.c)
+
+    # Arbitrary [offset, limit) row-range read (predicate-independent slice)
+    add_carquet_test(test_row_range tests/test_row_range.c)
+
+    # Module-level dictionary decode for BYTE_ARRAY / FIXED_LEN_BYTE_ARRAY
+    add_carquet_test(test_dict_decode tests/test_dict_decode.c)
+
+    # Signed big-endian ordering of DECIMAL(FLBA/BYTE_ARRAY) min/max statistics
+    add_carquet_test(test_decimal_stats tests/test_decimal_stats.c)
+
+    # Writing dictionary-encoded (categorical) Arrow arrays resolves to values
+    add_carquet_test(test_arrow_dictionary tests/test_arrow_dictionary.c)
+
+    # CLI value/type formatting (DATE, TIME, TIMESTAMP rendering)
+    add_carquet_test(test_cli_format "tests/test_cli_format.c;src/cli/commands.c")
 
     # Append row groups to an existing file (metadata carryover, bloom/page-index
     # preservation, nullable + multi-column append, structural-mismatch rejection)
