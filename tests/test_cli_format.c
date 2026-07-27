@@ -111,17 +111,40 @@ static int test_timestamp_and_date_values(void) {
           cli_format_value(CARQUET_PHYSICAL_INT64, &ms, 0, &lt, buf, sizeof buf),
           "1970-01-01T00:00:00");
 
+    /* Pre-epoch: the seconds/fraction split must floor, not truncate. */
+    ms = -1;
+    check("ts_ms pre_epoch",
+          cli_format_value(CARQUET_PHYSICAL_INT64, &ms, 0, &lt, buf, sizeof buf),
+          "1969-12-31T23:59:59.999");
+    ms = -86400000LL;
+    check("ts_ms one_day_before",
+          cli_format_value(CARQUET_PHYSICAL_INT64, &ms, 0, &lt, buf, sizeof buf),
+          "1969-12-31T00:00:00");
+
+    lt = timestamp_lt(CARQUET_TIME_UNIT_NANOS);
+    int64_t ns = 1234567890123456789LL;
+    check("ts_ns far_future",
+          cli_format_value(CARQUET_PHYSICAL_INT64, &ns, 0, &lt, buf, sizeof buf),
+          "2009-02-13T23:31:30.123456789");
+
     carquet_logical_type_t dlt;
     memset(&dlt, 0, sizeof(dlt));
     dlt.id = CARQUET_LOGICAL_DATE;
-    int32_t days = -719162; /* 0001-01-01 */
-    check("date min",
-          cli_format_value(CARQUET_PHYSICAL_INT32, &days, 0, &dlt, buf, sizeof buf),
-          "0001-01-01");
-    days = 2932896; /* 9999-12-31 */
-    check("date max",
-          cli_format_value(CARQUET_PHYSICAL_INT32, &days, 0, &dlt, buf, sizeof buf),
-          "9999-12-31");
+    struct { int32_t days; const char* want; } dates[] = {
+        { 0,       "1970-01-01" },
+        { -1,      "1969-12-31" },
+        { -719162, "0001-01-01" },  /* Parquet DATE minimum */
+        { 2932896, "9999-12-31" },  /* Parquet DATE maximum */
+        { 59,      "1970-03-01" },
+        { 719468,  "3939-11-03" },  /* past the MSVC CRT's year-3000 ceiling */
+        { 11016,   "2000-02-29" },  /* leap year divisible by 400 */
+        { -25567,  "1900-01-01" },  /* year divisible by 100, not a leap year */
+    };
+    for (size_t i = 0; i < sizeof dates / sizeof dates[0]; i++) {
+        check("date", cli_format_value(CARQUET_PHYSICAL_INT32, &dates[i].days, 0,
+                                       &dlt, buf, sizeof buf),
+              dates[i].want);
+    }
 
     if (failures != before) return 1;
     TEST_PASS("cli DATE/TIMESTAMP value formatting");

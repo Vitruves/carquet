@@ -146,6 +146,35 @@ void cli_format_bytes(int64_t bytes, char* buf, size_t buf_size) {
         snprintf(buf, buf_size, "%.2f GB", bytes / (1024.0 * 1024 * 1024));
 }
 
+/* Days since 1970-01-01 -> proleptic Gregorian y/m/d (Howard Hinnant's
+ * civil_from_days). Deliberately not gmtime_r/gmtime_s: the MSVC CRT rejects
+ * any time outside [1970-01-01, 3000-12-31] and leaves `struct tm` untouched,
+ * so Parquet's full DATE/TIMESTAMP range (year 1 through year 9999, and
+ * pre-epoch values everywhere) printed uninitialized garbage on Windows. This
+ * is total over the whole int64 domain and identical on every platform. */
+static void civil_from_days(int64_t z, int64_t* year, int* month, int* day) {
+    z += 719468; /* shift the epoch to 0000-03-01 so leap day lands last */
+    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    int64_t doe = z - era * 146097;                                   /* [0, 146096] */
+    int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; /* [0, 399] */
+    int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);            /* [0, 365] */
+    int64_t mp  = (5 * doy + 2) / 153;                                /* [0, 11], March-based */
+    *day   = (int)(doy - (153 * mp + 2) / 5 + 1);                     /* [1, 31] */
+    *month = (int)(mp < 10 ? mp + 3 : mp - 9);                        /* [1, 12] */
+    *year  = yoe + era * 400 + (*month <= 2);
+}
+
+/* Split a signed count into a floored quotient and a non-negative remainder,
+ * so pre-epoch values decompose correctly (truncating division would round
+ * toward zero and yield a negative remainder). */
+static int64_t floor_div_mod(int64_t val, int64_t divisor, int64_t* rem) {
+    int64_t q = val / divisor;
+    int64_t r = val % divisor;
+    if (r < 0) { r += divisor; q -= 1; }
+    *rem = r;
+    return q;
+}
+
 const char* cli_format_value(carquet_physical_type_t type,
                              const void* value, int32_t type_len,
                              const carquet_logical_type_t* logical,
@@ -155,16 +184,9 @@ const char* cli_format_value(carquet_physical_type_t type,
 
     /* Handle logical type formatting */
     if (logical && logical->id == CARQUET_LOGICAL_DATE && type == CARQUET_PHYSICAL_INT32) {
-        int32_t days = *(const int32_t*)value;
-        time_t t = (time_t)days * 86400;
-        struct tm tm;
-#ifdef _WIN32
-        gmtime_s(&tm, &t);
-#else
-        gmtime_r(&t, &tm);
-#endif
-        snprintf(buf, buf_size, "%04d-%02d-%02d",
-                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+        int64_t y; int m, d;
+        civil_from_days(*(const int32_t*)value, &y, &m, &d);
+        snprintf(buf, buf_size, "%04" PRId64 "-%02d-%02d", y, m, d);
         return buf;
     }
 
@@ -199,8 +221,6 @@ const char* cli_format_value(carquet_physical_type_t type,
     if (logical && logical->id == CARQUET_LOGICAL_TIMESTAMP &&
         type == CARQUET_PHYSICAL_INT64) {
         int64_t val = *(const int64_t*)value;
-        time_t secs;
-        int frac = 0;
         const char* frac_fmt = "";
         int64_t divisor = 1;
         switch (logical->params.timestamp.unit) {
@@ -217,28 +237,21 @@ const char* cli_format_value(carquet_physical_type_t type,
                 frac_fmt = ".%09d";
                 break;
         }
-        /* Floor division so pre-epoch (negative) values split correctly:
-         * truncating division would push secs up by one and make frac negative
-         * (e.g. -999 ms -> secs 0, frac -999 instead of secs -1, frac 1). */
-        int64_t sec_val = val / divisor;
-        int64_t frac_val = val % divisor;
-        if (frac_val < 0) {
-            frac_val += divisor;
-            sec_val -= 1;
-        }
-        secs = (time_t)sec_val;
-        frac = (int)frac_val;
-        struct tm tm;
-#ifdef _WIN32
-        gmtime_s(&tm, &secs);
-#else
-        gmtime_r(&secs, &tm);
-#endif
-        int n = snprintf(buf, buf_size, "%04d-%02d-%02dT%02d:%02d:%02d",
-                         tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                         tm.tm_hour, tm.tm_min, tm.tm_sec);
-        if (frac != 0 && n > 0 && (size_t)n < buf_size)
-            snprintf(buf + n, buf_size - (size_t)n, frac_fmt, frac);
+        /* Floor division at each step so pre-epoch (negative) values split
+         * correctly: truncating division would push the quotient up by one and
+         * make the remainder negative (e.g. -999 ms -> 0 s and -999 ms instead
+         * of -1 s and 1 ms). */
+        int64_t frac_val, secs_of_day;
+        int64_t secs = floor_div_mod(val, divisor, &frac_val);
+        int64_t days = floor_div_mod(secs, 86400, &secs_of_day);
+        int64_t y; int m, d;
+        civil_from_days(days, &y, &m, &d);
+        int n = snprintf(buf, buf_size,
+                         "%04" PRId64 "-%02d-%02dT%02" PRId64 ":%02" PRId64 ":%02" PRId64,
+                         y, m, d, secs_of_day / 3600, (secs_of_day / 60) % 60,
+                         secs_of_day % 60);
+        if (frac_val != 0 && n > 0 && (size_t)n < buf_size)
+            snprintf(buf + n, buf_size - (size_t)n, frac_fmt, (int)frac_val);
         return buf;
     }
 
