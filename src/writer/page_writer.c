@@ -143,6 +143,7 @@ typedef struct carquet_page_writer {
     int64_t* def_level_hist;
 
     bool data_page_v2;       /* Emit DATA_PAGE_V2 instead of DATA_PAGE */
+    int64_t bool_bits;       /* PLAIN BOOLEAN bits packed into this page */
 
     int32_t compression_level;   /* 0 = use codec default */
 
@@ -316,6 +317,7 @@ void carquet_page_writer_destroy(carquet_page_writer_t* writer) {
 
 void carquet_page_writer_reset(carquet_page_writer_t* writer) {
     carquet_buffer_clear(&writer->values_buffer);
+    writer->bool_bits = 0;
     carquet_buffer_clear(&writer->def_levels_buffer);
     carquet_buffer_clear(&writer->rep_levels_buffer);
     carquet_buffer_clear(&writer->staging_buffer);
@@ -907,6 +909,50 @@ static carquet_status_t encode_plain_double_with_stats(
 #endif
 }
 
+/* Append booleans to the page's PLAIN bit stream, continuing from the bit
+ * position the previous call left.
+ *
+ * Parquet packs a page's booleans as one continuous little-endian bit stream.
+ * carquet_encode_plain_boolean() always starts a fresh byte, so a column
+ * written in several batches restarted the stream at each call whose running
+ * count was not a multiple of 8, and every value after the first batch landed
+ * on the wrong bit. */
+static carquet_status_t append_plain_boolean(
+    carquet_page_writer_t* writer,
+    const uint8_t* values,
+    int64_t count) {
+
+    if (count == 0) {
+        return CARQUET_OK;
+    }
+
+    int64_t start_bit = writer->bool_bits;
+    size_t have_bytes = (size_t)((start_bit + 7) / 8);
+    size_t need_bytes = (size_t)((start_bit + count + 7) / 8);
+
+    if (need_bytes > have_bytes) {
+        uint8_t* grown = carquet_buffer_advance(&writer->values_buffer,
+                                                need_bytes - have_bytes);
+        if (!grown) {
+            return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
+        /* Only the newly added bytes need clearing; the partial byte already
+         * in the buffer holds bits this call must preserve. */
+        memset(grown, 0, need_bytes - have_bytes);
+    }
+
+    uint8_t* base = writer->values_buffer.data +
+                    (writer->values_buffer.size - need_bytes);
+    for (int64_t i = 0; i < count; i++) {
+        if (values[i]) {
+            int64_t bit = start_bit + i;
+            base[bit >> 3] |= (uint8_t)(1u << (bit & 7));
+        }
+    }
+    writer->bool_bits = start_bit + count;
+    return CARQUET_OK;
+}
+
 static carquet_status_t encode_float_values(
     carquet_page_writer_t* writer,
     const float* values,
@@ -1195,8 +1241,7 @@ carquet_status_t carquet_page_writer_add_values(
                 }
                 carquet_buffer_destroy(&rle);
             } else {
-                status = carquet_encode_plain_boolean(bools, num_non_null,
-                                                       &writer->values_buffer);
+                status = append_plain_boolean(writer, bools, num_non_null);
             }
             if (status == CARQUET_OK && writer->write_statistics) {
                 update_statistics_boolean(writer, bools, num_non_null);

@@ -1247,9 +1247,140 @@ static int test_file_format_version(void) {
     return 0;
 }
 
+/* ---- PLAIN BOOLEAN across several write_batch calls ---- */
+/* Parquet packs a page's booleans as one continuous bit stream, so a page
+ * written in several calls must produce the same bytes as one written in a
+ * single call. The chunk sizes below are deliberately not multiples of 8, so
+ * every batch after the first starts mid-byte. */
+static int test_boolean_chunked_writes(void) {
+    const char* name = "boolean_chunked_writes";
+    char path[512]; carquet_test_temp_path(path, sizeof(path), "ext_bool_chunk");
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    static const int64_t chunks[] = { 5, 3, 991, 1, 4000 };
+
+    static uint8_t in[N], out[N];
+    for (int i = 0; i < N; i++) in[i] = (uint8_t)((i * 7 + (i / 3)) & 1);
+
+    carquet_schema_t* s = carquet_schema_create(&err);
+    if (!s) TEST_FAIL(name, "schema create");
+    if (carquet_schema_add_column(s, "b", CARQUET_PHYSICAL_BOOLEAN, NULL,
+            CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK)
+        { carquet_schema_free(s); TEST_FAIL(name, "add col"); }
+
+    carquet_writer_options_t wo; carquet_writer_options_init(&wo);
+    carquet_writer_t* w = carquet_writer_create(path, s, &wo, &err);
+    if (!w) { carquet_schema_free(s); TEST_FAIL(name, "writer create"); }
+    int64_t done = 0;
+    for (size_t k = 0; k < sizeof(chunks) / sizeof(chunks[0]); k++) {
+        if (carquet_writer_write_batch(w, 0, in + done, chunks[k],
+                                       NULL, NULL) != CARQUET_OK)
+            { carquet_writer_close(w); carquet_schema_free(s);
+              TEST_FAIL(name, "write batch"); }
+        done += chunks[k];
+    }
+    if (carquet_writer_close(w) != CARQUET_OK)
+        { carquet_schema_free(s); TEST_FAIL(name, "close"); }
+    carquet_schema_free(s);
+
+    carquet_reader_t* r = carquet_reader_open(path, NULL, &err);
+    if (!r) { carquet_test_cleanup(path); TEST_FAIL(name, "open"); }
+    carquet_column_reader_t* c = carquet_reader_get_column(r, 0, 0, &err);
+    int64_t n = c ? carquet_column_read_batch(c, out, N, NULL, NULL) : -1;
+    int ok = (done == N) && (n == N);
+    int64_t wrong = 0;
+    for (int64_t i = 0; i < N && ok; i++) if (in[i] != out[i]) wrong++;
+    ok = ok && (wrong == 0);
+    carquet_column_reader_free(c); carquet_reader_close(r); carquet_test_cleanup(path);
+    if (!ok) TEST_FAIL(name, "value mismatch");
+    TEST_PASS(name);
+    return 0;
+}
+
+/* ---- PLAIN BOOLEAN: exact on-disk bytes ---- */
+/* A round-trip through carquet's own decoder cannot distinguish a correct page
+ * from a self-consistently wrong one, so this asserts the literal page payload.
+ *
+ * Twelve booleans, written as 5 + 7 so the second batch starts at bit 5 --
+ * mid-byte, which is the case that was broken:
+ *
+ *   index  0 1 2 3 4 | 5 6 7 8 9 10 11
+ *   value  1 0 1 1 0 | 0 1 0 1 1  0  1
+ *
+ * PLAIN packs them LSB-first into a continuous stream:
+ *
+ *   byte 0 = bits 0..7  = 1,0,1,1,0,0,1,0 -> 0x4D  (1 + 4 + 8 + 64)
+ *   byte 1 = bits 8..11 = 1,1,0,1         -> 0x0B  (1 + 2 + 8)
+ *
+ * so the payload is exactly 4D 0B. Restarting the stream at the second call
+ * instead emits the first 5 bits, pads to a byte, and starts again, giving
+ * 0D 5A -- which is what this pins against. */
+static int test_boolean_exact_page_bytes(void) {
+    const char* name = "boolean_exact_page_bytes";
+    char path[512]; carquet_test_temp_path(path, sizeof(path), "ext_bool_bytes");
+    carquet_error_t err = CARQUET_ERROR_INIT;
+
+    static const uint8_t in[12] = { 1,0,1,1,0, 0,1,0,1,1,0,1 };
+    static const uint8_t expect[2] = { 0x4D, 0x0B };
+
+    carquet_schema_t* s = carquet_schema_create(&err);
+    if (!s) TEST_FAIL(name, "schema create");
+    if (carquet_schema_add_column(s, "b", CARQUET_PHYSICAL_BOOLEAN, NULL,
+            CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK)
+        { carquet_schema_free(s); TEST_FAIL(name, "add col"); }
+
+    carquet_writer_options_t wo; carquet_writer_options_init(&wo);
+    wo.compression = CARQUET_COMPRESSION_UNCOMPRESSED;  /* payload is the values */
+    carquet_writer_t* w = carquet_writer_create(path, s, &wo, &err);
+    if (!w) { carquet_schema_free(s); TEST_FAIL(name, "writer create"); }
+    if (carquet_writer_write_batch(w, 0, in, 5, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_write_batch(w, 0, in + 5, 7, NULL, NULL) != CARQUET_OK)
+        { carquet_writer_close(w); carquet_schema_free(s);
+          TEST_FAIL(name, "write batch"); }
+    if (carquet_writer_close(w) != CARQUET_OK)
+        { carquet_schema_free(s); TEST_FAIL(name, "close"); }
+    carquet_schema_free(s);
+
+    carquet_reader_t* r = carquet_reader_open(path, NULL, &err);
+    if (!r) { carquet_test_cleanup(path); TEST_FAIL(name, "open"); }
+    carquet_column_chunk_metadata_t cm;
+    if (carquet_reader_column_chunk_metadata(r, 0, 0, &cm) != CARQUET_OK)
+        { carquet_reader_close(r); carquet_test_cleanup(path);
+          TEST_FAIL(name, "chunk meta"); }
+
+    uint8_t* fb = NULL; size_t fsz = 0;
+    if (!read_file(path, &fb, &fsz))
+        { carquet_reader_close(r); carquet_test_cleanup(path);
+          TEST_FAIL(name, "read file"); }
+
+    parquet_page_header_t ph; size_t consumed = 0;
+    carquet_status_t pst = parquet_parse_page_header(
+        fb + cm.data_page_offset, fsz - (size_t)cm.data_page_offset,
+        &ph, &consumed, &err);
+    int ok = (pst == CARQUET_OK) &&
+             (ph.uncompressed_page_size == (int32_t)sizeof(expect));
+    if (ok) {
+        const uint8_t* payload = fb + cm.data_page_offset + consumed;
+        ok = (memcmp(payload, expect, sizeof(expect)) == 0);
+        if (!ok) {
+            fprintf(stderr, "  expected: %02X %02X\n  actual:   %02X %02X\n",
+                    expect[0], expect[1], payload[0], payload[1]);
+        }
+    } else if (pst == CARQUET_OK) {
+        fprintf(stderr, "  payload is %d bytes, expected %d\n",
+                ph.uncompressed_page_size, (int)sizeof(expect));
+    }
+    free(fb);
+    carquet_reader_close(r); carquet_test_cleanup(path);
+    if (!ok) TEST_FAIL(name, "page payload is not the expected bit stream");
+    TEST_PASS(name);
+    return 0;
+}
+
 int main(void) {
     int failures = 0;
     failures += test_int96_roundtrip();
+    failures += test_boolean_chunked_writes();
+    failures += test_boolean_exact_page_bytes();
     failures += test_data_page_v2(0);
     failures += test_data_page_v2(1);
     failures += test_arrow_schema_metadata();
