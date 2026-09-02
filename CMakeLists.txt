@@ -627,6 +627,10 @@ if(CARQUET_BUILD_TESTS)
     # carquet-reads-carquet roundtrip for every opt-in encoding
     add_carquet_test(test_encoding_roundtrip tests/test_encoding_roundtrip.c)
 
+    # BSS page must hold exactly one byte-plane transposition (multi-chunk
+    # pages corrupted values after the first chunk's null-shrunk batch)
+    add_carquet_test(test_bss_multi_chunk_page tests/test_bss_multi_chunk_page.c)
+
     # INT96 writing, opt-in Data Page V2, ARROW:schema metadata
     add_carquet_test(test_writer_extensions tests/test_writer_extensions.c)
 

@@ -2181,6 +2181,11 @@ int64_t carquet_page_writer_num_values(const carquet_page_writer_t* writer) {
     return writer ? writer->num_values : 0;
 }
 
+carquet_encoding_t carquet_page_writer_get_encoding(
+    const carquet_page_writer_t* writer) {
+    return writer ? writer->encoding : CARQUET_ENCODING_PLAIN;
+}
+
 /* Unencoded BYTE_ARRAY value bytes accumulated for the current (not-yet-flushed)
  * page. Meaningful only for BYTE_ARRAY columns; 0 otherwise. */
 int64_t carquet_page_writer_byte_array_bytes(const carquet_page_writer_t* writer) {
