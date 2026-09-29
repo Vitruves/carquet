@@ -121,6 +121,8 @@ extern carquet_status_t carquet_page_writer_add_dictionary_indices(
     int64_t num_values_total, int64_t num_nulls);
 extern void carquet_page_writer_set_encoding(carquet_page_writer_t* writer,
                                              carquet_encoding_t encoding);
+extern carquet_encoding_t carquet_page_writer_get_encoding(
+    const carquet_page_writer_t* writer);
 extern carquet_status_t carquet_page_writer_set_min_max(
     carquet_page_writer_t* writer,
     const uint8_t* min_value, size_t min_size,
@@ -1012,8 +1014,20 @@ static carquet_status_t encode_batch_eager(
 
         /* Flush page when it reaches target size, or (when configured) when
          * it reaches the row-count cap. The row-count check is guarded by a
-         * cheap > 0 test first so it costs nothing when the knob is unset. */
-        if (carquet_page_writer_estimated_size(writer->page_writer) >= writer->target_page_size ||
+         * cheap > 0 test first so it costs nothing when the knob is unset.
+         *
+         * BYTE_STREAM_SPLIT encodes each add_values call as its own
+         * byte-plane transposition, strided by that call's non-null count.
+         * A data page must hold exactly one transposition sized by the
+         * page's TOTAL non-null count, so a page that accumulates more
+         * than one call is undecodable. Nulls can hold a chunk under the
+         * byte threshold, pulling a second call into the same page — flush
+         * every chunk so each page sees exactly one BSS layout. */
+        if (writer->page_writer && carquet_page_writer_get_encoding(
+                                       writer->page_writer) == CARQUET_ENCODING_BYTE_STREAM_SPLIT) {
+            status = flush_current_page(writer);
+            if (status != CARQUET_OK) return status;
+        } else if (carquet_page_writer_estimated_size(writer->page_writer) >= writer->target_page_size ||
             (writer->max_rows_per_page > 0 &&
              carquet_page_writer_num_values(writer->page_writer) >= writer->max_rows_per_page)) {
             status = flush_current_page(writer);
