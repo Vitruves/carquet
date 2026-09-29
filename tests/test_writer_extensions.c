@@ -1247,9 +1247,105 @@ static int test_file_format_version(void) {
     return 0;
 }
 
+/* ---- BYTE_STREAM_SPLIT: exact on-disk bytes ---- */
+/* A round-trip through carquet's own decoder cannot tell a correct page from a
+ * self-consistently wrong one, so this asserts the literal page payload.
+ *
+ * Four INT32 values, chosen so their little-endian bytes are readable by eye:
+ *
+ *   0x04030201 -> 01 02 03 04
+ *   0x08070605 -> 05 06 07 08
+ *   0x0C0B0A09 -> 09 0A 0B 0C
+ *   0x100F0E0D -> 0D 0E 0F 10
+ *
+ * BYTE_STREAM_SPLIT with element width 4 and 4 values emits four planes of four
+ * bytes: plane b holds byte b of every value, in order. So the page payload
+ * must be exactly
+ *
+ *   01 05 09 0D | 02 06 0A 0E | 03 07 0B 0F | 04 08 0C 10
+ *
+ * They are written as 1 + 3 values, so a per-call split would instead produce
+ * value 0 transposed alone followed by values 1..3 transposed as their own
+ * block -- 01 02 03 04 05 09 0D 06 0A 0E 07 0B 0F 08 0C 10 -- which is what
+ * this test pins against. */
+static int test_bss_exact_page_bytes(void) {
+    const char* name = "bss_exact_page_bytes";
+    char path[512]; carquet_test_temp_path(path, sizeof(path), "ext_bss_bytes");
+    carquet_error_t err = CARQUET_ERROR_INIT;
+
+    static const int32_t in[4] = {
+        0x04030201, 0x08070605, 0x0C0B0A09, 0x100F0E0D
+    };
+    static const uint8_t expect[16] = {
+        0x01, 0x05, 0x09, 0x0D,
+        0x02, 0x06, 0x0A, 0x0E,
+        0x03, 0x07, 0x0B, 0x0F,
+        0x04, 0x08, 0x0C, 0x10
+    };
+
+    carquet_schema_t* s = carquet_schema_create(&err);
+    if (!s) TEST_FAIL(name, "schema create");
+    if (carquet_schema_add_column(s, "v", CARQUET_PHYSICAL_INT32, NULL,
+            CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK)
+        { carquet_schema_free(s); TEST_FAIL(name, "add col"); }
+
+    carquet_writer_options_t wo; carquet_writer_options_init(&wo);
+    wo.compression = CARQUET_COMPRESSION_UNCOMPRESSED;  /* payload is the values */
+    carquet_writer_t* w = carquet_writer_create(path, s, &wo, &err);
+    if (!w) { carquet_schema_free(s); TEST_FAIL(name, "writer create"); }
+    if (carquet_writer_set_column_encoding(w, 0,
+            CARQUET_ENCODING_BYTE_STREAM_SPLIT) != CARQUET_OK)
+        { carquet_writer_close(w); carquet_schema_free(s);
+          TEST_FAIL(name, "set encoding"); }
+    /* Split across two calls: one page, two batches. */
+    if (carquet_writer_write_batch(w, 0, in, 1, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_write_batch(w, 0, in + 1, 3, NULL, NULL) != CARQUET_OK)
+        { carquet_writer_close(w); carquet_schema_free(s);
+          TEST_FAIL(name, "write batch"); }
+    if (carquet_writer_close(w) != CARQUET_OK)
+        { carquet_schema_free(s); TEST_FAIL(name, "close"); }
+    carquet_schema_free(s);
+
+    carquet_reader_t* r = carquet_reader_open(path, NULL, &err);
+    if (!r) { carquet_test_cleanup(path); TEST_FAIL(name, "open"); }
+    carquet_column_chunk_metadata_t cm;
+    if (carquet_reader_column_chunk_metadata(r, 0, 0, &cm) != CARQUET_OK)
+        { carquet_reader_close(r); carquet_test_cleanup(path);
+          TEST_FAIL(name, "chunk meta"); }
+
+    uint8_t* fb = NULL; size_t fsz = 0;
+    if (!read_file(path, &fb, &fsz))
+        { carquet_reader_close(r); carquet_test_cleanup(path);
+          TEST_FAIL(name, "read file"); }
+
+    parquet_page_header_t ph; size_t consumed = 0;
+    carquet_status_t pst = parquet_parse_page_header(
+        fb + cm.data_page_offset, fsz - (size_t)cm.data_page_offset,
+        &ph, &consumed, &err);
+    int ok = (pst == CARQUET_OK) &&
+             (ph.uncompressed_page_size == (int32_t)sizeof(expect));
+    if (ok) {
+        const uint8_t* payload = fb + cm.data_page_offset + consumed;
+        ok = (memcmp(payload, expect, sizeof(expect)) == 0);
+        if (!ok) {
+            fprintf(stderr, "  expected:");
+            for (size_t i = 0; i < sizeof(expect); i++) fprintf(stderr, " %02X", expect[i]);
+            fprintf(stderr, "\n  actual:  ");
+            for (size_t i = 0; i < sizeof(expect); i++) fprintf(stderr, " %02X", payload[i]);
+            fprintf(stderr, "\n");
+        }
+    }
+    free(fb);
+    carquet_reader_close(r); carquet_test_cleanup(path);
+    if (!ok) TEST_FAIL(name, "page payload is not the expected byte planes");
+    TEST_PASS(name);
+    return 0;
+}
+
 int main(void) {
     int failures = 0;
     failures += test_int96_roundtrip();
+    failures += test_bss_exact_page_bytes();
     failures += test_data_page_v2(0);
     failures += test_data_page_v2(1);
     failures += test_arrow_schema_metadata();

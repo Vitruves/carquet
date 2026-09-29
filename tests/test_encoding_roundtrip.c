@@ -167,6 +167,61 @@ static int test_bss(const char* name, const char* base,
     return 0;
 }
 
+/* BYTE_STREAM_SPLIT transposes a whole page into byte planes, so it is only
+ * correct when applied to the finished page. Writing the same page in several
+ * carquet_writer_write_batch() calls must therefore produce byte-identical
+ * output to writing it in one. The chunk sizes below are deliberately not
+ * multiples of any value width, so a per-call split leaves independently
+ * transposed regions that the reader de-splits as a single stride. */
+static int test_bss_chunked(const char* name, const char* base,
+                            carquet_physical_type_t phys, int32_t tl, size_t esz) {
+    static const int64_t chunks[] = { 7, 1, 1992, 2000 };
+    char path[512]; carquet_test_temp_path(path, sizeof(path), base);
+    static uint8_t in[N * 8], out[N * 8];
+    size_t bytes = (size_t)N * esz;
+    for (size_t i = 0; i < bytes; i++) in[i] = (uint8_t)((i * 131 + 7) & 0xFF);
+
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t* s = carquet_schema_create(&err);
+    if (!s) TEST_FAIL(name, "schema create failed");
+    if (carquet_schema_add_column(s, "c", phys, NULL,
+                                  CARQUET_REPETITION_REQUIRED, tl, 0) != CARQUET_OK) {
+        carquet_schema_free(s); TEST_FAIL(name, "add column failed");
+    }
+    carquet_writer_options_t wo;
+    carquet_writer_options_init(&wo);
+    carquet_writer_t* w = carquet_writer_create(path, s, &wo, &err);
+    if (!w) { carquet_schema_free(s); TEST_FAIL(name, "writer create failed"); }
+    if (carquet_writer_set_column_encoding(
+            w, 0, CARQUET_ENCODING_BYTE_STREAM_SPLIT) != CARQUET_OK) {
+        carquet_writer_close(w); carquet_schema_free(s);
+        TEST_FAIL(name, "set encoding failed");
+    }
+    int64_t done = 0;
+    for (size_t k = 0; k < sizeof(chunks) / sizeof(chunks[0]); k++) {
+        if (carquet_writer_write_batch(w, 0, in + (size_t)done * esz,
+                                       chunks[k], NULL, NULL) != CARQUET_OK) {
+            carquet_writer_close(w); carquet_schema_free(s);
+            TEST_FAIL(name, "write batch failed");
+        }
+        done += chunks[k];
+    }
+    if (carquet_writer_close(w) != CARQUET_OK) {
+        carquet_schema_free(s); TEST_FAIL(name, "writer close failed");
+    }
+    carquet_schema_free(s);
+
+    carquet_reader_t* r = carquet_reader_open(path, NULL, &err);
+    if (!r) TEST_FAIL(name, "open failed");
+    carquet_column_reader_t* c = carquet_reader_get_column(r, 0, 0, &err);
+    int64_t n = c ? carquet_column_read_batch(c, out, N, NULL, NULL) : -1;
+    int ok = (done == N) && (n == N) && (memcmp(in, out, bytes) == 0);
+    carquet_column_reader_free(c); carquet_reader_close(r); carquet_test_cleanup(path);
+    if (!ok) TEST_FAIL(name, "value mismatch");
+    TEST_PASS(name);
+    return 0;
+}
+
 static int test_delta_byte_array_nullable(void) {
     /* Nullable DELTA_BYTE_ARRAY: exercises the reconstruction scratch together
      * with definition levels (packed non-null value stream). */
@@ -217,6 +272,11 @@ int main(void) {
     failures += test_bss("bss_int32",  "bss_i32", CARQUET_PHYSICAL_INT32, 0, 4);
     failures += test_bss("bss_int64",  "bss_i64", CARQUET_PHYSICAL_INT64, 0, 8);
     failures += test_bss("bss_flba",   "bss_flba", CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY, 6, 6);
+    failures += test_bss_chunked("bss_float_chunked",  "bssc_f32", CARQUET_PHYSICAL_FLOAT, 0, 4);
+    failures += test_bss_chunked("bss_double_chunked", "bssc_f64", CARQUET_PHYSICAL_DOUBLE, 0, 8);
+    failures += test_bss_chunked("bss_int32_chunked",  "bssc_i32", CARQUET_PHYSICAL_INT32, 0, 4);
+    failures += test_bss_chunked("bss_int64_chunked",  "bssc_i64", CARQUET_PHYSICAL_INT64, 0, 8);
+    failures += test_bss_chunked("bss_flba_chunked",   "bssc_flba", CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY, 6, 6);
     if (failures) { printf("\n%d test(s) FAILED\n", failures); return 1; }
     printf("\nAll encoding roundtrip tests passed\n");
     return 0;
