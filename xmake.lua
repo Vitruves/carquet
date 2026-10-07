@@ -373,7 +373,7 @@ if want("tests") then
         "test_float16", "test_geo_wkb", "test_worker_pool", "test_custom_codec",
         "test_real_world", "test_arrow_c_data", "test_batch_nested",
         "test_nested_write", "test_arrow_nested", "test_p2_conformance",
-        "test_cli_format",
+        "test_cli_format", "test_bss_multi_chunk_page",
     }
     -- Tests that link extra non-library sources (the CLI helpers live in the
     -- carquet_cli target, not in libcarquet).
