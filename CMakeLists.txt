@@ -631,6 +631,10 @@ if(CARQUET_BUILD_TESTS)
     # pages corrupted values after the first chunk's null-shrunk batch)
     add_carquet_test(test_bss_multi_chunk_page tests/test_bss_multi_chunk_page.c)
 
+    # Deferred-encode stash must hold dense (non-null) values: stashing one
+    # slot per logical row over-read the caller's array and shifted values
+    add_carquet_test(test_deferred_stash tests/test_deferred_stash.c)
+
     # INT96 writing, opt-in Data Page V2, ARROW:schema metadata
     add_carquet_test(test_writer_extensions tests/test_writer_extensions.c)
 

@@ -1049,9 +1049,23 @@ static carquet_status_t stash_deferred_batch(
     const int16_t* rep_levels) {
 
     size_t stride = physical_type_stride(writer->type, writer->type_length);
+
+    /* `values` is dense (sparse encoding): for OPTIONAL columns it holds only
+     * the non-null entries packed contiguously, while `num_values` counts
+     * logical rows (one per definition level). Stashing `num_values` entries
+     * would read past the caller's array AND leave null-sized gaps between
+     * batches, which drain_deferred()'s replay through encode_batch_eager()
+     * — it walks the stash with a dense values cursor — would misinterpret.
+     * Stash exactly the entries the replay will consume. */
+    int64_t num_non_null = num_values;
+    if (def_levels && writer->max_def_level > 0) {
+        num_non_null = carquet_dispatch_count_non_nulls(
+            def_levels, num_values, writer->max_def_level);
+    }
+
     carquet_status_t s = carquet_buffer_append(
         &writer->deferred_values, (const uint8_t*)values,
-        (size_t)num_values * stride);
+        (size_t)num_non_null * stride);
     if (s != CARQUET_OK) return s;
 
     if (writer->max_def_level > 0) {
