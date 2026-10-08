@@ -56,9 +56,47 @@ include(FetchContent)
 # for prebuilt release artifacts (see .github/workflows/release.yml).
 option(CARQUET_BUNDLE_DEPS "Always fetch and static-bundle zstd/zlib/lz4 (portable release artifacts)" OFF)
 
+# Which zstd / zlib / lz4 carquet links, in order of precedence:
+#
+#   1. CARQUET_ZSTD_TARGET / CARQUET_ZLIB_TARGET / CARQUET_LZ4_TARGET, when
+#      set: the name of a target of the enclosing project. It is linked as is,
+#      with no search and no fetch, so this is how a project that builds
+#      several variants (a static and a shared zlib, say) picks the one
+#      carquet gets.
+#   2. A system copy, unless CARQUET_BUNDLE_DEPS is ON.
+#   3. A copy fetched and built here. If the enclosing project already builds
+#      the library under the target name that fetch would use (libzstd_static,
+#      zlibstatic, lz4_static), that target is reused instead: a second copy
+#      would only collide with it.
+#
+# A target taken from 1 or 3 may be imported or built in-tree, static or
+# shared; it must carry its include directories as a usage requirement.
+foreach(_carquet_dep ZSTD ZLIB LZ4)
+    # Not declared when already defined: before CMake 3.21 (CMP0126) creating a
+    # cache entry discards a same-named normal variable, which is exactly how
+    # an enclosing project sets these before add_subdirectory(carquet).
+    if(NOT DEFINED CARQUET_${_carquet_dep}_TARGET)
+        set(CARQUET_${_carquet_dep}_TARGET "" CACHE STRING
+            "Existing CMake target to link as ${_carquet_dep} instead of searching for or fetching it")
+    endif()
+    if(CARQUET_${_carquet_dep}_TARGET AND NOT TARGET ${CARQUET_${_carquet_dep}_TARGET})
+        message(FATAL_ERROR
+            "CARQUET_${_carquet_dep}_TARGET is set to \"${CARQUET_${_carquet_dep}_TARGET}\", "
+            "which is not a CMake target here. It must name a target that exists "
+            "before carquet is added; leave it empty to let carquet find the library.")
+    endif()
+endforeach()
+
 # Try to find system zstd first, fetch if not found
-if(CARQUET_BUNDLE_DEPS)
+if(CARQUET_ZSTD_TARGET)
+    message(STATUS "Using zstd target ${CARQUET_ZSTD_TARGET} (CARQUET_ZSTD_TARGET)")
+    set(ZSTD_LIBRARIES ${CARQUET_ZSTD_TARGET})
+    set(ZSTD_INCLUDE_DIRS "")
+elseif(CARQUET_BUNDLE_DEPS)
     message(STATUS "CARQUET_BUNDLE_DEPS=ON — forcing bundled static zstd")
+    # Nothing is searched for here, so a ZSTD_FOUND already in scope was set by
+    # the enclosing project (or by an earlier configure) and must not count.
+    set(ZSTD_FOUND FALSE)
 else()
     # Method 1: Try modern CMake config (works best on Windows/vcpkg/conda)
     find_package(zstd CONFIG QUIET)
@@ -83,8 +121,17 @@ else()
     endif()
 endif()
 
-if(ZSTD_FOUND)
+# <name>_populated: the enclosing project already fetched this content under
+# the same FetchContent name, in which case the fetch below simply reuses it.
+FetchContent_GetProperties(zstd POPULATED _carquet_zstd_populated)
+if(CARQUET_ZSTD_TARGET)
+    # Named explicitly: nothing to resolve.
+elseif(ZSTD_FOUND)
     message(STATUS "Found system libzstd")
+elseif(TARGET libzstd_static AND NOT _carquet_zstd_populated)
+    message(STATUS "Reusing the enclosing project's zstd target: libzstd_static")
+    set(ZSTD_LIBRARIES libzstd_static)
+    set(ZSTD_INCLUDE_DIRS "")
 else()
     # Method 3: Fetch from source
     message(STATUS "Fetching zstd...")
@@ -106,11 +153,24 @@ else()
 endif()
 
 # Try to find system zlib first, fetch if not found
-if(NOT CARQUET_BUNDLE_DEPS)
+if(CARQUET_ZLIB_TARGET)
+    message(STATUS "Using zlib target ${CARQUET_ZLIB_TARGET} (CARQUET_ZLIB_TARGET)")
+    set(ZLIB_LIBRARIES ${CARQUET_ZLIB_TARGET})
+    set(ZLIB_INCLUDE_DIRS "")
+elseif(NOT CARQUET_BUNDLE_DEPS)
     find_package(ZLIB QUIET)
+else()
+    set(ZLIB_FOUND FALSE)  # see ZSTD_FOUND above
 endif()
-if(ZLIB_FOUND)
+FetchContent_GetProperties(zlib POPULATED _carquet_zlib_populated)
+if(CARQUET_ZLIB_TARGET)
+    # Named explicitly: nothing to resolve.
+elseif(ZLIB_FOUND)
     message(STATUS "Found system zlib: ${ZLIB_VERSION_STRING}")
+elseif(TARGET zlibstatic AND NOT _carquet_zlib_populated)
+    message(STATUS "Reusing the enclosing project's zlib target: zlibstatic")
+    set(ZLIB_LIBRARIES zlibstatic)
+    set(ZLIB_INCLUDE_DIRS "")
 else()
     message(STATUS "Fetching zlib...")
     FetchContent_Declare(
@@ -128,10 +188,23 @@ endif()
 
 # Try to find system lz4 first, fetch if not found
 # Prefer CMake config (gives proper targets with full paths on all platforms)
-if(NOT CARQUET_BUNDLE_DEPS)
+if(CARQUET_LZ4_TARGET)
+    message(STATUS "Using lz4 target ${CARQUET_LZ4_TARGET} (CARQUET_LZ4_TARGET)")
+    set(LZ4_LIBRARIES ${CARQUET_LZ4_TARGET})
+    set(LZ4_INCLUDE_DIRS "")
+    set(LZ4_FOUND TRUE)
+elseif(NOT CARQUET_BUNDLE_DEPS)
     find_package(lz4 CONFIG QUIET)
+else()
+    set(lz4_FOUND FALSE)  # see ZSTD_FOUND above
+    set(LZ4_FOUND FALSE)
 endif()
-if(lz4_FOUND)
+# lz4_FOUND (lower case) is what find_package(lz4 CONFIG) sets: the variable is
+# named after the package exactly as written in the call. LZ4_FOUND (upper
+# case) is carquet's own "resolved to something linkable" flag, set below and
+# by pkg-config. The enclosing project may have run its own find_package(lz4),
+# leaving lz4_FOUND set in this scope; a target named explicitly still wins.
+if(lz4_FOUND AND NOT CARQUET_LZ4_TARGET)
     message(STATUS "Found lz4 via CMake config")
     if(CARQUET_BUILD_SHARED AND TARGET LZ4::lz4_shared)
         set(LZ4_LIBRARIES LZ4::lz4_shared)
@@ -164,6 +237,14 @@ if(NOT LZ4_FOUND AND NOT CARQUET_BUNDLE_DEPS)
             endif()
         endif()
     endif()
+endif()
+
+FetchContent_GetProperties(lz4 POPULATED _carquet_lz4_populated)
+if(NOT LZ4_FOUND AND TARGET lz4_static AND NOT _carquet_lz4_populated)
+    message(STATUS "Reusing the enclosing project's lz4 target: lz4_static")
+    set(LZ4_LIBRARIES lz4_static)
+    set(LZ4_INCLUDE_DIRS "")
+    set(LZ4_FOUND TRUE)
 endif()
 
 if(NOT LZ4_FOUND)
@@ -517,7 +598,9 @@ carquet_private_link_libraries_for_export(
     CARQUET_PRIVATE_COMPRESSION_LIBS
     ${CARQUET_COMPRESSION_LIBS})
 
-if(ZLIB_FOUND)
+# ZLIB_FOUND can also be inherited from a find_package(ZLIB) in the enclosing
+# project, so a target named explicitly is checked first.
+if(ZLIB_FOUND AND NOT CARQUET_ZLIB_TARGET)
     target_link_libraries(carquet PRIVATE ${CARQUET_PRIVATE_COMPRESSION_LIBS} ZLIB::ZLIB)
 else()
     carquet_private_link_libraries_for_export(
@@ -655,6 +738,12 @@ if(CARQUET_BUILD_TESTS)
 
     # Signed big-endian ordering of DECIMAL(FLBA/BYTE_ARRAY) min/max statistics
     add_carquet_test(test_decimal_stats tests/test_decimal_stats.c)
+
+    # Per-reason Snappy rejection diagnostics + first-data-page offset resolution
+    add_carquet_test(test_snappy_diag tests/test_snappy_diag.c)
+
+    # Page-granular parallel encode + background I/O: byte-identical output
+    add_carquet_test(test_parallel_write tests/test_parallel_write.c)
 
     # Writing dictionary-encoded (categorical) Arrow arrays resolves to values
     add_carquet_test(test_arrow_dictionary tests/test_arrow_dictionary.c)

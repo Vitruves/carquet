@@ -4,6 +4,7 @@
  */
 
 #include <carquet/carquet.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -679,6 +680,138 @@ static int test_fread_fallback(void) {
  * ============================================================================
  */
 
+/* Write `num_rgs` row groups of `rows_per_rg` REQUIRED INT64 values under ZSTD
+ * (so the multi-row-group mmap pipeline engages). constant != 0 writes that
+ * value everywhere, otherwise a pseudo-random sequence. */
+static int write_pipeline_file(const char* path, int num_rgs, int64_t rows_per_rg,
+                               int64_t constant) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t* schema = carquet_schema_create(&err);
+    if (!schema) return 1;
+    if (carquet_schema_add_column(schema, "v", CARQUET_PHYSICAL_INT64, NULL,
+                                  CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK) return 1;
+    carquet_writer_options_t opts;
+    carquet_writer_options_init(&opts);
+    opts.compression = CARQUET_COMPRESSION_ZSTD;
+    carquet_writer_t* w = carquet_writer_create(path, schema, &opts, &err);
+    if (!w) { carquet_schema_free(schema); return 1; }
+    if (carquet_writer_set_column_encoding(w, 0, CARQUET_ENCODING_PLAIN) != CARQUET_OK) return 1;
+    int64_t* v = malloc((size_t)rows_per_rg * sizeof(int64_t));
+    if (!v) return 1;
+    uint64_t x = 0x243F6A8885A308D3ULL;
+    int rc = 0;
+    for (int g = 0; g < num_rgs && rc == 0; g++) {
+        for (int64_t i = 0; i < rows_per_rg; i++) {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            v[i] = constant ? constant : (int64_t)x;
+        }
+        if (carquet_writer_write_batch(w, 0, v, rows_per_rg, NULL, NULL) != CARQUET_OK) rc = 1;
+        if (rc == 0 && g + 1 < num_rgs &&
+            carquet_writer_new_row_group(w) != CARQUET_OK) rc = 1;
+    }
+    free(v);
+    if (carquet_writer_close(w) != CARQUET_OK) rc = 1;
+    carquet_schema_free(schema);
+    return rc;
+}
+
+/* Read every batch through an mmap batch reader. Returns the last status and
+ * the rows delivered; *sum accumulates the values. */
+static carquet_status_t drain_mmap_batches(const char* path, int64_t* rows,
+                                           uint64_t* sum, bool* had_error_detail) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_reader_options_t ropts;
+    carquet_reader_options_init(&ropts);
+    ropts.use_mmap = true;
+    *rows = 0; *sum = 0; *had_error_detail = false;
+    carquet_reader_t* r = carquet_reader_open(path, &ropts, &err);
+    if (!r) return CARQUET_ERROR_FILE_OPEN;
+    carquet_batch_reader_config_t cfg;
+    carquet_batch_reader_config_init(&cfg);
+    carquet_batch_reader_t* br = carquet_batch_reader_create(r, &cfg, &err);
+    if (!br) { carquet_reader_close(r); return err.code; }
+    carquet_row_batch_t* batch = NULL;
+    carquet_status_t st;
+    while ((st = carquet_batch_reader_next(br, &batch)) == CARQUET_OK && batch) {
+        const void* data; const uint8_t* nulls; int64_t n;
+        if (carquet_row_batch_column(batch, 0, &data, &nulls, &n) != CARQUET_OK) break;
+        for (int64_t i = 0; i < n; i++) *sum += (uint64_t)rd_i64(data, i);
+        *rows += n;
+        carquet_row_batch_free(batch);
+        batch = NULL;
+    }
+    *had_error_detail = carquet_batch_reader_last_error(br) != NULL;
+    carquet_batch_reader_free(br);
+    carquet_reader_close(r);
+    return st;
+}
+
+/* Constant data compresses to a few hundred bytes per row group, so the file
+ * holds far more than 8 rows per byte. That is legitimate, and every row must
+ * still come back: the pre-read pipeline's allocation guard used to treat it
+ * as malformed and end the read with zero rows and END_OF_DATA. */
+static int test_mmap_highly_compressible(void) {
+    const char* path = "test_mmap_compressible.parquet";
+    enum { RGS = 4, ROWS = 200000 };
+    if (write_pipeline_file(path, RGS, ROWS, 7) != 0)
+        TEST_FAIL("mmap_highly_compressible", "write failed");
+    int64_t rows; uint64_t sum; bool detail;
+    carquet_status_t st = drain_mmap_batches(path, &rows, &sum, &detail);
+    remove(path);
+    if (st != CARQUET_ERROR_END_OF_DATA && st != CARQUET_OK)
+        TEST_FAIL("mmap_highly_compressible", "read failed");
+    if (rows != (int64_t)RGS * ROWS || sum != (uint64_t)RGS * ROWS * 7)
+        TEST_FAIL("mmap_highly_compressible", "rows were dropped");
+    TEST_PASS("mmap_highly_compressible");
+    return 0;
+}
+
+/* Damage a page payload in the middle of a multi-row-group file. The pipeline
+ * decodes row groups ahead on worker threads; a column that failed there must
+ * surface as an error from next(), with detail, and never as a normal end of
+ * data or as a full-size batch over a buffer the failed task left unwritten. */
+static int test_mmap_pipeline_corruption(void) {
+    const char* path = "test_mmap_corrupt.parquet";
+    enum { RGS = 4, ROWS = 50000 };
+    if (write_pipeline_file(path, RGS, ROWS, 0) != 0)
+        TEST_FAIL("mmap_pipeline_corruption", "write failed");
+
+    int64_t rows; uint64_t good_sum; bool detail;
+    carquet_status_t st = drain_mmap_batches(path, &rows, &good_sum, &detail);
+    if ((st != CARQUET_ERROR_END_OF_DATA && st != CARQUET_OK) || rows != (int64_t)RGS * ROWS) {
+        remove(path);
+        TEST_FAIL("mmap_pipeline_corruption", "clean read failed");
+    }
+
+    FILE* f = fopen(path, "r+b");
+    if (!f) { remove(path); TEST_FAIL("mmap_pipeline_corruption", "reopen failed"); }
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    /* Random INT64 barely compresses, so the file is ~RGS * ROWS * 8 bytes of
+     * page payload; 5/8 of the way in lands inside the third row group. */
+    long at = size / 8 * 5;
+    unsigned char junk[64];
+    fseek(f, at, SEEK_SET);
+    if (fread(junk, 1, sizeof(junk), f) != sizeof(junk)) { fclose(f); remove(path);
+        TEST_FAIL("mmap_pipeline_corruption", "read for corruption failed"); }
+    for (size_t i = 0; i < sizeof(junk); i++) junk[i] = (unsigned char)~junk[i];
+    fseek(f, at, SEEK_SET);
+    fwrite(junk, 1, sizeof(junk), f);
+    fclose(f);
+
+    uint64_t sum;
+    st = drain_mmap_batches(path, &rows, &sum, &detail);
+    remove(path);
+    if (st == CARQUET_OK || st == CARQUET_ERROR_END_OF_DATA)
+        TEST_FAIL("mmap_pipeline_corruption", "corruption was not reported");
+    if (!detail)
+        TEST_FAIL("mmap_pipeline_corruption", "no error detail");
+    if (rows >= (int64_t)RGS * ROWS)
+        TEST_FAIL("mmap_pipeline_corruption", "corrupt row group was delivered");
+    TEST_PASS("mmap_pipeline_corruption");
+    return 0;
+}
+
 int main(void) {
     printf("=== Memory-Mapped I/O Tests ===\n\n");
 
@@ -692,6 +825,8 @@ int main(void) {
     failures += test_mmap_compressed_optional_batch();
     failures += test_mmap_vs_fread();
     failures += test_fread_fallback();
+    failures += test_mmap_highly_compressible();
+    failures += test_mmap_pipeline_corruption();
 
     /* Cleanup */
     remove(TEST_FILE);

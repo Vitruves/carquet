@@ -1992,6 +1992,57 @@ carquet_status_t carquet_batch_reader_next(
     carquet_row_batch_t** batch);
 
 /**
+ * @brief Detail for the most recent carquet_batch_reader_next() failure.
+ *
+ * carquet_batch_reader_next() has no error out-parameter, so on failure it can
+ * only return a status code. This accessor recovers the message that was built
+ * deeper in the reader — which page failed, at which absolute file offset, and
+ * for a codec rejection which specific check fired — so a failure part-way
+ * through a large file can be diagnosed without a debugger.
+ *
+ * @param[in] batch_reader Batch reader (may be NULL)
+ * @return Pointer to the error, or NULL if the last
+ *         carquet_batch_reader_next() did not fail. The pointer is owned by the
+ *         batch reader and stays valid until the next
+ *         carquet_batch_reader_next() call or carquet_batch_reader_free();
+ *         copy the message out if you need to keep it.
+ *
+ * @note `CARQUET_ERROR_END_OF_DATA` is the normal end-of-iteration signal, not
+ *       a failure, and leaves the last error unset (this function returns NULL).
+ * @note When the failure happened inside a column read, the returned error is
+ *       that column's verbatim error, including its `offset`, `column_index`,
+ *       and `row_group_index` context fields where the failing layer set them.
+ *       Its `code` is then the *underlying* status, which is more specific than
+ *       next()'s return value: a corrupt Snappy page makes next() return
+ *       #CARQUET_ERROR_DECODE while `code` is
+ *       #CARQUET_ERROR_INVALID_COMPRESSED_DATA. For failures outside a column
+ *       read the message falls back to the status name and `code` equals what
+ *       next() returned.
+ * @note With more than one projected column, the reported error is the first
+ *       failing column in projection order; other columns may have failed too.
+ * @note Thread-safe: No (tied to the same single-threaded use as next())
+ *
+ * @code{.c}
+ * carquet_row_batch_t* batch = NULL;
+ * carquet_status_t st;
+ * while ((st = carquet_batch_reader_next(br, &batch)) == CARQUET_OK && batch) {
+ *     // Process batch...
+ *     carquet_row_batch_free(batch);
+ *     batch = NULL;
+ * }
+ * if (st != CARQUET_OK && st != CARQUET_ERROR_END_OF_DATA) {
+ *     const carquet_error_t* e = carquet_batch_reader_last_error(br);
+ *     fprintf(stderr, "read failed: %s\n", e ? e->message : carquet_status_string(st));
+ * }
+ * @endcode
+ *
+ * @see carquet_column_read_batch_ex() for the same detail on the column-level API
+ */
+CARQUET_API
+const carquet_error_t* carquet_batch_reader_last_error(
+    const carquet_batch_reader_t* batch_reader);
+
+/**
  * @brief Free a batch reader.
  *
  * @param[in] batch_reader Batch reader to free (may be NULL)
@@ -2498,6 +2549,22 @@ typedef struct carquet_writer_options {
      * Default: 2
      */
     int32_t file_format_version;
+
+    /**
+     * @brief Write each row group on a background thread.
+     *
+     * When enabled, a finalized row group is handed to an I/O thread that
+     * writes it while the caller's next batches are buffered, encoded and
+     * compressed, so file writes overlap with encoding instead of stalling
+     * it. At most one row group is in flight; peak memory grows by about one
+     * encoded (compressed) row group. A failed background write surfaces on
+     * the next row-group flush or on carquet_writer_close(). When the writer
+     * wraps a caller-supplied `FILE*`, the caller must not touch that stream
+     * between carquet_writer_create_file() and carquet_writer_close().
+     *
+     * Default: true
+     */
+    bool async_io;
 } carquet_writer_options_t;
 
 /**

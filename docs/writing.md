@@ -69,6 +69,7 @@ opts.data_page_version = 1;       /* 1 = DATA_PAGE (default); 2 = DATA_PAGE_V2 *
 opts.file_format_version = 2;     /* FileMetaData.version; 1 for very old readers */
 opts.coerce_timestamps = false;   /* rescale all TIMESTAMP columns to one unit */
 opts.write_batch_size = 0;        /* 0 = automatic internal batching */
+opts.async_io = true;             /* write row groups on a background thread */
 
 carquet_writer_t* writer = carquet_writer_create("out.parquet", schema, &opts, &err);
 if (!writer) {
@@ -87,6 +88,7 @@ Two opt-in options, both off by default so default output bytes are unchanged:
 - `coerce_timestamps` / `coerce_timestamp_unit` / `allow_timestamp_truncation`: when `coerce_timestamps` is true, every `TIMESTAMP` column is rescaled to `coerce_timestamp_unit` (and its metadata emitted at that unit) regardless of the unit declared in the schema — the equivalent of PyArrow's `coerce_timestamps`. A coarser target loses precision and is rejected unless `allow_timestamp_truncation` is true (PyArrow's `allow_truncated_timestamps`).
 - `write_batch_size`: caps how many values are processed per internal chunk before a page flush is considered (PyArrow's `write_batch_size`); `0` keeps the automatic page-size-derived heuristic. This tunes streaming/memory behavior, not the output format.
 - `file_format_version`: the value written into `FileMetaData.version` in the footer. Default `2`; set to `1` for the very small set of historical readers that reject version-2 files. Independent of `data_page_version` (which controls page format) and of carquet's always-compatible metadata (modern `LogicalType` + legacy `ConvertedType`); any value other than `1` is treated as `2`.
+- `async_io`: when `true` (the default from `carquet_writer_options_init()`), each finalized row group is written by a background thread while the next one is buffered, encoded and compressed, so file writes overlap with encoding. At most one row group is in flight (peak memory grows by about one compressed row group). A failed background write surfaces from the next row-group flush or from `carquet_writer_close()`. Output bytes are identical either way; set it to `false` to keep every write on the calling thread (for example when the `FILE*` handed to `carquet_writer_create_file()` must not be touched from another thread).
 
 Other writer entry points:
 

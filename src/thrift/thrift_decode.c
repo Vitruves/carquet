@@ -309,10 +309,15 @@ void thrift_read_list_begin(thrift_decoder_t* dec,
 
     /* Each list element consumes at least 1 byte, so count cannot exceed
      * remaining data.  This prevents billion-iteration busy loops from
-     * malicious varints in tiny payloads. */
+     * malicious varints in tiny payloads.
+     *
+     * Report this as TRUNCATED, not DECODE: callers that parse out of a
+     * growable window (see read_and_parse_page_header_fread) only enlarge the
+     * window on TRUNCATED, so misclassifying it turns "need more bytes" into a
+     * hard parse failure on an otherwise valid structure. */
     size_t remaining = carquet_buffer_reader_remaining(&dec->reader);
     if ((size_t)*count > remaining) {
-        set_error(dec, CARQUET_ERROR_THRIFT_DECODE, "List count exceeds remaining data");
+        set_error(dec, CARQUET_ERROR_THRIFT_TRUNCATED, "List count exceeds remaining data");
         *count = 0;
     }
 }
@@ -350,7 +355,7 @@ void thrift_read_map_begin(thrift_decoder_t* dec,
      * billion-iteration busy loops from malicious varints. */
     size_t remaining = carquet_buffer_reader_remaining(&dec->reader);
     if ((size_t)*count > remaining) {
-        set_error(dec, CARQUET_ERROR_THRIFT_DECODE, "Map count exceeds remaining data");
+        set_error(dec, CARQUET_ERROR_THRIFT_TRUNCATED, "Map count exceeds remaining data");
         *count = 0;
         *key_type = THRIFT_TYPE_STOP;
         *value_type = THRIFT_TYPE_STOP;
@@ -367,6 +372,21 @@ void thrift_read_map_begin(thrift_decoder_t* dec,
  * Skip Functions
  * ============================================================================
  */
+
+void thrift_skip(thrift_decoder_t* dec, thrift_type_t type);
+
+/* Skip one container element. Only a struct field carries a boolean inside
+ * its header; in a list, set or map each boolean is a byte of its own. */
+static void thrift_skip_element(thrift_decoder_t* dec, thrift_type_t type) {
+    if (type == THRIFT_TYPE_TRUE || type == THRIFT_TYPE_FALSE) {
+        if (dec->status == CARQUET_OK &&
+            carquet_buffer_reader_skip(&dec->reader, 1) != CARQUET_OK) {
+            set_error(dec, CARQUET_ERROR_THRIFT_DECODE, "Truncated boolean element");
+        }
+        return;
+    }
+    thrift_skip(dec, type);
+}
 
 void thrift_skip(thrift_decoder_t* dec, thrift_type_t type) {
     if (dec->status != CARQUET_OK) {
@@ -424,7 +444,7 @@ void thrift_skip(thrift_decoder_t* dec, thrift_type_t type) {
             }
             dec->nesting_level++;
             for (int32_t i = 0; i < count && dec->status == CARQUET_OK; i++) {
-                thrift_skip(dec, elem_type);
+                thrift_skip_element(dec, elem_type);
             }
             dec->nesting_level--;
             break;
@@ -440,8 +460,8 @@ void thrift_skip(thrift_decoder_t* dec, thrift_type_t type) {
             }
             dec->nesting_level++;
             for (int32_t i = 0; i < count && dec->status == CARQUET_OK; i++) {
-                thrift_skip(dec, key_type);
-                thrift_skip(dec, value_type);
+                thrift_skip_element(dec, key_type);
+                thrift_skip_element(dec, value_type);
             }
             dec->nesting_level--;
             break;

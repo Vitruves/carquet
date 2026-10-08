@@ -16,6 +16,7 @@
 #include "core/arena.h"
 #include "core/compat.h"
 #include "reader/reader_internal.h"
+#include "reader/worker_pool.h"
 #include "thrift/thrift_encode.h"
 #include "thrift/parquet_types.h"
 #include "writer/arrow_schema.h"
@@ -123,6 +124,15 @@ extern carquet_status_t carquet_row_group_writer_finalize(
     size_t* size,
     int64_t num_rows);
 
+extern carquet_status_t carquet_row_group_writer_finalize_columns(
+    carquet_row_group_writer_t* writer,
+    size_t* total_size,
+    int64_t num_rows);
+extern void carquet_row_group_writer_detach_column(
+    carquet_row_group_writer_t* writer,
+    int column_index,
+    carquet_buffer_t* out,
+    carquet_buffer_t* spare);
 extern carquet_status_t carquet_row_group_writer_write_to_file(
     carquet_row_group_writer_t* writer,
     FILE* file,
@@ -249,6 +259,13 @@ typedef struct row_group_info {
     int32_t num_columns;
 } row_group_info_t;
 
+/* One background write: a finalized column chunk headed for the file. */
+typedef struct io_job {
+    carquet_buffer_t buf;
+    FILE* file;
+    carquet_status_t status;
+} io_job_t;
+
 /* ============================================================================
  * Writer Structure
  * ============================================================================
@@ -344,6 +361,17 @@ struct carquet_writer {
     bool is_buffer_writer;
     uint8_t* output_buffer;
     size_t output_buffer_size;
+
+    /* Background I/O (options.async_io). The pool has one thread and runs
+     * io_jobs in submission order; jobs own their buffers until the main
+     * thread reclaims them into io_spares after a drain. io_error is sticky:
+     * once a background write fails, every later file operation fails too. */
+    carquet_worker_pool_t* io_pool;
+    io_job_t* io_jobs;            /* [num_columns] */
+    int32_t io_jobs_in_flight;
+    carquet_buffer_t* io_spares;  /* reclaimed chunk buffers, LIFO */
+    int32_t io_spare_count;
+    carquet_status_t io_error;
 };
 
 /* ============================================================================
@@ -373,6 +401,7 @@ void carquet_writer_options_init(carquet_writer_options_t* options) {
     options->allow_timestamp_truncation = false;
     options->write_batch_size = 0;
     options->file_format_version = 2;
+    options->async_io = true;
 }
 
 /* ============================================================================
@@ -1099,6 +1128,132 @@ static carquet_status_t ensure_row_group(carquet_writer_t* writer) {
     return CARQUET_OK;
 }
 
+/* ============================================================================
+ * Background I/O
+ * ============================================================================
+ */
+
+static void io_write_task(void* arg) {
+    io_job_t* job = (io_job_t*)arg;
+    job->status = CARQUET_OK;
+    if (job->buf.size > 0 &&
+        fwrite(job->buf.data, 1, job->buf.size, job->file) != job->buf.size) {
+        job->status = CARQUET_ERROR_FILE_WRITE;
+    }
+}
+
+/* Wait for every queued background write and take the chunk buffers back
+ * for reuse. Returns the first write error, which also sticks on the writer.
+ * Must precede any direct access to writer->file. */
+static carquet_status_t writer_io_drain(carquet_writer_t* writer) {
+    if (!writer->io_pool || writer->io_jobs_in_flight == 0) {
+        return writer->io_error;
+    }
+    carquet_worker_pool_wait(writer->io_pool);
+    for (int32_t i = 0; i < writer->io_jobs_in_flight; i++) {
+        io_job_t* job = &writer->io_jobs[i];
+        if (job->status != CARQUET_OK && writer->io_error == CARQUET_OK) {
+            writer->io_error = job->status;
+        }
+        if (job->buf.owns_data && job->buf.data &&
+            writer->io_spare_count < writer->num_columns) {
+            writer->io_spares[writer->io_spare_count++] = job->buf;
+        } else {
+            carquet_buffer_destroy(&job->buf);
+        }
+        carquet_buffer_init(&job->buf);
+    }
+    writer->io_jobs_in_flight = 0;
+    return writer->io_error;
+}
+
+static void writer_io_shutdown(carquet_writer_t* writer) {
+    if (writer->io_pool) {
+        /* Destroy runs the queue dry before joining, so nothing is lost. */
+        (void)writer_io_drain(writer);
+        carquet_worker_pool_destroy(writer->io_pool);
+        writer->io_pool = NULL;
+    }
+    if (writer->io_jobs) {
+        for (int32_t i = 0; i < writer->io_jobs_in_flight; i++) {
+            carquet_buffer_destroy(&writer->io_jobs[i].buf);
+        }
+        carquet_mem_free(writer->io_jobs);
+        writer->io_jobs = NULL;
+        writer->io_jobs_in_flight = 0;
+    }
+    if (writer->io_spares) {
+        for (int32_t i = 0; i < writer->io_spare_count; i++) {
+            carquet_buffer_destroy(&writer->io_spares[i]);
+        }
+        carquet_mem_free(writer->io_spares);
+        writer->io_spares = NULL;
+        writer->io_spare_count = 0;
+    }
+}
+
+/* Start the I/O thread on first use. A failure here just means the row
+ * group is written synchronously. */
+static bool writer_io_ready(carquet_writer_t* writer) {
+    if (!writer->options.async_io || writer->num_columns <= 0) return false;
+    if (writer->io_pool) return true;
+    writer->io_jobs = carquet_mem_calloc((size_t)writer->num_columns, sizeof(io_job_t));
+    writer->io_spares = carquet_mem_calloc((size_t)writer->num_columns, sizeof(carquet_buffer_t));
+    if (!writer->io_jobs || !writer->io_spares) {
+        carquet_mem_free(writer->io_jobs);
+        carquet_mem_free(writer->io_spares);
+        writer->io_jobs = NULL;
+        writer->io_spares = NULL;
+        writer->options.async_io = false;
+        return false;
+    }
+    for (int32_t i = 0; i < writer->num_columns; i++) {
+        carquet_buffer_init(&writer->io_jobs[i].buf);
+    }
+    writer->io_pool = carquet_worker_pool_create(1);
+    if (!writer->io_pool) {
+        carquet_mem_free(writer->io_jobs);
+        carquet_mem_free(writer->io_spares);
+        writer->io_jobs = NULL;
+        writer->io_spares = NULL;
+        writer->options.async_io = false;
+        return false;
+    }
+    return true;
+}
+
+/* Finalize the current row group and queue its column chunks for the I/O
+ * thread. Encoding runs first, overlapping the previous row group's write;
+ * only then do we wait for that write, reclaim its buffers and submit. */
+static carquet_status_t write_row_group_async(carquet_writer_t* writer, size_t* size) {
+    carquet_status_t status = carquet_row_group_writer_finalize_columns(
+        writer->current_row_group, size, writer->current_row_group_rows);
+    if (status != CARQUET_OK) {
+        return status;
+    }
+    status = writer_io_drain(writer);
+    if (status != CARQUET_OK) {
+        return status;
+    }
+    int num_cols = carquet_row_group_writer_num_columns(writer->current_row_group);
+    for (int i = 0; i < num_cols && i < writer->num_columns; i++) {
+        io_job_t* job = &writer->io_jobs[i];
+        carquet_buffer_t spare;
+        if (writer->io_spare_count > 0) {
+            spare = writer->io_spares[--writer->io_spare_count];
+        } else {
+            carquet_buffer_init(&spare);
+        }
+        carquet_row_group_writer_detach_column(writer->current_row_group, i,
+                                               &job->buf, &spare);
+        job->file = writer->file;
+        job->status = CARQUET_OK;
+        writer->io_jobs_in_flight = i + 1;
+        carquet_worker_pool_submit(writer->io_pool, io_write_task, job);
+    }
+    return CARQUET_OK;
+}
+
 static carquet_status_t flush_row_group(carquet_writer_t* writer) {
     if (!writer->current_row_group || writer->current_row_group_rows == 0) {
         return CARQUET_OK;
@@ -1107,9 +1262,17 @@ static carquet_status_t flush_row_group(carquet_writer_t* writer) {
     /* Finalize and write each column directly to file, avoiding
      * an intermediate copy of the entire row group into one buffer */
     size_t size;
-    carquet_status_t status = carquet_row_group_writer_write_to_file(
-        writer->current_row_group, writer->file, &size,
-        writer->current_row_group_rows);
+    carquet_status_t status;
+    if (writer->io_error != CARQUET_OK) {
+        return writer->io_error;
+    }
+    if (writer_io_ready(writer)) {
+        status = write_row_group_async(writer, &size);
+    } else {
+        status = carquet_row_group_writer_write_to_file(
+            writer->current_row_group, writer->file, &size,
+            writer->current_row_group_rows);
+    }
 
     if (status != CARQUET_OK) {
         return status;
@@ -1284,6 +1447,10 @@ static carquet_status_t flush_row_group(carquet_writer_t* writer) {
 
     /* Write bloom filters for each column (after row group data) */
     if (writer->options.write_bloom_filters) {
+        status = writer_io_drain(writer);
+        if (status != CARQUET_OK) {
+            return status;
+        }
         for (int i = 0; i < num_cols; i++) {
             carquet_bloom_filter_t* bf = carquet_row_group_writer_get_bloom_filter(
                 writer->current_row_group, i);
@@ -1355,6 +1522,10 @@ static carquet_status_t flush_row_group(carquet_writer_t* writer) {
 
     /* Write column indexes and offset indexes (after bloom filters) */
     if (writer->options.write_page_index) {
+        status = writer_io_drain(writer);
+        if (status != CARQUET_OK) {
+            return status;
+        }
         for (int i = 0; i < num_cols; i++) {
             row_group_column_info_t* chunk = &rg_info->columns[i];
 
@@ -2681,6 +2852,12 @@ carquet_status_t carquet_writer_close(carquet_writer_t* writer) {
         goto cleanup;
     }
 
+    /* Every row group must be on disk before the footer goes after it. */
+    status = writer_io_drain(writer);
+    if (status != CARQUET_OK) {
+        goto cleanup;
+    }
+
     /* Build file metadata */
     parquet_file_metadata_t metadata;
     status = build_file_metadata(writer, &metadata);
@@ -2754,6 +2931,7 @@ carquet_status_t carquet_writer_close(carquet_writer_t* writer) {
 
 cleanup:
     /* Free resources */
+    writer_io_shutdown(writer);
     if (writer->current_row_group) {
         carquet_row_group_writer_destroy(writer->current_row_group);
         writer->current_row_group = NULL;
@@ -2829,6 +3007,8 @@ cleanup:
 
 void carquet_writer_abort(carquet_writer_t* writer) {
     if (!writer) return;
+
+    writer_io_shutdown(writer);
 
     /* Cleanup row group */
     if (writer->current_row_group) {

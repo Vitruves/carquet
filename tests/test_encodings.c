@@ -138,6 +138,60 @@ static int test_plain_boolean_large(void) {
     return 0;
 }
 
+static int test_plain_boolean_append(void) {
+    /* A bit stream built in several appends must be byte-identical to the same
+     * values packed in one go, wherever the cuts fall -- including cuts that
+     * leave the stream mid-byte and appends that add nothing. The reference is
+     * packed by hand here: value i is bit (i % 8) of byte (i / 8). */
+    uint8_t input[73];
+    for (int i = 0; i < 73; i++) {
+        input[i] = (uint8_t)((((i * 5) + 3) % 3) == 0);
+    }
+
+    for (int n = 0; n <= 73; n++) {
+        uint8_t expect[10] = {0};
+        size_t expect_size = ((size_t)n + 7) / 8;
+        for (int i = 0; i < n; i++) {
+            if (input[i]) expect[i / 8] |= (uint8_t)(1u << (i % 8));
+        }
+
+        /* Two appends, cut at every position. */
+        for (int k = 0; k <= n; k++) {
+            carquet_buffer_t buf;
+            carquet_buffer_init(&buf);
+            assert(carquet_encode_plain_boolean_append(input, k, 0, &buf) == CARQUET_OK);
+            assert(carquet_encode_plain_boolean_append(input + k, n - k, k, &buf) == CARQUET_OK);
+            assert(carquet_buffer_size(&buf) == expect_size);
+            assert(n == 0 || memcmp(carquet_buffer_data_const(&buf), expect, expect_size) == 0);
+            carquet_buffer_destroy(&buf);
+        }
+
+        /* One value per append. */
+        carquet_buffer_t buf;
+        carquet_buffer_init(&buf);
+        for (int i = 0; i < n; i++) {
+            assert(carquet_encode_plain_boolean_append(input + i, 1, i, &buf) == CARQUET_OK);
+        }
+        assert(carquet_buffer_size(&buf) == expect_size);
+        assert(n == 0 || memcmp(carquet_buffer_data_const(&buf), expect, expect_size) == 0);
+        carquet_buffer_destroy(&buf);
+    }
+
+    /* A stream that claims to be mid-byte must have that byte. */
+    carquet_buffer_t empty;
+    carquet_buffer_init(&empty);
+    assert(carquet_encode_plain_boolean_append(input, 4, 3, &empty) == CARQUET_ERROR_INVALID_ARGUMENT);
+    assert(carquet_buffer_size(&empty) == 0);
+
+    /* Encoding no values is not an error: an all-null batch does exactly that. */
+    assert(carquet_encode_plain_boolean(input, 0, &empty) == CARQUET_OK);
+    assert(carquet_buffer_size(&empty) == 0);
+    carquet_buffer_destroy(&empty);
+
+    TEST_PASS("plain_boolean_append");
+    return 0;
+}
+
 static int test_plain_double(void) {
     double input[] = {0.0, 1.0, -1.0, 3.14159265359, 1e100};
     int count = sizeof(input) / sizeof(input[0]);
@@ -378,6 +432,7 @@ int main(void) {
     failures += test_plain_int64();
     failures += test_plain_boolean();
     failures += test_plain_boolean_large();
+    failures += test_plain_boolean_append();
     failures += test_plain_double();
 
     /* RLE encoding tests */

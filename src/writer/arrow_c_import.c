@@ -382,6 +382,8 @@ typedef struct {
     bool is_bytearray;
     bool off64;             /* byte-array with 64-bit offsets (large utf8/binary) */
     size_t stride;          /* fixed-width byte stride (0 for byte array) */
+    char narrow;            /* Arrow int8/uint8/int16/uint16 format code ('c','C','s','S')
+                             * widened to the INT32 physical type, else 0 */
     int16_t max_def;        /* definition level of a present value */
     int16_t max_rep;        /* repetition level of the leaf */
 
@@ -491,6 +493,20 @@ static void emit_value(shred_ctx_t* ctx, leaf_acc_t* acc,
     const uint8_t* d = (a->n_buffers >= 2) ? (const uint8_t*)a->buffers[1] : NULL;
     if (!d || acc->stride == 0) { ctx->rc = CARQUET_ERROR_INVALID_ARGUMENT; return; }
     if (!grow_fixed(acc, (int64_t)acc->stride)) return;
+    if (acc->narrow) {
+        /* The Arrow buffer holds 1- or 2-byte values; `stride` is the INT32
+         * the column stores. Sign- or zero-extend per the Arrow type. */
+        int32_t v;
+        switch (acc->narrow) {
+        case 'c': v = ((const int8_t*)d)[i]; break;
+        case 'C': v = ((const uint8_t*)d)[i]; break;
+        case 's': { int16_t t; memcpy(&t, d + (size_t)i * 2, 2); v = t; break; }
+        default:  { uint16_t t; memcpy(&t, d + (size_t)i * 2, 2); v = t; break; }
+        }
+        memcpy(acc->fixed + acc->fixed_bytes, &v, sizeof(v));
+        acc->fixed_bytes += (int64_t)sizeof(v);
+        return;
+    }
     memcpy(acc->fixed + acc->fixed_bytes, d + (size_t)i * acc->stride, acc->stride);
     acc->fixed_bytes += (int64_t)acc->stride;
 }
@@ -546,6 +562,7 @@ static bool shred_flat_fast(shred_ctx_t* ctx, leaf_acc_t* acc,
     if (acc->max_rep != 0) return false;             /* top-level (flat) only   */
     if (acc->is_bool || acc->is_bytearray) return false;  /* fixed-width only   */
     if (acc->stride == 0) return false;
+    if (acc->narrow) return false;                   /* needs widening, not memcpy */
     if (a->offset != 0) return false;                /* matches visit()'s guard */
     const uint8_t* d = (a->n_buffers >= 2) ? (const uint8_t*)a->buffers[1] : NULL;
     if (!d) return false;
@@ -739,6 +756,10 @@ static carquet_status_t assign_leaves(const struct ArrowSchema* s, int32_t* next
         acc->is_bytearray = (pt == CARQUET_PHYSICAL_BYTE_ARRAY);
         acc->off64 = (value_format[0] == 'U' || value_format[0] == 'Z');
         acc->stride = fixed_stride(pt, tlen);
+        acc->narrow = (value_format[1] == '\0' &&
+                       (value_format[0] == 'c' || value_format[0] == 'C' ||
+                        value_format[0] == 's' || value_format[0] == 'S'))
+                          ? value_format[0] : 0;
         acc->max_def = (int16_t)(cur_def + (nullable ? 1 : 0));
         acc->max_rep = cur_rep;
         (*next_col)++;

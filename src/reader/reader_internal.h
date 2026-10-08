@@ -188,6 +188,13 @@ struct carquet_column_reader {
 
     /* Dictionary preservation mode */
     bool preserve_dictionary;   /* If true, skip materialization, keep indices */
+
+    /* Last failure seen by this column reader, for callers that read through an
+     * API with no error out-parameter (the batch reader). Written only by the
+     * thread that owns this column reader — the batch reader's parallel column
+     * loop gives each thread its own reader, so this is not a shared write.
+     * Cleared by carquet_column_read_batch_ex() on entry. */
+    carquet_error_t last_error;
 };
 
 /* ============================================================================
@@ -281,6 +288,17 @@ carquet_status_t carquet_column_reader_seek_to_data_page(
     int64_t values_before_page,
     carquet_error_t* error);
 
+/**
+ * @brief Pick the offset of the first data page of a dictionary-encoded chunk.
+ *
+ * @param data_page_offset ColumnMetaData.data_page_offset as recorded by the writer
+ * @param dict_end         dictionary_page_offset + dict header + dict payload
+ * @return @p data_page_offset unless it is provably wrong (at or before
+ *         @p dict_end), in which case @p dict_end.
+ */
+int64_t carquet_resolve_data_start_offset(int64_t data_page_offset,
+                                          int64_t dict_end);
+
 /* ============================================================================
  * Page Decompression (shared between page_reader and batch_reader)
  * ============================================================================
@@ -293,6 +311,28 @@ carquet_status_t carquet_decompress_page(
     uint8_t* decompressed,
     size_t decompressed_capacity,
     size_t* decompressed_size);
+
+/** @brief Size of the buffer to pass to carquet_decompress_page_diag(). */
+#define CARQUET_DECOMPRESS_DIAG_SIZE 192
+
+/**
+ * @brief Decompress a page, additionally writing a codec-specific description
+ *        of the failure into @p diag.
+ *
+ * On failure the caller can fold @p diag into its error message so that a
+ * single failing run on a multi-gigabyte file identifies the exact check that
+ * rejected the block. @p diag is always NUL-terminated; it is set to the empty
+ * string when the codec has no detail to report.
+ */
+carquet_status_t carquet_decompress_page_diag(
+    carquet_compression_t codec,
+    const uint8_t* compressed,
+    size_t compressed_size,
+    uint8_t* decompressed,
+    size_t decompressed_capacity,
+    size_t* decompressed_size,
+    char* diag,
+    size_t diag_size);
 
 #ifdef __cplusplus
 }

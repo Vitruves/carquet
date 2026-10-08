@@ -340,7 +340,11 @@ size_t carquet_bitpack_32(const uint32_t* values, size_t count,
             temp[j] = values[i + j];
         }
         size_t remaining_bytes = carquet_packed_size(count - i, bit_width);
-        carquet_bitpack8_32(temp, bit_width, output + bytes_written);
+        /* bitpack8 always emits a full group (bit_width bytes); the caller's
+         * buffer only has room for the bytes the remaining values need. */
+        uint8_t packed_tail[32];
+        carquet_bitpack8_32(temp, bit_width, packed_tail);
+        memcpy(output + bytes_written, packed_tail, remaining_bytes);
         bytes_written += remaining_bytes;
     }
 
@@ -488,6 +492,13 @@ void carquet_bit_writer_write_bits(carquet_bit_writer_t* writer,
                                     uint32_t value, int num_bits) {
     if (num_bits == 0) return;
     if (num_bits > 32) num_bits = 32;
+
+    /* Make room first: appending to an accumulator that already holds more
+     * than 32 bits would shift the top of `value` out of the 64-bit word. */
+    if (writer->buffer_bits + num_bits > 64) {
+        flush_buffer(writer);
+        if (writer->buffer_bits + num_bits > 64) return;   /* output full */
+    }
 
     uint32_t mask = num_bits == 32 ? ~0U : (1U << num_bits) - 1;
     writer->buffer |= (uint64_t)(value & mask) << writer->buffer_bits;

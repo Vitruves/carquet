@@ -229,19 +229,55 @@ carquet_status_t carquet_encode_plain_boolean(
     int64_t count,
     carquet_buffer_t* output) {
 
-    if (!input || !output || count < 0) {
+    /* A new stream is an append at bit 0. */
+    return carquet_encode_plain_boolean_append(input, count, 0, output);
+}
+
+carquet_status_t carquet_encode_plain_boolean_append(
+    const uint8_t* input,
+    int64_t count,
+    int64_t bit_count,
+    carquet_buffer_t* output) {
+
+    if (!input || !output || count < 0 || bit_count < 0) {
         return CARQUET_ERROR_INVALID_ARGUMENT;
     }
 
-    size_t bytes_needed = ((size_t)count + 7) / 8;
-    uint8_t* dest = carquet_buffer_advance(output, bytes_needed);
-    if (!dest) {
-        return CARQUET_ERROR_OUT_OF_MEMORY;
+    /* The stream's last byte has `used` bits taken when it does not end on a
+     * byte boundary; the first `head` values go into the rest of it. */
+    int used = (int)(bit_count & 7);
+    int64_t head = 0;
+    if (used != 0) {
+        if (output->size == 0) {
+            return CARQUET_ERROR_INVALID_ARGUMENT;
+        }
+        head = 8 - used;
+        if (head > count) head = count;
     }
 
-    if (bytes_needed > 0) {
-        memset(dest, 0, bytes_needed);
-        carquet_dispatch_pack_bools(input, dest, count);
+    /* Whatever is left starts on a byte boundary. Reserve its bytes before
+     * touching the partial byte, so a failed allocation leaves the stream
+     * exactly as it was. */
+    int64_t tail = count - head;
+    size_t tail_bytes = ((size_t)tail + 7) / 8;
+    size_t partial = (used != 0) ? output->size - 1 : 0;
+    uint8_t* dest = NULL;
+    if (tail_bytes > 0) {
+        dest = carquet_buffer_advance(output, tail_bytes);
+        if (!dest) {
+            return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
+    }
+
+    for (int64_t i = 0; i < head; i++) {
+        if (input[i]) {
+            output->data[partial] |= (uint8_t)(1u << (used + (int)i));
+        }
+    }
+
+    if (tail_bytes > 0) {
+        memset(dest, 0, tail_bytes);
+        carquet_dispatch_pack_bools(input + head, dest, tail);
     }
 
     return CARQUET_OK;
@@ -363,10 +399,13 @@ carquet_status_t carquet_encode_plain_byte_array(
 
     /* Sum the total encoded size (4-byte length prefix + payload per value) so
      * the output can be grown once instead of two capacity checks per value.
-     * `total` is 64-bit; count and each length are bounded by page limits so
-     * the sum cannot realistically overflow, but guard the reservation cast. */
+     * Lengths are validated here, before anything is reserved: a negative
+     * int32 length would otherwise wrap to a tiny reservation and a ~4GB
+     * copy. `total` is 64-bit and each term is < 2^32, so the sum cannot
+     * realistically overflow, but guard the reservation cast. */
     uint64_t total = 0;
     for (int64_t i = 0; i < count; i++) {
+        if (input[i].length < 0) return CARQUET_ERROR_INVALID_ARGUMENT;
         total += 4u + (uint64_t)input[i].length;
     }
     if (total > SIZE_MAX - output->size) return CARQUET_ERROR_OUT_OF_MEMORY;

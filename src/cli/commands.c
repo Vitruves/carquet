@@ -1497,9 +1497,9 @@ static int cli_filter_grow(cli_filter_storage_t* s) {
     carquet_filter_clause_t* nc = realloc(s->clauses,
         (size_t)new_cap * sizeof(carquet_filter_clause_t));
     if (!nc) return -1;
+    s->clauses = nc;   /* realloc may have moved it: publish before the next one can fail */
     uint8_t** nb = realloc(s->blobs, (size_t)new_cap * sizeof(uint8_t*));
     if (!nb) return -1;
-    s->clauses = nc;
     s->blobs = nb;
     s->capacity = new_cap;
     return 0;
@@ -1738,6 +1738,9 @@ static int filter_parse_clause(const char** p, const carquet_schema_t* schema,
     carquet_filter_clause_t* c = &s->clauses[s->count];
     memset(c, 0, sizeof(*c));
     s->blobs[s->count] = NULL;
+    /* The slot is owned from here on, even if this clause fails to parse
+     * after its value was allocated. */
+    if (s->num_blobs <= s->count) s->num_blobs = s->count + 1;
 
     char name[128];
     if (filter_parse_ident(p, name, sizeof(name)) != 0) {

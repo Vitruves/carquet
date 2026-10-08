@@ -4,7 +4,7 @@ MetricStore is a small **mockup downstream library** that consumes [carquet](../
 
 It re-implements no Parquet logic of its own. The public API (`include/metricstore/metricstore.h`) is deliberately carquet-agnostic (no carquet types leak through), so it reads like an independent product.
 
-It drives **114 of carquet's 128 public functions (~89%)**. The remaining ~14 are niche paths (geospatial stats, custom-codec registration, dictionary-preserving reads, FILE*-based create/open, group/map/variant schema builders).
+It drives **117 of carquet's 143 public functions (~82%)**. The remaining 26 are niche paths (geospatial stats, custom-codec registration, dictionary-preserving reads, FILE*-based create/open, group/map/variant schema builders, the `[offset, limit)` row window, the batch reader's last-error accessor, the low-level column reader, the Arrow import-side read, and the `carquet_error_*` helpers).
 
 ## Layout
 

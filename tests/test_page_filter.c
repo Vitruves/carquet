@@ -2056,6 +2056,139 @@ static int test_ne_lt_le(void) {
 }
 
 /* ============================================================================
+ * Test: a page without min/max is not a null page
+ *
+ * With statistics disabled the column index still exists but carries no
+ * bounds. null_pages must come from the value counts: a page marked null is
+ * skipped by every value predicate, which would drop all the data here.
+ * ============================================================================ */
+
+static int test_no_stats_page_not_null(void) {
+    g_current_test = "no_stats_page_not_null";
+    char path[512];
+    carquet_test_temp_path(path, sizeof(path), "pf_nostats");
+
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t* schema = carquet_schema_create(&err);
+    ASSERT_TRUE(schema != NULL);
+    ASSERT_OK(carquet_schema_add_column(schema, "v", CARQUET_PHYSICAL_INT32,
+        NULL, CARQUET_REPETITION_REQUIRED, 0, 0));
+    carquet_writer_options_t opts;
+    carquet_writer_options_init(&opts);
+    opts.write_page_index = true;
+    opts.write_statistics = false;
+    opts.max_rows_per_page = ROWS_PER_PAGE;
+    opts.write_batch_size = ROWS_PER_PAGE;
+    opts.compression = CARQUET_COMPRESSION_UNCOMPRESSED;
+    opts.dictionary_encoding = CARQUET_ENCODING_PLAIN;
+    carquet_writer_t* w = carquet_writer_create(path, schema, &opts, &err);
+    ASSERT_TRUE(w != NULL);
+    ASSERT_OK(carquet_writer_set_column_encoding(w, 0, CARQUET_ENCODING_PLAIN));
+    int32_t values[TOTAL_ROWS];
+    for (int i = 0; i < TOTAL_ROWS; i++) values[i] = i * 10;
+    ASSERT_OK(carquet_writer_write_batch(w, 0, values, TOTAL_ROWS, NULL, NULL));
+    ASSERT_OK(carquet_writer_close(w));
+    carquet_schema_free(schema);
+
+    carquet_reader_t* r = carquet_reader_open(path, NULL, &err);
+    ASSERT_TRUE(r != NULL);
+    carquet_batch_reader_config_t cfg;
+    carquet_batch_reader_config_init(&cfg);
+    cfg.batch_size = 4096;
+    carquet_batch_reader_t* br = carquet_batch_reader_create(r, &cfg, &err);
+    ASSERT_TRUE(br != NULL);
+    int32_t target = 5500;
+    carquet_filter_clause_t clause = {0};
+    clause.column_index = 0;
+    clause.op = CARQUET_FILTER_EQ;
+    clause.value = &target;
+    clause.value_size = (int32_t)sizeof(target);
+    carquet_status_t fst = carquet_batch_reader_set_page_filter(br, &clause, 1);
+    if (fst == CARQUET_OK) {
+        bool saw_target = false;
+        carquet_row_batch_t* batch = NULL;
+        while (carquet_batch_reader_next(br, &batch) == CARQUET_OK && batch) {
+            const void* data; const uint8_t* nb; int64_t n;
+            ASSERT_OK(carquet_row_batch_column(batch, 0, &data, &nb, &n));
+            for (int64_t i = 0; i < n; i++) {
+                if (((const int32_t*)data)[i] == target) saw_target = true;
+            }
+            carquet_row_batch_free(batch);
+            batch = NULL;
+        }
+        /* Without bounds nothing can be proven absent: the row must survive. */
+        ASSERT_TRUE(saw_target);
+    }
+    /* A filter refused for lack of bounds is fine too; dropping rows is not. */
+    carquet_batch_reader_free(br);
+    carquet_reader_close(r);
+    remove(path);
+    TEST_PASS(g_current_test);
+    return 0;
+}
+
+/* ============================================================================
+ * Test: chunk statistics cover a page whose minimum is the empty string
+ *
+ * Page 0 holds "" and "zzz"; the later pages hold values in between. The
+ * chunk-level bounds are folded from the pages, and a zero-length page minimum
+ * is a real value there: leaving that page out would publish max = "m...",
+ * and a reader pruning on it would never see "zzz".
+ * ============================================================================ */
+
+static int test_empty_string_chunk_stats(void) {
+    g_current_test = "empty_string_chunk_stats";
+    char path[512];
+    carquet_test_temp_path(path, sizeof(path), "pf_empty_min");
+
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t* schema = carquet_schema_create(&err);
+    ASSERT_TRUE(schema != NULL);
+    carquet_logical_type_t lt = { .id = CARQUET_LOGICAL_STRING };
+    ASSERT_OK(carquet_schema_add_column(schema, "s",
+        CARQUET_PHYSICAL_BYTE_ARRAY, &lt, CARQUET_REPETITION_REQUIRED, 0, 0));
+    carquet_writer_options_t opts;
+    carquet_writer_options_init(&opts);
+    opts.max_rows_per_page = ROWS_PER_PAGE;
+    opts.write_batch_size = ROWS_PER_PAGE;
+    opts.compression = CARQUET_COMPRESSION_UNCOMPRESSED;
+    opts.dictionary_encoding = CARQUET_ENCODING_PLAIN;
+    carquet_writer_t* w = carquet_writer_create(path, schema, &opts, &err);
+    ASSERT_TRUE(w != NULL);
+    ASSERT_OK(carquet_writer_set_column_encoding(w, 0, CARQUET_ENCODING_PLAIN));
+
+    static carquet_byte_array_t entries[3 * ROWS_PER_PAGE];
+    static char buffers[3 * ROWS_PER_PAGE][16];
+    for (int row = 0; row < 3 * ROWS_PER_PAGE; row++) {
+        if (row == 0) buffers[row][0] = '\0';
+        else if (row < ROWS_PER_PAGE) snprintf(buffers[row], sizeof(buffers[row]), "zzz");
+        else snprintf(buffers[row], sizeof(buffers[row]), "m%03d", row);
+        entries[row].data = (uint8_t*)buffers[row];
+        entries[row].length = (int32_t)strlen(buffers[row]);
+    }
+    ASSERT_OK(carquet_writer_write_batch(w, 0, entries, 3 * ROWS_PER_PAGE, NULL, NULL));
+    ASSERT_OK(carquet_writer_close(w));
+    carquet_schema_free(schema);
+
+    carquet_reader_t* r = carquet_reader_open(path, NULL, &err);
+    ASSERT_TRUE(r != NULL);
+    carquet_column_statistics_t st;
+    memset(&st, 0, sizeof(st));
+    ASSERT_OK(carquet_reader_column_statistics(r, 0, 0, &st));
+    /* No bounds at all is acceptable (and what an empty minimum currently
+     * yields); bounds that exclude page 0 are not. */
+    if (st.has_min_max) {
+        ASSERT_TRUE(st.max_value_size >= 3 &&
+                    memcmp(st.max_value, "zzz", 3) == 0);
+        ASSERT_EQ_I64(st.min_value_size, 0);
+    }
+    carquet_reader_close(r);
+    remove(path);
+    TEST_PASS(g_current_test);
+    return 0;
+}
+
+/* ============================================================================
  * Test: BOOLEAN column
  *
  * Booleans use a 1-byte stored stat and go through the BOOLEAN branch of
@@ -3347,6 +3480,8 @@ int main(void) {
     failures += test_flba_size_mismatch();
     failures += test_seek_forward_values_remaining();
     failures += test_skip_does_not_decompress();
+    failures += test_no_stats_page_not_null();
+    failures += test_empty_string_chunk_stats();
 
     if (failures > 0) {
         fprintf(stderr, "%d test failures\n", failures);

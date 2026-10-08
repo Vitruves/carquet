@@ -827,7 +827,9 @@ carquet_status_t carquet_reader_prebuffer(
     uint8_t* buf = carquet_mem_malloc(total_size);
     if (!buf) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY,
-            "Failed to allocate prebuffer (%zu bytes)", total_size);
+            /* %llu, not %zu: the MinGW/msvcrt printf has no z length modifier. */
+            "Failed to allocate prebuffer (%llu bytes)",
+            (unsigned long long)total_size);
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
 

@@ -369,7 +369,7 @@ if want("tests") then
         "test_bloom_page_index", "test_mmap", "test_advanced_api",
         "test_encoding_roundtrip", "test_writer_extensions", "test_bitunpack_wide",
         "test_page_filter", "test_append", "test_row_range", "test_dict_decode",
-        "test_decimal_stats", "test_arrow_dictionary",
+        "test_decimal_stats", "test_arrow_dictionary", "test_snappy_diag", "test_parallel_write",
         "test_float16", "test_geo_wkb", "test_worker_pool", "test_custom_codec",
         "test_real_world", "test_arrow_c_data", "test_batch_nested",
         "test_nested_write", "test_arrow_nested", "test_p2_conformance",

@@ -1342,10 +1342,352 @@ static int test_bss_exact_page_bytes(void) {
     return 0;
 }
 
+/* ---- BOOLEAN: pages assembled from several encode calls ---- */
+/* A data page's BOOLEAN values are one stream however many calls built the
+ * page: PLAIN is a single LSB-first bit stream, RLE a single length-prefixed
+ * RLE/bit-packed hybrid block. Both used to be restarted on every encode call
+ * (PLAIN on a fresh byte, RLE with a fresh length prefix), so every value
+ * after the first call of a page was written where no reader looks for it. */
+
+/* Payload of column 0's first data page in an uncompressed file. The caller
+ * frees *file; *payload points into it. */
+static int first_page_payload(const char* path, uint8_t** file,
+                              const uint8_t** payload, size_t* payload_size) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_reader_t* r = carquet_reader_open(path, NULL, &err);
+    if (!r) return 0;
+    carquet_column_chunk_metadata_t cm;
+    int ok = (carquet_reader_column_chunk_metadata(r, 0, 0, &cm) == CARQUET_OK);
+    carquet_reader_close(r);
+    size_t fsz = 0;
+    if (!ok || !read_file(path, file, &fsz)) return 0;
+
+    parquet_page_header_t ph; size_t consumed = 0;
+    if (parquet_parse_page_header(*file + cm.data_page_offset,
+                                  fsz - (size_t)cm.data_page_offset,
+                                  &ph, &consumed, &err) != CARQUET_OK) {
+        free(*file);
+        return 0;
+    }
+    *payload = *file + cm.data_page_offset + consumed;
+    *payload_size = (size_t)ph.uncompressed_page_size;
+    return 1;
+}
+
+/* As with BYTE_STREAM_SPLIT above, a round-trip through carquet's own decoder
+ * cannot tell a correct page from a self-consistently wrong one, so these
+ * assert the literal payload of a REQUIRED column written in two calls. The
+ * expected bytes are derived by hand from the format, not from the writer.
+ *
+ * PLAIN, 12 values written as 5 + 7:
+ *
+ *   index  0 1 2 3 4 | 5 6 7  8 9 10 11
+ *   value  1 1 0 1 0 | 0 1 1  1 0  0  1
+ *
+ * Value i is bit (i % 8) of byte (i / 8), so byte 0 = 1+2+8+64+128 = 0xCB and
+ * byte 1 = 1+8 = 0x09. Restarting on a fresh byte for the second call gives
+ * 0B 4E instead: the first five bits, then the last seven in a byte of their
+ * own.
+ *
+ * RLE, 20 values written as 10 + 10: ten true, then ten false. A run is
+ * varint(length << 1) followed by the value in one byte, so the two runs are
+ * 14 01 and 14 00, and the page is the 4-byte little-endian length of those
+ * four bytes followed by them. One block per call gives 02 00 00 00 14 01
+ * 02 00 00 00 14 00 instead, of which a reader decodes only the first run. */
+static int test_boolean_exact_page_bytes(carquet_encoding_t enc) {
+    static const uint8_t plain_in[12] = { 1, 1, 0, 1, 0,  0, 1, 1, 1, 0, 0, 1 };
+    static const uint8_t plain_expect[2] = { 0xCB, 0x09 };
+    static const uint8_t rle_in[20] = { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    static const uint8_t rle_expect[8] = { 0x04, 0x00, 0x00, 0x00,
+                                           0x14, 0x01, 0x14, 0x00 };
+    int rle = (enc == CARQUET_ENCODING_RLE);
+    const char* name = rle ? "boolean_rle_exact_page_bytes"
+                           : "boolean_plain_exact_page_bytes";
+    const uint8_t* in = rle ? rle_in : plain_in;
+    int64_t first = rle ? 10 : 5;
+    int64_t total = rle ? 20 : 12;
+    const uint8_t* expect = rle ? rle_expect : plain_expect;
+    size_t expect_size = rle ? sizeof(rle_expect) : sizeof(plain_expect);
+
+    char path[512]; carquet_test_temp_path(path, sizeof(path), "ext_bool_bytes");
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t* s = carquet_schema_create(&err);
+    if (!s) TEST_FAIL(name, "schema create");
+    if (carquet_schema_add_column(s, "b", CARQUET_PHYSICAL_BOOLEAN, NULL,
+            CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK)
+        { carquet_schema_free(s); TEST_FAIL(name, "add col"); }
+
+    carquet_writer_options_t wo; carquet_writer_options_init(&wo);
+    wo.compression = CARQUET_COMPRESSION_UNCOMPRESSED;  /* payload is the values */
+    carquet_writer_t* w = carquet_writer_create(path, s, &wo, &err);
+    if (!w) { carquet_schema_free(s); TEST_FAIL(name, "writer create"); }
+    if (carquet_writer_set_column_encoding(w, 0, enc) != CARQUET_OK)
+        { carquet_writer_close(w); carquet_schema_free(s);
+          TEST_FAIL(name, "set encoding"); }
+    /* Split across two calls: one page, two batches. */
+    if (carquet_writer_write_batch(w, 0, in, first, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_write_batch(w, 0, in + first, total - first,
+                                   NULL, NULL) != CARQUET_OK)
+        { carquet_writer_close(w); carquet_schema_free(s);
+          TEST_FAIL(name, "write batch"); }
+    if (carquet_writer_close(w) != CARQUET_OK)
+        { carquet_schema_free(s); TEST_FAIL(name, "close"); }
+    carquet_schema_free(s);
+
+    uint8_t* fb = NULL; const uint8_t* payload = NULL; size_t payload_size = 0;
+    if (!first_page_payload(path, &fb, &payload, &payload_size))
+        { carquet_test_cleanup(path); TEST_FAIL(name, "locate page payload"); }
+    int ok = (payload_size == expect_size) &&
+             (memcmp(payload, expect, expect_size) == 0);
+    if (!ok) {
+        fprintf(stderr, "  expected:");
+        for (size_t i = 0; i < expect_size; i++) fprintf(stderr, " %02X", expect[i]);
+        fprintf(stderr, "\n  actual:  ");
+        for (size_t i = 0; i < payload_size; i++) fprintf(stderr, " %02X", payload[i]);
+        fprintf(stderr, "\n");
+    }
+    free(fb);
+    carquet_test_cleanup(path);
+    if (!ok) TEST_FAIL(name, "page payload is not a single value stream");
+    TEST_PASS(name);
+    return 0;
+}
+
+#define BOOL_ROWS 6000
+
+/* Write one BOOLEAN column in the given write_batch() row counts and read it
+ * back in a single call. `def` is NULL for a REQUIRED column; otherwise `in`
+ * holds only the non-null values, packed, as write_batch() takes and
+ * read_batch() returns them. Returns NULL on success, else what went wrong. */
+static const char* boolean_roundtrip(const char* base, carquet_encoding_t enc,
+                                     carquet_compression_t codec, int64_t page_size,
+                                     const uint8_t* in, const int16_t* def,
+                                     const int64_t* batches, size_t nbatches) {
+    static uint8_t out[BOOL_ROWS];
+    static int16_t outdef[BOOL_ROWS];
+    char path[512]; carquet_test_temp_path(path, sizeof(path), base);
+    carquet_error_t err = CARQUET_ERROR_INIT;
+
+    carquet_schema_t* s = carquet_schema_create(&err);
+    if (!s) return "schema create";
+    if (carquet_schema_add_column(s, "b", CARQUET_PHYSICAL_BOOLEAN, NULL,
+            def ? CARQUET_REPETITION_OPTIONAL : CARQUET_REPETITION_REQUIRED,
+            0, 0) != CARQUET_OK)
+        { carquet_schema_free(s); return "add col"; }
+
+    carquet_writer_options_t wo; carquet_writer_options_init(&wo);
+    wo.compression = codec;
+    if (page_size > 0) wo.page_size = page_size;
+    carquet_writer_t* w = carquet_writer_create(path, s, &wo, &err);
+    if (!w) { carquet_schema_free(s); return "writer create"; }
+    if (carquet_writer_set_column_encoding(w, 0, enc) != CARQUET_OK)
+        { carquet_writer_close(w); carquet_schema_free(s); return "set encoding"; }
+
+    int64_t rows = 0, non_null = 0;
+    for (size_t k = 0; k < nbatches; k++) {
+        if (carquet_writer_write_batch(w, 0, in + non_null, batches[k],
+                                       def ? def + rows : NULL, NULL) != CARQUET_OK)
+            { carquet_writer_close(w); carquet_schema_free(s); return "write batch"; }
+        for (int64_t i = 0; i < batches[k]; i++)
+            if (!def || def[rows + i]) non_null++;
+        rows += batches[k];
+    }
+    if (carquet_writer_close(w) != CARQUET_OK)
+        { carquet_schema_free(s); return "close"; }
+    carquet_schema_free(s);
+
+    carquet_reader_t* r = carquet_reader_open(path, NULL, &err);
+    if (!r) { carquet_test_cleanup(path); return "open"; }
+    carquet_column_reader_t* c = carquet_reader_get_column(r, 0, 0, &err);
+    int64_t n = c ? carquet_column_read_batch(c, out, rows, def ? outdef : NULL, NULL) : -1;
+    const char* bad = NULL;
+    if (n != rows) bad = "row count";
+    else if (def && memcmp(def, outdef, (size_t)rows * sizeof(int16_t)) != 0)
+        bad = "definition levels";
+    else if (memcmp(in, out, (size_t)non_null) != 0) bad = "value mismatch";
+    carquet_column_reader_free(c); carquet_reader_close(r); carquet_test_cleanup(path);
+    return bad;
+}
+
+static int test_boolean_multi_call_page(carquet_encoding_t enc) {
+    const char* name = (enc == CARQUET_ENCODING_RLE)
+        ? "boolean_rle_multi_call_page" : "boolean_plain_multi_call_page";
+    static uint8_t in[BOOL_ROWS];
+    static int16_t def[BOOL_ROWS];
+    /* Long runs and noise, so RLE emits both run kinds; every 5th row null. */
+    for (int i = 0; i < BOOL_ROWS; i++) {
+        in[i] = (i % 97 < 40) ? 1 : (uint8_t)((((uint32_t)i * 2654435761u) >> 13) & 1);
+        def[i] = (i % 5 == 4) ? 0 : 1;
+    }
+
+    /* Several write_batch() calls into one page. The running count before each
+     * call is 3, 4, 17 and 1007 -- never a multiple of 8, so no call starts on
+     * a byte boundary. */
+    static const int64_t calls[] = { 3, 1, 13, 990, 3993 };
+    const char* bad = boolean_roundtrip("ext_bool_calls", enc,
+        CARQUET_COMPRESSION_UNCOMPRESSED, 0, in, NULL,
+        calls, sizeof(calls) / sizeof(calls[0]));
+    if (bad) { fprintf(stderr, "  several calls: %s\n", bad); TEST_FAIL(name, "roundtrip"); }
+
+    /* One write_batch() call on a nullable column. The column writer cuts it
+     * into 2048-row chunks (page_size / 1 byte per value) but closes a page
+     * only at 2048 encoded bytes, which three chunks of bit-packed values
+     * never reach: they share one page, and with every 5th row null each
+     * chunk leaves the stream mid-byte. */
+    static const int64_t one[] = { BOOL_ROWS };
+    bad = boolean_roundtrip("ext_bool_chunks", enc,
+        CARQUET_COMPRESSION_SNAPPY, 2048, in, def, one, 1);
+    if (bad) { fprintf(stderr, "  chunked batch: %s\n", bad); TEST_FAIL(name, "roundtrip"); }
+
+    /* A batch that is entirely null adds no values but must not disturb the
+     * stream around it. Rows 4 and 9 are the only nulls in the first ten. */
+    static const int64_t with_empty[] = { 4, 1, 4, 1, BOOL_ROWS - 10 };
+    bad = boolean_roundtrip("ext_bool_empty", enc,
+        CARQUET_COMPRESSION_UNCOMPRESSED, 0, in, def,
+        with_empty, sizeof(with_empty) / sizeof(with_empty[0]));
+    if (bad) { fprintf(stderr, "  all-null batch: %s\n", bad); TEST_FAIL(name, "roundtrip"); }
+
+    TEST_PASS(name);
+    return 0;
+}
+
+/* ---- Deferred encode: nullable columns written in several batches ---- */
+/* In an OpenMP build, a row group with more than one column stashes the input
+ * of each compressed fixed-width column and encodes it at finalize, in
+ * parallel. write_batch() takes an OPTIONAL column's values packed -- only the
+ * non-nulls -- so the stash must hold exactly that many per batch. Copying one
+ * value per row instead read past the end of the caller's array, and left a
+ * gap after each batch that shifted every value of the batches behind it.
+ *
+ * Each batch's packed values live in a heap block of exactly their size, freed
+ * straight after the call, so the over-read is a real heap overflow for ASan
+ * and the stash cannot be leaning on the caller's memory. The batches cover a
+ * sparse, an all-null, an all-present and a dense-ish mix, and one column is
+ * null throughout. Without OpenMP nothing is deferred and this is a plain
+ * multi-batch round-trip. */
+#define DEFER_BATCHES 4
+#define DEFER_BATCH_ROWS 5000
+#define DEFER_ROWS (DEFER_BATCHES * DEFER_BATCH_ROWS)
+
+static int defer_present(int col, int64_t row) {
+    int batch = (int)(row / DEFER_BATCH_ROWS);
+    switch (col) {
+        case 1:  /* INT32: a different density in every batch */
+            if (batch == 0) return row % 64 == 7;
+            if (batch == 1) return 0;
+            if (batch == 2) return 1;
+            return row % 7 == 3;
+        case 2:  /* DOUBLE */
+            return row % 3 != 0;
+        case 3:  /* FLBA(5): never present */
+            return 0;
+        default: /* REQUIRED INT64 */
+            return 1;
+    }
+}
+
+static void defer_value(int col, int64_t row, uint8_t* dst) {
+    switch (col) {
+        case 0: { int64_t v = row * 3 - 11; memcpy(dst, &v, sizeof(v)); break; }
+        case 1: { int32_t v = (int32_t)(row * 7 + 1); memcpy(dst, &v, sizeof(v)); break; }
+        case 2: { double v = (double)row * 0.5; memcpy(dst, &v, sizeof(v)); break; }
+        default: memset(dst, (int)(row & 0xFF), 5); break;
+    }
+}
+
+static int test_deferred_nullable_batches(void) {
+    const char* name = "deferred_nullable_batches";
+    static const carquet_physical_type_t types[4] = {
+        CARQUET_PHYSICAL_INT64, CARQUET_PHYSICAL_INT32,
+        CARQUET_PHYSICAL_DOUBLE, CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY };
+    static const size_t widths[4] = { 8, 4, 8, 5 };
+    char path[512]; carquet_test_temp_path(path, sizeof(path), "ext_defer_null");
+    carquet_error_t err = CARQUET_ERROR_INIT;
+
+    carquet_schema_t* s = carquet_schema_create(&err);
+    if (!s) TEST_FAIL(name, "schema create");
+    for (int c = 0; c < 4; c++) {
+        char col[8]; snprintf(col, sizeof(col), "c%d", c);
+        if (carquet_schema_add_column(s, col, types[c], NULL,
+                c == 0 ? CARQUET_REPETITION_REQUIRED : CARQUET_REPETITION_OPTIONAL,
+                c == 3 ? 5 : 0, 0) != CARQUET_OK)
+            { carquet_schema_free(s); TEST_FAIL(name, "add col"); }
+    }
+    carquet_writer_options_t wo; carquet_writer_options_init(&wo);
+    wo.compression = CARQUET_COMPRESSION_SNAPPY;  /* uncompressed is never deferred */
+    carquet_writer_t* w = carquet_writer_create(path, s, &wo, &err);
+    if (!w) { carquet_schema_free(s); TEST_FAIL(name, "writer create"); }
+
+    static int16_t def[DEFER_BATCH_ROWS];
+    for (int b = 0; b < DEFER_BATCHES; b++) {
+        for (int c = 0; c < 4; c++) {
+            int64_t base = (int64_t)b * DEFER_BATCH_ROWS;
+            int64_t nn = 0;
+            for (int64_t i = 0; i < DEFER_BATCH_ROWS; i++) {
+                def[i] = (int16_t)defer_present(c, base + i);
+                nn += def[i];
+            }
+            /* write_batch() rejects a NULL array even when no row is present. */
+            uint8_t* packed = (uint8_t*)malloc(nn > 0 ? (size_t)nn * widths[c] : 1);
+            if (!packed) { carquet_writer_close(w); carquet_schema_free(s);
+                           TEST_FAIL(name, "alloc"); }
+            int64_t k = 0;
+            for (int64_t i = 0; i < DEFER_BATCH_ROWS; i++)
+                if (def[i]) defer_value(c, base + i, packed + (size_t)k++ * widths[c]);
+            carquet_status_t st = carquet_writer_write_batch(
+                w, c, packed, DEFER_BATCH_ROWS, c == 0 ? NULL : def, NULL);
+            free(packed);
+            if (st != CARQUET_OK) { carquet_writer_close(w); carquet_schema_free(s);
+                                    TEST_FAIL(name, "write batch"); }
+        }
+    }
+    if (carquet_writer_close(w) != CARQUET_OK)
+        { carquet_schema_free(s); TEST_FAIL(name, "close"); }
+    carquet_schema_free(s);
+
+    carquet_reader_t* r = carquet_reader_open(path, NULL, &err);
+    if (!r) { carquet_test_cleanup(path); TEST_FAIL(name, "open"); }
+    static uint8_t out[DEFER_ROWS * 8];
+    static int16_t outdef[DEFER_ROWS];
+    const char* bad = NULL;
+    int bad_col = -1;
+    for (int c = 0; c < 4 && !bad; c++) {
+        carquet_column_reader_t* cr = carquet_reader_get_column(r, 0, c, &err);
+        int64_t n = cr ? carquet_column_read_batch(cr, out, DEFER_ROWS,
+                                                   c == 0 ? NULL : outdef, NULL) : -1;
+        carquet_column_reader_free(cr);
+        if (n != DEFER_ROWS) { bad = "row count"; bad_col = c; break; }
+        int64_t k = 0;
+        for (int64_t i = 0; i < DEFER_ROWS && !bad; i++) {
+            int present = defer_present(c, i);
+            if (c != 0 && outdef[i] != present) { bad = "definition level"; break; }
+            if (!present) continue;
+            uint8_t want[8];
+            defer_value(c, i, want);
+            if (memcmp(out + (size_t)k++ * widths[c], want, widths[c]) != 0)
+                bad = "value";
+        }
+        if (bad) bad_col = c;
+    }
+    carquet_reader_close(r); carquet_test_cleanup(path);
+    if (bad) {
+        fprintf(stderr, "  column %d: wrong %s\n", bad_col, bad);
+        TEST_FAIL(name, "nullable multi-batch round-trip");
+    }
+    TEST_PASS(name);
+    return 0;
+}
+
 int main(void) {
     int failures = 0;
     failures += test_int96_roundtrip();
     failures += test_bss_exact_page_bytes();
+    failures += test_boolean_exact_page_bytes(CARQUET_ENCODING_PLAIN);
+    failures += test_boolean_exact_page_bytes(CARQUET_ENCODING_RLE);
+    failures += test_boolean_multi_call_page(CARQUET_ENCODING_PLAIN);
+    failures += test_boolean_multi_call_page(CARQUET_ENCODING_RLE);
+    failures += test_deferred_nullable_batches();
     failures += test_data_page_v2(0);
     failures += test_data_page_v2(1);
     failures += test_arrow_schema_metadata();

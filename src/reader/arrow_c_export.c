@@ -321,6 +321,30 @@ static uint8_t* copy_validity(const uint8_t* src, int64_t n) {
     return out;
 }
 
+/* Arrow value width of an INT32 column annotated INTEGER(8|16): the schema
+ * exports it as int8/uint8/int16/uint16, so the values buffer must hold 1- or
+ * 2-byte elements rather than carquet's 4-byte physical values. 0 otherwise. */
+static size_t arrow_narrow_int_width(carquet_physical_type_t pt,
+                                     const carquet_logical_type_t* lt) {
+    if (pt != CARQUET_PHYSICAL_INT32 || !lt || lt->id != CARQUET_LOGICAL_INTEGER) return 0;
+    if (lt->params.integer.bit_width == 8) return 1;
+    if (lt->params.integer.bit_width == 16) return 2;
+    return 0;
+}
+
+/* Truncate `n` INT32 values to `width`-byte elements (two's complement, so the
+ * same code serves the signed and unsigned Arrow types). */
+static void arrow_narrow_int_store(uint8_t* dst, const uint8_t* src_i32, size_t width) {
+    int32_t v;
+    memcpy(&v, src_i32, sizeof(v));
+    if (width == 1) {
+        dst[0] = (uint8_t)v;
+    } else {
+        uint16_t t = (uint16_t)v;
+        memcpy(dst, &t, sizeof(t));
+    }
+}
+
 /* Populate one leaf ArrowArray child from a carquet batch column. */
 static carquet_status_t export_child_array(
     struct ArrowArray* child,
@@ -328,7 +352,8 @@ static carquet_status_t export_child_array(
     const uint8_t* validity,
     int64_t n,
     carquet_physical_type_t pt,
-    int32_t type_length) {
+    int32_t type_length,
+    size_t narrow) {
 
     memset(child, 0, sizeof(*child));
     child->length = n;
@@ -405,10 +430,17 @@ static carquet_status_t export_child_array(
             free(val);
             return CARQUET_ERROR_NOT_IMPLEMENTED;
         }
-        size_t total = (size_t)n * stride;
+        size_t total = (size_t)n * (narrow ? narrow : stride);
         out_data = (uint8_t*)malloc(total > 0 ? total : 1);
         if (!out_data) { free(val); return CARQUET_ERROR_OUT_OF_MEMORY; }
-        if (total > 0 && data) memcpy(out_data, data, total);
+        if (total > 0 && data && narrow) {
+            for (int64_t i = 0; i < n; i++) {
+                arrow_narrow_int_store(out_data + (size_t)i * narrow,
+                                       (const uint8_t*)data + (size_t)i * stride, narrow);
+            }
+        } else if (total > 0 && data) {
+            memcpy(out_data, data, total);
+        }
     }
 
     const void** buffers = (const void**)malloc(2 * sizeof(void*));
@@ -476,8 +508,9 @@ static carquet_status_t build_leaf_child(struct ArrowArray* child,
                                          const carquet_schema_t* cs, int32_t e,
                                          const void* values, const uint8_t* validity,
                                          int64_t n) {
-    return export_child_array(child, values, validity, n,
-                              cs->elements[e].type, cs->elements[e].type_length);
+    const parquet_schema_element_t* el = &cs->elements[e];
+    return export_child_array(child, values, validity, n, el->type, el->type_length,
+        arrow_narrow_int_width(el->type, el->has_logical_type ? &el->logical_type : NULL));
 }
 
 /* Export a single top-level field `e` (leaf / single-level LIST / MAP) into a

@@ -22,6 +22,7 @@
 #include "thrift/thrift_decode.h"
 #include "thrift/thrift_encode.h"
 #include "thrift/parquet_types.h"
+#include "page_tasks.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -71,6 +72,10 @@ extern carquet_status_t carquet_delta_length_encode(
 extern carquet_status_t carquet_delta_strings_encode(
     const carquet_byte_array_t* values, int32_t num_values,
     carquet_buffer_t* output);
+extern void carquet_dispatch_byte_split_encode_float(const float* values, int64_t count,
+                                                     uint8_t* output);
+extern void carquet_dispatch_byte_split_encode_double(const double* values, int64_t count,
+                                                      uint8_t* output);
 extern int64_t carquet_dispatch_count_non_nulls(const int16_t* def_levels, int64_t count,
                                                  int16_t max_def_level);
 extern void carquet_dispatch_minmax_i32(const int32_t* values, int64_t count,
@@ -127,8 +132,13 @@ typedef struct carquet_page_writer {
     int64_t* rep_level_hist;
     int64_t* def_level_hist;
 
+    /* Non-null BOOLEAN values PLAIN-encoded into the current page. PLAIN packs
+     * a page's booleans as one bit stream, so every add_values call resumes at
+     * this bit position rather than on a fresh byte. Reset per page. */
+    int64_t bool_count;
+
     bool data_page_v2;       /* Emit DATA_PAGE_V2 instead of DATA_PAGE */
-    bool bss_applied;        /* Page already transposed by finalize */
+    bool deferred_applied;   /* Page already transposed / delta-encoded by finalize */
 
     int32_t compression_level;   /* 0 = use codec default */
 
@@ -302,7 +312,7 @@ void carquet_page_writer_destroy(carquet_page_writer_t* writer) {
 
 void carquet_page_writer_reset(carquet_page_writer_t* writer) {
     carquet_buffer_clear(&writer->values_buffer);
-    writer->bss_applied = false;
+    writer->deferred_applied = false;
     carquet_buffer_clear(&writer->def_levels_buffer);
     carquet_buffer_clear(&writer->rep_levels_buffer);
     carquet_buffer_clear(&writer->staging_buffer);
@@ -312,6 +322,7 @@ void carquet_page_writer_reset(carquet_page_writer_t* writer) {
     writer->num_nulls = 0;
     writer->num_rows = 0;
     writer->byte_array_data_bytes = 0;
+    writer->bool_count = 0;
     if (writer->def_level_hist) {
         memset(writer->def_level_hist, 0,
                ((size_t)writer->max_def_level + 1) * sizeof(int64_t));
@@ -931,91 +942,26 @@ static carquet_status_t encode_double_values(
 static carquet_status_t encode_int32_values(
     carquet_page_writer_t* writer, const int32_t* values, int64_t count) {
 
-    /* DELTA_BINARY_PACKED must still emit its 4-varint header for an
-     * all-null (zero value) page, otherwise the decoder hits EOF parsing
-     * the header. PLAIN/BYTE_STREAM_SPLIT legitimately produce no bytes. */
-    if (count == 0 && writer->encoding != CARQUET_ENCODING_DELTA_BINARY_PACKED) {
-        return CARQUET_OK;
-    }
-    size_t offset = writer->values_buffer.size;
-
-    if (writer->encoding == CARQUET_ENCODING_BYTE_STREAM_SPLIT) {
-        /* Accumulate raw values; apply_byte_stream_split() transposes the page
-         * once, at finalize. See encode_float_values(). */
-        return carquet_encode_plain_int32(values, count, &writer->values_buffer);
-    }
-
-    if (writer->encoding == CARQUET_ENCODING_DELTA_BINARY_PACKED) {
-        /* Delta output never exceeds plain size by more than block/miniblock
-         * headers; this bound is comfortably safe. */
-        size_t cap = (size_t)count * sizeof(int32_t) + (size_t)count + 512;
-        uint8_t* dest = carquet_buffer_advance(&writer->values_buffer, cap);
-        if (!dest) return CARQUET_ERROR_OUT_OF_MEMORY;
-        size_t written = 0;
-        carquet_status_t s = carquet_delta_encode_int32(
-            values, (int32_t)count, dest, cap, &written);
-        if (s != CARQUET_OK) { writer->values_buffer.size = offset; return s; }
-        writer->values_buffer.size = offset + written;
-        return CARQUET_OK;
-    }
-
+    /* BYTE_STREAM_SPLIT and DELTA_BINARY_PACKED both describe a whole page
+     * (one transposition, one delta stream with the page's value count), so
+     * raw values accumulate here and apply_byte_stream_split() /
+     * apply_delta_encoding() encode the page once, at finalize. */
     return carquet_encode_plain_int32(values, count, &writer->values_buffer);
 }
 
 static carquet_status_t encode_int64_values(
     carquet_page_writer_t* writer, const int64_t* values, int64_t count) {
 
-    /* DELTA_BINARY_PACKED must still emit its 4-varint header for an
-     * all-null (zero value) page, otherwise the decoder hits EOF parsing
-     * the header. PLAIN/BYTE_STREAM_SPLIT legitimately produce no bytes. */
-    if (count == 0 && writer->encoding != CARQUET_ENCODING_DELTA_BINARY_PACKED) {
-        return CARQUET_OK;
-    }
-    size_t offset = writer->values_buffer.size;
-
-    if (writer->encoding == CARQUET_ENCODING_BYTE_STREAM_SPLIT) {
-        /* Accumulate raw values; apply_byte_stream_split() transposes the page
-         * once, at finalize. See encode_float_values(). */
-        return carquet_encode_plain_int64(values, count, &writer->values_buffer);
-    }
-
-    if (writer->encoding == CARQUET_ENCODING_DELTA_BINARY_PACKED) {
-        size_t cap = (size_t)count * sizeof(int64_t) + (size_t)count + 512;
-        uint8_t* dest = carquet_buffer_advance(&writer->values_buffer, cap);
-        if (!dest) return CARQUET_ERROR_OUT_OF_MEMORY;
-        size_t written = 0;
-        carquet_status_t s = carquet_delta_encode_int64(
-            values, (int32_t)count, dest, cap, &written);
-        if (s != CARQUET_OK) { writer->values_buffer.size = offset; return s; }
-        writer->values_buffer.size = offset + written;
-        return CARQUET_OK;
-    }
-
+    /* Raw accumulation; see encode_int32_values(). */
     return carquet_encode_plain_int64(values, count, &writer->values_buffer);
 }
 
-/* Encode BYTE_ARRAY values for the delta string encodings. */
+/* BYTE_ARRAY values always accumulate PLAIN (length-prefixed). The delta
+ * string encodings are one stream per page, so apply_delta_encoding() re-encodes
+ * the accumulated page once, at finalize. */
 static carquet_status_t encode_byte_array_values(
     carquet_page_writer_t* writer,
     const carquet_byte_array_t* values, int64_t count) {
-
-    /* DELTA_LENGTH_BYTE_ARRAY and DELTA_BYTE_ARRAY must still emit their
-     * DELTA header(s) for an all-null (zero value) page, otherwise the
-     * decoder hits EOF parsing the header. PLAIN produces no bytes. */
-    if (count == 0 &&
-        writer->encoding != CARQUET_ENCODING_DELTA_LENGTH_BYTE_ARRAY &&
-        writer->encoding != CARQUET_ENCODING_DELTA_BYTE_ARRAY) {
-        return CARQUET_OK;
-    }
-
-    if (writer->encoding == CARQUET_ENCODING_DELTA_LENGTH_BYTE_ARRAY) {
-        return carquet_delta_length_encode(values, (int32_t)count,
-                                           &writer->values_buffer);
-    }
-    if (writer->encoding == CARQUET_ENCODING_DELTA_BYTE_ARRAY) {
-        return carquet_delta_strings_encode(values, (int32_t)count,
-                                            &writer->values_buffer);
-    }
     return carquet_encode_plain_byte_array(values, count,
                                            &writer->values_buffer);
 }
@@ -1110,35 +1056,50 @@ carquet_status_t carquet_page_writer_add_values(
             if (writer->encoding == CARQUET_ENCODING_RLE) {
                 /* RLE value encoding for BOOLEAN: a 4-byte little-endian length
                  * prefix followed by the RLE/bit-packed hybrid at bit width 1
-                 * (matches parquet-mr's RunLengthBitPackingHybridValuesWriter). */
-                uint32_t* tmp = NULL;
-                if (num_non_null > 0) {
-                    tmp = carquet_mem_malloc((size_t)num_non_null * sizeof(uint32_t));
-                    if (!tmp) { status = CARQUET_ERROR_OUT_OF_MEMORY; break; }
-                    for (int64_t i = 0; i < num_non_null; i++)
-                        tmp[i] = bools[i] ? 1u : 0u;
+                 * (matches parquet-mr's RunLengthBitPackingHybridValuesWriter).
+                 *
+                 * A page carries exactly one prefix however many calls build
+                 * it, and readers decode only the block it describes. The
+                 * first call of a page reserves it; every call appends its
+                 * runs behind the earlier ones and re-patches the prefix to
+                 * cover them all. As with the level sections, concatenated
+                 * raw runs decode as one stream. */
+                carquet_buffer_t* vb = &writer->values_buffer;
+                if (vb->size == 0) {
+                    status = carquet_buffer_append_u32_le(vb, 0);
                 }
-                carquet_buffer_t rle;
-                carquet_buffer_init(&rle);
-                status = num_non_null > 0
-                    ? carquet_rle_encode_all(tmp, num_non_null, 1, &rle)
-                    : CARQUET_OK;
-                carquet_mem_free(tmp);
-                if (status == CARQUET_OK) {
-                    uint32_t rlen = (uint32_t)rle.size;
-                    uint8_t len_le[4] = {
-                        (uint8_t)rlen, (uint8_t)(rlen >> 8),
-                        (uint8_t)(rlen >> 16), (uint8_t)(rlen >> 24) };
-                    status = carquet_buffer_append(&writer->values_buffer, len_le, 4);
-                    if (status == CARQUET_OK && rle.size > 0) {
-                        status = carquet_buffer_append(&writer->values_buffer,
-                                                       rle.data, rle.size);
+                if (status == CARQUET_OK && num_non_null > 0) {
+                    carquet_rle_encoder_t enc;
+                    carquet_rle_encoder_init(&enc, vb, 1);
+                    for (int64_t i = 0; status == CARQUET_OK && i < num_non_null; i++) {
+                        status = carquet_rle_encoder_put(&enc, bools[i] ? 1u : 0u);
+                    }
+                    if (status == CARQUET_OK) {
+                        status = carquet_rle_encoder_flush(&enc);
                     }
                 }
-                carquet_buffer_destroy(&rle);
+                if (status == CARQUET_OK) {
+                    size_t rle_size = vb->size - 4;
+                    if (rle_size > UINT32_MAX) {
+                        status = CARQUET_ERROR_OUT_OF_MEMORY;
+                    } else {
+                        vb->data[0] = (uint8_t)(rle_size & 0xFF);
+                        vb->data[1] = (uint8_t)((rle_size >> 8) & 0xFF);
+                        vb->data[2] = (uint8_t)((rle_size >> 16) & 0xFF);
+                        vb->data[3] = (uint8_t)((rle_size >> 24) & 0xFF);
+                    }
+                }
             } else {
-                status = carquet_encode_plain_boolean(bools, num_non_null,
-                                                       &writer->values_buffer);
+                /* Continue the page's bit stream where the previous call left
+                 * it. The append leaves the stream untouched on failure and
+                 * nothing after it can fail, so the fail path below has no
+                 * partial byte to restore. */
+                status = carquet_encode_plain_boolean_append(
+                    bools, num_non_null, writer->bool_count,
+                    &writer->values_buffer);
+                if (status == CARQUET_OK) {
+                    writer->bool_count += num_non_null;
+                }
             }
             if (status == CARQUET_OK && writer->write_statistics) {
                 update_statistics_boolean(writer, bools, num_non_null);
@@ -1229,35 +1190,12 @@ carquet_status_t carquet_page_writer_add_values(
 
         case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY: {
             const uint8_t* fixed = (const uint8_t*)values;
-            if (writer->encoding == CARQUET_ENCODING_BYTE_STREAM_SPLIT) {
-                /* Accumulate raw values; apply_byte_stream_split() transposes
-                 * the page once, at finalize. See encode_float_values(). */
-                status = carquet_encode_plain_fixed_byte_array(
-                    fixed, num_non_null, writer->type_length,
-                    &writer->values_buffer);
-            } else if (writer->encoding == CARQUET_ENCODING_DELTA_BYTE_ARRAY) {
-                /* Spec allows DELTA_BYTE_ARRAY for FLBA: present each
-                 * fixed-width value as a byte array of length type_length. */
-                if (num_non_null > 0) {
-                    carquet_byte_array_t* tmp = carquet_mem_malloc(
-                        (size_t)num_non_null * sizeof(carquet_byte_array_t));
-                    if (!tmp) {
-                        status = CARQUET_ERROR_OUT_OF_MEMORY;
-                    } else {
-                        for (int64_t i = 0; i < num_non_null; i++) {
-                            tmp[i].data = (uint8_t*)(fixed + i * writer->type_length);
-                            tmp[i].length = writer->type_length;
-                        }
-                        status = carquet_delta_strings_encode(
-                            tmp, (int32_t)num_non_null, &writer->values_buffer);
-                        carquet_mem_free(tmp);
-                    }
-                }
-            } else {
-                status = carquet_encode_plain_fixed_byte_array(fixed, num_non_null,
-                                                                writer->type_length,
-                                                                &writer->values_buffer);
-            }
+            /* Raw values for every encoding: BYTE_STREAM_SPLIT is transposed
+             * and DELTA_BYTE_ARRAY (spec-valid for FLBA) is encoded once per
+             * page, at finalize. */
+            status = carquet_encode_plain_fixed_byte_array(
+                fixed, num_non_null, writer->type_length,
+                &writer->values_buffer);
             if (status == CARQUET_OK && writer->write_statistics) {
                 update_statistics_flba(writer, fixed, num_non_null, writer->type_length);
             }
@@ -1768,7 +1706,7 @@ static carquet_status_t apply_byte_stream_split(carquet_page_writer_t* writer) {
     if (writer->encoding != CARQUET_ENCODING_BYTE_STREAM_SPLIT) {
         return CARQUET_OK;
     }
-    if (writer->bss_applied || writer->values_buffer.size == 0) {
+    if (writer->deferred_applied || writer->values_buffer.size == 0) {
         return CARQUET_OK;
     }
 
@@ -1795,19 +1733,136 @@ static carquet_status_t apply_byte_stream_split(carquet_page_writer_t* writer) {
     }
     size_t count = size / width;
 
-    uint8_t* planes = (uint8_t*)carquet_mem_malloc(size);
-    if (!planes) {
-        return CARQUET_ERROR_OUT_OF_MEMORY;
+    /* Transpose into the reusable staging buffer (no per-page malloc), then
+     * swap it in as the values buffer. build_page_payload clears staging
+     * before it uses it, so handing it the old values allocation is safe. */
+    carquet_buffer_clear(&writer->staging_buffer);
+    carquet_status_t rs = carquet_buffer_reserve(&writer->staging_buffer, size);
+    if (rs != CARQUET_OK) {
+        return rs;
     }
+    uint8_t* planes = writer->staging_buffer.data;
     const uint8_t* src = writer->values_buffer.data;
-    for (size_t i = 0; i < count; i++) {
+    if (width == 4) {
+        /* The 4/8-byte transposers are byte-level and need no alignment;
+         * they take the SIMD path when one is wired for this CPU. */
+        carquet_dispatch_byte_split_encode_float(
+            (const float*)(const void*)src, (int64_t)count, planes);
+    } else if (width == 8) {
+        carquet_dispatch_byte_split_encode_double(
+            (const double*)(const void*)src, (int64_t)count, planes);
+    } else {
+        /* Generic width (FIXED_LEN_BYTE_ARRAY): plane-major so the writes
+         * stream sequentially; the strided reads stay within one value. */
         for (size_t b = 0; b < width; b++) {
-            planes[b * count + i] = src[i * width + b];
+            uint8_t* plane = planes + b * count;
+            const uint8_t* in = src + b;
+            for (size_t i = 0; i < count; i++) {
+                plane[i] = in[i * width];
+            }
         }
     }
-    memcpy(writer->values_buffer.data, planes, size);
-    carquet_mem_free(planes);
-    writer->bss_applied = true;
+    writer->staging_buffer.size = size;
+
+    carquet_buffer_t tmp = writer->values_buffer;
+    writer->values_buffer = writer->staging_buffer;
+    writer->staging_buffer = tmp;
+    writer->deferred_applied = true;
+    return CARQUET_OK;
+}
+
+/* Encode the accumulated raw values as the page's single DELTA_* stream. Runs
+ * even for a page with no values: every delta encoding still carries its
+ * header then, and the decoder hits EOF without it. Idempotent within a page,
+ * like apply_byte_stream_split(). */
+static carquet_status_t apply_delta_encoding(carquet_page_writer_t* writer) {
+    carquet_encoding_t enc = writer->encoding;
+    bool binary = enc == CARQUET_ENCODING_DELTA_BINARY_PACKED &&
+                  (writer->type == CARQUET_PHYSICAL_INT32 ||
+                   writer->type == CARQUET_PHYSICAL_INT64);
+    bool strings = (enc == CARQUET_ENCODING_DELTA_LENGTH_BYTE_ARRAY &&
+                    writer->type == CARQUET_PHYSICAL_BYTE_ARRAY) ||
+                   (enc == CARQUET_ENCODING_DELTA_BYTE_ARRAY &&
+                    (writer->type == CARQUET_PHYSICAL_BYTE_ARRAY ||
+                     writer->type == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY));
+    if ((!binary && !strings) || writer->deferred_applied) {
+        return CARQUET_OK;
+    }
+
+    const uint8_t* src = writer->values_buffer.data;
+    size_t size = writer->values_buffer.size;
+    carquet_buffer_clear(&writer->staging_buffer);
+    carquet_status_t status = CARQUET_OK;
+
+    if (binary) {
+        size_t width = writer->type == CARQUET_PHYSICAL_INT32 ? 4 : 8;
+        size_t count = size / width;
+        if (size % width != 0 || count > (size_t)INT32_MAX) {
+            return CARQUET_ERROR_ENCODE;
+        }
+        /* Delta output never exceeds plain size by more than block/miniblock
+         * headers; this bound is comfortably safe. */
+        size_t cap = size + count + 512;
+        status = carquet_buffer_reserve(&writer->staging_buffer, cap);
+        if (status != CARQUET_OK) return status;
+        size_t written = 0;
+        /* values_buffer.data is allocator-aligned and holds whole values. */
+        status = width == 4
+            ? carquet_delta_encode_int32((const int32_t*)(const void*)src,
+                  (int32_t)count, writer->staging_buffer.data, cap, &written)
+            : carquet_delta_encode_int64((const int64_t*)(const void*)src,
+                  (int32_t)count, writer->staging_buffer.data, cap, &written);
+        if (status != CARQUET_OK) return status;
+        writer->staging_buffer.size = written;
+    } else {
+        /* Rebuild the value views over the accumulated page. */
+        size_t count = 0;
+        bool fixed = writer->type == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY;
+        if (fixed) {
+            if (writer->type_length <= 0 || size % (size_t)writer->type_length != 0) {
+                return CARQUET_ERROR_ENCODE;
+            }
+            count = size / (size_t)writer->type_length;
+        } else {
+            for (size_t pos = 0; pos < size; count++) {
+                if (size - pos < 4) return CARQUET_ERROR_ENCODE;
+                uint32_t len = (uint32_t)src[pos] | ((uint32_t)src[pos + 1] << 8) |
+                               ((uint32_t)src[pos + 2] << 16) | ((uint32_t)src[pos + 3] << 24);
+                if (len > size - pos - 4) return CARQUET_ERROR_ENCODE;
+                pos += 4 + (size_t)len;
+            }
+        }
+        if (count > (size_t)INT32_MAX) return CARQUET_ERROR_ENCODE;
+
+        carquet_byte_array_t* views = NULL;
+        if (count > 0) {
+            views = carquet_mem_malloc(count * sizeof(carquet_byte_array_t));
+            if (!views) return CARQUET_ERROR_OUT_OF_MEMORY;
+            size_t pos = 0;
+            for (size_t i = 0; i < count; i++) {
+                if (fixed) {
+                    views[i].data = (uint8_t*)src + i * (size_t)writer->type_length;
+                    views[i].length = writer->type_length;
+                } else {
+                    uint32_t len = (uint32_t)src[pos] | ((uint32_t)src[pos + 1] << 8) |
+                                   ((uint32_t)src[pos + 2] << 16) | ((uint32_t)src[pos + 3] << 24);
+                    views[i].data = (uint8_t*)src + pos + 4;
+                    views[i].length = (int32_t)len;
+                    pos += 4 + (size_t)len;
+                }
+            }
+        }
+        status = enc == CARQUET_ENCODING_DELTA_LENGTH_BYTE_ARRAY
+            ? carquet_delta_length_encode(views, (int32_t)count, &writer->staging_buffer)
+            : carquet_delta_strings_encode(views, (int32_t)count, &writer->staging_buffer);
+        carquet_mem_free(views);
+        if (status != CARQUET_OK) return status;
+    }
+
+    carquet_buffer_t tmp = writer->values_buffer;
+    writer->values_buffer = writer->staging_buffer;
+    writer->staging_buffer = tmp;
+    writer->deferred_applied = true;
     return CARQUET_OK;
 }
 
@@ -1847,6 +1902,10 @@ carquet_status_t carquet_page_writer_finalize_to_buffer(
     carquet_status_t split_status = apply_byte_stream_split(writer);
     if (split_status != CARQUET_OK) {
         return split_status;
+    }
+    carquet_status_t delta_status = apply_delta_encoding(writer);
+    if (delta_status != CARQUET_OK) {
+        return delta_status;
     }
 
     if (writer->data_page_v2) {
@@ -2162,7 +2221,8 @@ size_t carquet_page_writer_estimated_size(const carquet_page_writer_t* writer) {
     if (!writer) return 0;
     return writer->values_buffer.size +
            writer->def_levels_buffer.size +
-           writer->rep_levels_buffer.size + 64;  /* Header overhead */
+           writer->rep_levels_buffer.size +
+           CARQUET_PAGE_SIZE_ESTIMATE_OVERHEAD;  /* Header overhead */
 }
 
 int64_t carquet_page_writer_num_values(const carquet_page_writer_t* writer) {
@@ -2243,4 +2303,42 @@ bool carquet_page_writer_get_statistics(
 
 int64_t carquet_page_writer_null_count(const carquet_page_writer_t* writer) {
     return writer ? writer->num_nulls : 0;
+}
+
+/* ============================================================================
+ * Scratch page writers (page-granular parallel encode, see page_tasks.h)
+ * ============================================================================
+ */
+
+carquet_page_writer_t* carquet_page_writer_create_scratch(void) {
+    return carquet_page_writer_create(CARQUET_PHYSICAL_INT32, NULL,
+                                      CARQUET_ENCODING_PLAIN,
+                                      CARQUET_COMPRESSION_UNCOMPRESSED,
+                                      0, 0, 0, 0);
+}
+
+carquet_status_t carquet_page_writer_adopt_config(
+    carquet_page_writer_t* dst,
+    const carquet_page_writer_t* src) {
+
+    if (!dst || !src) return CARQUET_ERROR_INVALID_ARGUMENT;
+    /* The level histograms are sized at create time (one bucket per level);
+     * a scratch writer is flat, so only flat columns can be adopted. Geo
+     * statistics span a column, not a page, so they stay serial too. */
+    if (src->max_def_level != 0 || src->max_rep_level != 0 || src->geo_enabled ||
+        dst->max_def_level != 0 || dst->max_rep_level != 0) {
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+    dst->type = src->type;
+    dst->logical_type = src->logical_type;
+    dst->encoding = src->encoding;
+    dst->compression = src->compression;
+    dst->compression_level = src->compression_level;
+    dst->type_length = src->type_length;
+    dst->write_crc = src->write_crc;
+    dst->write_statistics = src->write_statistics;
+    dst->data_page_v2 = src->data_page_v2;
+    dst->geo_enabled = false;
+    carquet_page_writer_reset(dst);
+    return CARQUET_OK;
 }

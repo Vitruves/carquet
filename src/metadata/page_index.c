@@ -169,6 +169,15 @@ void carquet_column_index_builder_destroy(carquet_column_index_builder_t* builde
 /**
  * Ensure capacity for more pages.
  */
+/* Grow one builder array to `n` elements in place, returning OOM from the
+ * enclosing function on failure with the array untouched. */
+#define PAGE_INDEX_GROW(arr, n)                                              \
+    do {                                                                     \
+        void* grown_ = carquet_mem_realloc((arr), (size_t)(n) * sizeof(*(arr))); \
+        if (!grown_) return CARQUET_ERROR_OUT_OF_MEMORY;                     \
+        (arr) = grown_;                                                      \
+    } while (0)
+
 static carquet_status_t ensure_capacity(carquet_column_index_builder_t* builder) {
     if (builder->num_pages < builder->capacity) {
         return CARQUET_OK;
@@ -176,24 +185,16 @@ static carquet_status_t ensure_capacity(carquet_column_index_builder_t* builder)
 
     int32_t new_cap = builder->capacity * 2;
 
-    int64_t* new_null_counts = carquet_mem_realloc(builder->null_counts, new_cap * sizeof(int64_t));
-    uint8_t** new_min_values = carquet_mem_realloc(builder->min_values, new_cap * sizeof(uint8_t*));
-    int32_t* new_min_lens = carquet_mem_realloc(builder->min_value_lens, new_cap * sizeof(int32_t));
-    uint8_t** new_max_values = carquet_mem_realloc(builder->max_values, new_cap * sizeof(uint8_t*));
-    int32_t* new_max_lens = carquet_mem_realloc(builder->max_value_lens, new_cap * sizeof(int32_t));
-    bool* new_null_pages = carquet_mem_realloc(builder->null_pages, new_cap * sizeof(bool));
-
-    if (!new_null_counts || !new_min_values || !new_max_values ||
-        !new_min_lens || !new_max_lens || !new_null_pages) {
-        return CARQUET_ERROR_OUT_OF_MEMORY;
-    }
-
-    builder->null_counts = new_null_counts;
-    builder->min_values = new_min_values;
-    builder->min_value_lens = new_min_lens;
-    builder->max_values = new_max_values;
-    builder->max_value_lens = new_max_lens;
-    builder->null_pages = new_null_pages;
+    /* Publish each array as soon as its realloc succeeds. If a later one
+     * fails, every pointer in the builder is still live (and at least as large
+     * as `capacity` says); holding the results back until all succeeded would
+     * leave the builder pointing at blocks realloc had already freed. */
+    PAGE_INDEX_GROW(builder->null_counts, new_cap);
+    PAGE_INDEX_GROW(builder->min_values, new_cap);
+    PAGE_INDEX_GROW(builder->min_value_lens, new_cap);
+    PAGE_INDEX_GROW(builder->max_values, new_cap);
+    PAGE_INDEX_GROW(builder->max_value_lens, new_cap);
+    PAGE_INDEX_GROW(builder->null_pages, new_cap);
 
     /* Grow the flattened histogram arrays. The layout is page-major and
      * contiguous, so the existing num_pages*len prefix survives the realloc. */
@@ -463,17 +464,9 @@ static carquet_status_t offset_ensure_capacity(carquet_offset_index_builder_t* b
 
     int32_t new_cap = builder->capacity * 2;
 
-    int64_t* new_offsets = carquet_mem_realloc(builder->offsets, new_cap * sizeof(int64_t));
-    int32_t* new_compressed = carquet_mem_realloc(builder->compressed_sizes, new_cap * sizeof(int32_t));
-    int64_t* new_first_rows = carquet_mem_realloc(builder->first_row_indices, new_cap * sizeof(int64_t));
-
-    if (!new_offsets || !new_compressed || !new_first_rows) {
-        return CARQUET_ERROR_OUT_OF_MEMORY;
-    }
-
-    builder->offsets = new_offsets;
-    builder->compressed_sizes = new_compressed;
-    builder->first_row_indices = new_first_rows;
+    PAGE_INDEX_GROW(builder->offsets, new_cap);
+    PAGE_INDEX_GROW(builder->compressed_sizes, new_cap);
+    PAGE_INDEX_GROW(builder->first_row_indices, new_cap);
 
     if (builder->track_unencoded) {
         int64_t* new_unencoded = carquet_mem_realloc(builder->unencoded_bytes, new_cap * sizeof(int64_t));

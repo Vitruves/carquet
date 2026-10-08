@@ -14,6 +14,7 @@
 #include "core/float16.h"
 #include "thrift/thrift_encode.h"
 #include "thrift/parquet_types.h"
+#include "page_tasks.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -252,8 +253,8 @@ typedef struct carquet_column_writer_internal {
      * compression run concurrently across columns. Output is byte-identical
      * to the eager path (same bytes, same code, different thread). */
     bool defer_encode;
-    carquet_buffer_t deferred_values;   /* full-width raw value bytes */
-    int64_t deferred_count;             /* logical values stashed */
+    carquet_buffer_t deferred_values;   /* full-width raw value bytes, non-nulls only */
+    int64_t deferred_count;             /* logical values stashed (nulls included) */
     int16_t* deferred_def_levels;
     size_t deferred_def_capacity;
     int64_t deferred_def_count;
@@ -592,7 +593,8 @@ static int compare_stat_values(carquet_physical_type_t type,
     }
     /* BYTE_ARRAY / FLBA / mismatched sizes: lexicographic unsigned compare. */
     size_t n = alen < blen ? alen : blen;
-    int c = memcmp(a, b, n);
+    /* n == 0 can pair with a NULL pointer (an empty BYTE_ARRAY min/max). */
+    int c = n ? memcmp(a, b, n) : 0;
     if (c != 0) return c;
     if (alen < blen) return -1;
     if (alen > blen) return 1;
@@ -610,20 +612,20 @@ static carquet_status_t column_stats_grow(uint8_t** buf, size_t* cap, size_t nee
     return CARQUET_OK;
 }
 
+/* Fold one page's min/max into the chunk's. Only called for a page that has
+ * statistics, so a zero size is a real value (the empty BYTE_ARRAY, possibly
+ * with a NULL pointer), not "absent": skipping such a page would leave the
+ * chunk bounds narrower than its data and let readers prune matching rows. */
 static void merge_page_statistics(carquet_column_writer_internal_t* writer,
                                   const uint8_t* page_min, size_t min_size,
                                   const uint8_t* page_max, size_t max_size) {
-    if (!page_min || !page_max || min_size == 0 || max_size == 0) {
-        return;
-    }
-
     if (!writer->has_min_max) {
         if (column_stats_grow(&writer->min_value, &writer->min_value_capacity,
                               min_size) != CARQUET_OK) return;
         if (column_stats_grow(&writer->max_value, &writer->max_value_capacity,
                               max_size) != CARQUET_OK) return;
-        memcpy(writer->min_value, page_min, min_size);
-        memcpy(writer->max_value, page_max, max_size);
+        if (min_size > 0) memcpy(writer->min_value, page_min, min_size);
+        if (max_size > 0) memcpy(writer->max_value, page_max, max_size);
         writer->min_value_size = min_size;
         writer->max_value_size = max_size;
         writer->has_min_max = true;
@@ -635,7 +637,7 @@ static void merge_page_statistics(carquet_column_writer_internal_t* writer,
                             writer->min_value, writer->min_value_size) < 0) {
         if (column_stats_grow(&writer->min_value, &writer->min_value_capacity,
                               min_size) != CARQUET_OK) return;
-        memcpy(writer->min_value, page_min, min_size);
+        if (min_size > 0) memcpy(writer->min_value, page_min, min_size);
         writer->min_value_size = min_size;
     }
     if (compare_stat_values(writer->type, &writer->logical_type,
@@ -643,7 +645,7 @@ static void merge_page_statistics(carquet_column_writer_internal_t* writer,
                             writer->max_value, writer->max_value_size) > 0) {
         if (column_stats_grow(&writer->max_value, &writer->max_value_capacity,
                               max_size) != CARQUET_OK) return;
-        memcpy(writer->max_value, page_max, max_size);
+        if (max_size > 0) memcpy(writer->max_value, page_max, max_size);
         writer->max_value_size = max_size;
     }
 }
@@ -671,6 +673,12 @@ static carquet_status_t flush_current_page(carquet_column_writer_internal_t* wri
     if (!has_stats) {
         page_null_count = carquet_page_writer_null_count(writer->page_writer);
     }
+    /* A null page holds no present value. Missing min/max does not imply
+     * that: statistics may be disabled, undefined for the type, or withheld
+     * for an all-NaN page, and readers skip a null page for any value
+     * predicate. */
+    bool is_null_page =
+        page_null_count == carquet_page_writer_num_values(writer->page_writer);
 
     /* Accumulate column-level statistics across pages */
     writer->total_nulls += page_null_count;
@@ -708,7 +716,6 @@ static carquet_status_t flush_current_page(carquet_column_writer_internal_t* wri
 
     /* Record page index entries before appending */
     if (writer->column_index) {
-        bool is_null_page = !has_stats;
         carquet_column_index_add_page(
             writer->column_index,
             page_null_count,
@@ -998,12 +1005,8 @@ static carquet_status_t encode_batch_eager(
          * chunk. REQUIRED columns (max_def_level == 0 or def_levels NULL)
          * have all entries non-null. */
         if (def_levels && writer->max_def_level > 0) {
-            int64_t non_null = 0;
-            int16_t max_def = writer->max_def_level;
-            for (int64_t k = 0; k < chunk; k++) {
-                if (def_levels[offset + k] == max_def) non_null++;
-            }
-            values_offset += non_null;
+            values_offset += carquet_dispatch_count_non_nulls(
+                def_levels + offset, chunk, writer->max_def_level);
         } else {
             values_offset += chunk;
         }
@@ -1034,10 +1037,21 @@ static carquet_status_t stash_deferred_batch(
     const int16_t* def_levels,
     const int16_t* rep_levels) {
 
+    /* `values` is packed: for an OPTIONAL column it holds only the non-null
+     * entries, so it is shorter than num_values wherever there are nulls.
+     * Copy exactly what is there. The replay walks the stash with the same
+     * packed cursor, so batches must also sit back to back with no room left
+     * for the nulls. */
+    int64_t num_packed = num_values;
+    if (def_levels && writer->max_def_level > 0) {
+        num_packed = carquet_dispatch_count_non_nulls(
+            def_levels, num_values, writer->max_def_level);
+    }
+
     size_t stride = physical_type_stride(writer->type, writer->type_length);
     carquet_status_t s = carquet_buffer_append(
         &writer->deferred_values, (const uint8_t*)values,
-        (size_t)num_values * stride);
+        (size_t)num_packed * stride);
     if (s != CARQUET_OK) return s;
 
     if (writer->max_def_level > 0) {
@@ -1074,8 +1088,14 @@ static carquet_status_t stash_deferred_batch(
 static carquet_status_t drain_deferred(
     carquet_column_writer_internal_t* writer) {
     if (writer->deferred_count == 0) return CARQUET_OK;
+    /* A stash whose rows are all null holds no value bytes and may never have
+     * allocated; add_values rejects a NULL values pointer even then. */
+    static const uint8_t no_values[1] = {0};
+    const void* stashed = writer->deferred_values.data
+        ? (const void*)writer->deferred_values.data
+        : (const void*)no_values;
     carquet_status_t s = encode_batch_eager(
-        writer, writer->deferred_values.data, writer->deferred_count,
+        writer, stashed, writer->deferred_count,
         writer->max_def_level > 0 ? writer->deferred_def_levels : NULL,
         writer->max_rep_level > 0 ? writer->deferred_rep_levels : NULL);
     /* Free the stash early; the column buffer now holds the encoded pages. */
@@ -1643,4 +1663,242 @@ carquet_column_index_builder_t* carquet_column_writer_get_column_index(
 carquet_offset_index_builder_t* carquet_column_writer_get_offset_index(
     const carquet_column_writer_internal_t* writer) {
     return writer ? writer->offset_index : NULL;
+}
+
+/* ============================================================================
+ * Page-granular parallel encode (see page_tasks.h)
+ * ============================================================================
+ */
+
+/* Flat, fixed-stride, non-dictionary deferred columns whose page boundaries
+ * depend only on the value count. Everything else keeps the serial replay. */
+static bool parallel_pages_eligible(const carquet_column_writer_internal_t* w) {
+    if (!w->defer_encode || w->use_dictionary) return false;
+    if (w->deferred_count <= 0 || !w->deferred_values.data) return false;
+    if (w->max_def_level != 0 || w->max_rep_level != 0) return false;
+    /* Bloom insertion and page-index entries are serial, page-ordered side
+     * effects of the eager flush; keep those columns on that path. */
+    if (w->bloom_filter || w->column_index || w->offset_index) return false;
+    if (w->encoding != CARQUET_ENCODING_PLAIN &&
+        w->encoding != CARQUET_ENCODING_BYTE_STREAM_SPLIT) {
+        return false;
+    }
+    switch (w->type) {
+        case CARQUET_PHYSICAL_INT32:
+        case CARQUET_PHYSICAL_INT64:
+        case CARQUET_PHYSICAL_FLOAT:
+        case CARQUET_PHYSICAL_DOUBLE:
+        case CARQUET_PHYSICAL_INT96:
+            break;
+        case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY:
+            if (w->type_length <= 0) return false;
+            break;
+        default:
+            /* BOOLEAN packs bits (page size is not count * stride) and
+             * BYTE_ARRAY is variable-length. */
+            return false;
+    }
+    size_t stride = physical_type_stride(w->type, w->type_length);
+    if (stride == 0 ||
+        w->deferred_values.size != (size_t)w->deferred_count * stride) {
+        return false;
+    }
+    return true;
+}
+
+int32_t carquet_column_writer_plan_page_tasks(
+    carquet_column_writer_internal_t* writer,
+    carquet_page_task_t* tasks,
+    int32_t capacity) {
+
+    if (!writer || !parallel_pages_eligible(writer)) return 0;
+
+    /* Mirror encode_batch_eager: chunks of max_chunk values, a flush once the
+     * page's estimated size reaches the target (or the row cap), and a final
+     * flush of whatever is left at finalize. */
+    size_t stride = physical_type_stride(writer->type, writer->type_length);
+    int64_t max_chunk = (int64_t)(writer->target_page_size / stride);
+    if (max_chunk < 1024) max_chunk = 1024;
+    if (writer->write_batch_size > 0 && writer->write_batch_size < max_chunk) {
+        max_chunk = writer->write_batch_size;
+    }
+
+    int64_t total = writer->deferred_count;
+    int64_t offset = 0;
+    int64_t page_start = 0;
+    int64_t page_values = 0;
+    int32_t n = 0;
+    while (offset < total) {
+        int64_t chunk = total - offset;
+        if (chunk > max_chunk) chunk = max_chunk;
+        page_values += chunk;
+        offset += chunk;
+
+        bool flush =
+            (size_t)page_values * stride + CARQUET_PAGE_SIZE_ESTIMATE_OVERHEAD >=
+                writer->target_page_size ||
+            (writer->max_rows_per_page > 0 &&
+             page_values >= writer->max_rows_per_page);
+        if (flush || offset == total) {
+            if (tasks && n < capacity) {
+                tasks[n].column = writer;
+                tasks[n].first_value = page_start;
+                tasks[n].num_values = page_values;
+            }
+            if (n == INT32_MAX) return 0;
+            n++;
+            page_start = offset;
+            page_values = 0;
+        }
+    }
+    return n;
+}
+
+static carquet_status_t task_copy_stat(uint8_t** buf, size_t* cap, size_t* len,
+                                       const uint8_t* src, size_t n) {
+    carquet_status_t s = column_stats_grow(buf, cap, n);
+    if (s != CARQUET_OK) return s;
+    memcpy(*buf, src, n);
+    *len = n;
+    return CARQUET_OK;
+}
+
+void carquet_column_writer_run_page_task(
+    carquet_page_task_t* task,
+    carquet_page_writer_t* scratch) {
+
+    carquet_column_writer_internal_t* w = task->column;
+    task->has_stats = false;
+    task->page_size = 0;
+    task->uncompressed_size = 0;
+    task->compressed_size = 0;
+    task->null_count = 0;
+    task->def_hist0 = 0;
+    task->rep_hist0 = 0;
+
+    if (!w || !scratch || !task->out) {
+        task->status = CARQUET_ERROR_INVALID_ARGUMENT;
+        return;
+    }
+    task->status = carquet_page_writer_adopt_config(scratch, w->page_writer);
+    if (task->status != CARQUET_OK) return;
+
+    size_t stride = physical_type_stride(w->type, w->type_length);
+    const uint8_t* values = w->deferred_values.data + (size_t)task->first_value * stride;
+    task->status = carquet_page_writer_add_values(scratch, values, task->num_values,
+                                                  NULL, NULL);
+    if (task->status != CARQUET_OK) return;
+
+    /* Same capture order as flush_current_page: statistics first, then the
+     * page bytes. The scratch writer is reused by the next task, so the
+     * min/max bytes are copied out. */
+    const uint8_t* page_min = NULL;
+    const uint8_t* page_max = NULL;
+    size_t min_size = 0, max_size = 0;
+    int64_t nulls = 0;
+    task->has_stats = carquet_page_writer_get_statistics(
+        scratch, &page_min, &min_size, &page_max, &max_size, &nulls);
+    task->null_count = task->has_stats ? nulls : carquet_page_writer_null_count(scratch);
+    if (task->has_stats) {
+        task->status = task_copy_stat(&task->min_value, &task->min_capacity,
+                                      &task->min_size, page_min, min_size);
+        if (task->status == CARQUET_OK) {
+            task->status = task_copy_stat(&task->max_value, &task->max_capacity,
+                                          &task->max_size, page_max, max_size);
+        }
+        if (task->status != CARQUET_OK) return;
+    }
+
+    carquet_buffer_clear(task->out);
+    task->status = carquet_page_writer_finalize_to_buffer(
+        scratch, task->out, &task->page_size,
+        &task->uncompressed_size, &task->compressed_size);
+    if (task->status != CARQUET_OK) return;
+
+    int32_t len = 0;
+    const int64_t* hist = carquet_page_writer_def_level_histogram(scratch, &len);
+    if (hist && len == 1) task->def_hist0 = hist[0];
+    hist = carquet_page_writer_rep_level_histogram(scratch, &len);
+    if (hist && len == 1) task->rep_hist0 = hist[0];
+
+    carquet_page_writer_reset(scratch);
+}
+
+carquet_status_t carquet_column_writer_assemble_page_tasks(
+    carquet_column_writer_internal_t* writer,
+    carquet_page_task_t* tasks,
+    int32_t count) {
+
+    if (!writer || (!tasks && count > 0)) return CARQUET_ERROR_INVALID_ARGUMENT;
+
+    size_t total = 0;
+    for (int32_t k = 0; k < count; k++) {
+        if (tasks[k].status != CARQUET_OK) return tasks[k].status;
+        if (tasks[k].column != writer || !tasks[k].out) {
+            return CARQUET_ERROR_INVALID_ARGUMENT;
+        }
+        total += tasks[k].out->size;
+    }
+    carquet_status_t status = carquet_buffer_reserve(
+        &writer->column_buffer, writer->column_buffer.size + total);
+    if (status != CARQUET_OK) return status;
+
+    /* The bookkeeping of flush_current_page, page by page in file order. A
+     * flat column has one histogram bucket, and no bloom filter or page
+     * index (eligibility rules both out). */
+    for (int32_t k = 0; k < count; k++) {
+        carquet_page_task_t* t = &tasks[k];
+        writer->total_nulls += t->null_count;
+        if (t->has_stats) {
+            merge_page_statistics(writer, t->min_value, t->min_size,
+                                  t->max_value, t->max_size);
+        }
+        status = carquet_buffer_append(&writer->column_buffer,
+                                       t->out->data, t->out->size);
+        if (status != CARQUET_OK) return status;
+        writer->chunk_def_hist[0] += t->def_hist0;
+        writer->chunk_rep_hist[0] += t->rep_hist0;
+        writer->total_uncompressed_size += t->uncompressed_size;
+        writer->total_compressed_size += t->compressed_size;
+        writer->num_pages++;
+    }
+
+    /* The stash is spent; finalize's replay then has nothing left to do. */
+    carquet_buffer_clear(&writer->deferred_values);
+    writer->deferred_count = 0;
+    writer->deferred_def_count = 0;
+    writer->deferred_rep_count = 0;
+    return CARQUET_OK;
+}
+
+void carquet_page_task_release(carquet_page_task_t* task) {
+    if (!task) return;
+    carquet_mem_free(task->min_value);
+    carquet_mem_free(task->max_value);
+    task->min_value = NULL;
+    task->max_value = NULL;
+    task->min_size = task->max_size = 0;
+    task->min_capacity = task->max_capacity = 0;
+}
+
+/* Hand the finalized chunk bytes to the caller. The column keeps writing into
+ * `spare` (an owned buffer the caller no longer needs, typically one it wrote
+ * to the file earlier) or into a fresh buffer when there is none; the spare
+ * is consumed either way. Lets a file writer keep one row group in flight on
+ * a background thread while the next one is encoded. */
+void carquet_column_writer_detach_buffer(
+    carquet_column_writer_internal_t* writer,
+    carquet_buffer_t* out,
+    carquet_buffer_t* spare) {
+
+    if (!writer || !out) return;
+    *out = writer->column_buffer;
+    if (spare && spare->owns_data) {
+        writer->column_buffer = *spare;
+        carquet_buffer_clear(&writer->column_buffer);
+    } else {
+        if (spare) carquet_buffer_destroy(spare);
+        carquet_buffer_init(&writer->column_buffer);
+    }
+    if (spare) carquet_buffer_init(spare);
 }

@@ -299,6 +299,7 @@ typedef struct {
     carquet_physical_type_t pt;
     int32_t  type_length;
     size_t   stride;        /* fixed-width byte stride; 0 for byte array */
+    size_t   narrow;        /* Arrow element width for INTEGER(8|16), else 0 */
     bool     is_bool;
     bool     is_bytearray;
     void*    values;        /* dense present values */
@@ -310,6 +311,30 @@ typedef struct {
  * Array assembly
  * ============================================================================
  */
+
+/* Arrow value width of an INT32 column annotated INTEGER(8|16): the schema
+ * exports it as int8/uint8/int16/uint16, so the values buffer must hold 1- or
+ * 2-byte elements rather than carquet's 4-byte physical values. 0 otherwise. */
+static size_t arrow_narrow_int_width(carquet_physical_type_t pt,
+                                     const carquet_logical_type_t* lt) {
+    if (pt != CARQUET_PHYSICAL_INT32 || !lt || lt->id != CARQUET_LOGICAL_INTEGER) return 0;
+    if (lt->params.integer.bit_width == 8) return 1;
+    if (lt->params.integer.bit_width == 16) return 2;
+    return 0;
+}
+
+/* Truncate `n` INT32 values to `width`-byte elements (two's complement, so the
+ * same code serves the signed and unsigned Arrow types). */
+static void arrow_narrow_int_store(uint8_t* dst, const uint8_t* src_i32, size_t width) {
+    int32_t v;
+    memcpy(&v, src_i32, sizeof(v));
+    if (width == 1) {
+        dst[0] = (uint8_t)v;
+    } else {
+        uint16_t t = (uint16_t)v;
+        memcpy(dst, &t, sizeof(t));
+    }
+}
 typedef struct {
     const carquet_schema_t* cs;
     rleaf_t* leaves;        /* [num_leaves] */
@@ -395,13 +420,21 @@ static carquet_status_t build_leaf(rctx_t* ctx, int32_t leaf_col, int16_t exist_
         a->n_buffers = 2; a->buffers = bufs;
     } else {
         size_t stride = L->stride;
-        uint8_t* data = (uint8_t*)calloc((size_t)(len > 0 ? len : 1) * stride, 1);
+        size_t ostride = L->narrow ? L->narrow : stride;
+        uint8_t* data = (uint8_t*)calloc((size_t)(len > 0 ? len : 1) * ostride, 1);
         const void** bufs = (const void**)malloc(2 * sizeof(void*));
         if (!data || !bufs) { free(data); free(bufs); rc = CARQUET_ERROR_OUT_OF_MEMORY; goto fail; }
         const uint8_t* src = (const uint8_t*)L->values;
         int64_t vc = 0;
         for (int64_t i = 0; i < len; i++) {
-            if (present[i]) { memcpy(data + (size_t)i * stride, src + (size_t)vc * stride, stride); vc++; }
+            if (!present[i]) continue;
+            if (L->narrow) {
+                arrow_narrow_int_store(data + (size_t)i * ostride,
+                                       src + (size_t)vc * stride, ostride);
+            } else {
+                memcpy(data + (size_t)i * stride, src + (size_t)vc * stride, stride);
+            }
+            vc++;
         }
         bufs[0] = validity; bufs[1] = data;
         a->n_buffers = 2; a->buffers = bufs;
@@ -624,6 +657,8 @@ carquet_status_t carquet_reader_read_arrow(
         L->max_rep = cs->max_rep_levels[l];
         L->is_bool = (el->type == CARQUET_PHYSICAL_BOOLEAN);
         L->is_bytearray = (el->type == CARQUET_PHYSICAL_BYTE_ARRAY);
+        L->narrow = arrow_narrow_int_width(
+            el->type, el->has_logical_type ? &el->logical_type : NULL);
         switch (el->type) {
         case CARQUET_PHYSICAL_INT32: case CARQUET_PHYSICAL_FLOAT: L->stride = 4; break;
         case CARQUET_PHYSICAL_INT64: case CARQUET_PHYSICAL_DOUBLE: L->stride = 8; break;

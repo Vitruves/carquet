@@ -85,6 +85,7 @@ carquet_reader_close(reader);
 
 Notes:
 
+- The loop above exits on any non-`CARQUET_OK` status. To tell end-of-file from a genuine failure, keep the status and consult `carquet_batch_reader_last_error()` — `carquet_batch_reader_next()` has no error out-parameter, so that accessor is the only way to get the message (see [error-handling.md](error-handling.md#per-read-error-reporting-on-the-batch-reader)).
 - `column_indices` takes precedence over `column_names`.
 - `row_group_filter` lets you skip entire row groups before any data pages are read. Use it with `carquet_reader_row_group_matches()` or `carquet_reader_column_statistics()`.
 - `carquet_row_batch_num_columns()` is the number of projected columns, not the file-wide total.

@@ -118,9 +118,12 @@ typedef struct carquet_error {
  */
 
 /**
- * Initialize an error structure to success state.
+ * Initialize an error structure to success state. Matches carquet_error_init():
+ * the context fields use -1 for "not applicable", since 0 is a valid file
+ * offset, column and row group.
  */
-#define CARQUET_ERROR_INIT { .code = CARQUET_OK, .message = {0} }
+#define CARQUET_ERROR_INIT { .code = CARQUET_OK, .message = {0}, .offset = -1, \
+                             .column_index = -1, .row_group_index = -1 }
 
 /**
  * Check if status indicates success.

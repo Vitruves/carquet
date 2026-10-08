@@ -1,8 +1,6 @@
-<p align="center">
-  <img src="res/img/carquet_logo.png" alt="Carquet" width="280" />
-</p>
-
-<h1 align="center">Carquet</h1>
+<h1 align="center">
+  <img src="res/img/carquet_banner.png" alt="Carquet" width="840" />
+</h1>
 
 <p align="center">
   A fast, pure C library for reading and writing Apache Parquet files.
@@ -12,200 +10,61 @@
   <a href="https://github.com/Vitruves/carquet/actions/workflows/cpp.yml"><img src="https://github.com/Vitruves/carquet/actions/workflows/cpp.yml/badge.svg" alt="Build" /></a>
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue" alt="Platform" />
   <img src="https://img.shields.io/badge/C-C11-blue" alt="C Standard" />
+  <img src="https://img.shields.io/badge/version-0.7.1-blue" alt="Version" />
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License" /></a>
   <br/>
   <img src="https://img.shields.io/badge/SIMD-SSE4.2%20%7C%20AVX%20%7C%20AVX2%20%7C%20AVX--512-red" alt="x86 SIMD" />
   <img src="https://img.shields.io/badge/SIMD-NEON%20%7C%20SVE-orange" alt="ARM SIMD" />
 </p>
 
+<p align="center">
+  <a href="#highlights">Highlights</a> &nbsp;·&nbsp;
+  <a href="#installation">Installation</a> &nbsp;·&nbsp;
+  <a href="#c-api">C API</a> &nbsp;·&nbsp;
+  <a href="#cli-tool">CLI Tool</a> &nbsp;·&nbsp;
+  <a href="#benchmarks">Benchmarks</a> &nbsp;·&nbsp;
+  <a href="#parquet-feature-support">Feature Support</a> &nbsp;·&nbsp;
+  <a href="#interoperability">Interoperability</a> &nbsp;·&nbsp;
+  <a href="docs/README.md">Manual</a>
+</p>
+
+<br/>
+
+---
+
 <!-- ────────────────────────────  PRESENTATION  ──────────────────────────── -->
 
 ## Highlights
 
+**Small and self-contained**
+
 - **Pure C11** with three external dependencies (zstd, zlib, lz4) -- all auto-fetched by CMake
-- **~200KB binary** vs ~50MB+ for Arrow
+- **~500KB library** (stripped Release build, codecs linked separately) vs ~50MB+ for Arrow
 - **Built-in CLI** for file inspection (`schema`, `info`, `head`, `tail`, `stat`, ...) and C code generation (`codegen`)
+
+**Fast**
+
 - **70x faster reads** than Arrow C++ on uncompressed data (mmap zero-copy), **150x faster** than PyArrow
-- **1.2-2.6x faster compressed reads** than Arrow C++ on the same file (cross-read benchmark)
+- **1.3-2.6x faster compressed reads** than Arrow C++ on the same file (cross-read benchmark)
 - **Writes 1.0-2.3x faster** than Arrow C++ across codecs and platforms
-- Reads 10M uncompressed rows in **0.25ms** (mmap zero-copy on Apple M3)
-- Full Parquet spec: all types, encodings, compression codecs, nested schemas, bloom filters, page indexes
+- Reads 10M uncompressed rows in **0.26ms** (mmap zero-copy on Apple M3)
 - SIMD-optimized (SSE4.2, AVX2, AVX-512, NEON, SVE) with runtime detection and scalar fallbacks
+
+**Complete and compatible**
+
+- Broad Parquet coverage: all physical types and encodings, Snappy / GZIP / LZ4 / ZSTD, nested schemas, bloom filters, page indexes ([full matrix](#parquet-feature-support))
 - PyArrow, DuckDB, Spark compatible out of the box
 - [Arrow C Data Interface](docs/reading.md#export-to-arrow-c-data-interface) bridge (`carquet_arrow_export_*` / `carquet_arrow_import_*` / `carquet_writer_write_arrow` / `carquet_reader_read_arrow`) for zero-dependency, copy-light interchange with the Arrow ecosystem, with **arbitrary-depth nested read/write** (struct/list/map at any depth)
 
-<!-- ────────────────────────────  BENCHMARKS  ──────────────────────────── -->
+<br/>
 
-## Benchmarks
-
-At 10M rows (the most representative size); higher ratio = Carquet faster. ARM (Apple M3): Carquet 0.6.0 vs Arrow C++ 24.0.0. x86 (Xeon D-1531): Carquet 0.4.4 vs Arrow C++ 23.0.1.
-
-| | x86 (Xeon D-1531) | | ARM (Apple M3) | |
-|---|---|---|---|---|
-| **Codec** | **Write** | **Read** | **Write** | **Read** |
-| snappy | **1.55x** | **1.25x** | **1.88x** | **1.59x** |
-| zstd | **1.31x** | **1.04x** | **2.23x** | **1.30x** |
-| lz4 | **1.02x** | 0.83x | **1.89x** | **1.59x** |
-| none | **1.13x** | **40.6x**\* | **1.97x** | **52.9x**\* |
-
-\* Uncompressed reads use mmap zero-copy -- see note below.
-
-Compressed reads involve full decompression and decoding of every value, no shortcuts — and both libraries use the same system lz4/zstd shared libraries, so the raw codec speed is identical. The most meaningful comparison is the **same-file cross-read** table (below), where both libraries read the exact same Parquet file: Carquet reads compressed data **1.5-2.6x faster** than Arrow C++ on that apples-to-apples test.
-
-To run the benchmarks yourself, see [Running Benchmarks](#running-benchmarks).
-
-<details>
-<summary>Benchmark methodology</summary>
-
-All benchmarks use identical data (deterministic LCG PRNG), identical Parquet settings (no dictionary, BYTE_STREAM_SPLIT for floats, page checksums, mmap reads), trimmed median of 11-51 iterations, with OS page cache purged between write and read phases and cooldown between configurations. Schema: 3 columns (INT64, DOUBLE, INT32). Compared against Arrow C++ 23.0.1 low-level Parquet reader (bypassing Arrow Table materialization) and PyArrow 23.0.1.
-
-The **same-file cross-read** benchmark is the fairest comparison: both libraries read the exact same Parquet file (written by one, read by both). This eliminates differences in page sizes, encoding choices, and row group layout.
-
-**Uncompressed reads** marked with \* use Carquet's **mmap zero-copy path**: for PLAIN-encoded, uncompressed, fixed-size, required columns, the batch reader returns pointers directly into the memory-mapped file with no memcpy. Arrow always materializes into its own buffers. **The compressed read numbers are the most representative measure of end-to-end read throughput.**
-
-</details>
-
-<details>
-<summary>Full x86 results (Intel Xeon D-1531, Linux)</summary>
-
-*12 threads @ 2.2GHz, 32GB RAM, Ubuntu 24.04 -- ZSTD level 1*
-
-#### 10M rows vs Arrow C++
-
-| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio | Size |
-|-------|--------------|-----------------|---------|-------------|----------------|---------|------|
-| none | **1557ms** | 1766ms | **1.13x** | **1.25ms** | 50.8ms | **40.6x**\* | 190.7MB |
-| snappy | **1002ms** | 1549ms | **1.55x** | **78ms** | 97.8ms | **1.25x** | 125.1MB |
-| zstd | **1311ms** | 1714ms | **1.31x** | **76.8ms** | 80.2ms | **1.04x** | 95.3MB |
-| lz4 | **1521ms** | 1554ms | **1.02x** | 59.1ms | **49.0ms** | 0.83x | 122.9MB |
-
-#### 1M rows vs Arrow C++
-
-| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio |
-|-------|--------------|-----------------|---------|-------------|----------------|---------|
-| none | **180ms** | 196ms | **1.09x** | **0.22ms** | 6.2ms | **28x**\* |
-| snappy | **141ms** | 148ms | **1.05x** | **8.1ms** | 11.6ms | **1.44x** |
-| zstd | **131ms** | 185ms | **1.41x** | 10.3ms | **9.1ms** | 0.88x |
-| lz4 | **143ms** | 149ms | **1.04x** | 8.5ms | **6.1ms** | 0.72x |
-
-#### 100K rows vs Arrow C++
-
-| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio |
-|-------|--------------|-----------------|---------|-------------|----------------|---------|
-| none | **14.1ms** | 18.4ms | **1.30x** | **0.11ms** | 2.18ms | **19.8x**\* |
-| snappy | **10.1ms** | 10.6ms | **1.05x** | **1.27ms** | 5.97ms | **4.70x** |
-| zstd | **8.7ms** | 14.1ms | **1.62x** | **1.58ms** | 3.88ms | **2.46x** |
-| lz4 | **9.6ms** | 11.0ms | **1.14x** | **0.77ms** | 2.78ms | **3.61x** |
-
-#### Same-file cross-read (10M rows)
-
-Both libraries read the **same** Parquet file — the fairest apples-to-apples comparison.
-
-| Codec | Writer | Carquet Read | Arrow C++ Read | Ratio |
-|-------|--------|-------------|----------------|-------|
-| none | Carquet | **0.99ms** | 73.6ms | **74x**\* |
-| none | Arrow | **7.6ms** | 51.2ms | **6.8x**\* |
-| snappy | Carquet | **41.0ms** | 107ms | **2.61x** |
-| snappy | Arrow | **43.4ms** | 101ms | **2.33x** |
-| zstd | Carquet | **46.1ms** | 88.4ms | **1.92x** |
-| zstd | Arrow | **49.1ms** | 79.5ms | **1.62x** |
-| lz4 | Carquet | **34.8ms** | 74.8ms | **2.15x** |
-| lz4 | Arrow | **27.4ms** | 52.0ms | **1.90x** |
-
-#### 10M rows vs PyArrow
-
-| Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
-|-------|--------------|---------------|---------|-------------|--------------|---------|
-| none | **1557ms** | 1806ms | **1.16x** | **1.25ms** | 213ms | **170x**\* |
-| snappy | **1002ms** | 1649ms | **1.65x** | **78ms** | 384ms | **4.91x** |
-| zstd | **1311ms** | 1796ms | **1.37x** | **76.8ms** | 369ms | **4.81x** |
-| lz4 | **1521ms** | 1676ms | **1.10x** | **59.1ms** | 281ms | **4.76x** |
-
-\* Zero-copy mmap path
-
-</details>
-
-<details>
-<summary>Full ARM results (Apple M3, macOS)</summary>
-
-*Carquet 0.6.0 -- MacBook Air M3, 16GB RAM, macOS 26.5, Arrow C++ 24.0.0, PyArrow 23.0.1 -- ZSTD level 1*
-
-#### 10M rows vs Arrow C++
-
-| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio | Size |
-|-------|--------------|-----------------|---------|-------------|----------------|---------|------|
-| none | **62.21ms** | 122.5ms | **1.97x** | **0.26ms** | 13.75ms | **52.9x**\* | 190.7MB |
-| snappy | **129.0ms** | 242.6ms | **1.88x** | **14.15ms** | 22.47ms | **1.59x** | 125.1MB |
-| zstd | **149.6ms** | 334.0ms | **2.23x** | **21.39ms** | 27.91ms | **1.30x** | 95.3MB |
-| lz4 | **128.1ms** | 241.7ms | **1.89x** | **10.13ms** | 16.08ms | **1.59x** | 122.9MB |
-
-#### 1M rows vs Arrow C++
-
-| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio |
-|-------|--------------|-----------------|---------|-------------|----------------|---------|
-| none | **5.85ms** | 12.65ms | **2.16x** | **0.05ms** | 1.54ms | **30.8x**\* |
-| snappy | **12.39ms** | 23.62ms | **1.91x** | **1.36ms** | 2.41ms | **1.77x** |
-| zstd | **15.26ms** | 33.90ms | **2.22x** | **2.39ms** | 3.17ms | **1.33x** |
-| lz4 | **12.28ms** | 24.51ms | **2.00x** | **0.97ms** | 1.77ms | **1.82x** |
-
-#### 100K rows vs Arrow C++
-
-| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio |
-|-------|--------------|-----------------|---------|-------------|----------------|---------|
-| none | **1.02ms** | 1.54ms | **1.51x** | **0.02ms** | 0.22ms | **11.0x**\* |
-| snappy | **1.51ms** | 2.45ms | **1.62x** | **0.36ms** | 0.90ms | **2.50x** |
-| zstd | **1.65ms** | 3.58ms | **2.17x** | **0.63ms** | 1.23ms | **1.95x** |
-| lz4 | **1.57ms** | 2.45ms | **1.56x** | **0.24ms** | 0.55ms | **2.29x** |
-
-#### Same-file cross-read (10M rows)
-
-Both libraries read the **same** Parquet file — the fairest apples-to-apples comparison.
-
-| Codec | Writer | Carquet Read | Arrow C++ Read | Ratio |
-|-------|--------|-------------|----------------|-------|
-| none | Carquet | **0.27ms** | 15.60ms | **57.8x**\* |
-| none | Arrow | **0.91ms** | 13.68ms | **15.0x**\* |
-| snappy | Carquet | **14.63ms** | 23.29ms | **1.59x** |
-| snappy | Arrow | **13.20ms** | 22.15ms | **1.68x** |
-| zstd | Carquet | **20.96ms** | 28.04ms | **1.34x** |
-| zstd | Arrow | **21.03ms** | 27.73ms | **1.32x** |
-| lz4 | Carquet | **10.16ms** | 16.89ms | **1.66x** |
-| lz4 | Arrow | **9.66ms** | 16.09ms | **1.67x** |
-
-#### 10M rows vs PyArrow
-
-| Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
-|-------|--------------|---------------|---------|-------------|--------------|---------|
-| none | **62.21ms** | 176.4ms | **2.83x** | **0.26ms** | 36.49ms | **140.4x**\* |
-| snappy | **129.0ms** | 294.2ms | **2.28x** | **14.15ms** | 44.19ms | **3.12x** |
-| zstd | **149.6ms** | 396.3ms | **2.65x** | **21.39ms** | 55.96ms | **2.62x** |
-| lz4 | **128.1ms** | 305.3ms | **2.38x** | **10.13ms** | 38.00ms | **3.75x** |
-
-#### 1M rows vs PyArrow
-
-| Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
-|-------|--------------|---------------|---------|-------------|--------------|---------|
-| none | **5.85ms** | 17.13ms | **2.93x** | **0.05ms** | 2.55ms | **51.0x**\* |
-| snappy | **12.39ms** | 29.62ms | **2.39x** | **1.36ms** | 3.57ms | **2.62x** |
-| zstd | **15.26ms** | 40.26ms | **2.64x** | **2.39ms** | 4.41ms | **1.85x** |
-| lz4 | **12.28ms** | 31.15ms | **2.54x** | **0.97ms** | 3.11ms | **3.21x** |
-
-#### 100K rows vs PyArrow
-
-| Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
-|-------|--------------|---------------|---------|-------------|--------------|---------|
-| none | **1.02ms** | 1.94ms | **1.90x** | **0.02ms** | 0.23ms | **11.5x**\* |
-| snappy | **1.51ms** | 2.96ms | **1.96x** | **0.36ms** | 0.58ms | **1.61x** |
-| zstd | **1.65ms** | 4.15ms | **2.52x** | **0.63ms** | 0.80ms | **1.27x** |
-| lz4 | **1.57ms** | 3.01ms | **1.92x** | **0.24ms** | 0.41ms | **1.71x** |
-
-\* Zero-copy mmap path
-
-</details>
+---
 
 <!-- ────────────────────────────  INSTALLATION  ──────────────────────────── -->
 
 ## Installation
+
+Carquet builds with CMake (primary) or [xmake](https://xmake.io), on Linux, macOS, and Windows.
 
 ### Requirements
 
@@ -213,6 +72,8 @@ Both libraries read the **same** Parquet file — the fairest apples-to-apples c
 - CMake 3.16+ (or [xmake](https://xmake.io) — see [Building with xmake](#building-with-xmake))
 - zstd, zlib, lz4 (auto-fetched if missing)
 - OpenMP (optional, for parallel column reading)
+
+<br/>
 
 ### Quick Start (make)
 
@@ -225,6 +86,8 @@ make                              # optimized build (run `make help` to list all
 sudo make install                 # install to /usr/local (override with PREFIX=/opt/carquet)
 ```
 
+<br/>
+
 ### Full Build & Install (CMake)
 
 Invoke CMake directly when you need specific build options or a custom prefix:
@@ -236,6 +99,7 @@ sudo cmake --install build --prefix /usr/local
 ```
 
 Either path installs:
+
 - `libcarquet.a` (or `.so` / `.dylib` with `-DCARQUET_BUILD_SHARED=ON`)
 - `include/carquet/` headers
 - `carquet` CLI binary
@@ -243,96 +107,11 @@ Either path installs:
 
 After installation, link with `-lcarquet`, or resolve flags via `pkg-config --cflags --libs carquet`.
 
-#### Build Options
+Every CMake option, the development build (tests), the xmake alternative and the Doxygen target are covered in [Build Configuration](#build-configuration).
 
-Pass these to the CMake configure step:
+<br/>
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `CARQUET_BUILD_DEV` | OFF | Build everything (tests, examples, benchmarks) |
-| `CARQUET_BUILD_TESTS` | OFF | Build test suite only |
-| `CARQUET_BUILD_CLI` | ON | Build `carquet` CLI tool |
-| `CARQUET_BUILD_SHARED` | OFF | Build shared library instead of static |
-| `CARQUET_NATIVE_ARCH` | OFF | `-march=native` for max performance |
-| `CARQUET_ENABLE_SVE` | OFF | ARM SVE (experimental) |
-
-All x86 SIMD (SSE, AVX, AVX2, AVX-512) and ARM NEON are auto-detected and enabled by default.
-
-<details>
-<summary>All build options</summary>
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `CARQUET_BUILD_EXAMPLES` | OFF | Build example programs |
-| `CARQUET_BUILD_BENCHMARKS` | OFF | Build benchmark and profiling programs |
-| `CARQUET_BUILD_ARROW_CPP_BENCHMARK` | OFF | Optional Arrow C++ comparison benchmark |
-| `CARQUET_BUILD_INTEROP` | OFF | Build interoperability tests |
-| `CARQUET_BUILD_FUZZ` | OFF | Build fuzz targets |
-| `CARQUET_BUILD_DOCS` | OFF | Add a `docs` target (needs Doxygen) |
-| `CARQUET_ENABLE_SSE` | ON | SSE optimizations (x86, auto-detected) |
-| `CARQUET_ENABLE_AVX` | ON | AVX optimizations (x86, auto-detected) |
-| `CARQUET_ENABLE_AVX2` | ON | AVX2 optimizations (x86, auto-detected) |
-| `CARQUET_ENABLE_AVX512` | ON | AVX-512 optimizations (x86, auto-detected) |
-| `CARQUET_ENABLE_NEON` | ON | NEON optimizations (ARM, auto-detected) |
-
-</details>
-
-#### Development Build
-
-```bash
-cmake -B build -DCARQUET_BUILD_DEV=ON
-cmake --build build -j$(nproc)
-cd build && ctest --output-on-failure
-```
-
-### Building with xmake
-
-An [xmake](https://xmake.io) build (`xmake.lua`) is provided as an alternative to CMake, with the same options and defaults; zstd/zlib/lz4 are linked statically so binaries are self-contained.
-
-```bash
-xmake                    # build the static library + `carquet` CLI (release)
-xmake f --dev=y && xmake # add tests, examples, benchmarks, interop
-xmake test               # run the test suite
-```
-
-<details>
-<summary>Configure options (<code>xmake f --option=y|n</code>)</summary>
-
-Options mirror the CMake ones (drop the `CARQUET_` prefix, lower-case):
-
-| xmake option | Default | Description |
-|--------------|---------|-------------|
-| `--dev` | n | Build tests, examples, benchmarks and interop |
-| `--tests` / `--examples` / `--benchmarks` / `--interop` | n | Build one group individually |
-| `--cli` | y | Build the `carquet` CLI tool |
-| `--shared` | n | Build a shared library instead of static |
-| `--openmp` | y | OpenMP parallel column reading (auto-disabled if unavailable) |
-| `--native_arch` | n | `-march=native` for max performance (host-only binary) |
-| `--sse` / `--avx` / `--avx2` / `--avx512` / `--neon` | y | SIMD instruction sets (auto-detected) |
-| `--sve` | n | ARM SVE (experimental) |
-| `--fuzz` | n | Build fuzz targets (use `--toolchain=clang`) |
-
-```bash
-xmake f -m release --shared=y            # shared library
-xmake f --dev=y --avx512=n && xmake      # dev build, AVX-512 disabled
-```
-
-</details>
-
-### API Documentation
-
-The public headers are annotated with [Doxygen](https://www.doxygen.nl) comments. Generating the HTML reference needs `doxygen` installed (plus optional `graphviz` for include/dependency diagrams); neither is required for a normal build.
-
-```bash
-# CMake — enable the target at configure time, then build it
-cmake -B build -DCARQUET_BUILD_DOCS=ON
-cmake --build build --target docs
-
-# xmake — a standalone task, no configure flag needed
-xmake docs
-```
-
-Both write to `build/docs/html/index.html`. If Doxygen is not installed the target/task simply reports that and does nothing.
+---
 
 <!-- ────────────────────────────  C API  ──────────────────────────── -->
 
@@ -371,6 +150,8 @@ int main(void) {
     return 0;
 }
 ```
+
+<br/>
 
 ### Read a Parquet File
 
@@ -418,6 +199,8 @@ int main(void) {
 }
 ```
 
+<br/>
+
 ### More Recipes
 
 Everything beyond flat read/write lives in the manual — each links to a runnable example:
@@ -433,9 +216,20 @@ Everything beyond flat read/write lives in the manual — each links to a runnab
 | mmap, zero-copy, prebuffering, I/O coalescing | [`docs/performance.md`](docs/performance.md) |
 | Error codes and recovery hints | [`docs/error-handling.md`](docs/error-handling.md) |
 
-### Example application
+<br/>
 
-[`mocklib/`](mocklib/) is **MetricStore** — a complete, self-contained example application built on top of carquet, useful both as a reference for real-world usage and as an end-to-end integration test of the public API. It models a time-series telemetry store (ingest events, then introspect and query them) and, in doing so, exercises **114 of carquet's 128 public functions (~89%)**: schema construction with logical types, per-column encoding/compression/bloom tuning, page indexes and statistics on the write side; column projection, predicate pushdown, page-level filtering, bloom membership, the Arrow C Data Interface bridge, nested `LIST` reconstruction, buffer/append I/O and metadata introspection on the read side. It links carquet the way any downstream project would (`find_package(carquet)` / `add_subdirectory`), ships a self-checking round-trip test, and its `write_sample` binary emits a file for external inspection. See [`mocklib/README.md`](mocklib/README.md).
+### Example Application
+
+[`mocklib/`](mocklib/) is **MetricStore** — a complete, self-contained example application built on top of carquet, useful both as a reference for real-world usage and as an end-to-end integration test of the public API.
+
+It models a time-series telemetry store (ingest events, then introspect and query them) and, in doing so, exercises **117 of carquet's 143 public functions (~82%)**:
+
+- **Write side** — schema construction with logical types, per-column encoding/compression/bloom tuning, page indexes and statistics
+- **Read side** — column projection, predicate pushdown, page-level filtering, bloom membership, the Arrow C Data Interface bridge, nested `LIST` reconstruction, buffer/append I/O and metadata introspection
+
+It links carquet the way any downstream project would (`find_package(carquet)` / `add_subdirectory`), ships a self-checking round-trip test, and its `write_sample` binary emits a file for external inspection. See [`mocklib/README.md`](mocklib/README.md).
+
+<br/>
 
 ### API Reference
 
@@ -450,6 +244,12 @@ Full API is in [`include/carquet/carquet.h`](include/carquet/carquet.h). Key typ
 | `carquet_error_t` | Rich error info (code, message, source location, recovery hint) |
 
 Full signatures live in the [header](include/carquet/carquet.h); the [manual](docs/README.md) explains which surface to use when. The source layout and architecture are documented in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+A browsable HTML reference can be generated from the headers' Doxygen comments — see [API Documentation](#api-documentation).
+
+<br/>
+
+---
 
 <!-- ────────────────────────────  CLI TOOL  ──────────────────────────── -->
 
@@ -473,6 +273,8 @@ Commands:
   codegen    Generate C reader code
 ```
 
+Typical usage:
+
 ```bash
 carquet schema data.parquet
 carquet head -n 20 data.parquet
@@ -480,7 +282,11 @@ carquet stat data.parquet
 carquet validate data.parquet
 ```
 
-`cat`, `count`, `head`, and `export` accept `-p / --filter EXPR` to push a row predicate down to the page level — only pages whose column-index min/max can match the predicate are decompressed:
+<br/>
+
+### Row Filtering
+
+`cat`, `count`, `head`, `tail`, `sample`, and `export` accept `-p / --filter EXPR` to push a row predicate down to the page level — only pages whose column-index min/max can match the predicate are decompressed:
 
 ```bash
 carquet cat -p "price > 100 AND status = 'active'" data.parquet
@@ -488,7 +294,11 @@ carquet count --filter "id >= 1000" data.parquet
 carquet export --filter "ts IS NOT NULL" -c id,ts data.parquet
 ```
 
-The grammar is `column OP value [AND column OP value]...` with `OP` ∈ {`=`, `==`, `!=`, `<>`, `<`, `<=`, `>`, `>=`}, plus `column IS NULL` / `column IS NOT NULL`. Filtering requires the file to have a page index (`write_page_index = true`).
+The grammar is `column OP value [AND column OP value]...` with `OP` ∈ {`=`, `==`, `!=`, `<>`, `<`, `<=`, `>`, `>=`}, plus `column IS NULL` / `column IS NOT NULL`.
+
+> Filtering requires the file to have a page index (`write_page_index = true`).
+
+<br/>
 
 ### Code Generation
 
@@ -514,58 +324,212 @@ Options:
 | `-c`, `--columns COLS` | Comma-separated column filter |
 | `-b`, `--batch-size N` | Batch size (default: 1024) |
 
-<!-- ────────────────────────────  INTEROP & REFERENCE  ──────────────────────────── -->
+<br/>
 
-## Interoperability
+---
 
-Carquet files are fully compatible with PyArrow, DuckDB, Spark, and any Parquet reader:
+<!-- ────────────────────────────  BENCHMARKS  ──────────────────────────── -->
 
-```python
-import pyarrow.parquet as pq
-table = pq.read_table("carquet_output.parquet")  # just works
-```
+## Benchmarks
 
-```sql
--- DuckDB
-SELECT * FROM read_parquet('carquet_output.parquet');
-```
+At 10M rows (the most representative size); higher ratio = Carquet faster.
 
-Bidirectional interop testing:
+ARM (Apple M3): Carquet 0.7.1 vs Arrow C++ 24.0.0, measured 2026-10-08. x86 (Xeon D-1531): Carquet 0.4.4 vs Arrow C++ 23.0.1; that run predates the writer parallelism of 0.7.1 and has not been re-measured since.
 
-```bash
-cmake -B build -DCARQUET_BUILD_INTEROP=ON && cmake --build build
-python3 interop/run_interop.py
-```
+| | x86 (Xeon D-1531) | | ARM (Apple M3) | |
+|---|---|---|---|---|
+| **Codec** | **Write** | **Read** | **Write** | **Read** |
+| snappy | **1.55x** | **1.25x** | **3.90x** | **1.49x** |
+| zstd | **1.31x** | **1.04x** | **4.91x** | **1.12x** |
+| lz4 | **1.02x** | 0.83x | **4.01x** | **1.59x** |
+| none | **1.13x** | **40.6x**\* | **2.22x** | **43.8x**\* |
 
-## Parquet Feature Support
+\* Uncompressed reads use mmap zero-copy -- see note below.
 
-| Feature | Status |
-|---------|--------|
-| Physical types | All 8 (BOOLEAN through FIXED_LEN_BYTE_ARRAY) |
-| Logical types | STRING, DATE, TIME, TIMESTAMP, DECIMAL, UUID, JSON, INTERVAL, FLOAT16, VARIANT, GEOMETRY, GEOGRAPHY |
-| Encodings | PLAIN, RLE, DICTIONARY, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT (read + write) |
-| Data Page versions | V1 (default) and V2 (read + write) |
-| Compression | UNCOMPRESSED, SNAPPY, GZIP, LZ4 (Hadoop-framed, codec 5), LZ4_RAW (codec 7), ZSTD |
-| Nested schemas | Groups, lists, maps with definition/repetition levels; single-level LIST/MAP auto-shredding on write (`carquet_writer_write_list_column`) and List reconstruction on read; nested `ARROW:schema` emission |
-| Bloom filters | Read, write, and query (`carquet_bloom_filter_check_*`); consulted automatically for row-group pruning |
-| Page indexes | Column index + offset index (read + write + per-page stats access) |
-| Statistics | Min/max/null count per column chunk; exact `distinct_count` for dictionary columns; Parquet 2.9 SizeStatistics (unencoded byte-array bytes + level histograms) |
-| Predicate pushdown | Automatic row-group pruning via statistics + bloom filters (no callback needed); page-level filtering via column index (`carquet_batch_reader_set_page_filter`) |
-| Append | Add row groups to an existing file (`carquet_writer_open_append`) |
-| Custom codecs | Register a custom compress/decompress impl per codec slot (`carquet_register_codec`) |
-| Key-value metadata | Read and write arbitrary footer metadata |
-| Per-field metadata | Arrow `Field.custom_metadata` (variable labels/descriptions) via `ARROW:schema` (read + write) |
-| Per-column options | Per-column encoding, compression, statistics, bloom filter |
-| Buffer writer | Write Parquet to in-memory buffer |
-| CRC32 | Page-level verification (HW-accelerated on ARM) |
-| Memory-mapped I/O | Zero-copy reads for uncompressed PLAIN data |
-| Column projection | Read only selected columns |
-| I/O coalescing | Pre-buffer multi-column reads in a single I/O |
-| Speculative footer | Single-I/O file open for most files |
-| OpenMP parallel reads | When available |
-| Encryption | Not supported |
+Compressed reads involve full decompression and decoding of every value, no shortcuts — and both libraries use the same system lz4/zstd shared libraries, so the raw codec speed is identical.
 
-## Running Benchmarks
+The most meaningful comparison is the **same-file cross-read** table (below), where both libraries read the exact same Parquet file: Carquet reads compressed data **1.2-2.6x faster** than Arrow C++ on that apples-to-apples test.
+
+To run the benchmarks yourself, see [Running Benchmarks](#running-benchmarks).
+
+<details>
+<summary><b>Benchmark methodology</b></summary>
+
+<br/>
+
+All benchmarks use identical data (deterministic LCG PRNG), identical Parquet settings (no dictionary, BYTE_STREAM_SPLIT for floats, page checksums, mmap reads), trimmed median of 11-51 iterations, with OS page cache purged between write and read phases and cooldown between configurations. Schema: 3 columns (INT64, DOUBLE, INT32). Compared against Arrow C++ 23.0.1 low-level Parquet reader (bypassing Arrow Table materialization) and PyArrow 23.0.1.
+
+The **same-file cross-read** benchmark is the fairest comparison: both libraries read the exact same Parquet file (written by one, read by both). This eliminates differences in page sizes, encoding choices, and row group layout.
+
+**Uncompressed reads** marked with \* use Carquet's **mmap zero-copy path**: for PLAIN-encoded, uncompressed, fixed-size, required columns, the batch reader returns pointers directly into the memory-mapped file with no memcpy. Arrow always materializes into its own buffers. **The compressed read numbers are the most representative measure of end-to-end read throughput.**
+
+</details>
+
+<details>
+<summary><b>Full x86 results</b> (Intel Xeon D-1531, Linux)</summary>
+
+<br/>
+
+*12 threads @ 2.2GHz, 32GB RAM, Ubuntu 24.04 -- ZSTD level 1*
+
+#### 10M rows vs Arrow C++
+
+| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio | Size |
+|-------|--------------|-----------------|---------|-------------|----------------|---------|------|
+| none | **1557ms** | 1766ms | **1.13x** | **1.25ms** | 50.8ms | **40.6x**\* | 190.7MB |
+| snappy | **1002ms** | 1549ms | **1.55x** | **78ms** | 97.8ms | **1.25x** | 125.1MB |
+| zstd | **1311ms** | 1714ms | **1.31x** | **76.8ms** | 80.2ms | **1.04x** | 95.3MB |
+| lz4 | **1521ms** | 1554ms | **1.02x** | 59.1ms | **49.0ms** | 0.83x | 122.9MB |
+
+<br/>
+
+#### 1M rows vs Arrow C++
+
+| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio |
+|-------|--------------|-----------------|---------|-------------|----------------|---------|
+| none | **180ms** | 196ms | **1.09x** | **0.22ms** | 6.2ms | **28x**\* |
+| snappy | **141ms** | 148ms | **1.05x** | **8.1ms** | 11.6ms | **1.44x** |
+| zstd | **131ms** | 185ms | **1.41x** | 10.3ms | **9.1ms** | 0.88x |
+| lz4 | **143ms** | 149ms | **1.04x** | 8.5ms | **6.1ms** | 0.72x |
+
+<br/>
+
+#### 100K rows vs Arrow C++
+
+| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio |
+|-------|--------------|-----------------|---------|-------------|----------------|---------|
+| none | **14.1ms** | 18.4ms | **1.30x** | **0.11ms** | 2.18ms | **19.8x**\* |
+| snappy | **10.1ms** | 10.6ms | **1.05x** | **1.27ms** | 5.97ms | **4.70x** |
+| zstd | **8.7ms** | 14.1ms | **1.62x** | **1.58ms** | 3.88ms | **2.46x** |
+| lz4 | **9.6ms** | 11.0ms | **1.14x** | **0.77ms** | 2.78ms | **3.61x** |
+
+<br/>
+
+#### Same-file cross-read (10M rows)
+
+Both libraries read the **same** Parquet file — the fairest apples-to-apples comparison.
+
+| Codec | Writer | Carquet Read | Arrow C++ Read | Ratio |
+|-------|--------|-------------|----------------|-------|
+| none | Carquet | **0.99ms** | 73.6ms | **74x**\* |
+| none | Arrow | **7.6ms** | 51.2ms | **6.8x**\* |
+| snappy | Carquet | **41.0ms** | 107ms | **2.61x** |
+| snappy | Arrow | **43.4ms** | 101ms | **2.33x** |
+| zstd | Carquet | **46.1ms** | 88.4ms | **1.92x** |
+| zstd | Arrow | **49.1ms** | 79.5ms | **1.62x** |
+| lz4 | Carquet | **34.8ms** | 74.8ms | **2.15x** |
+| lz4 | Arrow | **27.4ms** | 52.0ms | **1.90x** |
+
+<br/>
+
+#### 10M rows vs PyArrow
+
+| Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
+|-------|--------------|---------------|---------|-------------|--------------|---------|
+| none | **1557ms** | 1806ms | **1.16x** | **1.25ms** | 213ms | **170x**\* |
+| snappy | **1002ms** | 1649ms | **1.65x** | **78ms** | 384ms | **4.91x** |
+| zstd | **1311ms** | 1796ms | **1.37x** | **76.8ms** | 369ms | **4.81x** |
+| lz4 | **1521ms** | 1676ms | **1.10x** | **59.1ms** | 281ms | **4.76x** |
+
+\* Zero-copy mmap path
+
+</details>
+
+<details>
+<summary><b>Full ARM results</b> (Apple M3, macOS)</summary>
+
+<br/>
+
+*Carquet 0.7.1 -- MacBook Air M3, 16GB RAM, macOS 26.5, Arrow C++ 24.0.0, PyArrow 23.0.1 -- ZSTD level 1 -- 2026-10-08*
+
+#### 10M rows vs Arrow C++
+
+| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio | Size |
+|-------|--------------|-----------------|---------|-------------|----------------|---------|------|
+| none | **66.18ms** | 146.9ms | **2.22x** | **0.31ms** | 13.59ms | **43.8x**\* | 190.7MB |
+| snappy | **64.81ms** | 252.9ms | **3.90x** | **15.58ms** | 23.28ms | **1.49x** | 125.1MB |
+| zstd | **71.23ms** | 350.0ms | **4.91x** | **24.99ms** | 28.01ms | **1.12x** | 95.3MB |
+| lz4 | **63.47ms** | 254.7ms | **4.01x** | **10.09ms** | 16.06ms | **1.59x** | 122.9MB |
+
+<br/>
+
+#### 1M rows vs Arrow C++
+
+| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio |
+|-------|--------------|-----------------|---------|-------------|----------------|---------|
+| none | **6.48ms** | 14.82ms | **2.29x** | **0.06ms** | 1.63ms | **27.2x**\* |
+| snappy | **14.28ms** | 26.44ms | **1.85x** | **2.14ms** | 2.85ms | **1.33x** |
+| zstd | **14.76ms** | 36.17ms | **2.45x** | **2.70ms** | 3.46ms | **1.28x** |
+| lz4 | **12.30ms** | 26.10ms | **2.12x** | **1.04ms** | 1.87ms | **1.80x** |
+
+<br/>
+
+#### 100K rows vs Arrow C++
+
+| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio |
+|-------|--------------|-----------------|---------|-------------|----------------|---------|
+| none | **1.07ms** | 1.79ms | **1.67x** | **0.02ms** | 0.25ms | **12.5x**\* |
+| snappy | **1.60ms** | 2.63ms | **1.64x** | **0.34ms** | 0.91ms | **2.68x** |
+| zstd | **1.73ms** | 3.63ms | **2.10x** | **0.63ms** | 1.26ms | **2.00x** |
+| lz4 | **1.52ms** | 2.62ms | **1.72x** | **0.25ms** | 0.55ms | **2.20x** |
+
+<br/>
+
+#### Same-file cross-read (10M rows)
+
+Both libraries read the **same** Parquet file — the fairest apples-to-apples comparison.
+
+| Codec | Writer | Carquet Read | Arrow C++ Read | Ratio |
+|-------|--------|-------------|----------------|-------|
+| none | Carquet | **0.36ms** | 15.73ms | **43.7x**\* |
+| none | Arrow | **0.94ms** | 14.36ms | **15.3x**\* |
+| snappy | Carquet | **15.57ms** | 24.79ms | **1.59x** |
+| snappy | Arrow | **15.36ms** | 23.28ms | **1.52x** |
+| zstd | Carquet | **26.39ms** | 30.29ms | **1.15x** |
+| zstd | Arrow | **23.40ms** | 29.35ms | **1.25x** |
+| lz4 | Carquet | **10.46ms** | 19.08ms | **1.82x** |
+| lz4 | Arrow | **9.79ms** | 16.12ms | **1.65x** |
+
+<br/>
+
+#### 10M rows vs PyArrow
+
+| Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
+|-------|--------------|---------------|---------|-------------|--------------|---------|
+| none | **66.18ms** | 200.9ms | **3.04x** | **0.31ms** | 33.20ms | **107.1x**\* |
+| snappy | **64.81ms** | 310.3ms | **4.79x** | **15.58ms** | 46.23ms | **2.97x** |
+| zstd | **71.23ms** | 408.7ms | **5.74x** | **24.99ms** | 57.27ms | **2.29x** |
+| lz4 | **63.47ms** | 320.0ms | **5.04x** | **10.09ms** | 37.80ms | **3.75x** |
+
+<br/>
+
+#### 1M rows vs PyArrow
+
+| Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
+|-------|--------------|-----------------|---------|-------------|----------------|---------|
+| none | **6.48ms** | 20.17ms | **3.11x** | **0.06ms** | 2.79ms | **46.5x**\* |
+| snappy | **14.28ms** | 31.54ms | **2.21x** | **2.14ms** | 4.01ms | **1.87x** |
+| zstd | **14.76ms** | 42.51ms | **2.88x** | **2.70ms** | 4.42ms | **1.64x** |
+| lz4 | **12.30ms** | 32.03ms | **2.60x** | **1.04ms** | 3.22ms | **3.10x** |
+
+<br/>
+
+#### 100K rows vs PyArrow
+
+| Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
+|-------|--------------|-----------------|---------|-------------|----------------|---------|
+| none | **1.07ms** | 2.12ms | **1.98x** | **0.02ms** | 0.24ms | **12.0x**\* |
+| snappy | **1.60ms** | 3.17ms | **1.98x** | **0.34ms** | 0.60ms | **1.76x** |
+| zstd | **1.73ms** | 4.16ms | **2.40x** | **0.63ms** | 0.81ms | **1.29x** |
+| lz4 | **1.52ms** | 3.21ms | **2.11x** | **0.25ms** | 0.42ms | **1.68x** |
+
+\* Zero-copy mmap path
+
+</details>
+
+<br/>
+
+### Running Benchmarks
 
 ```bash
 # Build with max optimizations
@@ -585,7 +549,9 @@ CARQUET_BENCH_ZSTD_LEVEL=3 python3 ../benchmark/run_benchmark.py
 ```
 
 <details>
-<summary>Optional Arrow C++ benchmark</summary>
+<summary><b>Optional Arrow C++ benchmark</b></summary>
+
+<br/>
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DCARQUET_NATIVE_ARCH=ON \
@@ -601,6 +567,246 @@ The Arrow C++ benchmark uses the low-level `parquet::ParquetFileReader` API (byp
 
 </details>
 
+<br/>
+
+---
+
+<!-- ────────────────────────────  FEATURE SUPPORT  ──────────────────────────── -->
+
+## Parquet Feature Support
+
+What the library implements today, by area.
+
+### Format
+
+| Feature | Status |
+|---------|--------|
+| Physical types | All 8 (BOOLEAN through FIXED_LEN_BYTE_ARRAY) |
+| Logical types | STRING, DATE, TIME, TIMESTAMP, DECIMAL, UUID, JSON, INTERVAL, FLOAT16, VARIANT, GEOMETRY, GEOGRAPHY |
+| Encodings | PLAIN, RLE, DICTIONARY, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT (read + write) |
+| Data Page versions | V1 (default) and V2 (read + write) |
+| Compression | UNCOMPRESSED, SNAPPY, GZIP, LZ4 (Hadoop-framed, codec 5), LZ4_RAW (codec 7), ZSTD |
+| Nested schemas | Groups, lists, maps with definition/repetition levels; single-level LIST/MAP auto-shredding on write (`carquet_writer_write_list_column`) and List reconstruction on read; nested `ARROW:schema` emission |
+| Encryption | Not supported |
+
+<br/>
+
+### Indexing & Pruning
+
+| Feature | Status |
+|---------|--------|
+| Bloom filters | Read, write, and query (`carquet_bloom_filter_check_*`); consulted automatically for row-group pruning |
+| Page indexes | Column index + offset index (read + write + per-page stats access) |
+| Statistics | Min/max/null count per column chunk; exact `distinct_count` for dictionary columns; Parquet 2.9 SizeStatistics (unencoded byte-array bytes + level histograms) |
+| Predicate pushdown | Automatic row-group pruning via statistics + bloom filters (no callback needed); page-level filtering via column index (`carquet_batch_reader_set_page_filter`) |
+| Geospatial statistics | Per-column bounding box and geometry types for GEOMETRY/GEOGRAPHY (`carquet_reader_geospatial_statistics`) |
+| Column projection | Read only selected columns |
+| Row window | Read an `[offset, limit)` slice of rows, skipping pages entirely (`carquet_batch_reader_set_row_range`) |
+
+<br/>
+
+### I/O & Extensibility
+
+| Feature | Status |
+|---------|--------|
+| Append | Add row groups to an existing file (`carquet_writer_open_append`) |
+| Custom codecs | Register a custom compress/decompress impl per codec slot (`carquet_register_codec`) |
+| Key-value metadata | Read and write arbitrary footer metadata |
+| Per-field metadata | Arrow `Field.custom_metadata` (variable labels/descriptions) via `ARROW:schema` (read + write) |
+| Per-column options | Per-column encoding, compression, statistics, bloom filter |
+| Buffer writer | Write Parquet to in-memory buffer |
+| CRC32 | Page-level verification (HW-accelerated on ARM) |
+| Memory-mapped I/O | Zero-copy reads for uncompressed PLAIN data |
+| Dictionary-preserving reads | Return RLE indices + dictionary instead of materialized values (`preserve_dictionaries`, `carquet_row_batch_column_dictionary`) |
+| I/O coalescing | Pre-buffer multi-column reads in a single I/O |
+| Speculative footer | Single-I/O file open for most files |
+| OpenMP parallel reads | When available |
+| Parallel writes | Page-level parallel encode/compress across columns (OpenMP) + background row-group I/O (`async_io`) |
+
+<br/>
+
+---
+
+<!-- ────────────────────────────  INTEROPERABILITY  ──────────────────────────── -->
+
+## Interoperability
+
+Carquet files are fully compatible with PyArrow, DuckDB, Spark, and any Parquet reader.
+
+```python
+import pyarrow.parquet as pq
+table = pq.read_table("carquet_output.parquet")  # just works
+```
+
+```sql
+-- DuckDB
+SELECT * FROM read_parquet('carquet_output.parquet');
+```
+
+<br/>
+
+### Interop Testing
+
+Bidirectional round-trips (C writes / Python reads, and back):
+
+```bash
+cmake -B build -DCARQUET_BUILD_INTEROP=ON && cmake --build build
+python3 interop/run_interop.py
+```
+
+Large multi-row-group Snappy files (many row groups, wide `BYTE_ARRAY` columns, page offsets past 2 GiB) have their own generator, which builds the file with PyArrow and checks carquet decodes every page:
+
+```bash
+CARQUET_BIN=build/carquet python3 interop/snappy_multi_rowgroup.py --rows 150000 --row-groups 92
+```
+
+<br/>
+
+---
+
+<!-- ────────────────────────────  BUILD CONFIGURATION  ──────────────────────────── -->
+
+## Build Configuration
+
+Everything beyond the default build: CMake options, the development build, the xmake alternative, and the Doxygen reference.
+
+### Build Options
+
+Pass these to the CMake configure step:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `CARQUET_BUILD_DEV` | OFF | Build everything (tests, examples, benchmarks) |
+| `CARQUET_BUILD_TESTS` | OFF | Build test suite only |
+| `CARQUET_BUILD_CLI` | ON | Build `carquet` CLI tool |
+| `CARQUET_BUILD_SHARED` | OFF | Build shared library instead of static |
+| `CARQUET_NATIVE_ARCH` | OFF | `-march=native` for max performance |
+| `CARQUET_ENABLE_SVE` | OFF | ARM SVE (experimental) |
+
+All x86 SIMD (SSE, AVX, AVX2, AVX-512) and ARM NEON are auto-detected and enabled by default.
+
+<details>
+<summary><b>All build options</b></summary>
+
+<br/>
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `CARQUET_BUILD_EXAMPLES` | OFF | Build example programs |
+| `CARQUET_BUILD_BENCHMARKS` | OFF | Build benchmark and profiling programs |
+| `CARQUET_BUILD_ARROW_CPP_BENCHMARK` | OFF | Optional Arrow C++ comparison benchmark |
+| `CARQUET_BUILD_INTEROP` | OFF | Build interoperability tests |
+| `CARQUET_BUILD_FUZZ` | OFF | Build fuzz targets |
+| `CARQUET_BUILD_DOCS` | OFF | Add a `docs` target (needs Doxygen) |
+| `CARQUET_BUNDLE_DEPS` | OFF | Always fetch and static-bundle zstd/zlib/lz4 (portable release artifacts) |
+| `CARQUET_ZSTD_TARGET` / `CARQUET_ZLIB_TARGET` / `CARQUET_LZ4_TARGET` | *(empty)* | Existing CMake target to link for that library instead of searching for or fetching it (see below) |
+| `CARQUET_ARROW_CPP_ROOT` | *(empty)* | Path to a custom Arrow C++ install for the comparison benchmark |
+| `CARQUET_ENABLE_SSE` | ON | SSE optimizations (x86, auto-detected) |
+| `CARQUET_ENABLE_AVX` | ON | AVX optimizations (x86, auto-detected) |
+| `CARQUET_ENABLE_AVX2` | ON | AVX2 optimizations (x86, auto-detected) |
+| `CARQUET_ENABLE_AVX512` | ON | AVX-512 optimizations (x86, auto-detected) |
+| `CARQUET_ENABLE_NEON` | ON | NEON optimizations (ARM, auto-detected) |
+
+</details>
+
+<br/>
+
+### Using Your Own zstd / zlib / lz4
+
+When carquet is pulled in with `add_subdirectory()` or `FetchContent`, it resolves each compression library in this order:
+
+1. The target named by `CARQUET_ZSTD_TARGET`, `CARQUET_ZLIB_TARGET` or `CARQUET_LZ4_TARGET`, if set.
+2. A system copy (skipped when `CARQUET_BUNDLE_DEPS` is ON).
+3. A copy it fetches and builds itself. If your project already builds the library under its usual target name (`libzstd_static`, `zlibstatic`, `lz4_static`), carquet reuses that target instead of fetching a second copy.
+
+A project that vendors these libraries and has no system copy therefore needs no configuration. To choose explicitly, for example your own zlib over the system one, or your shared build over your static one, name the target:
+
+```cmake
+set(CARQUET_ZLIB_TARGET zlibstatic)
+add_subdirectory(carquet)
+```
+
+The same can be done without editing anything: `cmake -DCARQUET_ZLIB_TARGET=zlib ...`. The three variables are independent. A named target is linked as is, with no search and no fetch, and a name that is not a target is a configure error rather than a silent fallback. The target can be imported or built in-tree, static or shared, and must carry its include directories as a usage requirement.
+
+### Development Build
+
+```bash
+cmake -B build -DCARQUET_BUILD_DEV=ON
+cmake --build build -j$(nproc)
+cd build && ctest --output-on-failure
+```
+
+<br/>
+
+### Building with xmake
+
+An [xmake](https://xmake.io) build (`xmake.lua`) is provided as an alternative to CMake, with the same options and defaults; zstd/zlib/lz4 are linked statically so binaries are self-contained.
+
+```bash
+xmake                    # build the static library + `carquet` CLI (release)
+xmake f --dev=y && xmake # add tests, examples, benchmarks, interop
+xmake test               # run the test suite
+```
+
+<details>
+<summary><b>Configure options</b> (<code>xmake f --option=y|n</code>)</summary>
+
+<br/>
+
+Options mirror the CMake ones (drop the `CARQUET_` prefix, lower-case):
+
+| xmake option | Default | Description |
+|--------------|---------|-------------|
+| `--dev` | n | Build tests, examples, benchmarks and interop |
+| `--tests` / `--examples` / `--benchmarks` / `--interop` | n | Build one group individually |
+| `--cli` | y | Build the `carquet` CLI tool |
+| `--shared` | n | Build a shared library instead of static |
+| `--openmp` | y | OpenMP parallel column reading (auto-disabled if unavailable) |
+| `--native_arch` | n | `-march=native` for max performance (host-only binary) |
+| `--sse` / `--avx` / `--avx2` / `--avx512` / `--neon` | y | SIMD instruction sets (auto-detected) |
+| `--sve` | n | ARM SVE (experimental) |
+| `--fuzz` | n | Build fuzz targets (use `--toolchain=clang`) |
+
+```bash
+xmake f -m release --shared=y            # shared library
+xmake f --dev=y --avx512=n && xmake      # dev build, AVX-512 disabled
+```
+
+</details>
+
+<br/>
+
+### API Documentation
+
+The public headers are annotated with [Doxygen](https://www.doxygen.nl) comments. Generating the HTML reference needs `doxygen` installed (plus optional `graphviz` for include/dependency diagrams); neither is required for a normal build.
+
+```bash
+# CMake — enable the target at configure time, then build it
+cmake -B build -DCARQUET_BUILD_DOCS=ON
+cmake --build build --target docs
+
+# xmake — a standalone task, no configure flag needed
+xmake docs
+```
+
+Both write to `build/docs/html/index.html`. If Doxygen is not installed the target/task simply reports that and does nothing.
+
+<br/>
+
+---
+
+<!-- ────────────────────────────  CONTRIBUTING  ──────────────────────────── -->
+
+## Contributing
+
+[CONTRIBUTING.md](CONTRIBUTING.md) covers setup, code style and the per-pull-request gate (tests, sanitizers, fuzzing, interop, benchmarks). Release notes are in [CHANGELOG.md](CHANGELOG.md).
+
+<br/>
+
+---
+
+<!-- ────────────────────────────  LICENSE  ──────────────────────────── -->
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

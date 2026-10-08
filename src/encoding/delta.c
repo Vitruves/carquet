@@ -97,6 +97,55 @@ static int64_t zigzag_decode64(uint64_t n) {
 }
 
 /* ============================================================================
+ * 64-bit bit packing (mini-blocks wider than 32 bits)
+ * ============================================================================
+ *
+ * The spec bit-packs every mini-block LSB-first whatever its width, so a
+ * 33..64-bit mini-block is `count * bit_width / 8` bytes, not `count` whole
+ * little-endian values. `count * bit_width` is always a multiple of 8 here
+ * (mini-block sizes are multiples of 32).
+ */
+
+static void delta_bitpack_64(const uint64_t* values, int count, int bit_width,
+                             uint8_t* out) {
+    memset(out, 0, ((size_t)count * (size_t)bit_width) / 8);
+    size_t bit_pos = 0;
+    for (int i = 0; i < count; i++, bit_pos += (size_t)bit_width) {
+        uint8_t* p = out + (bit_pos >> 3);
+        int shift = (int)(bit_pos & 7);
+        int nbytes = (shift + bit_width + 7) / 8;   /* 5..9 */
+        uint64_t lo = values[i] << shift;
+        for (int b = 0; b < nbytes && b < 8; b++) {
+            p[b] |= (uint8_t)(lo >> (b * 8));
+        }
+        if (nbytes == 9) {
+            p[8] |= (uint8_t)(values[i] >> (64 - shift));
+        }
+    }
+}
+
+static void delta_bitunpack_64(const uint8_t* in, int count, int bit_width,
+                               uint64_t* values) {
+    uint64_t mask = bit_width == 64 ? ~(uint64_t)0
+                                    : (((uint64_t)1 << bit_width) - 1);
+    size_t bit_pos = 0;
+    for (int i = 0; i < count; i++, bit_pos += (size_t)bit_width) {
+        const uint8_t* p = in + (bit_pos >> 3);
+        int shift = (int)(bit_pos & 7);
+        int nbytes = (shift + bit_width + 7) / 8;   /* 5..9 */
+        uint64_t lo = 0;
+        for (int b = 0; b < nbytes && b < 8; b++) {
+            lo |= (uint64_t)p[b] << (b * 8);
+        }
+        uint64_t v = lo >> shift;
+        if (nbytes == 9) {
+            v |= (uint64_t)p[8] << (64 - shift);
+        }
+        values[i] = v & mask;
+    }
+}
+
+/* ============================================================================
  * Delta Decoder Implementation
  * ============================================================================
  */
@@ -250,21 +299,23 @@ static carquet_status_t delta_decoder_read_mini_block(delta_decoder_t* dec) {
 
         dec->pos += packed_size;
     } else if (bit_width <= 64) {
-        /* Unpack 64-bit values (stored as little-endian bytes) */
-        int bytes_per_value = (bit_width + 7) / 8;
-        size_t packed_size = mini_block_size * bytes_per_value;
-        if (dec->pos + packed_size > dec->size) {
+        /* Wide mini-block: same LSB-first bit packing, 64-bit values. The
+         * unpacked deltas land in mini_block_values and are rebased in place. */
+        size_t packed_size = ((size_t)mini_block_size * (size_t)bit_width) / 8;
+        if (packed_size > dec->size - dec->pos) {
             return CARQUET_ERROR_DECODE;
         }
 
+        delta_bitunpack_64(dec->data + dec->pos, mini_block_size, bit_width,
+                           (uint64_t*)dec->mini_block_values);
+
         for (int i = 0; i < mini_block_size; i++) {
-            uint64_t val = 0;
-            for (int b = 0; b < bytes_per_value; b++) {
-                val |= (uint64_t)dec->data[dec->pos++] << (b * 8);
-            }
             /* Use unsigned addition to avoid overflow UB */
-            dec->mini_block_values[i] = (int64_t)((uint64_t)dec->min_delta + val);
+            dec->mini_block_values[i] = (int64_t)((uint64_t)dec->min_delta +
+                                                  (uint64_t)dec->mini_block_values[i]);
         }
+
+        dec->pos += packed_size;
     } else {
         return CARQUET_ERROR_DECODE;  /* bit_width > 64 is invalid */
     }
@@ -461,14 +512,8 @@ static carquet_status_t delta_encoder_flush_block(delta_encoder_t* enc) {
 
         bit_widths[mb] = (uint8_t)bit_width_required(max_val);
         if (bit_widths[mb] > 0) {
-            /* Calculate bytes needed for this mini-block */
-            if (bit_widths[mb] <= 32) {
-                /* Bitpacked: mini_block_size values * bit_width / 8 */
-                packed_bytes_needed += (size_t)mini_block_size * bit_widths[mb] / 8;
-            } else {
-                /* Byte-by-byte: mini_block_size values * bytes_per_value */
-                packed_bytes_needed += (size_t)mini_block_size * ((bit_widths[mb] + 7) / 8);
-            }
+            /* Every width is bit-packed: mini_block_size * bit_width / 8 */
+            packed_bytes_needed += (size_t)mini_block_size * bit_widths[mb] / 8;
         }
     }
 
@@ -507,21 +552,19 @@ static carquet_status_t delta_encoder_flush_block(delta_encoder_t* enc) {
             enc->pos += carquet_bitpack_32(to_pack, mini_block_size,
                                             bit_widths[mb], enc->data + enc->pos);
         } else {
-            /* For bit widths > 32, pack directly as bytes (little-endian) */
-            int bytes_per_value = (bit_widths[mb] + 7) / 8;
+            /* Wider than 32 bits: same bit packing over 64-bit values */
+            uint64_t to_pack[DELTA_MINI_BLOCK_SIZE];
             for (int i = start; i < end; i++) {
                 /* Use unsigned subtraction to avoid overflow UB */
-                uint64_t adjusted = (uint64_t)enc->deltas[i] - (uint64_t)min_delta;
-                for (int b = 0; b < bytes_per_value; b++) {
-                    enc->data[enc->pos++] = (uint8_t)(adjusted >> (b * 8));
-                }
+                to_pack[i - start] = (uint64_t)enc->deltas[i] - (uint64_t)min_delta;
             }
             /* Pad with zeros */
             for (int i = end - start; i < mini_block_size; i++) {
-                for (int b = 0; b < bytes_per_value; b++) {
-                    enc->data[enc->pos++] = 0;
-                }
+                to_pack[i] = 0;
             }
+            delta_bitpack_64(to_pack, mini_block_size, bit_widths[mb],
+                             enc->data + enc->pos);
+            enc->pos += (size_t)mini_block_size * bit_widths[mb] / 8;
         }
     }
 
@@ -569,8 +612,10 @@ carquet_status_t carquet_delta_encode_int32(
 
     /* Encode remaining values */
     for (int32_t i = 1; i < num_values; i++) {
-        /* Use unsigned subtraction to avoid overflow UB, then reinterpret as signed */
-        int64_t delta = (int64_t)((uint64_t)(int64_t)values[i] - (uint64_t)enc.last_value);
+        /* INT32 deltas wrap modulo 2^32 (as parquet-mr and Arrow compute
+         * them), which keeps every mini-block within 32 bits; readers reject
+         * wider widths for an INT32 column. */
+        int64_t delta = (int64_t)(int32_t)((uint32_t)values[i] - (uint32_t)enc.last_value);
         enc.deltas[enc.delta_count++] = delta;
         enc.last_value = values[i];
 

@@ -13,6 +13,7 @@
 #include "encoding/plain.h"
 #include "encoding/rle.h"
 #include "compression/custom.h"
+#include "compression/snappy.h"
 #include "core/endian.h"
 #include "core/bitpack.h"
 #include <stdlib.h>
@@ -62,9 +63,7 @@ extern carquet_status_t carquet_lz4_decompress(
 extern carquet_status_t carquet_lz4_hadoop_decompress(
     const uint8_t* src, size_t src_size,
     uint8_t* dst, size_t dst_capacity, size_t* dst_size);
-extern carquet_status_t carquet_snappy_decompress(
-    const uint8_t* src, size_t src_size,
-    uint8_t* dst, size_t dst_capacity, size_t* dst_size);
+/* carquet_snappy_decompress / _diag come from compression/snappy.h */
 extern int carquet_gzip_decompress(
     const uint8_t* src, size_t src_size,
     uint8_t* dst, size_t dst_capacity, size_t* dst_size);
@@ -169,6 +168,38 @@ static size_t prebuf_read_at(carquet_reader_t* file_reader,
  * Decompression
  * ============================================================================
  */
+
+carquet_status_t carquet_decompress_page_diag(
+    carquet_compression_t codec,
+    const uint8_t* compressed,
+    size_t compressed_size,
+    uint8_t* decompressed,
+    size_t decompressed_capacity,
+    size_t* decompressed_size,
+    char* diag,
+    size_t diag_size) {
+
+    if (diag && diag_size > 0) diag[0] = '\0';
+
+    /* Only the built-in Snappy decoder reports a detailed reason; a
+     * user-registered replacement keeps the plain path. */
+    carquet_custom_codec_t custom_override;
+    if (codec == CARQUET_COMPRESSION_SNAPPY && diag && diag_size > 0 &&
+        !carquet_custom_codec_lookup(codec, &custom_override)) {
+        carquet_snappy_diag_t sd;
+        carquet_status_t st = carquet_snappy_decompress_diag(
+            compressed, compressed_size, decompressed, decompressed_capacity,
+            decompressed_size, &sd);
+        if (st != CARQUET_OK && sd.reason != CARQUET_SNAPPY_OK) {
+            carquet_snappy_diag_format(&sd, diag, diag_size);
+        }
+        return st;
+    }
+
+    return carquet_decompress_page(codec, compressed, compressed_size,
+                                   decompressed, decompressed_capacity,
+                                   decompressed_size);
+}
 
 carquet_status_t carquet_decompress_page(
     carquet_compression_t codec,
@@ -330,6 +361,33 @@ static carquet_status_t validate_page_payload_span(
     }
 
     return CARQUET_OK;
+}
+
+/**
+ * Resolve the offset of the first data page of a dictionary-encoded chunk.
+ *
+ * `data_page_offset` is the spec-mandated answer and is what every conforming
+ * writer records. Some writers (e.g. DuckDB) instead point it at the dictionary
+ * page, so carquet used to *always* recompute the offset as
+ * `dictionary_page_offset + dict_header + dict_payload`.
+ *
+ * That override is wrong whenever anything sits between the dictionary page and
+ * the first data page — an index page (ColumnMetaData.index_page_offset is a
+ * legal, if rare, field), or writer-inserted alignment padding. In those files
+ * the recomputed offset lands inside or short of the first data page, so the
+ * page header parses out of a payload and the reader hands garbage bytes to the
+ * codec, which then reports the block as corrupt even though the file is fine.
+ *
+ * Only recompute when `data_page_offset` is *provably* wrong, i.e. when it
+ * points at or before the end of the dictionary page. Conforming files keep
+ * their own offset.
+ */
+int64_t carquet_resolve_data_start_offset(int64_t data_page_offset,
+                                          int64_t dict_end) {
+    if (data_page_offset >= dict_end) {
+        return data_page_offset;
+    }
+    return dict_end;
 }
 
 static carquet_status_t ensure_decompress_capacity(
@@ -1103,8 +1161,12 @@ carquet_status_t carquet_read_data_page_v1(
                     uint32_t* out_indices = (uint32_t*)values;
                     int64_t decoded = carquet_rle_decode_all(
                         ptr, remaining, bit_width, out_indices, encoded_count);
-                    if (decoded < 0) {
-                        CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Failed to decode dictionary indices");
+                    /* A short count means a truncated index stream; the tail
+                     * of the output would be whatever the buffer held before. */
+                    if (decoded != encoded_count) {
+                        CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
+                            "Dictionary indices truncated: decoded %lld of %lld",
+                            (long long)decoded, (long long)encoded_count);
                         return CARQUET_ERROR_DECODE;
                     }
                     break;
@@ -1130,8 +1192,10 @@ carquet_status_t carquet_read_data_page_v1(
                 int64_t decoded = carquet_rle_decode_all(
                     ptr, remaining, bit_width, indices, encoded_count);
 
-                if (decoded < 0) {
-                    CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Failed to decode dictionary indices");
+                if (decoded != encoded_count) {
+                    CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
+                        "Dictionary indices truncated: decoded %lld of %lld",
+                        (long long)decoded, (long long)encoded_count);
                     return CARQUET_ERROR_DECODE;
                 }
 
@@ -1474,8 +1538,12 @@ carquet_status_t carquet_read_data_page_v2(
                     uint32_t* out_indices = (uint32_t*)values;
                     int64_t decoded = carquet_rle_decode_all(
                         ptr, remaining, bit_width, out_indices, encoded_count);
-                    if (decoded < 0) {
-                        CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Failed to decode dictionary indices");
+                    /* A short count means a truncated index stream; the tail
+                     * of the output would be whatever the buffer held before. */
+                    if (decoded != encoded_count) {
+                        CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
+                            "Dictionary indices truncated: decoded %lld of %lld",
+                            (long long)decoded, (long long)encoded_count);
                         return CARQUET_ERROR_DECODE;
                     }
                     break;
@@ -1500,8 +1568,10 @@ carquet_status_t carquet_read_data_page_v2(
                 int64_t decoded = carquet_rle_decode_all(
                     ptr, remaining, bit_width, indices, encoded_count);
 
-                if (decoded < 0) {
-                    CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Failed to decode dictionary indices");
+                if (decoded != encoded_count) {
+                    CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
+                        "Dictionary indices truncated: decoded %lld of %lld",
+                        (long long)decoded, (long long)encoded_count);
                     return CARQUET_ERROR_DECODE;
                 }
 
@@ -1702,6 +1772,12 @@ static int32_t count_present_levels(
     return (int32_t)carquet_dispatch_count_non_nulls(def_levels, count, max_def_level);
 }
 
+/* Absolute file offset of the payload currently being decompressed, used only
+ * to make decompression failures locatable in the source file. */
+static int64_t current_page_payload_offset(const carquet_column_reader_t* reader) {
+    return reader->data_start_offset + reader->current_page;
+}
+
 static carquet_status_t prepare_data_page_payload(
     carquet_column_reader_t* reader,
     const parquet_column_metadata_t* col_meta,
@@ -1748,12 +1824,25 @@ static carquet_status_t prepare_data_page_payload(
             }
 
             size_t decompressed_data_size = 0;
-            status = carquet_decompress_page(col_meta->codec,
+            char diag[CARQUET_DECOMPRESS_DIAG_SIZE];
+            status = carquet_decompress_page_diag(col_meta->codec,
                 compressed + levels_size, compressed_data_size,
                 reader->decompress_buffer + levels_size, uncompressed_data_size,
-                &decompressed_data_size);
+                &decompressed_data_size, diag, sizeof(diag));
             if (status != CARQUET_OK) {
-                CARQUET_SET_ERROR(error, status, "Failed to decompress V2 page data");
+                /* The diagnostic goes first: carquet_error_t messages are
+                 * capped at CARQUET_ERROR_MESSAGE_MAX, so the detail that
+                 * identifies the failure must not be what gets truncated.
+                 * %llu, not %zu — the MinGW/msvcrt printf has no z modifier. */
+                CARQUET_SET_ERROR(error, status,
+                    "Failed to decompress V2 page at file offset %lld%s%s "
+                    "(codec=%d, levels=%llu, compressed=%llu, uncompressed=%llu)",
+                    (long long)current_page_payload_offset(reader),
+                    diag[0] ? ": " : "", diag,
+                    (int)col_meta->codec,
+                    (unsigned long long)levels_size,
+                    (unsigned long long)compressed_data_size,
+                    (unsigned long long)uncompressed_data_size);
                 return status;
             }
 
@@ -1781,12 +1870,19 @@ static carquet_status_t prepare_data_page_payload(
         return status;
     }
 
-    status = carquet_decompress_page(col_meta->codec,
+    char diag[CARQUET_DECOMPRESS_DIAG_SIZE];
+    status = carquet_decompress_page_diag(col_meta->codec,
         compressed, (size_t)page_header->compressed_page_size,
         reader->decompress_buffer, (size_t)page_header->uncompressed_page_size,
-        page_size);
+        page_size, diag, sizeof(diag));
     if (status != CARQUET_OK) {
-        CARQUET_SET_ERROR(error, status, "Failed to decompress page");
+        CARQUET_SET_ERROR(error, status,
+            "Failed to decompress data page at file offset %lld%s%s "
+            "(codec=%d, compressed=%d, uncompressed=%d)",
+            (long long)current_page_payload_offset(reader),
+            diag[0] ? ": " : "", diag,
+            (int)col_meta->codec,
+            page_header->compressed_page_size, page_header->uncompressed_page_size);
         return status;
     }
 
@@ -1875,13 +1971,21 @@ static carquet_status_t load_dictionary_page_mmap(
             return CARQUET_ERROR_OUT_OF_MEMORY;
         }
 
-        status = carquet_decompress_page(col_meta->codec,
+        char diag[CARQUET_DECOMPRESS_DIAG_SIZE];
+        status = carquet_decompress_page_diag(col_meta->codec,
             compressed, page_header.compressed_page_size,
-            decompressed, page_header.uncompressed_page_size, &page_size);
+            decompressed, page_header.uncompressed_page_size, &page_size,
+            diag, sizeof(diag));
 
         if (status != CARQUET_OK) {
             carquet_mem_free(decompressed);
-            CARQUET_SET_ERROR(error, status, "Failed to decompress dictionary");
+            CARQUET_SET_ERROR(error, status,
+                "Failed to decompress dictionary page at file offset %lld%s%s "
+                "(codec=%d, compressed=%d, uncompressed=%d)",
+                (long long)dict_offset,
+                diag[0] ? ": " : "", diag,
+                (int)col_meta->codec,
+                page_header.compressed_page_size, page_header.uncompressed_page_size);
             return status;
         }
         page_data = decompressed;
@@ -1896,19 +2000,16 @@ static carquet_status_t load_dictionary_page_mmap(
             : CARQUET_DATA_OWNED,
         error);
 
-    /* Compute actual first data page offset from dictionary page layout.
-     * Some writers (e.g. DuckDB) set data_page_offset incorrectly for
-     * dictionary-encoded columns. The reliable offset is always right
-     * after the dictionary page: dict_offset + header + compressed data. */
     if (status == CARQUET_OK) {
-        int64_t data_start;
-        if (!checked_add_i64(dict_offset, (int64_t)header_size, &data_start) ||
-            !checked_add_i64(data_start, (int64_t)page_header.compressed_page_size,
-                             &data_start)) {
+        int64_t dict_end;
+        if (!checked_add_i64(dict_offset, (int64_t)header_size, &dict_end) ||
+            !checked_add_i64(dict_end, (int64_t)page_header.compressed_page_size,
+                             &dict_end)) {
             CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Dictionary page offset overflow");
             return CARQUET_ERROR_INVALID_PAGE;
         }
-        reader->data_start_offset = data_start;
+        reader->data_start_offset =
+            carquet_resolve_data_start_offset(col_meta->data_page_offset, dict_end);
     }
 
     if (col_meta->codec != CARQUET_COMPRESSION_UNCOMPRESSED && status != CARQUET_OK) {
@@ -2060,14 +2161,22 @@ static carquet_status_t load_dictionary_page_fread(
             return CARQUET_ERROR_OUT_OF_MEMORY;
         }
 
-        status = carquet_decompress_page(col_meta->codec,
+        char diag[CARQUET_DECOMPRESS_DIAG_SIZE];
+        status = carquet_decompress_page_diag(col_meta->codec,
             compressed, page_header.compressed_page_size,
-            page_data, page_header.uncompressed_page_size, &page_size);
+            page_data, page_header.uncompressed_page_size, &page_size,
+            diag, sizeof(diag));
         carquet_mem_free(compressed);
 
         if (status != CARQUET_OK) {
             carquet_mem_free(page_data);
-            CARQUET_SET_ERROR(error, status, "Failed to decompress dictionary");
+            CARQUET_SET_ERROR(error, status,
+                "Failed to decompress dictionary page at file offset %lld%s%s "
+                "(codec=%d, compressed=%d, uncompressed=%d)",
+                (long long)col_meta->dictionary_page_offset,
+                diag[0] ? ": " : "", diag,
+                (int)col_meta->codec,
+                page_header.compressed_page_size, page_header.uncompressed_page_size);
             return status;
         }
     }
@@ -2078,20 +2187,17 @@ static carquet_status_t load_dictionary_page_fread(
         &page_header.dictionary_page_header,
         CARQUET_DATA_OWNED, error);
 
-    /* Compute actual first data page offset from dictionary page layout.
-     * Some writers (e.g. DuckDB) set data_page_offset incorrectly for
-     * dictionary-encoded columns. The reliable offset is always right
-     * after the dictionary page: dict_offset + header + compressed data. */
     if (status == CARQUET_OK) {
-        int64_t data_start;
+        int64_t dict_end;
         if (!checked_add_i64(col_meta->dictionary_page_offset,
-                             (int64_t)header_size, &data_start) ||
-            !checked_add_i64(data_start, (int64_t)page_header.compressed_page_size,
-                             &data_start)) {
+                             (int64_t)header_size, &dict_end) ||
+            !checked_add_i64(dict_end, (int64_t)page_header.compressed_page_size,
+                             &dict_end)) {
             CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Dictionary page offset overflow");
             return CARQUET_ERROR_INVALID_PAGE;
         }
-        reader->data_start_offset = data_start;
+        reader->data_start_offset =
+            carquet_resolve_data_start_offset(col_meta->data_page_offset, dict_end);
     }
 
     if (status != CARQUET_OK) {

@@ -590,11 +590,132 @@ static int test_export_struct_rejected(void) {
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* INTEGER(8|16) columns are INT32 on the Parquet side but int8/uint8/int16/
+ * uint16 on the Arrow side: export must narrow the values buffer to the width
+ * its format string declares, and import must widen from that width rather than
+ * read the Arrow buffer with the INT32 stride. */
+static carquet_schema_t* make_narrow_schema(void) {
+    carquet_schema_t* s = carquet_schema_create(NULL);
+    static const struct { const char* name; int bw; bool sgn; int rep; } cols[4] = {
+        {"i8", 8, true, CARQUET_REPETITION_REQUIRED},
+        {"u8", 8, false, CARQUET_REPETITION_REQUIRED},
+        {"i16", 16, true, CARQUET_REPETITION_REQUIRED},
+        {"u16", 16, false, CARQUET_REPETITION_OPTIONAL},
+    };
+    for (int i = 0; i < 4; i++) {
+        carquet_logical_type_t lt = {0};
+        lt.id = CARQUET_LOGICAL_INTEGER;
+        lt.params.integer.bit_width = (int8_t)cols[i].bw;
+        lt.params.integer.is_signed = cols[i].sgn;
+        carquet_schema_add_column(s, cols[i].name, CARQUET_PHYSICAL_INT32, &lt,
+                                  (carquet_field_repetition_t)cols[i].rep, 0, 0);
+    }
+    return s;
+}
+
+static const int32_t NARROW_I8[5]  = {-128, -1, 0, 1, 127};
+static const int32_t NARROW_U8[5]  = {0, 1, 128, 200, 255};
+static const int32_t NARROW_I16[5] = {-32768, -2, 0, 3, 32767};
+static const int32_t NARROW_U16[4] = {0, 40000, 65535, 7};      /* dense */
+static const int16_t NARROW_U16_DEF[5] = {1, 0, 1, 1, 1};
+
+static void check_narrow_array(const struct ArrowSchema* sc, const struct ArrowArray* ar) {
+    assert(sc->n_children == 4 && ar->n_children == 4);
+    assert(strcmp(sc->children[0]->format, "c") == 0);
+    assert(strcmp(sc->children[1]->format, "C") == 0);
+    assert(strcmp(sc->children[2]->format, "s") == 0);
+    assert(strcmp(sc->children[3]->format, "S") == 0);
+    const int8_t*   a = (const int8_t*)ar->children[0]->buffers[1];
+    const uint8_t*  b = (const uint8_t*)ar->children[1]->buffers[1];
+    const int16_t*  c = (const int16_t*)ar->children[2]->buffers[1];
+    const uint16_t* d = (const uint16_t*)ar->children[3]->buffers[1];
+    const uint8_t*  dv = (const uint8_t*)ar->children[3]->buffers[0];
+    for (int i = 0; i < 5; i++) {
+        assert(a[i] == NARROW_I8[i]);
+        assert(b[i] == NARROW_U8[i]);
+        assert(c[i] == NARROW_I16[i]);
+    }
+    assert(dv && dv[0] == 0x1D);                    /* row 1 null */
+    assert(d[0] == 0 && d[2] == 40000 && d[3] == 65535 && d[4] == 7);
+}
+
+static int test_narrow_ints(void) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t* schema = make_narrow_schema();
+    carquet_writer_t* w = carquet_writer_create_buffer(schema, NULL, &err);
+    if (!w) TEST_FAIL("narrow_ints", "writer create failed");
+    if (carquet_writer_write_batch(w, 0, NARROW_I8, 5, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_write_batch(w, 1, NARROW_U8, 5, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_write_batch(w, 2, NARROW_I16, 5, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_write_batch(w, 3, NARROW_U16, 5, NARROW_U16_DEF, NULL) != CARQUET_OK)
+        TEST_FAIL("narrow_ints", "write failed");
+    void* buf = NULL; size_t sz = 0;
+    if (carquet_writer_close(w) != CARQUET_OK ||
+        carquet_writer_get_buffer(w, &buf, &sz) != CARQUET_OK)
+        TEST_FAIL("narrow_ints", "close failed");
+    carquet_schema_free(schema);
+
+    /* Whole-row-group read: buffers at the declared Arrow width. */
+    carquet_reader_t* r0 = carquet_reader_open_buffer(buf, sz, NULL, &err);
+    if (!r0) TEST_FAIL("narrow_ints", "open failed");
+    struct ArrowSchema rs; struct ArrowArray ra;
+    if (carquet_reader_read_arrow(r0, 0, &rs, &ra, &err) != CARQUET_OK)
+        TEST_FAIL("narrow_ints", err.message);
+    check_narrow_array(&rs, &ra);
+    rs.release(&rs); ra.release(&ra);
+    carquet_reader_close(r0);
+
+    /* Batch export: same layout. */
+    carquet_reader_t* r = NULL; carquet_batch_reader_t* br = NULL; carquet_row_batch_t* batch = NULL;
+    if (read_one_batch(buf, sz, &r, &br, &batch) != 0) TEST_FAIL("narrow_ints", "read failed");
+    struct ArrowSchema aschema; struct ArrowArray aarray;
+    if (carquet_arrow_export_batch(batch, carquet_reader_schema(r), &aschema, &aarray, &err) != CARQUET_OK)
+        TEST_FAIL("narrow_ints", err.message);
+    check_narrow_array(&aschema, &aarray);
+    free_one_batch(r, br);
+    free(buf);
+
+    /* Import the narrow Arrow arrays (consumes them) and read INT32 back. */
+    carquet_schema_t* schema2 = make_narrow_schema();
+    carquet_writer_t* w2 = carquet_writer_create_buffer(schema2, NULL, &err);
+    if (!w2) TEST_FAIL("narrow_ints", "writer2 create failed");
+    if (carquet_writer_write_arrow(w2, &aarray, &aschema, &err) != CARQUET_OK)
+        TEST_FAIL("narrow_ints", err.message);
+    void* buf2 = NULL; size_t sz2 = 0;
+    if (carquet_writer_close(w2) != CARQUET_OK ||
+        carquet_writer_get_buffer(w2, &buf2, &sz2) != CARQUET_OK)
+        TEST_FAIL("narrow_ints", "close2 failed");
+    carquet_schema_free(schema2);
+
+    carquet_reader_t* r2 = carquet_reader_open_buffer(buf2, sz2, NULL, &err);
+    if (!r2) TEST_FAIL("narrow_ints", "open2 failed");
+    const int32_t* expect[3] = {NARROW_I8, NARROW_U8, NARROW_I16};
+    for (int col = 0; col < 3; col++) {
+        carquet_column_reader_t* c = carquet_reader_get_column(r2, 0, col, NULL);
+        int32_t v[5];
+        assert(carquet_column_read_batch(c, v, 5, NULL, NULL) == 5);
+        assert(memcmp(v, expect[col], sizeof(v)) == 0);
+        carquet_column_reader_free(c);
+    }
+    carquet_column_reader_t* c3 = carquet_reader_get_column(r2, 0, 3, NULL);
+    int32_t v3[5]; int16_t d3[5];
+    assert(carquet_column_read_batch(c3, v3, 5, d3, NULL) == 5);
+    assert(memcmp(d3, NARROW_U16_DEF, sizeof(d3)) == 0);
+    assert(memcmp(v3, NARROW_U16, sizeof(NARROW_U16)) == 0);
+    carquet_column_reader_free(c3);
+    carquet_reader_close(r2);
+    free(buf2);
+    TEST_PASS("narrow_ints");
+    return 0;
+}
+
 int main(void) {
     int rc = 0;
     rc |= test_export_bytes();
     rc |= test_export_owns_memory();
     rc |= test_roundtrip();
+    rc |= test_narrow_ints();
     rc |= test_import_schema();
     rc |= test_errors();
     rc |= test_write_arrow_errors();
