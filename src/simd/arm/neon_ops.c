@@ -1468,12 +1468,8 @@ void carquet_neon_minmax_double(const double* values, int64_t count,
     }
 
     /* Horizontal reduction via lane extract */
-    double mn0 = vgetq_lane_f64(min_vec, 0);
-    double mn1 = vgetq_lane_f64(min_vec, 1);
-    double mx0 = vgetq_lane_f64(max_vec, 0);
-    double mx1 = vgetq_lane_f64(max_vec, 1);
-    min_v = mn0 < mn1 ? mn0 : mn1;
-    max_v = mx0 > mx1 ? mx0 : mx1;
+    min_v = vpminqd_f64(min_vec); /*FMINP: NaN if either lane is NaN */
+    max_v = vpmaxqd_f64(max_vec);
 
     for (; i < count; i++) {
         if (values[i] < min_v) min_v = values[i];
