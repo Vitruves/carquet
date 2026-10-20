@@ -39,6 +39,15 @@ option(CARQUET_BUILD_ARROW_CPP_BENCHMARK "Build the optional Arrow C++ compariso
 option(CARQUET_BUILD_INTEROP "Build interoperability test programs" ${CARQUET_BUILD_DEV})
 option(CARQUET_BUILD_CLI "Build carquet CLI tool" ON)
 option(CARQUET_BUILD_SHARED "Build shared library" OFF)
+if(CARQUET_BUILD_SHARED)
+    # The fetched codec archives (zlib, zstd, lz4, brotli) are linked INTO
+    # libcarquet.so, so their objects must be position independent; without
+    # this the Linux link fails with "relocation ... can not be used when making
+    # a shared object; recompile with -fPIC" (seen on the manylinux wheel build).
+    # Setting the variable here initialises POSITION_INDEPENDENT_CODE for every
+    # target created below, including the FetchContent subprojects.
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
 option(CARQUET_ENABLE_SSE "Enable SSE optimizations" ON)
 option(CARQUET_ENABLE_AVX "Enable AVX optimizations" ON)
 option(CARQUET_ENABLE_AVX2 "Enable AVX2 optimizations" ON)
