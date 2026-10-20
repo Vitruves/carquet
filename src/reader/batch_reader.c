@@ -112,6 +112,8 @@ typedef struct {
     carquet_column_reader_t** col_readers;  /* [num_projected] readers, used for bulk read */
     int32_t rg_index;                       /* row group index, -1 = empty */
     bool ready;                             /* all columns fully read */
+    int32_t pending_tasks;                  /* bulk-read tasks still running for this
+                                             * slot; guarded by the reader's slot_mutex */
 
     /* Pre-read value buffers (entire column chunk per column) */
     void** col_values;       /* [num_projected] value buffers */
@@ -119,6 +121,11 @@ typedef struct {
     int64_t* col_num_values; /* [num_projected] values actually read */
     int64_t total_rows;      /* total rows in this slot (= range total when filter active) */
     int64_t rows_consumed;   /* rows already served to batch_reader_next */
+    /* Columns read as several page-range segments: the task_args index of the
+     * first segment and the segment count (<= 1 means a single whole-chunk
+     * task, whose count lands in col_num_values directly). */
+    int32_t* col_task_first; /* [num_projected] */
+    int32_t* col_task_count; /* [num_projected] */
 
     /* Page-filter row ranges for this slot (only populated when a page
      * filter is active). Per-projected-column offset indexes are cached
@@ -152,6 +159,10 @@ static bool can_coalesce_column(const carquet_column_reader_t* cr);
 static void coalesced_read_column_range(const carquet_column_reader_t* cr,
     const uint8_t* data_base, void* dest, int64_t max_values,
     int64_t start_offset, int64_t end_offset, int64_t* out_values_read);
+static bool coalesced_read_segment(const carquet_column_reader_t* cr,
+    const uint8_t* data_base, void* dest, int64_t max_values,
+    int64_t start_offset, int64_t end_offset,
+    struct carquet_batch_reader* scratch_owner, int64_t* out_values_read);
 static void coalesced_read_column(const carquet_column_reader_t* cr,
     void* dest, int64_t max_values, int64_t* out_values_read);
 static int32_t plan_coalesced_column_splits(const carquet_column_reader_t* cr,
@@ -177,6 +188,8 @@ typedef struct {
     int64_t start_offset;      /* 0 = full chunk */
     int64_t end_offset;        /* 0 = full chunk */
     int64_t local_values_read; /* scratch for split tasks */
+    bool is_split;             /* one page-range segment of a column chunk:
+                                * never falls back inline (see bulk_read_task_body) */
 
     /* Page-filter mode: when ranges is non-NULL the task reads only the
      * matching pages, writing rows contiguously into dest. */
@@ -184,6 +197,12 @@ typedef struct {
     const carquet_offset_index_t* offset_index;
     int64_t rg_num_rows;
     size_t value_size;
+
+    /* Completion accounting: the owning reader's slot_mutex/slot_cond and the
+     * slot's pending_tasks counter, decremented when the task finishes so
+     * the consumer can wait for one slot instead of draining the pool. */
+    struct carquet_batch_reader* owner;
+    int32_t* slot_pending;
 } bulk_read_arg_t;
 
 struct carquet_batch_reader {
@@ -233,6 +252,28 @@ struct carquet_batch_reader {
      * Pre-decompresses pages for upcoming row groups so that by the time
      * batch_reader_next() needs data, it's already decompressed. */
     rg_slot_t* pipeline;          /* [pipeline_depth] ring buffer */
+    /* Per-slot completion: lets next() wait for the head slot only, so the
+     * other slots keep decompressing in the background (previously a global
+     * pool wait stalled every row-group transition on the newest fill). */
+#ifdef _WIN32
+    CRITICAL_SECTION slot_mutex;
+    CONDITION_VARIABLE slot_cond;
+#else
+    pthread_mutex_t slot_mutex;
+    pthread_cond_t slot_cond;
+#endif
+    bool slot_sync_init;
+    /* Intra-chunk splitting: a column chunk may be cut into up to max_splits
+     * page-aligned segments, each its own task, so a few large row groups
+     * still keep every pool thread busy. Segment tasks of one column run
+     * concurrently and therefore cannot share the column reader's
+     * decompress_buffer: BYTE_STREAM_SPLIT staging comes from this small
+     * pool instead (one entry per pool thread; guarded by slot_mutex). */
+    int32_t max_splits;
+    uint8_t** scratch_bufs;       /* [scratch_cap]; entries [0, scratch_free) are free */
+    size_t* scratch_sizes;        /* [scratch_cap] capacities (0 = not yet allocated) */
+    int32_t scratch_free;
+    int32_t scratch_cap;
     int32_t pipeline_depth;       /* window size */
     int32_t pipeline_head;        /* next slot to consume */
     int32_t pipeline_count;       /* slots in use */
@@ -727,6 +768,27 @@ static void read_nested_list_column(
     bool elem_optional = (leaf->repetition_type == CARQUET_REPETITION_OPTIONAL);
     int16_t elem_exists = elem_optional ? (int16_t)(max_def - 1) : max_def;
 
+    /* Definition level at which the list itself is present. It is the max
+     * definition level of the list's container (the group above the repeated
+     * node): OPTIONAL/REPEATED ancestors each add one. A REQUIRED top-level
+     * list has container_def == 0, so def == 0 is an *empty* list, not a null
+     * one; an OPTIONAL top-level list has container_def == 1. */
+    int16_t container_def = 0;
+    {
+        int32_t leaf_idx = schema->leaf_indices[file_col];
+        int32_t rep_node = leaf_idx;
+        while (rep_node > 0 &&
+               schema->elements[rep_node].repetition_type != CARQUET_REPETITION_REPEATED) {
+            rep_node = schema->parent_indices[rep_node];
+        }
+        int32_t node = rep_node > 0 ? schema->parent_indices[rep_node] : 0;
+        for (; node > 0; node = schema->parent_indices[node]) {
+            if (schema->elements[node].repetition_type != CARQUET_REPETITION_REQUIRED) {
+                container_def++;
+            }
+        }
+    }
+
     /* Total leaf slots in this chunk = number of (def, rep) entries. */
     int64_t total_slots = carquet_column_remaining(col_reader);
     if (total_slots < 0) {
@@ -824,7 +886,7 @@ static void read_nested_list_column(
         if (rep_levels[j] == 0) {
             li++;
             offsets[li] = (int32_t)cc;
-            if (def_levels[j] > 0) {
+            if (def_levels[j] >= container_def) {
                 list_valid[li >> 3] |= (uint8_t)(1u << (li & 7));
             } else {
                 any_list_null = true;
@@ -978,6 +1040,12 @@ carquet_batch_reader_t* carquet_batch_reader_create(
         batch_reader->config = *config;
     } else {
         carquet_batch_reader_config_init(&batch_reader->config);
+    }
+    /* A zero-initialised config (not config_init) has batch_size 0, which
+     * the sequential and pipeline paths would turn into endless empty
+     * batches (and a negative size into a wrapped buffer offset). */
+    if (batch_reader->config.batch_size <= 0) {
+        batch_reader->config.batch_size = 65536;
     }
 
     /* Resolve column projection */
@@ -1237,16 +1305,53 @@ carquet_batch_reader_t* carquet_batch_reader_create(
                 batch_reader->pipeline = carquet_mem_calloc(depth, sizeof(rg_slot_t));
                 if (batch_reader->pipeline) {
                     batch_reader->pipeline_depth = depth;
+#ifdef _WIN32
+                    InitializeCriticalSection(&batch_reader->slot_mutex);
+                    InitializeConditionVariable(&batch_reader->slot_cond);
+                    batch_reader->slot_sync_init = true;
+#else
+                    batch_reader->slot_sync_init =
+                        pthread_mutex_init(&batch_reader->slot_mutex, NULL) == 0;
+                    if (batch_reader->slot_sync_init &&
+                        pthread_cond_init(&batch_reader->slot_cond, NULL) != 0) {
+                        pthread_mutex_destroy(&batch_reader->slot_mutex);
+                        batch_reader->slot_sync_init = false;
+                    }
+#endif
                     batch_reader->pipeline_head = 0;
                     batch_reader->pipeline_count = 0;
                     batch_reader->pipeline_active = true;
 
-                    /* Allocate per-reader task args.  The pipeline currently
-                     * submits one task per projected column.  Intra-column
-                     * splitting needs per-task scratch buffers before it can
-                     * safely share column readers. */
+                    /* Allocate per-reader task args. Each projected column of
+                     * a slot is one task, or up to max_splits page-range
+                     * segment tasks when the pipeline window would otherwise
+                     * offer the pool too few tasks (few row groups and/or
+                     * columns). Aim for ~32 tasks per thread per window. */
                     int32_t np = batch_reader->num_projected;
                     int32_t max_splits = 1;
+                    if (batch_reader->slot_sync_init && np > 0) {
+                        int64_t budget = 32 * (int64_t)pt;
+                        int64_t base_tasks = (int64_t)depth * np;
+                        int64_t ms = budget / base_tasks;
+                        if (ms > 16) ms = 16;
+                        if (ms < 1) ms = 1;
+                        max_splits = (int32_t)ms;
+                    }
+                    batch_reader->max_splits = max_splits;
+                    if (max_splits > 1) {
+                        batch_reader->scratch_bufs = carquet_mem_calloc(pt, sizeof(uint8_t*));
+                        batch_reader->scratch_sizes = carquet_mem_calloc(pt, sizeof(size_t));
+                        if (batch_reader->scratch_bufs && batch_reader->scratch_sizes) {
+                            batch_reader->scratch_cap = pt;
+                            batch_reader->scratch_free = pt;
+                        } else {
+                            carquet_mem_free(batch_reader->scratch_bufs);
+                            carquet_mem_free(batch_reader->scratch_sizes);
+                            batch_reader->scratch_bufs = NULL;
+                            batch_reader->scratch_sizes = NULL;
+                            batch_reader->max_splits = max_splits = 1;
+                        }
+                    }
                     batch_reader->task_args_capacity = depth * np * (max_splits + 1);
                     batch_reader->task_args = carquet_mem_calloc(batch_reader->task_args_capacity,
                                                      sizeof(bulk_read_arg_t));
@@ -1263,17 +1368,23 @@ carquet_batch_reader_t* carquet_batch_reader_create(
                         batch_reader->pipeline[s].col_values = carquet_mem_calloc(np, sizeof(void*));
                         batch_reader->pipeline[s].col_buf_sizes = carquet_mem_calloc(np, sizeof(size_t));
                         batch_reader->pipeline[s].col_num_values = carquet_mem_calloc(np, sizeof(int64_t));
+                        batch_reader->pipeline[s].col_task_first = carquet_mem_calloc(np, sizeof(int32_t));
+                        batch_reader->pipeline[s].col_task_count = carquet_mem_calloc(np, sizeof(int32_t));
                         batch_reader->pipeline[s].rg_index = -1;
                         if (!batch_reader->pipeline[s].col_readers ||
                             !batch_reader->pipeline[s].col_values ||
                             !batch_reader->pipeline[s].col_buf_sizes ||
-                            !batch_reader->pipeline[s].col_num_values) {
+                            !batch_reader->pipeline[s].col_num_values ||
+                            !batch_reader->pipeline[s].col_task_first ||
+                            !batch_reader->pipeline[s].col_task_count) {
                             /* Cleanup all slots on failure */
                             for (int32_t j = 0; j <= s; j++) {
                                 carquet_mem_free(batch_reader->pipeline[j].col_readers);
                                 carquet_mem_free(batch_reader->pipeline[j].col_values);
                                 carquet_mem_free(batch_reader->pipeline[j].col_buf_sizes);
                                 carquet_mem_free(batch_reader->pipeline[j].col_num_values);
+                                carquet_mem_free(batch_reader->pipeline[j].col_task_first);
+                                carquet_mem_free(batch_reader->pipeline[j].col_task_count);
                             }
                             carquet_mem_free(batch_reader->pipeline);
                             batch_reader->pipeline = NULL;
@@ -1390,8 +1501,60 @@ static carquet_status_t open_row_group_readers(
  * Bulk-read task: reads ALL values from a column reader into a pre-allocated
  * buffer. This forces decompression of ALL pages in the column chunk.
  */
+static void bulk_read_task_body(bulk_read_arg_t* t);
+
+static void slot_sync_lock(carquet_batch_reader_t* br) {
+#ifdef _WIN32
+    EnterCriticalSection(&br->slot_mutex);
+#else
+    pthread_mutex_lock(&br->slot_mutex);
+#endif
+}
+static void slot_sync_unlock(carquet_batch_reader_t* br) {
+#ifdef _WIN32
+    LeaveCriticalSection(&br->slot_mutex);
+#else
+    pthread_mutex_unlock(&br->slot_mutex);
+#endif
+}
+
+/* Block until every bulk-read task submitted for `slot` has finished. The
+ * task results (col_num_values, last_error, the value buffers) are published
+ * by the decrement under slot_mutex, so reading them after this returns is
+ * race-free. */
+static void pipeline_wait_slot(carquet_batch_reader_t* br, rg_slot_t* slot) {
+    if (!br->slot_sync_init) {
+        carquet_worker_pool_wait(br->pool);
+        return;
+    }
+    slot_sync_lock(br);
+    while (slot->pending_tasks > 0) {
+#ifdef _WIN32
+        SleepConditionVariableCS(&br->slot_cond, &br->slot_mutex, INFINITE);
+#else
+        pthread_cond_wait(&br->slot_cond, &br->slot_mutex);
+#endif
+    }
+    slot_sync_unlock(br);
+}
+
 static void bulk_read_task(void* arg) {
     bulk_read_arg_t* t = (bulk_read_arg_t*)arg;
+    bulk_read_task_body(t);
+    if (t->owner && t->slot_pending && t->owner->slot_sync_init) {
+        slot_sync_lock(t->owner);
+        if (--(*t->slot_pending) == 0) {
+#ifdef _WIN32
+            WakeAllConditionVariable(&t->owner->slot_cond);
+#else
+            pthread_cond_broadcast(&t->owner->slot_cond);
+#endif
+        }
+        slot_sync_unlock(t->owner);
+    }
+}
+
+static void bulk_read_task_body(bulk_read_arg_t* t) {
     if (!t->col_reader || !t->dest || t->max_values <= 0) {
         *t->out_values_read = 0;
         return;
@@ -1468,16 +1631,19 @@ static void bulk_read_task(void* arg) {
     /* ------------------------------------------------------------------
      * Unfiltered branch: existing fast paths.
      * ------------------------------------------------------------------ */
-    if (can_coalesce_column(t->col_reader)) {
-        if (t->start_offset > 0 && t->end_offset > t->start_offset) {
-            coalesced_read_column_range(t->col_reader, t->data_base,
-                                        t->dest, t->max_values,
-                                        t->start_offset, t->end_offset,
-                                        t->out_values_read);
-        } else {
-            coalesced_read_column(t->col_reader, t->dest, t->max_values,
-                                  t->out_values_read);
-        }
+    if (t->is_split) {
+        /* One page-range segment of a chunk whose other segments are being
+         * decoded concurrently by other tasks: the column reader is shared,
+         * so no inline fallback through it. A bail leaves the segment's count
+         * short; the consumer notices the column total is short after the
+         * slot's wait and re-reads the chunk on its own thread. */
+        (void)coalesced_read_segment(t->col_reader, t->data_base,
+                                     t->dest, t->max_values,
+                                     t->start_offset, t->end_offset,
+                                     t->owner, t->out_values_read);
+    } else if (can_coalesce_column(t->col_reader)) {
+        coalesced_read_column(t->col_reader, t->dest, t->max_values,
+                              t->out_values_read);
     } else {
         *t->out_values_read = carquet_column_read_batch_ex(
             t->col_reader, t->dest, t->max_values, NULL, NULL,
@@ -1506,13 +1672,56 @@ static bool can_coalesce_column(const carquet_column_reader_t* cr) {
     return true;
 }
 
-static void coalesced_read_column_range(
+/* Scratch pool for segment tasks (BYTE_STREAM_SPLIT staging). Entries
+ * [0, scratch_free) are free; an entry's buffer may still be NULL (capacity 0)
+ * until a task first grows it. Returns false when no entry is free, which
+ * cannot happen while every task is run by a pool thread (one entry per
+ * thread) but is handled anyway. */
+static bool scratch_acquire(carquet_batch_reader_t* br, uint8_t** buf, size_t* cap) {
+    bool ok = false;
+    slot_sync_lock(br);
+    if (br->scratch_free > 0) {
+        br->scratch_free--;
+        *buf = br->scratch_bufs[br->scratch_free];
+        *cap = br->scratch_sizes[br->scratch_free];
+        br->scratch_bufs[br->scratch_free] = NULL;
+        br->scratch_sizes[br->scratch_free] = 0;
+        ok = true;
+    }
+    slot_sync_unlock(br);
+    return ok;
+}
+
+static void scratch_release(carquet_batch_reader_t* br, uint8_t* buf, size_t cap) {
+    slot_sync_lock(br);
+    if (br->scratch_free < br->scratch_cap) {
+        br->scratch_bufs[br->scratch_free] = buf;
+        br->scratch_sizes[br->scratch_free] = cap;
+        br->scratch_free++;
+        buf = NULL;
+    }
+    slot_sync_unlock(br);
+    carquet_mem_free(buf);   /* pool full (cannot happen): don't leak */
+}
+
+/**
+ * Decode every data page in [start_offset, end_offset) of a coalescable
+ * column chunk straight into dest. Returns true when the whole range was
+ * decoded; on false *out_values_read holds the number of values decoded
+ * before the bail (whole pages only) and the caller recovers.
+ *
+ * scratch_owner != NULL selects the batch reader's scratch pool for
+ * BYTE_STREAM_SPLIT staging instead of the column reader's decompress_buffer,
+ * which is required when several segments of one chunk decode concurrently.
+ */
+static bool coalesced_read_segment(
     const carquet_column_reader_t* cr,
     const uint8_t* data_base,
     void* dest,
     int64_t max_values,
     int64_t start_offset,
     int64_t end_offset,
+    carquet_batch_reader_t* scratch_owner,
     int64_t* out_values_read) {
 
     const carquet_reader_t* fr = cr->file_reader;
@@ -1520,26 +1729,33 @@ static void coalesced_read_column_range(
     const parquet_column_metadata_t* meta = cr->col_meta;
     size_t file_size = fr->file_size;
 
+    uint8_t* out = (uint8_t*)dest;
+    int64_t total_values = 0;
+
+    /* BYTE_STREAM_SPLIT staging buffer: the column reader's own (single
+     * task per chunk) or one borrowed from the scratch pool (segments). */
+    uint8_t* stage = NULL;
+    size_t stage_cap = 0;
+    bool stage_from_pool = false;
+
     size_t value_size = 0;
     switch (cr->type) {
         case CARQUET_PHYSICAL_INT32: case CARQUET_PHYSICAL_FLOAT: value_size = 4; break;
         case CARQUET_PHYSICAL_INT64: case CARQUET_PHYSICAL_DOUBLE: value_size = 8; break;
         case CARQUET_PHYSICAL_INT96: value_size = 12; break;
         case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY: value_size = (size_t)cr->type_length; break;
-        default: goto fallback;
+        default: goto bail;
     }
+    if (value_size == 0) goto bail;
 
     int64_t offset = start_offset;
     int64_t chunk_end = end_offset;
     if (offset <= 0) offset = meta->data_page_offset;
     if (chunk_end <= 0) chunk_end = meta->data_page_offset + meta->total_compressed_size;
     if (offset < meta->data_page_offset || chunk_end > meta->data_page_offset + meta->total_compressed_size) {
-        goto fallback;
+        goto bail;
     }
-    if (offset < 0 || chunk_end > (int64_t)file_size) goto fallback;
-
-    uint8_t* out = (uint8_t*)dest;
-    int64_t total_values = 0;
+    if (offset < 0 || chunk_end > (int64_t)file_size) goto bail;
 
     while (offset < chunk_end && total_values < max_values) {
         /* Parse page header */
@@ -1551,15 +1767,15 @@ static void coalesced_read_column_range(
         parquet_page_header_t hdr;
         size_t hdr_size;
         if (parquet_parse_page_header(ptr, max_hdr, &hdr, &hdr_size, NULL) != CARQUET_OK)
-            goto fallback;
+            goto bail;
 
         if (hdr.type != CARQUET_PAGE_DATA)
-            goto fallback;
+            goto bail;
 
         int32_t num_values = hdr.data_page_header.num_values;
         carquet_encoding_t encoding = hdr.data_page_header.encoding;
 
-        if (num_values <= 0 || total_values + num_values > max_values) goto fallback;
+        if (num_values <= 0 || total_values + num_values > max_values) goto bail;
 
         const uint8_t* compressed = ptr + hdr_size;
         size_t comp_size = (size_t)hdr.compressed_page_size;
@@ -1570,7 +1786,7 @@ static void coalesced_read_column_range(
             uncomp_size > CARQUET_MAX_PAGE_PAYLOAD_SIZE ||
             hdr_size > remaining ||
             comp_size > remaining - hdr_size) {
-            goto fallback;
+            goto bail;
         }
 
         /* This path decompresses straight into the caller's buffer, which has
@@ -1579,14 +1795,14 @@ static void coalesced_read_column_range(
          * codec would be handed a capacity larger than the space that actually
          * exists. */
         if (uncomp_size != (size_t)num_values * value_size) {
-            goto fallback;
+            goto bail;
         }
 
         /* Same integrity check as the page-by-page reader, so this path does
          * not trade verification for speed. */
         if (hdr.has_crc && fr->options.verify_checksums &&
             carquet_crc32(compressed, comp_size) != (uint32_t)hdr.crc) {
-            goto fallback;
+            goto bail;
         }
 
         if (encoding == CARQUET_ENCODING_PLAIN) {
@@ -1594,47 +1810,60 @@ static void coalesced_read_column_range(
             size_t actual;
             if (carquet_decompress_page(meta->codec, compressed, comp_size,
                                          out, uncomp_size, &actual) != CARQUET_OK)
-                goto fallback;
+                goto bail;
             /* A short payload would leave the tail of this page's values
              * holding whatever the buffer held before. */
-            if (actual != uncomp_size) goto fallback;
+            if (actual != uncomp_size) goto bail;
         } else if (encoding == CARQUET_ENCODING_BYTE_STREAM_SPLIT) {
-            /* Decompress to temp, then cache-tiled transpose to output */
-            if (uncomp_size > reader->decompress_capacity) {
-                uint8_t* new_buf = carquet_mem_realloc(reader->decompress_buffer, uncomp_size);
-                if (!new_buf) {
-                    goto fallback;
+            /* Decompress to staging, then cache-tiled transpose to output */
+            if (!stage && !stage_from_pool) {
+                if (scratch_owner) {
+                    if (!scratch_acquire(scratch_owner, &stage, &stage_cap)) goto bail;
+                    stage_from_pool = true;
+                } else {
+                    stage = reader->decompress_buffer;
+                    stage_cap = reader->decompress_capacity;
                 }
-                reader->decompress_buffer = new_buf;
-                reader->decompress_capacity = uncomp_size;
+            }
+            if (uncomp_size > stage_cap) {
+                uint8_t* new_buf = carquet_mem_realloc(stage, uncomp_size);
+                if (!new_buf) {
+                    goto bail;
+                }
+                stage = new_buf;
+                stage_cap = uncomp_size;
+                if (!stage_from_pool) {
+                    reader->decompress_buffer = stage;
+                    reader->decompress_capacity = stage_cap;
+                }
             }
             size_t actual;
             if (carquet_decompress_page(meta->codec, compressed, comp_size,
-                                         reader->decompress_buffer, uncomp_size, &actual) != CARQUET_OK)
-                goto fallback;
-            if (actual != uncomp_size) goto fallback;
+                                         stage, uncomp_size, &actual) != CARQUET_OK)
+                goto bail;
+            if (actual != uncomp_size) goto bail;
             if (value_size == 4) {
                 if (carquet_byte_stream_split_decode_float(
-                        reader->decompress_buffer, actual, (float*)out, num_values) != CARQUET_OK) {
-                    goto fallback;
+                        stage, actual, (float*)out, num_values) != CARQUET_OK) {
+                    goto bail;
                 }
             } else if (value_size == 8) {
                 if (carquet_byte_stream_split_decode_double(
-                        reader->decompress_buffer, actual, (double*)out, num_values) != CARQUET_OK) {
-                    goto fallback;
+                        stage, actual, (double*)out, num_values) != CARQUET_OK) {
+                    goto bail;
                 }
             } else {
                 /* Other widths (FIXED_LEN_BYTE_ARRAY) have value_size planes,
                  * which the 4- and 8-plane transposers above would misread. */
                 if (carquet_byte_stream_split_decode(
-                        reader->decompress_buffer, actual, (int32_t)value_size,
+                        stage, actual, (int32_t)value_size,
                         out, num_values) != CARQUET_OK) {
-                    goto fallback;
+                    goto bail;
                 }
             }
         } else {
-            /* Unsupported encoding — bail to fallback */
-            goto fallback;
+            /* Unsupported encoding — bail */
+            goto bail;
         }
 
         out += (size_t)num_values * value_size;
@@ -1642,13 +1871,36 @@ static void coalesced_read_column_range(
         offset += (int64_t)hdr_size + (int64_t)comp_size;
     }
 
+    if (stage_from_pool) scratch_release(scratch_owner, stage, stage_cap);
     *out_values_read = total_values;
-    return;
+    return true;
 
-fallback:
+bail:
+    if (stage_from_pool) scratch_release(scratch_owner, stage, stage_cap);
+    *out_values_read = total_values;
+    return false;
+}
+
+static void coalesced_read_column_range(
+    const carquet_column_reader_t* cr,
+    const uint8_t* data_base,
+    void* dest,
+    int64_t max_values,
+    int64_t start_offset,
+    int64_t end_offset,
+    int64_t* out_values_read) {
+
+    if (coalesced_read_segment(cr, data_base, dest, max_values,
+                               start_offset, end_offset, NULL,
+                               out_values_read)) {
+        return;
+    }
+
     /* Fall back to standard page-by-page reader. It re-reads the chunk from
-     * its start and applies every check itself, so whatever made this path
-     * bail (including a CRC mismatch) is reported with its own detail. */
+     * its start and applies every check itself, so whatever made the fast
+     * path bail (including a CRC mismatch) is reported with its own detail.
+     * Only valid for a whole-chunk read (segments never reach this). */
+    carquet_column_reader_t* reader = (carquet_column_reader_t*)cr;
     *out_values_read = carquet_column_read_batch_ex(
         reader, dest, max_values, NULL, NULL, &reader->last_error);
 }
@@ -1682,14 +1934,13 @@ static int32_t plan_coalesced_column_splits(
     int64_t* split_offsets,
     int64_t* split_values) {
 
+    /* Every built-in codec (and any registered custom one) is already
+     * entered concurrently by the per-column tasks, so segments add no new
+     * thread-safety requirement. */
     if (!split_offsets || !split_values || !can_coalesce_column(cr)) return 0;
     if (max_splits < 2) return 0;
-    if (cr->col_meta->codec != CARQUET_COMPRESSION_ZSTD &&
-        cr->col_meta->codec != CARQUET_COMPRESSION_LZ4 &&
-        cr->col_meta->codec != CARQUET_COMPRESSION_LZ4_RAW) {
-        return 0;
-    }
-    if (max_values < 100000) return 0;
+    const int64_t min_seg_values = 65536;
+    if (max_values < 2 * min_seg_values) return 0;
 
     const carquet_reader_t* fr = cr->file_reader;
     const parquet_column_metadata_t* meta = cr->col_meta;
@@ -1703,9 +1954,9 @@ static int32_t plan_coalesced_column_splits(
     int32_t num_segments = 1;
 
     int64_t target_per_split = max_values / max_splits;
-    /* Need at least 50k values per segment to be worthwhile */
-    if (target_per_split < 50000) {
-        max_splits = (int32_t)(max_values / 50000);
+    /* Segments below ~64k values cost more in task dispatch than they gain */
+    if (target_per_split < min_seg_values) {
+        max_splits = (int32_t)(max_values / min_seg_values);
         if (max_splits < 2) return 0;
         target_per_split = max_values / max_splits;
     }
@@ -1791,6 +2042,19 @@ static void slot_release_filter_state(rg_slot_t* slot, int32_t num_projected) {
             CARQUET_SET_ERROR(&(br)->pipeline_error, (status_code), __VA_ARGS__); \
         }                                                                    \
     } while (0)
+
+/* Register a task on its slot's pending count, then hand it to the pool. */
+static void pipeline_submit(carquet_batch_reader_t* br, rg_slot_t* slot,
+                            bulk_read_arg_t* t) {
+    t->owner = br;
+    t->slot_pending = &slot->pending_tasks;
+    if (br->slot_sync_init) {
+        slot_sync_lock(br);
+        slot->pending_tasks++;
+        slot_sync_unlock(br);
+    }
+    carquet_worker_pool_submit(br->pool, bulk_read_task, t);
+}
 
 static void pipeline_fill(carquet_batch_reader_t* br) {
     if (!br->pipeline_active || !br->pool) return;
@@ -1922,9 +2186,10 @@ static void pipeline_fill(carquet_batch_reader_t* br) {
             if (needed > slot->col_buf_sizes[i]) {
                 void* new_buf = carquet_mem_realloc(slot->col_values[i], needed);
                 if (!new_buf) {
+                    /* %llu, not %zu: the MinGW/msvcrt printf has no z length modifier. */
                     PIPELINE_FAIL(br, CARQUET_ERROR_OUT_OF_MEMORY,
-                                  "Row group %d column %d: cannot allocate %zu bytes",
-                                  target_rg, file_col_idx, needed);
+                                  "Row group %d column %d: cannot allocate %llu bytes",
+                                  target_rg, file_col_idx, (unsigned long long)needed);
                     return;
                 }
                 slot->col_values[i] = new_buf;
@@ -1936,6 +2201,7 @@ static void pipeline_fill(carquet_batch_reader_t* br) {
         slot->ready = false;
         slot->total_rows = slot_rows;
         slot->rows_consumed = 0;
+        slot->pending_tasks = 0;
         /* Until its task reports, a column has read nothing: a task that is
          * never submitted must not inherit the previous row group's count. */
         for (int32_t i = 0; i < br->num_projected; i++) {
@@ -1970,9 +2236,15 @@ static void pipeline_fill(carquet_batch_reader_t* br) {
                 int64_t page_mask = (ps > 0) ? (int64_t)ps - 1 : (int64_t)4095;
                 int64_t page_lo = range_lo & ~page_mask;
                 size_t mmap_len = (size_t)(range_hi - page_lo);
-                uint8_t* m = (uint8_t*)mmap(NULL, mmap_len, PROT_READ, MAP_PRIVATE,
+                uint8_t* m = (uint8_t*)mmap(NULL, mmap_len, PROT_READ, MAP_SHARED,
                                              br->reader->mmap_info->fd, (off_t)page_lo);
                 if (m != MAP_FAILED) {
+                    /* Pre-fault the slot's range from this (otherwise idle)
+                     * thread. Demand faults taken by eight workers on the
+                     * same file object serialise in the kernel and cost
+                     * ~2 us each; one WILLNEED pass maps the cached pages
+                     * at a fraction of that. A hint only: failure is fine. */
+                    (void)madvise(m, mmap_len, MADV_WILLNEED);
                     /* Unmap previous slot mmap if it exists (reuse across fills) */
                     if (slot->slot_mmap && slot->slot_mmap_size > 0)
                         munmap(slot->slot_mmap, slot->slot_mmap_size);
@@ -1987,13 +2259,20 @@ static void pipeline_fill(carquet_batch_reader_t* br) {
         }
 #endif
 
-        /* Submit one task per compressed column.  Sharing a column reader
-         * across split tasks would race on its reusable decompression buffer. */
-        int32_t max_splits_per_col = 1;
+        /* Submit one task per compressed column, or up to max_splits
+         * page-range segment tasks per column (see coalesced_read_segment). */
+        int32_t max_splits_per_col = br->max_splits;
+        if (max_splits_per_col > 512) max_splits_per_col = 512;
+        for (int32_t i = 0; i < br->num_projected; i++) {
+            slot->col_task_first[i] = 0;
+            slot->col_task_count[i] = 0;
+        }
 
-        /* Bound by task_args space available for this pipeline slot */
+        /* Bound by task_args space available for this pipeline slot. Indexed
+         * by the slot, not by pipeline_count: other slots' tasks may still be
+         * running when this one is filled, and their args must stay intact. */
         int32_t tasks_per_slot = br->task_args_capacity / (br->pipeline_depth > 0 ? br->pipeline_depth : 1);
-        int32_t base = br->pipeline_count * tasks_per_slot;
+        int32_t base = slot_idx * tasks_per_slot;
         int32_t task_offset = 0;
 
         int64_t split_offsets[513];
@@ -2014,13 +2293,13 @@ static void pipeline_fill(carquet_batch_reader_t* br) {
                 br->task_args[tidx].start_offset = 0;
                 br->task_args[tidx].end_offset = 0;
                 br->task_args[tidx].local_values_read = 0;
+                br->task_args[tidx].is_split = false;
                 br->task_args[tidx].ranges = &slot->ranges;
                 br->task_args[tidx].offset_index = slot->col_offset_indexes[i];
                 br->task_args[tidx].rg_num_rows = rg_rows;
                 br->task_args[tidx].value_size = br->projected_value_sizes[i];
                 slot->col_num_values[i] = slot_rows;
-                carquet_worker_pool_submit(br->pool, bulk_read_task,
-                                           &br->task_args[tidx]);
+                pipeline_submit(br, slot, &br->task_args[tidx]);
                 continue;
             }
 
@@ -2031,7 +2310,11 @@ static void pipeline_fill(carquet_batch_reader_t* br) {
 
             if (nseg >= 2 && base + task_offset + nseg <= br->task_args_capacity) {
                 size_t value_size = br->projected_value_sizes[i];
-                slot->col_num_values[i] = rg_rows;
+                /* The column total is folded from the segment counts once the
+                 * slot is waited on (see batch_reader_next_impl). */
+                slot->col_num_values[i] = 0;
+                slot->col_task_first[i] = base + task_offset;
+                slot->col_task_count[i] = nseg;
 
                 for (int32_t s = 0; s < nseg; s++) {
                     int32_t tidx = base + task_offset++;
@@ -2047,10 +2330,10 @@ static void pipeline_fill(carquet_batch_reader_t* br) {
                     br->task_args[tidx].start_offset = split_offsets[s];
                     br->task_args[tidx].end_offset = split_offsets[s + 1];
                     br->task_args[tidx].local_values_read = 0;
+                    br->task_args[tidx].is_split = true;
                     br->task_args[tidx].ranges = NULL;
                     br->task_args[tidx].offset_index = NULL;
-                    carquet_worker_pool_submit(br->pool, bulk_read_task,
-                                               &br->task_args[tidx]);
+                    pipeline_submit(br, slot, &br->task_args[tidx]);
                 }
             } else {
                 int32_t tidx = base + task_offset++;
@@ -2063,10 +2346,10 @@ static void pipeline_fill(carquet_batch_reader_t* br) {
                 br->task_args[tidx].start_offset = 0;
                 br->task_args[tidx].end_offset = 0;
                 br->task_args[tidx].local_values_read = 0;
+                br->task_args[tidx].is_split = false;
                 br->task_args[tidx].ranges = NULL;
                 br->task_args[tidx].offset_index = NULL;
-                carquet_worker_pool_submit(br->pool, bulk_read_task,
-                                           &br->task_args[tidx]);
+                pipeline_submit(br, slot, &br->task_args[tidx]);
             }
         }
 
@@ -2349,6 +2632,25 @@ static carquet_status_t batch_reader_next_filtered(
         read_projected_column(br, new_batch, i, rows_to_read, true, &read_error);
     }
     if (read_error) {
+        return CARQUET_ERROR_DECODE;
+    }
+    /* Every projected column must have produced the same row count: a
+     * column whose chunk is shorter than column 0's would otherwise be
+     * served over stale buffer bytes, and a column 0 that produced nothing
+     * for a non-empty range would spin forever on empty batches. */
+    for (int32_t i = 1; i < br->num_projected; i++) {
+        if (new_batch->columns[i].num_values != new_batch->columns[0].num_values) {
+            CARQUET_SET_ERROR(&br->last_error, CARQUET_ERROR_DECODE,
+                "Column %d produced %lld values but column 0 produced %lld",
+                i, (long long)new_batch->columns[i].num_values,
+                (long long)new_batch->columns[0].num_values);
+            return CARQUET_ERROR_DECODE;
+        }
+    }
+    if (new_batch->columns[0].num_values <= 0 && rows_to_read > 0) {
+        CARQUET_SET_ERROR(&br->last_error, CARQUET_ERROR_DECODE,
+            "Column 0 produced no values for a range of %lld rows",
+            (long long)rows_to_read);
         return CARQUET_ERROR_DECODE;
     }
 
@@ -2834,8 +3136,30 @@ static carquet_status_t batch_reader_next_impl(
                 }
                 return CARQUET_ERROR_END_OF_DATA;
             }
-            carquet_worker_pool_wait(batch_reader->pool);
             slot = &batch_reader->pipeline[batch_reader->pipeline_head];
+            pipeline_wait_slot(batch_reader, slot);
+
+            /* Columns read as page-range segments: fold the per-segment
+             * counts into the column total. A segment that bailed leaves the
+             * sum short; re-read the whole chunk here, on this thread, through
+             * the page-by-page reader, which applies every check itself and
+             * reports the detail of whatever stopped the fast path (the same
+             * recovery a whole-chunk task performs inline). */
+            for (int32_t i = 0; i < batch_reader->num_projected; i++) {
+                if (slot->col_task_count[i] <= 1) continue;
+                int64_t sum = 0;
+                for (int32_t k = 0; k < slot->col_task_count[i]; k++) {
+                    sum += batch_reader->task_args[slot->col_task_first[i] + k].local_values_read;
+                }
+                if (sum == slot->total_rows) {
+                    slot->col_num_values[i] = sum;
+                    continue;
+                }
+                carquet_column_reader_t* cr = slot->col_readers[i];
+                slot->col_num_values[i] = carquet_column_read_batch_ex(
+                    cr, slot->col_values[i], slot->total_rows, NULL, NULL,
+                    &cr->last_error);
+            }
 
             /* Every column must have produced the slot's full row count before
              * any of it is exposed: a failed or truncated column leaves the
@@ -3056,6 +3380,8 @@ static carquet_status_t batch_reader_next_impl(
         }
     }
 #else
+    (void)is_mmap;
+    (void)needs_decompression;   /* only steer the OpenMP `if` clause above */
     for (int32_t pi = 0; pi < batch_reader->num_projected; pi++) {
         carquet_column_reader_t* col_reader = batch_reader->col_readers[pi];
         if (col_reader && !col_reader->page_loaded && col_reader->values_remaining > 0) {
@@ -3099,6 +3425,8 @@ static carquet_status_t batch_reader_next_impl(
         }
     }
 
+    (void)all_zero_copy_ready;   /* consulted only by the OpenMP branch below */
+
     int32_t col_i;
 #ifdef _OPENMP
     {
@@ -3141,6 +3469,16 @@ static carquet_status_t batch_reader_next_impl(
     if (read_error) {
         /* Don't free cached_batch, just return error */
         return CARQUET_ERROR_DECODE;
+    }
+    /* See the filtered path: all columns must agree on the row count. */
+    for (col_i = 1; col_i < batch_reader->num_projected; col_i++) {
+        if (new_batch->columns[col_i].num_values != new_batch->columns[0].num_values) {
+            CARQUET_SET_ERROR(&batch_reader->last_error, CARQUET_ERROR_DECODE,
+                "Column %d produced %lld values but column 0 produced %lld",
+                col_i, (long long)new_batch->columns[col_i].num_values,
+                (long long)new_batch->columns[0].num_values);
+            return CARQUET_ERROR_DECODE;
+        }
     }
 
     new_batch->num_rows = new_batch->columns[0].num_values;
@@ -3221,6 +3559,15 @@ void carquet_batch_reader_free(carquet_batch_reader_t* batch_reader) {
     if (batch_reader->pool) {
         carquet_worker_pool_wait(batch_reader->pool);
     }
+    if (batch_reader->slot_sync_init) {
+#ifdef _WIN32
+        DeleteCriticalSection(&batch_reader->slot_mutex);
+#else
+        pthread_mutex_destroy(&batch_reader->slot_mutex);
+        pthread_cond_destroy(&batch_reader->slot_cond);
+#endif
+        batch_reader->slot_sync_init = false;
+    }
 
     /* Free pipeline slots */
     if (batch_reader->pipeline) {
@@ -3247,6 +3594,8 @@ void carquet_batch_reader_free(carquet_batch_reader_t* batch_reader) {
             }
             carquet_mem_free(slot->col_buf_sizes);
             carquet_mem_free(slot->col_num_values);
+            carquet_mem_free(slot->col_task_first);
+            carquet_mem_free(slot->col_task_count);
 #if !defined(_WIN32)
             if (slot->slot_mmap && slot->slot_mmap_size > 0)
                 munmap(slot->slot_mmap, slot->slot_mmap_size);
@@ -3255,8 +3604,16 @@ void carquet_batch_reader_free(carquet_batch_reader_t* batch_reader) {
         carquet_mem_free(batch_reader->pipeline);
     }
 
-    /* Free per-reader task args */
+    /* Free per-reader task args and the segment scratch pool (all tasks have
+     * finished, so every scratch buffer is back in the pool). */
     carquet_mem_free(batch_reader->task_args);
+    if (batch_reader->scratch_bufs) {
+        for (int32_t i = 0; i < batch_reader->scratch_cap; i++) {
+            carquet_mem_free(batch_reader->scratch_bufs[i]);
+        }
+        carquet_mem_free(batch_reader->scratch_bufs);
+        carquet_mem_free(batch_reader->scratch_sizes);
+    }
 
     /* Destroy worker pool (only if we created it) */
     if (!batch_reader->pool_is_borrowed) {

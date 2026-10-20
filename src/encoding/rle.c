@@ -303,33 +303,60 @@ static inline void write_value_bytes(uint8_t* dst, uint32_t value, int value_byt
 }
 
 static void flush_rle(carquet_rle_encoder_t* enc) {
-    if (enc->repeat_count == 0) return;
+    /* The run header is `count << 1` in a 32-bit varint, so one RLE run holds
+     * at most 2^31 - 1 values; a longer run (int64 repeat_count, reachable via
+     * put_repeat) is emitted as several back-to-back runs. */
+    while (enc->repeat_count > 0) {
+        int64_t run = enc->repeat_count;
+        if (run > 0x7FFFFFFF) run = 0x7FFFFFFF;
 
-    /* Write RLE header + value in a single buffer append where possible */
-    int vb = rle_value_bytes(enc->bit_width);
-    uint8_t buf[9]; /* max 5 (varint) + 4 (value) */
-    int len = 0;
+        /* Write RLE header + value in a single buffer append where possible */
+        int vb = rle_value_bytes(enc->bit_width);
+        uint8_t buf[9]; /* max 5 (varint) + 4 (value) */
+        int len = 0;
 
-    /* Inline varint encoding */
-    uint32_t header = (uint32_t)(enc->repeat_count << 1);
-    while (header >= 0x80) {
-        buf[len++] = (uint8_t)((header & 0x7F) | 0x80);
-        header >>= 7;
+        /* Inline varint encoding */
+        uint32_t header = (uint32_t)run << 1;
+        while (header >= 0x80) {
+            buf[len++] = (uint8_t)((header & 0x7F) | 0x80);
+            header >>= 7;
+        }
+        buf[len++] = (uint8_t)header;
+
+        /* Append value bytes */
+        write_value_bytes(buf + len, enc->prev_value, vb);
+        len += vb;
+
+        carquet_buffer_append(enc->buffer, buf, (size_t)len);
+        enc->repeat_count -= run;
     }
-    buf[len++] = (uint8_t)header;
+}
 
-    /* Append value bytes */
-    write_value_bytes(buf + len, enc->prev_value, vb);
-    len += vb;
+/* Emit the staged complete groups as one bit-packed run. */
+static void emit_staged_groups(carquet_rle_encoder_t* enc) {
+    if (enc->staged_groups == 0) return;
+    write_varint(enc->buffer, (uint32_t)((enc->staged_groups << 1) | 1));
+    carquet_buffer_append(enc->buffer, enc->staged,
+                          (size_t)enc->staged_groups * (size_t)enc->bit_width);
+    enc->staged_groups = 0;
+}
 
-    carquet_buffer_append(enc->buffer, buf, (size_t)len);
-    enc->repeat_count = 0;
+/* Pack the 8 buffered values into the staging area; emit when full. */
+static void stage_full_group(carquet_rle_encoder_t* enc) {
+    carquet_bitpack8_32(enc->bitpack_buffer, enc->bit_width,
+                        enc->staged + (size_t)enc->staged_groups * (size_t)enc->bit_width);
+    enc->staged_groups++;
+    enc->bitpack_count = 0;
+    if (enc->staged_groups == 63) {
+        emit_staged_groups(enc);
+    }
 }
 
 static void flush_bitpack_as_rle(carquet_rle_encoder_t* enc) {
     /* Emit remaining buffered values as individual RLE runs.
-     * Used when we have a partial group (< 8 values) that can't form
-     * a complete bit-packed group per the Parquet spec. */
+     * Used when we have a partial group (< 8 values) in the middle of the
+     * stream (an RLE run follows): a bit-packed group always decodes to 8
+     * values, so it cannot be padded there. */
     int vb = rle_value_bytes(enc->bit_width);
 
     int i = 0;
@@ -358,27 +385,19 @@ static void flush_bitpack_as_rle(carquet_rle_encoder_t* enc) {
     enc->bitpack_total = 0;
 }
 
+/* Flush the bit-packed state: staged complete groups as one run, then any
+ * partial group as RLE runs. The partial group is never zero-padded, even at
+ * the end of the stream: the page writer concatenates one encoded stream per
+ * add_values() call into a single levels block, so every stream must decode
+ * to exactly its own value count. */
 static void flush_bitpack(carquet_rle_encoder_t* enc) {
-    if (enc->bitpack_count == 0) return;
-
-    /* If we have a partial group, emit as RLE runs instead of
-     * padding with zeros (which corrupts the output). */
-    if (enc->bitpack_count < 8) {
+    if (enc->bitpack_count == 8) {
+        stage_full_group(enc);
+    }
+    emit_staged_groups(enc);
+    if (enc->bitpack_count > 0) {
         flush_bitpack_as_rle(enc);
-        return;
     }
-
-    /* Write bit-packed header: (num_groups << 1) | 1 */
-    int num_groups = (int)((enc->bitpack_total + 7) / 8);
-    write_varint(enc->buffer, (uint32_t)((num_groups << 1) | 1));
-
-    /* Write packed data for all groups */
-    uint8_t packed[32];  /* Max for 32-bit values, 8 values */
-    for (int g = 0; g < num_groups; g++) {
-        carquet_bitpack8_32(enc->bitpack_buffer, enc->bit_width, packed);
-        carquet_buffer_append(enc->buffer, packed, (size_t)enc->bit_width);
-    }
-
     enc->bitpack_count = 0;
     enc->bitpack_total = 0;
 }
@@ -426,7 +445,7 @@ carquet_status_t carquet_rle_encoder_put(
             enc->bitpack_total++;
 
             if (enc->bitpack_count == 8) {
-                flush_bitpack(enc);
+                stage_full_group(enc);
             }
         }
         enc->repeat_count = 0;
@@ -480,16 +499,13 @@ carquet_status_t carquet_rle_encoder_flush(carquet_rle_encoder_t* enc) {
             enc->bitpack_total++;
 
             if (enc->bitpack_count == 8) {
-                flush_bitpack(enc);
+                stage_full_group(enc);
             }
         }
         enc->repeat_count = 0;
-
-        /* Flush remaining bit-pack buffer */
-        if (enc->bitpack_count > 0) {
-            flush_bitpack(enc);
-        }
     }
+    /* End of stream: emit staged groups, then the partial tail as RLE runs. */
+    flush_bitpack(enc);
 
     return CARQUET_OK;
 }

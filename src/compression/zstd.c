@@ -23,7 +23,7 @@
  *   POSIX (any) -> pthread_key_create with destructors.  Works for both
  *                  OpenMP threads and worker pool pthreads.  The pthread
  *                  runtime calls the destructor when each thread exits.
- *   Windows     -> Win32 TLS API (TlsAlloc/TlsGetValue/TlsSetValue), which is
+ *   Windows     -> Win32 FLS API (FlsAlloc with destructor/FlsGetValue/FlsSetValue), which is
  *                  reliably per-thread for every thread including raw
  *                  CreateThread worker threads (native __declspec(thread) is
  *                  not), with explicit carquet_zstd_cleanup per thread.
@@ -102,19 +102,27 @@ void carquet_zstd_cleanup(void) {
  * native TLS is NOT reliably allocated per-thread for threads created
  * with the raw CreateThread API under every loader/runtime (observed all
  * worker threads sharing one slot), whereas the explicit TLS API is
- * guaranteed per-thread for every thread. Contexts have no destructor, so
- * worker-thread contexts leak at pool teardown; callers arrange per-thread
- * carquet_zstd_cleanup where it matters. */
+ * guaranteed per-thread for every thread. The FLS variant of that API adds
+ * a per-thread destructor, so worker-thread contexts are freed when the
+ * thread exits (v0.7.2; TlsAlloc leaked them at pool teardown). */
 #include <windows.h>
 
-static DWORD tls_dctx_index = TLS_OUT_OF_INDEXES;
-static DWORD tls_cctx_index = TLS_OUT_OF_INDEXES;
+/* Fiber-local storage (Vista+): same per-thread guarantee as TlsAlloc for
+ * every thread, including raw CreateThread pool workers, plus a destructor
+ * that the system runs when the thread exits, so worker contexts no longer
+ * leak at pool teardown. FlsSetValue(idx, NULL) in the explicit cleanup
+ * below does not invoke the callback, so there is no double free. */
+static DWORD tls_dctx_index = FLS_OUT_OF_INDEXES;
+static DWORD tls_cctx_index = FLS_OUT_OF_INDEXES;
+
+static void WINAPI fls_free_dctx(PVOID p) { if (p) ZSTD_freeDCtx((ZSTD_DCtx*)p); }
+static void WINAPI fls_free_cctx(PVOID p) { if (p) ZSTD_freeCCtx((ZSTD_CCtx*)p); }
 static INIT_ONCE tls_index_once = INIT_ONCE_STATIC_INIT;
 
 static BOOL CALLBACK init_tls_indices(PINIT_ONCE once, PVOID param, PVOID* ctx) {
     (void)once; (void)param; (void)ctx;
-    tls_dctx_index = TlsAlloc();
-    tls_cctx_index = TlsAlloc();
+    tls_dctx_index = FlsAlloc(fls_free_dctx);
+    tls_cctx_index = FlsAlloc(fls_free_cctx);
     return TRUE;
 }
 
@@ -124,35 +132,35 @@ static void ensure_tls_indices(void) {
 
 static ZSTD_DCtx* get_dctx(void) {
     ensure_tls_indices();
-    if (tls_dctx_index == TLS_OUT_OF_INDEXES) return NULL;
-    ZSTD_DCtx* dctx = (ZSTD_DCtx*)TlsGetValue(tls_dctx_index);
+    if (tls_dctx_index == FLS_OUT_OF_INDEXES) return NULL;
+    ZSTD_DCtx* dctx = (ZSTD_DCtx*)FlsGetValue(tls_dctx_index);
     if (!dctx) {
         dctx = ZSTD_createDCtx();
-        if (dctx) TlsSetValue(tls_dctx_index, dctx);
+        if (dctx) FlsSetValue(tls_dctx_index, dctx);
     }
     return dctx;
 }
 
 static ZSTD_CCtx* get_cctx(void) {
     ensure_tls_indices();
-    if (tls_cctx_index == TLS_OUT_OF_INDEXES) return NULL;
-    ZSTD_CCtx* cctx = (ZSTD_CCtx*)TlsGetValue(tls_cctx_index);
+    if (tls_cctx_index == FLS_OUT_OF_INDEXES) return NULL;
+    ZSTD_CCtx* cctx = (ZSTD_CCtx*)FlsGetValue(tls_cctx_index);
     if (!cctx) {
         cctx = ZSTD_createCCtx();
-        if (cctx) TlsSetValue(tls_cctx_index, cctx);
+        if (cctx) FlsSetValue(tls_cctx_index, cctx);
     }
     return cctx;
 }
 
 void carquet_zstd_cleanup(void) {
     ensure_tls_indices();
-    if (tls_dctx_index != TLS_OUT_OF_INDEXES) {
-        ZSTD_DCtx* dctx = (ZSTD_DCtx*)TlsGetValue(tls_dctx_index);
-        if (dctx) { ZSTD_freeDCtx(dctx); TlsSetValue(tls_dctx_index, NULL); }
+    if (tls_dctx_index != FLS_OUT_OF_INDEXES) {
+        ZSTD_DCtx* dctx = (ZSTD_DCtx*)FlsGetValue(tls_dctx_index);
+        if (dctx) { ZSTD_freeDCtx(dctx); FlsSetValue(tls_dctx_index, NULL); }
     }
-    if (tls_cctx_index != TLS_OUT_OF_INDEXES) {
-        ZSTD_CCtx* cctx = (ZSTD_CCtx*)TlsGetValue(tls_cctx_index);
-        if (cctx) { ZSTD_freeCCtx(cctx); TlsSetValue(tls_cctx_index, NULL); }
+    if (tls_cctx_index != FLS_OUT_OF_INDEXES) {
+        ZSTD_CCtx* cctx = (ZSTD_CCtx*)FlsGetValue(tls_cctx_index);
+        if (cctx) { ZSTD_freeCCtx(cctx); FlsSetValue(tls_cctx_index, NULL); }
     }
 }
 #endif

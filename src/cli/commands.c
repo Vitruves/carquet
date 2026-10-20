@@ -1165,6 +1165,8 @@ int cmd_sample(const char* path, int64_t n, const char* filter) {
      * with skip to jump to each sampled row. */
     table_t tbl;
     table_init(&tbl, schema, num_cols, n);
+    void* valbuf = NULL;        /* one-value read buffer, sized per column */
+    size_t valbuf_cap = 0;
 
     for (int32_t c = 0; c < num_cols; c++) {
         carquet_physical_type_t phys = carquet_schema_column_type(schema, c);
@@ -1203,15 +1205,23 @@ int cmd_sample(const char* path, int64_t n, const char* filter) {
                     pos_in_rg += skip;
                 }
 
-                /* Read one value */
-                union {
-                    int32_t i32; int64_t i64; float f; double d; uint8_t b;
-                    carquet_byte_array_t ba;
-                    uint8_t fixed[128];
-                } val;
+                /* Read one value. A FIXED_LEN_BYTE_ARRAY value is
+                 * `type_length` bytes (file-controlled, up to 16 MiB), so
+                 * size the buffer from the column, not a fixed union. */
+                size_t val_cap = sizeof(carquet_byte_array_t) > 16
+                    ? sizeof(carquet_byte_array_t) : 16;
+                if (phys == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY && tl > 0 &&
+                    (size_t)tl > val_cap) {
+                    val_cap = (size_t)tl;
+                }
+                if (val_cap > valbuf_cap) {
+                    void* nb = realloc(valbuf, val_cap);
+                    if (!nb) { free(valbuf); valbuf = NULL; valbuf_cap = 0; break; }
+                    valbuf = nb; valbuf_cap = val_cap;
+                }
                 int16_t def_level = 0;
 
-                int64_t got = carquet_column_read_batch(col, &val, 1,
+                int64_t got = carquet_column_read_batch(col, valbuf, 1,
                     nullable ? &def_level : NULL, NULL);
                 pos_in_rg++;
 
@@ -1221,7 +1231,7 @@ int cmd_sample(const char* path, int64_t n, const char* filter) {
                 } else if (nullable && def_level < max_def) {
                     table_add_cell(&tbl, sample_idx, c, "null");
                 } else {
-                    cli_format_value(phys, &val, tl, lt, vbuf, sizeof(vbuf));
+                    cli_format_value(phys, valbuf, tl, lt, vbuf, sizeof(vbuf));
                     table_add_cell(&tbl, sample_idx, c, vbuf);
                 }
 
@@ -1235,6 +1245,7 @@ int cmd_sample(const char* path, int64_t n, const char* filter) {
 
     table_print(&tbl);
     table_free(&tbl);
+    free(valbuf);
     free(indices);
     carquet_reader_close(reader);
     return 0;

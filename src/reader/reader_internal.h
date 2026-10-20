@@ -169,6 +169,8 @@ struct carquet_column_reader {
     bool page_loaded;           /* Is a page currently loaded? */
     int32_t page_num_values;    /* Total values in current page */
     int32_t page_values_read;   /* Values already read from current page */
+    int32_t dense_cursor_pos;   /* page_values_read at which dense_cursor_val is valid */
+    int32_t dense_cursor_val;   /* present values before dense_cursor_pos (OPTIONAL columns) */
     int32_t page_header_size;   /* Size of current page header */
     int32_t page_compressed_size; /* Size of current page compressed data */
     uint8_t* decoded_values;    /* Buffer for decoded values from current page */
@@ -185,6 +187,11 @@ struct carquet_column_reader {
     size_t indices_capacity;    /* Capacity of indices buffer */
     uint8_t* decompress_buffer; /* Reusable decompression buffer */
     size_t decompress_capacity; /* Capacity of decompression buffer */
+    int16_t* scratch_def_levels; /* Reusable def-level scratch for batch reads
+                                  * on a nullable column when the caller passes
+                                  * def_levels == NULL; grown on demand, freed
+                                  * with the reader (was a malloc/free per call) */
+    size_t scratch_def_capacity; /* Capacity of scratch_def_levels, in levels */
 
     /* Dictionary preservation mode */
     bool preserve_dictionary;   /* If true, skip materialization, keep indices */

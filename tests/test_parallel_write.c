@@ -363,6 +363,14 @@ static int test_mixed_nullable(void) {
 /* A background write failure must surface from close() rather than vanish.
  * Only runnable where a stream that rejects writes exists (/dev/full). */
 static int test_async_write_error(void) {
+#ifdef _WIN32
+    /* Windows has no always-full stream. Do not even try the fopen: under
+     * Wine "/dev/full" resolves through the Z: drive to the real Unix device
+     * and the UCRT terminates the process inside fopen() with exit status 0,
+     * which would silently cut the run short and hide every later test. */
+    TEST_PASS("async_write_error (skipped: no /dev/full on Windows)");
+    return 0;
+#else
     FILE* full = fopen("/dev/full", "wb");
     if (!full) { TEST_PASS("async_write_error (skipped: no /dev/full)"); return 0; }
     data_t d; data_init(&d);
@@ -392,6 +400,7 @@ static int test_async_write_error(void) {
     if (st == CARQUET_OK) TEST_FAIL("async_write_error", "close() hid the write failure");
     TEST_PASS("async_write_error");
     return 0;
+#endif
 }
 
 int main(void) {

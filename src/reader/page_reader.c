@@ -70,6 +70,9 @@ extern int carquet_gzip_decompress(
 extern int carquet_zstd_decompress(
     const uint8_t* src, size_t src_size,
     uint8_t* dst, size_t dst_capacity, size_t* dst_size);
+extern int carquet_brotli_decompress(
+    const uint8_t* src, size_t src_size,
+    uint8_t* dst, size_t dst_capacity, size_t* dst_size);
 extern carquet_status_t carquet_byte_stream_split_decode_float(
     const uint8_t* data,
     size_t data_size,
@@ -112,6 +115,15 @@ extern carquet_status_t carquet_delta_strings_decode(
     uint8_t* work_buffer,
     size_t work_buffer_size,
     size_t* bytes_consumed);
+extern carquet_status_t carquet_delta_strings_decode_lengths(
+    const uint8_t* data, size_t data_size, int32_t num_values,
+    int32_t** prefix_out, int32_t** suffix_out,
+    size_t* header_bytes, size_t* total_size);
+extern carquet_status_t carquet_delta_strings_reconstruct(
+    const uint8_t* data, size_t data_size, size_t header_bytes,
+    const int32_t* prefix_lengths, const int32_t* suffix_lengths,
+    carquet_byte_array_t* values, int32_t num_values,
+    uint8_t* work_buffer, size_t work_buffer_size, size_t* bytes_consumed);
 extern carquet_status_t carquet_delta_strings_decoded_size(
     const uint8_t* data,
     size_t data_size,
@@ -211,7 +223,7 @@ carquet_status_t carquet_decompress_page(
 
     /* Honor user-registered codec implementations before falling through to
      * the built-ins, so callers can replace e.g. GZIP with a HW-accelerated
-     * variant or fill the LZO/BROTLI slots that carquet doesn't ship. */
+     * variant or fill the LZO slot (and BROTLI when built without libbrotli). */
     carquet_custom_codec_t custom;
     if (carquet_custom_codec_lookup(codec, &custom)) {
         return custom.decompress(compressed, compressed_size,
@@ -251,6 +263,12 @@ carquet_status_t carquet_decompress_page(
 
         case CARQUET_COMPRESSION_ZSTD:
             return carquet_zstd_decompress(
+                compressed, compressed_size,
+                decompressed, decompressed_capacity, decompressed_size);
+
+        case CARQUET_COMPRESSION_BROTLI:
+            /* UNSUPPORTED_CODEC when built without libbrotli. */
+            return carquet_brotli_decompress(
                 compressed, compressed_size,
                 decompressed, decompressed_capacity, decompressed_size);
 
@@ -789,7 +807,17 @@ carquet_status_t carquet_read_dictionary_page(
         reader->dictionary_data = page_data;
         reader->dictionary_size = page_size;
 
-        /* Build offset table for O(1) BYTE_ARRAY lookup */
+        /* Build offset table for O(1) BYTE_ARRAY lookup. Every entry needs
+         * at least its 4-byte length prefix, so an (untrusted) num_values
+         * above page_size / 4 is malformed; reject it before it sizes an
+         * allocation (fuzzer: num_values = 1.7e9 asked for 6.9 GB). */
+        if ((size_t)header->num_values > page_size / 4) {
+            reader->dictionary_data = NULL;  /* caller frees page_data */
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
+                "Dictionary declares %d entries but holds %llu bytes",
+                header->num_values, (unsigned long long)page_size);
+            return CARQUET_ERROR_DECODE;
+        }
         reader->dictionary_offsets = carquet_mem_malloc((size_t)header->num_values * sizeof(uint32_t));
         if (!reader->dictionary_offsets) {
             reader->dictionary_data = NULL;  /* caller frees page_data */
@@ -916,10 +944,13 @@ static carquet_status_t decode_phase3_values(
                 if (non_null_count <= 0) {
                     return CARQUET_OK;
                 }
-                /* Exact reconstruction size (no guessing). */
-                size_t work_size = 0;
-                carquet_status_t st = carquet_delta_strings_decoded_size(
-                    ptr, remaining, non_null_count, &work_size);
+                /* Decode the two length streams once: they give the exact
+                 * reconstruction size (no guessing) and are reused below. */
+                int32_t* pfx = NULL;
+                int32_t* sfx = NULL;
+                size_t hdr_bytes = 0, work_size = 0;
+                carquet_status_t st = carquet_delta_strings_decode_lengths(
+                    ptr, remaining, non_null_count, &pfx, &sfx, &hdr_bytes, &work_size);
                 if (st != CARQUET_OK) {
                     return st;
                 }
@@ -928,6 +959,8 @@ static carquet_status_t decode_phase3_values(
                 uint8_t* work = carquet_column_retain_page(
                     reader, NULL, work_size == 0 ? 1 : work_size);
                 if (!work) {
+                    carquet_mem_free(pfx);
+                    carquet_mem_free(sfx);
                     CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY,
                         "Failed to allocate DELTA_BYTE_ARRAY scratch");
                     return CARQUET_ERROR_OUT_OF_MEMORY;
@@ -938,20 +971,28 @@ static carquet_status_t decode_phase3_values(
                  * type_length). For BYTE_ARRAY decode straight into the
                  * carquet_byte_array_t output. */
                 if (reader->type == CARQUET_PHYSICAL_BYTE_ARRAY) {
-                    return carquet_delta_strings_decode(
-                        ptr, remaining, (carquet_byte_array_t*)values,
-                        non_null_count, work, work_size, &consumed);
+                    st = carquet_delta_strings_reconstruct(
+                        ptr, remaining, hdr_bytes, pfx, sfx,
+                        (carquet_byte_array_t*)values, non_null_count,
+                        work, work_size, &consumed);
+                    carquet_mem_free(pfx);
+                    carquet_mem_free(sfx);
+                    return st;
                 } else {
                     carquet_byte_array_t* tmp = (carquet_byte_array_t*)carquet_mem_malloc(
                         (size_t)non_null_count * sizeof(carquet_byte_array_t));
                     if (!tmp) {
+                        carquet_mem_free(pfx);
+                        carquet_mem_free(sfx);
                         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY,
                             "Failed to allocate FLBA decode view");
                         return CARQUET_ERROR_OUT_OF_MEMORY;
                     }
-                    st = carquet_delta_strings_decode(
-                        ptr, remaining, tmp, non_null_count,
+                    st = carquet_delta_strings_reconstruct(
+                        ptr, remaining, hdr_bytes, pfx, sfx, tmp, non_null_count,
                         work, work_size, &consumed);
+                    carquet_mem_free(pfx);
+                    carquet_mem_free(sfx);
                     if (st != CARQUET_OK) {
                         carquet_mem_free(tmp);
                         return st;
@@ -1153,6 +1194,14 @@ carquet_status_t carquet_read_data_page_v1(
                 int bit_width = ptr[0];
                 ptr++;
                 remaining--;
+                if (bit_width > 32) {
+                    /* The RLE decoder clamps a width above 32 to 0 and would
+                     * then hand back `count` copies of dictionary entry 0 with
+                     * no error. */
+                    CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
+                        "Dictionary index bit width %d exceeds 32", bit_width);
+                    return CARQUET_ERROR_DECODE;
+                }
 
                 int32_t encoded_count = non_null_count;
 
@@ -1431,10 +1480,12 @@ carquet_status_t carquet_read_data_page_v2(
     } else {
         /* Skip rep level bytes even if we don't need them */
         int32_t rep_bytes = header->repetition_levels_byte_length;
-        if (rep_bytes > 0 && (size_t)rep_bytes <= remaining) {
-            ptr += rep_bytes;
-            remaining -= (size_t)rep_bytes;
+        if (rep_bytes < 0 || (size_t)rep_bytes > remaining) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Invalid V2 rep level size");
+            return CARQUET_ERROR_DECODE;
         }
+        ptr += rep_bytes;
+        remaining -= (size_t)rep_bytes;
         if (rep_levels) {
             memset(rep_levels, 0, num_values * sizeof(int16_t));
         }
@@ -1464,10 +1515,12 @@ carquet_status_t carquet_read_data_page_v2(
     } else {
         /* Skip def level bytes even if we don't need them */
         int32_t def_bytes = header->definition_levels_byte_length;
-        if (def_bytes > 0 && (size_t)def_bytes <= remaining) {
-            ptr += def_bytes;
-            remaining -= (size_t)def_bytes;
+        if (def_bytes < 0 || (size_t)def_bytes > remaining) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Invalid V2 def level size");
+            return CARQUET_ERROR_DECODE;
         }
+        ptr += def_bytes;
+        remaining -= (size_t)def_bytes;
         if (def_levels) {
             /* Set all to max level (all values present) - use SIMD dispatch */
             carquet_dispatch_fill_def_levels(def_levels, num_values, reader->max_def_level);
@@ -1531,6 +1584,14 @@ carquet_status_t carquet_read_data_page_v2(
                 int bit_width = ptr[0];
                 ptr++;
                 remaining--;
+                if (bit_width > 32) {
+                    /* The RLE decoder clamps a width above 32 to 0 and would
+                     * then hand back `count` copies of dictionary entry 0 with
+                     * no error. */
+                    CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
+                        "Dictionary index bit width %d exceeds 32", bit_width);
+                    return CARQUET_ERROR_DECODE;
+                }
                 int32_t encoded_count = non_null_count;
 
                 /* Dictionary preservation: decode indices directly into output */
@@ -2938,15 +2999,28 @@ carquet_status_t carquet_read_next_page(
     int32_t values_to_copy = to_copy;
 
     if (reader->decoded_def_levels && reader->max_def_level > 0) {
-        int32_t dense_start = count_present_levels(
-            reader->decoded_def_levels,
-            reader->page_values_read,
-            reader->max_def_level);
+        /* Dense (present-value) offset of the first unread level. Recounting
+         * [0, page_values_read) on every call made a page read in small
+         * batches quadratic; keep a cursor and only recount when a skip
+         * moved page_values_read behind our back. */
+        int32_t dense_start;
+        if (reader->page_values_read == 0) {
+            dense_start = 0;
+        } else if (reader->dense_cursor_pos == reader->page_values_read) {
+            dense_start = reader->dense_cursor_val;
+        } else {
+            dense_start = count_present_levels(
+                reader->decoded_def_levels,
+                reader->page_values_read,
+                reader->max_def_level);
+        }
         values_to_copy = count_present_levels(
             reader->decoded_def_levels + reader->page_values_read,
             to_copy,
             reader->max_def_level);
         offset = (size_t)dense_start * value_size;
+        reader->dense_cursor_pos = reader->page_values_read + to_copy;
+        reader->dense_cursor_val = dense_start + values_to_copy;
     }
 
     memcpy(values, (uint8_t*)reader->decoded_values + offset,

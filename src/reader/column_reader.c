@@ -112,13 +112,31 @@ int64_t carquet_column_read_batch_ex(
     }
 
     if (reader->max_def_level > 0 && !def_levels) {
-        scratch_def_levels = carquet_mem_malloc((size_t)max_values * sizeof(*scratch_def_levels));
-        if (!scratch_def_levels) {
-            CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY,
-                              "failed to allocate %lld scratch definition levels",
+        /* Nullable column read without caller-provided def_levels: decode the
+         * levels into a per-reader scratch buffer that is grown on demand and
+         * freed with the reader, instead of a malloc/free on every call. The
+         * guard also rejects a byte count that would overflow size_t on a
+         * 32-bit target ((size_t)max_values * 2 wraps for max_values >= 2^31). */
+        if ((uint64_t)max_values > SIZE_MAX / sizeof(*scratch_def_levels)) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT,
+                              "max_values %lld too large for scratch definition levels",
                               (long long)max_values);
             return -1;
         }
+        if (reader->scratch_def_capacity < (size_t)max_values) {
+            int16_t* grown = carquet_mem_realloc(
+                reader->scratch_def_levels,
+                (size_t)max_values * sizeof(*scratch_def_levels));
+            if (!grown) {
+                CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY,
+                                  "failed to allocate %lld scratch definition levels",
+                                  (long long)max_values);
+                return -1;
+            }
+            reader->scratch_def_levels = grown;
+            reader->scratch_def_capacity = (size_t)max_values;
+        }
+        scratch_def_levels = reader->scratch_def_levels;
     }
 
     /* Read pages until we have enough values or run out */
@@ -147,7 +165,6 @@ int64_t carquet_column_read_batch_ex(
             if (total_read > 0) {
                 break;
             }
-            carquet_mem_free(scratch_def_levels);
             return -1;
         }
 
@@ -164,7 +181,7 @@ int64_t carquet_column_read_batch_ex(
         total_read += values_read;
     }
 
-    carquet_mem_free(scratch_def_levels);
+    /* scratch_def_levels (if used) is owned by the reader; nothing to free. */
     return total_read;
 }
 

@@ -32,6 +32,9 @@ extern carquet_offset_index_t* carquet_offset_index_parse(const uint8_t* data, s
  */
 
 #define PARQUET_MAGIC "PAR1"
+/* Trailing magic of a file whose footer is encrypted (Parquet modular
+ * encryption). Recognised only to produce a clear error. */
+#define PARQUET_ENCRYPTED_MAGIC "PARE"
 #define PARQUET_MAGIC_LEN 4
 #define PARQUET_FOOTER_SIZE_LEN 4
 
@@ -339,7 +342,15 @@ static carquet_status_t read_footer(carquet_reader_t* reader, carquet_error_t* e
 
     /* Verify trailing magic (last 4 bytes of file) */
     if (memcmp(spec_buf + spec_size - 4, PARQUET_MAGIC, PARQUET_MAGIC_LEN) != 0) {
+        bool encrypted = memcmp(spec_buf + spec_size - 4, PARQUET_ENCRYPTED_MAGIC,
+                                PARQUET_MAGIC_LEN) == 0;
         carquet_mem_free(spec_buf);
+        if (encrypted) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_NOT_IMPLEMENTED,
+                "File uses Parquet modular encryption (encrypted footer, magic "
+                "\"PARE\"), which carquet does not support");
+            return CARQUET_ERROR_NOT_IMPLEMENTED;
+        }
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_MAGIC, "Invalid trailing magic");
         return CARQUET_ERROR_INVALID_MAGIC;
     }
@@ -430,6 +441,12 @@ static carquet_status_t read_footer_mmap(carquet_reader_t* reader, carquet_error
 
     const uint8_t* end = data + file_size;
     if (memcmp(end - 4, PARQUET_MAGIC, PARQUET_MAGIC_LEN) != 0) {
+        if (memcmp(end - 4, PARQUET_ENCRYPTED_MAGIC, PARQUET_MAGIC_LEN) == 0) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_NOT_IMPLEMENTED,
+                "File uses Parquet modular encryption (encrypted footer, magic "
+                "\"PARE\"), which carquet does not support");
+            return CARQUET_ERROR_NOT_IMPLEMENTED;
+        }
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_MAGIC, "Invalid trailing magic");
         return CARQUET_ERROR_INVALID_MAGIC;
     }
@@ -809,6 +826,10 @@ carquet_status_t carquet_reader_prebuffer(
         }
 
         int64_t col_end = col_start + meta->total_compressed_size;
+        /* total_compressed_size is untrusted: a chunk claiming more bytes
+         * than the file holds must not drive a multi-GB allocation. */
+        if (col_start >= (int64_t)reader->file_size) continue;
+        if (col_end > (int64_t)reader->file_size) col_end = (int64_t)reader->file_size;
 
         if (col_start < min_offset) min_offset = col_start;
         if (col_end > max_end) max_end = col_end;
@@ -973,6 +994,7 @@ void carquet_column_reader_free(carquet_column_reader_t* reader) {
     carquet_mem_free(reader->decoded_rep_levels);
     carquet_mem_free(reader->indices_buffer);
     carquet_mem_free(reader->decompress_buffer);
+    carquet_mem_free(reader->scratch_def_levels);
     carquet_mem_free(reader);
 }
 

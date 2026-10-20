@@ -337,7 +337,10 @@ carquet_status_t carquet_bloom_filter_read(
 
     carquet_bloom_filter_t* filter = carquet_bloom_filter_from_data(data, data_size);
     if (!filter) {
-        return CARQUET_ERROR_OUT_OF_MEMORY;
+        /* A size that is below one block or not a multiple of 32 bytes is a
+         * malformed filter, not an allocation failure. */
+        return (data_size < 32 || data_size % 32 != 0)
+            ? CARQUET_ERROR_INVALID_METADATA : CARQUET_ERROR_OUT_OF_MEMORY;
     }
 
     *filter_out = filter;

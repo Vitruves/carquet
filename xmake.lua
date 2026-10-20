@@ -11,7 +11,7 @@
 -- Enable optional pieces individually, e.g. `xmake f --tests=y --fuzz=y`.
 
 set_project("carquet")
-set_version("0.7.1")
+set_version("0.7.2")
 -- gnu11, not strict c11: matches CMake's `set(CMAKE_C_STANDARD 11)` (GNU
 -- extensions stay on by default). Under strict -std=c11 the POSIX feature-test
 -- macros are off, so functions like strdup/posix_memalign aren't declared and
@@ -113,6 +113,12 @@ option_end()
 -- (`xmake f --openmp=n`). Applied declaratively on the carquet target below —
 -- doing it there (not in on_load/on_config) is what makes the flag reach the
 -- shared library's own link, not just its interface.
+option("brotli")
+    set_default(true)
+    set_showmenu(true)
+    set_description("Build the BROTLI codec (libbrotli fetched from the xmake repo)")
+option_end()
+
 option("openmp")
     set_default(true)
     set_showmenu(true)
@@ -158,6 +164,9 @@ end
 add_requires("zstd 1.5.6", {system = false, configs = {shared = false}})
 add_requires("zlib 1.3.1", {system = false, configs = {shared = false}})
 add_requires("lz4 1.10.0", {system = false, configs = {shared = false}})
+if has_config("brotli") then
+    add_requires("brotli 1.1.0", {system = false, configs = {shared = false}})
+end
 
 -- Parallel column reading (OpenMP) is handled by the auto-detected `openmp`
 -- option above and applied on the carquet target below, mirroring CMake's
@@ -176,6 +185,10 @@ target("carquet")
     add_includedirs("src")
 
     add_packages("zstd", "zlib", "lz4", {public = true})
+    if has_config("brotli") then
+        add_packages("brotli", {public = true})
+        add_defines("CARQUET_HAVE_BROTLI=1")
+    end
 
     -- OpenMP (auto-detected via the `openmp` option). Declared here so the flag
     -- reaches carquet's own link (the shared dylib) as well as its interface;
@@ -320,6 +333,7 @@ local function carquet_exe(name, files, opts)
         -- carquet is a static archive; name the (static) compression packages
         -- directly on each executable so their link flags are pulled in.
         add_packages("zstd", "zlib", "lz4")
+        if has_config("brotli") then add_packages("brotli") end
         add_files(files)
         if opts.basename then set_basename(opts.basename) end
         if opts.with_src then add_includedirs("src") end
@@ -373,7 +387,7 @@ if want("tests") then
         "test_float16", "test_geo_wkb", "test_worker_pool", "test_custom_codec",
         "test_real_world", "test_arrow_c_data", "test_batch_nested",
         "test_nested_write", "test_arrow_nested", "test_p2_conformance",
-        "test_cli_format",
+        "test_cli_format", "test_fixes_0_7_2",
     }
     -- Tests that link extra non-library sources (the CLI helpers live in the
     -- carquet_cli target, not in libcarquet).
@@ -462,6 +476,7 @@ if has_config("cli") then
         set_basename("carquet")
         add_deps("carquet")
         add_packages("zstd", "zlib", "lz4")
+        if has_config("brotli") then add_packages("brotli") end
         add_includedirs("src")
         add_files(
             "src/cli/main.c",
@@ -509,6 +524,8 @@ if has_config("fuzz") then
             set_default(false)
             add_deps("carquet")
             add_packages("zstd", "zlib", "lz4")
+            if has_config("brotli") then add_packages("brotli") end
+        if has_config("brotli") then add_packages("brotli") end
             add_includedirs("src", "include")
             add_files("fuzz/" .. f .. ".c")
             if engine == "libFuzzer" then

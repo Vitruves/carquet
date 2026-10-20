@@ -91,6 +91,12 @@ struct carquet_column_index_builder {
 
     int32_t boundary_order;
 
+    /* Set once a non-null page without min/max was added (statistics
+     * disabled, undefined sort order, all-NaN page). The spec has no way to
+     * say "this page has no bounds", so the whole ColumnIndex is withheld,
+     * as parquet-cpp does; the OffsetIndex is unaffected. */
+    bool discarded;
+
     /* Per-page level histograms (Parquet 2.9), flattened page-major:
      * rep_level_histograms[page * rep_hist_len + level]. Allocated lazily on the
      * first add_page that supplies histograms; lengths come from the max
@@ -285,6 +291,12 @@ carquet_status_t carquet_column_index_add_page(
 
     builder->null_counts[idx] = null_count;
     builder->null_pages[idx] = is_null_page;
+    if (!is_null_page && (!min_value || !max_value)) {
+        /* No statistics for a page holding values: see `discarded`. (A
+         * zero-length bound with a non-NULL pointer is the empty string and
+         * counts as present.) */
+        builder->discarded = true;
+    }
 
     if (builder->track_histograms) {
         if (builder->rep_hist_len > 0) {
@@ -335,6 +347,11 @@ carquet_status_t carquet_column_index_add_page(
     return CARQUET_OK;
 }
 
+/* Withhold this chunk's ColumnIndex (see `discarded`). */
+void carquet_column_index_builder_discard(carquet_column_index_builder_t* builder) {
+    if (builder) builder->discarded = true;
+}
+
 /**
  * Set boundary order for the column index.
  */
@@ -357,6 +374,18 @@ static int compare_index_values(const carquet_column_index_builder_t* builder,
                                 const uint8_t* b, int32_t blen) {
     if (alen == blen) {
         switch (builder->type) {
+            case CARQUET_PHYSICAL_FLOAT: {
+                float av, bv;
+                memcpy(&av, a, sizeof(av));
+                memcpy(&bv, b, sizeof(bv));
+                return (av < bv) ? -1 : (av > bv ? 1 : 0);
+            }
+            case CARQUET_PHYSICAL_DOUBLE: {
+                double av, bv;
+                memcpy(&av, a, sizeof(av));
+                memcpy(&bv, b, sizeof(bv));
+                return (av < bv) ? -1 : (av > bv ? 1 : 0);
+            }
             case CARQUET_PHYSICAL_INT32:
                 if (index_logical_integer_is_unsigned(&builder->logical_type)) {
                     uint32_t av, bv;
@@ -387,7 +416,7 @@ static int compare_index_values(const carquet_column_index_builder_t* builder,
     }
 
     int32_t n = alen < blen ? alen : blen;
-    int c = memcmp(a, b, (size_t)n);
+    int c = n > 0 ? memcmp(a, b, (size_t)n) : 0;
     if (c != 0) return c;
     if (alen < blen) return -1;
     if (alen > blen) return 1;
@@ -539,6 +568,9 @@ carquet_status_t carquet_column_index_serialize(
 
     if (!builder || !output) {
         return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+    if (builder->discarded) {
+        return CARQUET_OK;  /* nothing serialized: no ColumnIndex for this chunk */
     }
 
     thrift_encoder_t enc;
@@ -1020,8 +1052,8 @@ carquet_status_t carquet_column_index_get_page_stats(
         return CARQUET_ERROR_INVALID_ARGUMENT;
     }
 
-    stats->null_count = (index->null_counts && page_index < index->num_null_counts)
-        ? index->null_counts[page_index] : 0;
+    stats->has_null_count = (index->null_counts && page_index < index->num_null_counts);
+    stats->null_count = stats->has_null_count ? index->null_counts[page_index] : 0;
     stats->min_value = (index->min_values && page_index < index->num_min_values)
         ? index->min_values[page_index] : NULL;
     stats->min_value_size = (index->min_value_lens && page_index < index->num_min_values)

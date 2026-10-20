@@ -1144,24 +1144,13 @@ void carquet_neon_match_copy(uint8_t* dst, const uint8_t* src, size_t len, size_
             len--;
         }
     } else {
-        /* Offset 3, 5, 6, 7: tile the seed bytes into a vector and blast full chunks. */
-        uint8_t pattern[16];
-        for (size_t i = 0; i < offset; i++) {
-            pattern[i] = src[i];
-        }
-        for (size_t i = offset; i < sizeof(pattern); i++) {
-            pattern[i] = pattern[i % offset];
-        }
-
-        uint8x16_t v = vld1q_u8(pattern);
-        while (len >= 16) {
-            vst1q_u8(dst, v);
-            dst += 16;
-            len -= 16;
-        }
-
-        for (size_t i = 0; i < len; i++) {
-            dst[i] = pattern[i];
+        /* Offset 3, 5, 6, 7: the period does not divide 16, so a tiled
+         * 16-byte vector restarts the pattern at the wrong phase on every
+         * store after the first. Copy byte by byte (src trails dst by
+         * `offset`, so the overlap reproduces the pattern exactly). */
+        while (len > 0) {
+            *dst++ = *src++;
+            len--;
         }
     }
 }
@@ -1467,8 +1456,9 @@ void carquet_neon_minmax_double(const double* values, int64_t count,
         max_vec = vmaxq_f64(max_vec, v);
     }
 
-    /* Horizontal reduction via lane extract */
-    min_v = vpminqd_f64(min_vec); /*FMINP: NaN if either lane is NaN */
+    /* Horizontal reduction. FMINP/FMAXP propagate a NaN lane so the caller
+     * sees it and rescans NaN-skipping (a ternary would drop it, #35). */
+    min_v = vpminqd_f64(min_vec);
     max_v = vpmaxqd_f64(max_vec);
 
     for (; i < count; i++) {
@@ -1584,14 +1574,9 @@ void carquet_neon_copy_minmax_double(const double* values, int64_t count, double
         max_vec = vmaxq_f64(max_vec, v);
     }
 
-    {
-        double mn0 = vgetq_lane_f64(min_vec, 0);
-        double mn1 = vgetq_lane_f64(min_vec, 1);
-        double mx0 = vgetq_lane_f64(max_vec, 0);
-        double mx1 = vgetq_lane_f64(max_vec, 1);
-        min_v = mn0 < mn1 ? mn0 : mn1;
-        max_v = mx0 > mx1 ? mx0 : mx1;
-    }
+    /* Propagate a NaN lane, as in carquet_neon_minmax_double(). */
+    min_v = vpminqd_f64(min_vec);
+    max_v = vpmaxqd_f64(max_vec);
     for (; i < count; i++) {
         double v = values[i];
         output[i] = v;

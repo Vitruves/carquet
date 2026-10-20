@@ -260,13 +260,22 @@ static carquet_status_t dict_builder_add(dict_builder_t* builder,
     new_entry->next = builder->buckets[bucket];
     builder->buckets[bucket] = new_entry;
 
-    /* Add to dictionary buffer */
+    /* Add to dictionary buffer. An append failure must not leave an indexed
+     * entry without its bytes (the indices would reference a missing value). */
+    carquet_status_t append_status = CARQUET_OK;
     if (builder->is_variable_length) {
         /* Write length prefix */
         uint32_t len = (uint32_t)value_size;
-        carquet_buffer_append_u32_le(&builder->dict_buffer, len);
+        append_status = carquet_buffer_append_u32_le(&builder->dict_buffer, len);
     }
-    carquet_buffer_append(&builder->dict_buffer, value, value_size);
+    if (append_status == CARQUET_OK) {
+        append_status = carquet_buffer_append(&builder->dict_buffer, value, value_size);
+    }
+    if (append_status != CARQUET_OK) {
+        builder->buckets[bucket] = new_entry->next;
+        carquet_mem_free(new_entry);
+        return append_status;
+    }
 
     builder->indices[builder->indices_count++] = new_entry->index;
     builder->count++;
@@ -322,14 +331,22 @@ carquet_status_t carquet_dictionary_encode_int32(
     }
 
     /* Copy dictionary */
-    carquet_buffer_append(dict_output, builder.dict_buffer.data, builder.dict_buffer.size);
+    status = carquet_buffer_append(dict_output, builder.dict_buffer.data, builder.dict_buffer.size);
+    if (status != CARQUET_OK) {
+        dict_builder_destroy(&builder);
+        return status;
+    }
 
     /* Encode indices with RLE */
     int bit_width = bit_width_for_count((uint32_t)builder.count);
 
     /* Write bit width byte */
     uint8_t bw = (uint8_t)bit_width;
-    carquet_buffer_append_byte(indices_output, bw);
+    status = carquet_buffer_append_byte(indices_output, bw);
+    if (status != CARQUET_OK) {
+        dict_builder_destroy(&builder);
+        return status;
+    }
 
     /* RLE encode indices */
     status = carquet_rle_encode_all(builder.indices, count, bit_width, indices_output);
@@ -361,12 +378,14 @@ carquet_status_t carquet_dictionary_encode_int64(
         }
     }
 
-    carquet_buffer_append(dict_output, builder.dict_buffer.data, builder.dict_buffer.size);
-
-    int bit_width = bit_width_for_count((uint32_t)builder.count);
-    uint8_t bw = (uint8_t)bit_width;
-    carquet_buffer_append_byte(indices_output, bw);
-    status = carquet_rle_encode_all(builder.indices, count, bit_width, indices_output);
+    status = carquet_buffer_append(dict_output, builder.dict_buffer.data, builder.dict_buffer.size);
+    if (status == CARQUET_OK) {
+        int bit_width = bit_width_for_count((uint32_t)builder.count);
+        status = carquet_buffer_append_byte(indices_output, (uint8_t)bit_width);
+        if (status == CARQUET_OK) {
+            status = carquet_rle_encode_all(builder.indices, count, bit_width, indices_output);
+        }
+    }
 
     dict_builder_destroy(&builder);
     return status;
@@ -395,12 +414,14 @@ carquet_status_t carquet_dictionary_encode_float(
         }
     }
 
-    carquet_buffer_append(dict_output, builder.dict_buffer.data, builder.dict_buffer.size);
-
-    int bit_width = bit_width_for_count((uint32_t)builder.count);
-    uint8_t bw = (uint8_t)bit_width;
-    carquet_buffer_append_byte(indices_output, bw);
-    status = carquet_rle_encode_all(builder.indices, count, bit_width, indices_output);
+    status = carquet_buffer_append(dict_output, builder.dict_buffer.data, builder.dict_buffer.size);
+    if (status == CARQUET_OK) {
+        int bit_width = bit_width_for_count((uint32_t)builder.count);
+        status = carquet_buffer_append_byte(indices_output, (uint8_t)bit_width);
+        if (status == CARQUET_OK) {
+            status = carquet_rle_encode_all(builder.indices, count, bit_width, indices_output);
+        }
+    }
 
     dict_builder_destroy(&builder);
     return status;
@@ -429,12 +450,14 @@ carquet_status_t carquet_dictionary_encode_double(
         }
     }
 
-    carquet_buffer_append(dict_output, builder.dict_buffer.data, builder.dict_buffer.size);
-
-    int bit_width = bit_width_for_count((uint32_t)builder.count);
-    uint8_t bw = (uint8_t)bit_width;
-    carquet_buffer_append_byte(indices_output, bw);
-    status = carquet_rle_encode_all(builder.indices, count, bit_width, indices_output);
+    status = carquet_buffer_append(dict_output, builder.dict_buffer.data, builder.dict_buffer.size);
+    if (status == CARQUET_OK) {
+        int bit_width = bit_width_for_count((uint32_t)builder.count);
+        status = carquet_buffer_append_byte(indices_output, (uint8_t)bit_width);
+        if (status == CARQUET_OK) {
+            status = carquet_rle_encode_all(builder.indices, count, bit_width, indices_output);
+        }
+    }
 
     dict_builder_destroy(&builder);
     return status;
@@ -453,19 +476,25 @@ carquet_status_t carquet_dictionary_encode_byte_array(
     }
 
     for (int64_t i = 0; i < count; i++) {
-        status = dict_builder_add(&builder, values[i].data, values[i].length);
+        if (values[i].length < 0 || (!values[i].data && values[i].length > 0)) {
+            dict_builder_destroy(&builder);
+            return CARQUET_ERROR_INVALID_ARGUMENT;
+        }
+        status = dict_builder_add(&builder, values[i].data, (size_t)values[i].length);
         if (status != CARQUET_OK) {
             dict_builder_destroy(&builder);
             return status;
         }
     }
 
-    carquet_buffer_append(dict_output, builder.dict_buffer.data, builder.dict_buffer.size);
-
-    int bit_width = bit_width_for_count((uint32_t)builder.count);
-    uint8_t bw = (uint8_t)bit_width;
-    carquet_buffer_append_byte(indices_output, bw);
-    status = carquet_rle_encode_all(builder.indices, count, bit_width, indices_output);
+    status = carquet_buffer_append(dict_output, builder.dict_buffer.data, builder.dict_buffer.size);
+    if (status == CARQUET_OK) {
+        int bit_width = bit_width_for_count((uint32_t)builder.count);
+        status = carquet_buffer_append_byte(indices_output, (uint8_t)bit_width);
+        if (status == CARQUET_OK) {
+            status = carquet_rle_encode_all(builder.indices, count, bit_width, indices_output);
+        }
+    }
 
     dict_builder_destroy(&builder);
     return status;
@@ -545,6 +574,11 @@ carquet_status_t carquet_dictionary_encode_capped(
                     value_size);
                 break;
             default:  /* BYTE_ARRAY */
+                if (ba_values[i].length < 0 ||
+                    (!ba_values[i].data && ba_values[i].length > 0)) {
+                    status = CARQUET_ERROR_INVALID_ARGUMENT;
+                    break;
+                }
                 status = dict_builder_add(&builder, ba_values[i].data,
                                           (size_t)ba_values[i].length);
                 break;
@@ -561,12 +595,16 @@ carquet_status_t carquet_dictionary_encode_capped(
         return CARQUET_OK;
     }
 
-    carquet_buffer_append(dict_output, builder.dict_buffer.data,
-                          builder.dict_buffer.size);
-    int bit_width = bit_width_for_count((uint32_t)builder.count);
-    carquet_buffer_append_byte(indices_output, (uint8_t)bit_width);
-    status = carquet_rle_encode_all(builder.indices, count, bit_width,
-                                    indices_output);
+    status = carquet_buffer_append(dict_output, builder.dict_buffer.data,
+                                   builder.dict_buffer.size);
+    if (status == CARQUET_OK) {
+        int bit_width = bit_width_for_count((uint32_t)builder.count);
+        status = carquet_buffer_append_byte(indices_output, (uint8_t)bit_width);
+        if (status == CARQUET_OK) {
+            status = carquet_rle_encode_all(builder.indices, count, bit_width,
+                                            indices_output);
+        }
+    }
     dict_builder_destroy(&builder);
     return status;
 }
@@ -624,6 +662,10 @@ carquet_status_t carquet_dictionary_decode_int32(
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
     /* Big-endian: use scalar path with endian conversion */
     for (int64_t i = 0; i < decoded; i++) {
+        if (indices[i] >= (uint32_t)dict_count) {
+            carquet_mem_free(indices);
+            return CARQUET_ERROR_DECODE;  /* index past the dictionary */
+        }
         output[i] = carquet_read_i32_le(dict_data + indices[i] * sizeof(int32_t));
     }
 #else
@@ -693,6 +735,10 @@ carquet_status_t carquet_dictionary_decode_int64(
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
     /* Big-endian: use scalar path with endian conversion */
     for (int64_t i = 0; i < decoded; i++) {
+        if (indices[i] >= (uint32_t)dict_count) {
+            carquet_mem_free(indices);
+            return CARQUET_ERROR_DECODE;  /* index past the dictionary */
+        }
         output[i] = carquet_read_i64_le(dict_data + indices[i] * sizeof(int64_t));
     }
 #else
@@ -762,6 +808,10 @@ carquet_status_t carquet_dictionary_decode_float(
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
     /* Big-endian: use scalar path with endian conversion */
     for (int64_t i = 0; i < decoded; i++) {
+        if (indices[i] >= (uint32_t)dict_count) {
+            carquet_mem_free(indices);
+            return CARQUET_ERROR_DECODE;  /* index past the dictionary */
+        }
         output[i] = carquet_read_f32_le(dict_data + indices[i] * sizeof(float));
     }
 #else
@@ -831,6 +881,10 @@ carquet_status_t carquet_dictionary_decode_double(
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
     /* Big-endian: use scalar path with endian conversion */
     for (int64_t i = 0; i < decoded; i++) {
+        if (indices[i] >= (uint32_t)dict_count) {
+            carquet_mem_free(indices);
+            return CARQUET_ERROR_DECODE;  /* index past the dictionary */
+        }
         output[i] = carquet_read_f64_le(dict_data + indices[i] * sizeof(double));
     }
 #else
@@ -881,7 +935,12 @@ carquet_status_t carquet_dictionary_decode_byte_array(
     }
 
     /* Build an offset/length table over the length-prefixed dictionary,
-     * validating that every entry stays within dict_size. */
+     * validating that every entry stays within dict_size. Each entry needs
+     * at least its 4-byte length prefix, so dict_count is bounded by
+     * dict_size / 4 before anything is allocated from it. */
+    if ((size_t)dict_count > dict_size / 4) {
+        return CARQUET_ERROR_DECODE;
+    }
     typedef struct { const uint8_t* data; int32_t length; } ba_entry_t;
     ba_entry_t* entries =
         carquet_mem_malloc((size_t)dict_count * sizeof(ba_entry_t));

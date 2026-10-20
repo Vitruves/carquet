@@ -49,6 +49,7 @@ extern carquet_status_t carquet_column_index_add_page(
     const int64_t* def_level_hist, int32_t def_level_hist_len);
 extern carquet_status_t carquet_column_index_serialize(
     const carquet_column_index_builder_t* builder, carquet_buffer_t* output);
+extern void carquet_column_index_builder_discard(carquet_column_index_builder_t* builder);
 
 extern carquet_offset_index_builder_t* carquet_offset_index_builder_create(bool track_unencoded);
 extern void carquet_offset_index_builder_destroy(carquet_offset_index_builder_t* builder);
@@ -99,6 +100,7 @@ extern carquet_status_t carquet_page_writer_finalize_to_buffer(
 
 extern size_t carquet_page_writer_estimated_size(const carquet_page_writer_t* writer);
 extern int64_t carquet_page_writer_num_values(const carquet_page_writer_t* writer);
+extern int64_t carquet_page_writer_num_rows(const carquet_page_writer_t* writer);
 extern int64_t carquet_page_writer_byte_array_bytes(const carquet_page_writer_t* writer);
 extern void carquet_page_writer_set_byte_array_bytes(
     carquet_page_writer_t* writer, int64_t bytes);
@@ -216,6 +218,8 @@ typedef struct carquet_column_writer_internal {
      * fallback). dictionary_page_size_bytes is reported back so the file
      * writer can compute dictionary_page_offset / data_page_offset. */
     bool use_dictionary;
+    bool dict_configured;   /* use_dictionary as configured (restored by reset) */
+    uint8_t dict_minmax_scratch[16];  /* FLOAT/DOUBLE dictionary min (0..7) / max (8..15) */
     size_t dictionary_page_size_limit;  /* options.dictionary_page_size */
     carquet_buffer_t dict_values;       /* Accumulated raw non-null values */
     int64_t dict_value_count;           /* Count of accumulated non-null values */
@@ -321,6 +325,7 @@ carquet_column_writer_internal_t* carquet_column_writer_create(
     writer->use_dictionary = dict_eligible_type &&
         (encoding == CARQUET_ENCODING_RLE_DICTIONARY ||
          encoding == CARQUET_ENCODING_PLAIN_DICTIONARY);
+    writer->dict_configured = writer->use_dictionary;
     writer->dictionary_page_size_limit = 1024 * 1024;
     carquet_buffer_init(&writer->dict_values);
     carquet_buffer_init(&writer->dict_ba_storage);
@@ -451,6 +456,13 @@ void carquet_column_writer_reset(carquet_column_writer_internal_t* writer) {
     writer->dict_total_nulls = 0;
     writer->has_dictionary_page = false;
     writer->dictionary_page_size_bytes = 0;
+    /* A dictionary fallback (all-unique chunk, or dictionary over the size
+     * limit) switches this chunk to PLAIN; the next row group starts again
+     * with the configured encoding instead of staying PLAIN for good. */
+    if (writer->dict_configured && !writer->use_dictionary) {
+        writer->use_dictionary = true;
+        carquet_page_writer_set_encoding(writer->page_writer, writer->encoding);
+    }
     writer->has_distinct_count = false;
     writer->distinct_count = 0;
     writer->chunk_unencoded_ba_bytes = 0;
@@ -715,12 +727,25 @@ static carquet_status_t flush_current_page(carquet_column_writer_internal_t* wri
     }
 
     /* Record page index entries before appending */
-    if (writer->column_index) {
+    if (writer->column_index && !has_stats && !is_null_page) {
+        /* A page with values but no bounds cannot be described by a
+         * ColumnIndex (the spec has no "unknown" marker and an empty binary
+         * would be read as a typed bound): withhold the index, as
+         * parquet-cpp does. Triggers: statistics disabled, undefined sort
+         * order (INT96, INTERVAL, ...), an all-NaN FLOAT/DOUBLE page. */
+        carquet_column_index_builder_discard(writer->column_index);
+    } else if (writer->column_index) {
+        /* A zero-length bound (the empty BYTE_ARRAY) may come with a NULL
+         * pointer; hand the builder a non-NULL one so it is recorded as a
+         * present empty value rather than as "no statistics". */
+        static const uint8_t empty_bound = 0;
+        const uint8_t* ci_min = has_stats ? (page_min ? page_min : &empty_bound) : NULL;
+        const uint8_t* ci_max = has_stats ? (page_max ? page_max : &empty_bound) : NULL;
         carquet_column_index_add_page(
             writer->column_index,
             page_null_count,
-            has_stats ? page_min : NULL, has_stats ? (int32_t)min_size : 0,
-            has_stats ? page_max : NULL, has_stats ? (int32_t)max_size : 0,
+            ci_min, has_stats ? (int32_t)min_size : 0,
+            ci_max, has_stats ? (int32_t)max_size : 0,
             is_null_page,
             rep_hist, rep_hist_len, def_hist, def_hist_len);
     }
@@ -740,7 +765,9 @@ static carquet_status_t flush_current_page(carquet_column_writer_internal_t* wri
             (int32_t)page_size,
             writer->page_row_offset,
             carquet_page_writer_byte_array_bytes(writer->page_writer));
-        writer->page_row_offset += carquet_page_writer_num_values(writer->page_writer);
+        /* first_row_index counts rows (rep_level == 0), not levels: for a
+         * repeated column the two differ. */
+        writer->page_row_offset += carquet_page_writer_num_rows(writer->page_writer);
     }
 
     /* Update statistics */
@@ -863,6 +890,24 @@ static carquet_status_t dict_accumulate(
         num_non_null = carquet_dispatch_count_non_nulls(
             def_levels, num_values, writer->max_def_level);
     }
+
+    /* Validate BYTE_ARRAY entries before any writer state is touched, so a bad
+     * batch is rejected atomically (same rule as the dictionary / DELTA_LENGTH
+     * encoders and carquet_column_writer_write_batch): a negative length or a
+     * NULL data pointer with a positive length is CARQUET_ERROR_INVALID_ARGUMENT.
+     * Previously such an entry reached carquet_buffer_append(), which asserts
+     * on data == NULL (and would memcpy from NULL in release builds).
+     * (dict_ba_storage is appended per string below; it already grows by
+     * doubling, and a one-shot reserve of the batch total measured no faster.) */
+    if (writer->type == CARQUET_PHYSICAL_BYTE_ARRAY) {
+        const carquet_byte_array_t* arr = (const carquet_byte_array_t*)values;
+        for (int64_t i = 0; i < num_non_null; i++) {
+            if (arr[i].length < 0 || (!arr[i].data && arr[i].length > 0)) {
+                return CARQUET_ERROR_INVALID_ARGUMENT;
+            }
+        }
+    }
+
     writer->dict_total_rows += num_values;
     writer->dict_total_nulls += (num_values - num_non_null);
 
@@ -952,7 +997,12 @@ static carquet_status_t encode_batch_eager(
      * hundreds of MB into a single page. */
     size_t stride = physical_type_stride(writer->type, writer->type_length);
 
-    int64_t max_chunk = num_values;
+    /* BYTE_ARRAY (stride 0): the size check below runs once per chunk, so
+     * a whole-batch chunk would turn one write_batch call into one page of
+     * any size, ignoring page_size / max_rows_per_page (the Arrow bridge
+     * hands a column over in a single call). Check every 1024 values, the
+     * granularity Arrow uses. */
+    int64_t max_chunk = (stride > 0) ? num_values : 1024;
     if (stride > 0) {
         max_chunk = (int64_t)(writer->target_page_size / stride);
         if (max_chunk < 1024) max_chunk = 1024;
@@ -986,6 +1036,15 @@ static carquet_status_t encode_batch_eager(
     while (offset < num_values) {
         int64_t chunk = num_values - offset;
         if (chunk > max_chunk) chunk = max_chunk;
+        /* A repeated column's page must end on a record boundary (the next
+         * level has rep == 0): first_row_index and V2 num_rows assume it,
+         * and readers skip pages by rows. Extend the chunk to the next
+         * record start when it would cut a list in two. */
+        if (rep_levels && writer->max_rep_level > 0) {
+            while (offset + chunk < num_values && rep_levels[offset + chunk] != 0) {
+                chunk++;
+            }
+        }
 
         const void* chunk_values = (stride > 0)
             ? (const void*)(val_bytes + values_offset * stride)
@@ -1118,11 +1177,31 @@ carquet_status_t carquet_column_writer_write_batch(
     }
 
     if (writer->use_dictionary) {
+        /* dict_accumulate validates BYTE_ARRAY entries itself (it needs the
+         * same pass to size its storage reservation). */
         carquet_status_t s = dict_accumulate(writer, values, num_values,
                                              def_levels, rep_levels);
         if (s != CARQUET_OK) return s;
         writer->total_values += num_values;
         return CARQUET_OK;
+    }
+
+    /* Non-dictionary BYTE_ARRAY (PLAIN / DELTA_*): apply the same input rule
+     * as the dictionary path so every writer path agrees. Without this the
+     * PLAIN encoder silently zero-fills a {NULL, len > 0} entry while the
+     * dictionary and DELTA_LENGTH encoders reject it. */
+    if (writer->type == CARQUET_PHYSICAL_BYTE_ARRAY) {
+        int64_t num_non_null = num_values;
+        if (def_levels && writer->max_def_level > 0) {
+            num_non_null = carquet_dispatch_count_non_nulls(
+                def_levels, num_values, writer->max_def_level);
+        }
+        const carquet_byte_array_t* arr = (const carquet_byte_array_t*)values;
+        for (int64_t i = 0; i < num_non_null; i++) {
+            if (arr[i].length < 0 || (!arr[i].data && arr[i].length > 0)) {
+                return CARQUET_ERROR_INVALID_ARGUMENT;
+            }
+        }
     }
 
     if (writer->defer_encode) {
@@ -1201,6 +1280,41 @@ static void dict_compute_min_max(carquet_column_writer_internal_t* writer,
 
     size_t stride = physical_type_stride(writer->type, writer->type_length);
     const uint8_t* base = writer->dict_values.data;
+
+    if (writer->type == CARQUET_PHYSICAL_FLOAT || writer->type == CARQUET_PHYSICAL_DOUBLE) {
+        /* Same rules as the PLAIN page statistics: NaN is skipped (a NaN seed
+         * would otherwise never be replaced, since every comparison with it
+         * is false), min -0.0 / max +0.0 are normalised. No non-NaN value
+         * leaves the chunk without min/max. */
+        bool is_float = writer->type == CARQUET_PHYSICAL_FLOAT;
+        double mnv = 0, mxv = 0;
+        bool found = false;
+        for (int64_t i = 0; i < writer->dict_value_count; i++) {
+            double v;
+            if (is_float) { float f; memcpy(&f, base + i * stride, 4); v = f; }
+            else memcpy(&v, base + i * stride, 8);
+            if (v != v) continue;
+            if (!found) { mnv = mxv = v; found = true; continue; }
+            if (v < mnv) mnv = v;
+            if (v > mxv) mxv = v;
+        }
+        if (!found) return;
+        if (mnv == 0.0) mnv = -0.0;
+        if (mxv == 0.0) mxv = 0.0;
+        if (is_float) {
+            float fmn = (float)mnv, fmx = (float)mxv;
+            memcpy(writer->dict_minmax_scratch, &fmn, 4);
+            memcpy(writer->dict_minmax_scratch + 8, &fmx, 4);
+        } else {
+            memcpy(writer->dict_minmax_scratch, &mnv, 8);
+            memcpy(writer->dict_minmax_scratch + 8, &mxv, 8);
+        }
+        *min_out = writer->dict_minmax_scratch;
+        *max_out = writer->dict_minmax_scratch + 8;
+        *min_len = *max_len = stride;
+        return;
+    }
+
     size_t mn = 0, mx = 0;
     for (int64_t i = 1; i < writer->dict_value_count; i++) {
         if (compare_stat_values(writer->type, &writer->logical_type,
@@ -1827,8 +1941,11 @@ void carquet_column_writer_run_page_task(
 carquet_status_t carquet_column_writer_assemble_page_tasks(
     carquet_column_writer_internal_t* writer,
     carquet_page_task_t* tasks,
-    int32_t count) {
+    int32_t count,
+    bool copy_pages,
+    size_t* page_bytes) {
 
+    if (page_bytes) *page_bytes = 0;
     if (!writer || (!tasks && count > 0)) return CARQUET_ERROR_INVALID_ARGUMENT;
 
     size_t total = 0;
@@ -1839,9 +1956,13 @@ carquet_status_t carquet_column_writer_assemble_page_tasks(
         }
         total += tasks[k].out->size;
     }
-    carquet_status_t status = carquet_buffer_reserve(
-        &writer->column_buffer, writer->column_buffer.size + total);
-    if (status != CARQUET_OK) return status;
+    if (page_bytes) *page_bytes = total;
+    carquet_status_t status = CARQUET_OK;
+    if (copy_pages) {
+        status = carquet_buffer_reserve(
+            &writer->column_buffer, writer->column_buffer.size + total);
+        if (status != CARQUET_OK) return status;
+    }
 
     /* The bookkeeping of flush_current_page, page by page in file order. A
      * flat column has one histogram bucket, and no bloom filter or page
@@ -1853,9 +1974,11 @@ carquet_status_t carquet_column_writer_assemble_page_tasks(
             merge_page_statistics(writer, t->min_value, t->min_size,
                                   t->max_value, t->max_size);
         }
-        status = carquet_buffer_append(&writer->column_buffer,
-                                       t->out->data, t->out->size);
-        if (status != CARQUET_OK) return status;
+        if (copy_pages) {
+            status = carquet_buffer_append(&writer->column_buffer,
+                                           t->out->data, t->out->size);
+            if (status != CARQUET_OK) return status;
+        }
         writer->chunk_def_hist[0] += t->def_hist0;
         writer->chunk_rep_hist[0] += t->rep_hist0;
         writer->total_uncompressed_size += t->uncompressed_size;

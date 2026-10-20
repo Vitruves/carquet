@@ -1041,23 +1041,33 @@ void carquet_avx2_unpack_bools(const uint8_t* input, uint8_t* output, int64_t co
 void carquet_avx2_pack_bools(const uint8_t* input, uint8_t* output, int64_t count) {
     int64_t i = 0;
 
-    /* Process 8 bools at a time using movemask */
+    /* 32 bools -> 4 output bytes per iteration via compare + movemask.
+     * cmpeq(v, 0) yields 0xFF for every zero byte; movemask gathers the top
+     * bit of each byte (byte k -> mask bit k), so the inverted mask has bit k
+     * set iff byte k is non-zero. That is exactly the scalar reference rule
+     * (any non-zero byte is true, not just 0x01) and movemask's byte order is
+     * the LSB-first layout the PLAIN BOOLEAN encoding needs. This replaces a
+     * 128-bit mullo/horizontal-add reduction that handled only 8 bools per
+     * iteration. */
+    const __m256i zero256 = _mm256_setzero_si256();
+    for (; i + 32 <= count; i += 32) {
+        __m256i v = _mm256_loadu_si256((const __m256i*)(input + i));
+        uint32_t nz = ~(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, zero256));
+        uint8_t* o = output + i / 8;
+        o[0] = (uint8_t)nz;
+        o[1] = (uint8_t)(nz >> 8);
+        o[2] = (uint8_t)(nz >> 16);
+        o[3] = (uint8_t)(nz >> 24);
+    }
+
+    /* 8 bools -> 1 byte with the 128-bit half of the same trick. loadl_epi64
+     * zero-fills the upper 8 lanes; their mask bits land above bit 7 and are
+     * dropped by the uint8_t cast. */
+    const __m128i zero128 = _mm_setzero_si128();
     for (; i + 8 <= count; i += 8) {
-        __m128i bools = _mm_loadl_epi64((const __m128i*)(input + i));
-
-        /* Actually simpler: multiply by bit positions */
-        __m128i mult = _mm_set_epi8(0, 0, 0, 0, 0, 0, 0, 0,
-                                     (char)128, 64, 32, 16, 8, 4, 2, 1);
-        __m128i zero = _mm_setzero_si128();
-        __m128i words = _mm_unpacklo_epi8(bools, zero);
-        __m128i mwords = _mm_unpacklo_epi8(mult, zero);
-
-        __m128i prod = _mm_mullo_epi16(words, mwords);
-        prod = _mm_add_epi16(prod, _mm_srli_si128(prod, 2));
-        prod = _mm_add_epi16(prod, _mm_srli_si128(prod, 4));
-        prod = _mm_add_epi16(prod, _mm_srli_si128(prod, 8));
-
-        output[i / 8] = (uint8_t)_mm_extract_epi16(prod, 0);
+        __m128i v = _mm_loadl_epi64((const __m128i*)(input + i));
+        int eq = _mm_movemask_epi8(_mm_cmpeq_epi8(v, zero128));
+        output[i / 8] = (uint8_t)~eq;
     }
 
     /* Handle remaining */

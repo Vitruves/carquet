@@ -140,7 +140,10 @@ carquet_mmap_info_t* carquet_mmap_open(const char* path, carquet_error_t* error)
     mmap_info->size = (size_t)st.st_size;
 
     /* Memory map the file */
-    mmap_info->data = mmap(NULL, mmap_info->size, PROT_READ, MAP_PRIVATE, mmap_info->fd, 0);
+    /* Read-only, so MAP_SHARED and MAP_PRIVATE see the same bytes; a private
+     * mapping additionally sets up copy-on-write shadow state that costs
+     * noticeable time at mmap/munmap for a large file. */
+    mmap_info->data = mmap(NULL, mmap_info->size, PROT_READ, MAP_SHARED, mmap_info->fd, 0);
     if (mmap_info->data == MAP_FAILED) {
         close(mmap_info->fd);
         carquet_mem_free(mmap_info);
@@ -314,8 +317,16 @@ carquet_reader_t* carquet_reader_open_buffer(
 
     const uint8_t* end = (const uint8_t*)buffer + size;
     if (memcmp(end - 4, "PAR1", 4) != 0) {
+        bool encrypted = memcmp(end - 4, "PARE", 4) == 0;
         carquet_arena_destroy(&reader->arena);
         carquet_mem_free(reader);
+        if (encrypted) {
+            /* Parquet modular encryption: say so instead of "corrupt". */
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_NOT_IMPLEMENTED,
+                "File uses Parquet modular encryption (encrypted footer, magic "
+                "\"PARE\"), which carquet does not support");
+            return NULL;
+        }
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_MAGIC, "Invalid footer magic");
         return NULL;
     }

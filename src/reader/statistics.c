@@ -35,7 +35,8 @@ typedef enum {
     CMP_BOOL,
     CMP_FLOAT16,
     CMP_DECIMAL_BE,  /* DECIMAL(FLBA/BYTE_ARRAY): signed big-endian two's comp. */
-    CMP_BYTES
+    CMP_BYTES,
+    CMP_NONE         /* no defined order (INT96): never prune */
 } cmp_kind_t;
 
 #define CMP3(va, vb) (((va) > (vb)) - ((va) < (vb)))
@@ -94,6 +95,7 @@ static bool stat_compare(cmp_kind_t kind,
             float a, b;
             memcpy(&a, val, 4);
             memcpy(&b, st, 4);
+            if (a != a || b != b) return false;  /* NaN bound: indeterminate */
             *out = CMP3(a, b);
             return true;
         }
@@ -102,6 +104,7 @@ static bool stat_compare(cmp_kind_t kind,
             double a, b;
             memcpy(&a, val, 8);
             memcpy(&b, st, 8);
+            if (a != a || b != b) return false;  /* NaN bound: indeterminate */
             *out = CMP3(a, b);
             return true;
         }
@@ -112,9 +115,12 @@ static bool stat_compare(cmp_kind_t kind,
             memcpy(&hb, st, 2);
             float a = carquet_half_to_float(ha);
             float b = carquet_half_to_float(hb);
+            if (a != a || b != b) return false;  /* NaN bound: indeterminate */
             *out = CMP3(a, b);
             return true;
         }
+        case CMP_NONE:
+            return false;
         case CMP_DECIMAL_BE: {
             *out = carquet_compare_decimal_be(val, val_len, st, st_len);
             return true;
@@ -178,6 +184,8 @@ static cmp_kind_t get_cmp_kind(const parquet_schema_element_t* elem,
                 return CMP_FLOAT16;
             }
             return is_decimal ? CMP_DECIMAL_BE : CMP_BYTES;
+        case CARQUET_PHYSICAL_INT96:
+            return CMP_NONE;  /* no defined sort order */
         default:
             return is_decimal ? CMP_DECIMAL_BE : CMP_BYTES;
     }
@@ -187,6 +195,29 @@ static cmp_kind_t get_cmp_kind(const parquet_schema_element_t* elem,
  * Statistics Access
  * ============================================================================
  */
+
+/* The deprecated `min` / `max` fields were computed with signed byte
+ * comparison by parquet-mr before 1.10 (PARQUET-686), which is why they were
+ * deprecated: for BYTE_ARRAY / FIXED_LEN_BYTE_ARRAY (UNSIGNED sort order) a
+ * UTF-8 string starting with a byte >= 0x80 sorted *below* ASCII, so the
+ * stored max can be smaller than real values and pruning on it drops rows.
+ * Arrow / parquet-mr only trust the pair when the column's sort order is
+ * SIGNED, where the two definitions agree. */
+static bool deprecated_stats_usable(const carquet_reader_t* reader, int32_t column_index) {
+    int32_t schema_idx = reader->schema->leaf_indices[column_index];
+    const parquet_schema_element_t* elem = &reader->schema->elements[schema_idx];
+    if (!elem->has_type) return false;
+    switch (elem->type) {
+        case CARQUET_PHYSICAL_BOOLEAN:
+        case CARQUET_PHYSICAL_INT32:
+        case CARQUET_PHYSICAL_INT64:
+        case CARQUET_PHYSICAL_FLOAT:
+        case CARQUET_PHYSICAL_DOUBLE:
+            return true;
+        default:
+            return false;  /* BYTE_ARRAY, FLBA, INT96 */
+    }
+}
 
 carquet_status_t carquet_reader_column_statistics(
     const carquet_reader_t* reader,
@@ -248,7 +279,8 @@ carquet_status_t carquet_reader_column_statistics(
         stats->max_value = pstats->max_value;
         stats->max_value_size = pstats->max_value_len;
     } else if (pstats->min_deprecated && pstats->min_deprecated_len > 0 &&
-               pstats->max_deprecated && pstats->max_deprecated_len > 0) {
+               pstats->max_deprecated && pstats->max_deprecated_len > 0 &&
+               deprecated_stats_usable(reader, column_index)) {
         stats->has_min_max = true;
         stats->min_value = pstats->min_deprecated;
         stats->min_value_size = pstats->min_deprecated_len;

@@ -232,7 +232,10 @@ static float decode_float16(const uint8_t* b) {
 static int cmp_bytes_lex(const uint8_t* a, int32_t alen,
                          const uint8_t* b, int32_t blen) {
     int32_t n = alen < blen ? alen : blen;
-    int c = memcmp(a, b, (size_t)n);
+    /* An empty-string predicate value (vlen == 0) reaches here with n == 0;
+     * memcmp requires valid pointers even for a zero length, so skip the call
+     * (same guard as page_index.c / reader/statistics.c). */
+    int c = n > 0 ? memcmp(a, b, (size_t)n) : 0;
     if (c != 0) return c < 0 ? -1 : 1;
     if (alen == blen) return 0;
     return alen < blen ? -1 : 1;
@@ -482,6 +485,9 @@ static bool page_matches_clause(const column_type_info_t* ti,
     /* Null-presence ops: decide purely from the null count + null page
      * flag. */
     if (clause->op == CARQUET_FILTER_IS_NULL) {
+        /* null_counts is optional in the ColumnIndex: without it a page
+         * cannot be proven null-free. */
+        if (!stats->has_null_count) return true;
         return stats->null_count > 0 || stats->is_null_page;
     }
     if (clause->op == CARQUET_FILTER_IS_NOT_NULL) {
@@ -519,6 +525,11 @@ static bool page_matches_clause(const column_type_info_t* ti,
     int32_t pmax_len = stats->max_value_size;
     bool have_min = (pmin != NULL && stat_len_ok(ti, pmin_len));
     bool have_max = (pmax != NULL && stat_len_ok(ti, pmax_len));
+    /* A NaN bound (written by older parquet-cpp and some other writers; the
+     * spec only says writers *should* skip NaN) orders against nothing, so
+     * it is no bound at all. */
+    if (have_min && predicate_value_is_nan(ti, pmin)) have_min = false;
+    if (have_max && predicate_value_is_nan(ti, pmax)) have_max = false;
 
     if (!have_min && !have_max) {
         /* No stats available — cannot prune. */
@@ -780,13 +791,23 @@ static carquet_status_t eval_clause_to_ranges(
     carquet_offset_index_t* oi = carquet_reader_get_offset_index(
         file_reader, row_group_index, clause->column_index, error);
 
-    if (!ci || !oi) {
+    if (!oi) {
         if (ci) carquet_column_index_free(ci);
-        if (oi) carquet_offset_index_free(oi);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_PAGE_INDEX_REQUIRED,
             "Page index missing for column %d in row group %d",
             clause->column_index, row_group_index);
         return CARQUET_ERROR_PAGE_INDEX_REQUIRED;
+    }
+    if (!ci) {
+        /* OffsetIndex without ColumnIndex: the writer had no page bounds to
+         * publish (statistics off, undefined sort order, ...). Nothing can be
+         * proven absent, so every row of the group is a candidate. */
+        carquet_offset_index_free(oi);
+        carquet_row_range_list_clear(out);
+        if (row_group_num_rows > 0) {
+            return carquet_row_range_list_append(out, 0, row_group_num_rows);
+        }
+        return CARQUET_OK;
     }
 
     int32_t n_ci_pages = carquet_column_index_num_pages(ci);

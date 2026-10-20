@@ -55,6 +55,11 @@ extern int carquet_zstd_compress(const uint8_t* src, size_t src_size,
                                   uint8_t* dst, size_t dst_capacity,
                                   size_t* dst_size, int level);
 extern size_t carquet_zstd_compress_bound(size_t src_size);
+extern int carquet_brotli_compress(const uint8_t* src, size_t src_size,
+                                    uint8_t* dst, size_t dst_capacity,
+                                    size_t* dst_size, int level);
+extern size_t carquet_brotli_compress_bound(size_t src_size);
+extern bool carquet_brotli_available(void);
 
 /* The incremental BYTE_STREAM_SPLIT encoders in encoding/byte_stream_split.c
  * are no longer called from here: the transposition is applied to the finished
@@ -648,10 +653,16 @@ static void update_statistics_byte_array(carquet_page_writer_t* writer,
     /* DECIMAL(BYTE_ARRAY) is ordered as signed big-endian two's complement, not
      * unsigned lexicographic; the values may also differ in length. */
     bool is_decimal = writer->logical_type.id == CARQUET_LOGICAL_DECIMAL;
+    static const uint8_t empty_value = 0;
     for (int64_t i = 0; i < count; i++) {
         const uint8_t* v = values[i].data;
         size_t vlen = (size_t)values[i].length;
-        if (!v) continue;
+        if (!v) {
+            /* {NULL, 0} is a legal spelling of the empty string and must
+             * bound the statistics like {"", 0} does. */
+            if (vlen != 0) continue;
+            v = &empty_value;
+        }
 
         if (!writer->has_min_max) {
             if (stats_set_min(writer, v, vlen) != CARQUET_OK) return;
@@ -1221,14 +1232,14 @@ carquet_status_t carquet_page_writer_add_values(
     }
 
     writer->num_values += num_values;
-    if (writer->data_page_v2) {
-        if (writer->max_rep_level > 0 && rep_levels) {
-            for (int64_t i = 0; i < num_values; i++) {
-                if (rep_levels[i] == 0) writer->num_rows++;
-            }
-        } else {
-            writer->num_rows += num_values;
+    /* Logical rows (rep_level == 0): the V2 header's num_rows and the
+     * OffsetIndex first_row_index both need rows, not levels. */
+    if (writer->max_rep_level > 0 && rep_levels) {
+        for (int64_t i = 0; i < num_values; i++) {
+            if (rep_levels[i] == 0) writer->num_rows++;
         }
+    } else {
+        writer->num_rows += num_values;
     }
 
     /* Accumulate per-page level histograms (Parquet 2.9). A NULL def_levels on
@@ -1326,6 +1337,10 @@ static carquet_status_t compress_data(
             case CARQUET_COMPRESSION_ZSTD:
                 bound = carquet_zstd_compress_bound(input_size);
                 break;
+            case CARQUET_COMPRESSION_BROTLI:
+                if (!carquet_brotli_available()) return CARQUET_ERROR_UNSUPPORTED_CODEC;
+                bound = carquet_brotli_compress_bound(input_size);
+                break;
             default:
                 return CARQUET_ERROR_UNSUPPORTED_CODEC;
         }
@@ -1370,6 +1385,12 @@ static carquet_status_t compress_data(
                 status = carquet_zstd_compress(input, input_size,
                                                 compressed, bound, &local_compressed_size,
                                                 compression_level > 0 ? compression_level : 3);
+                break;
+            case CARQUET_COMPRESSION_BROTLI:
+                /* level 0 selects Brotli quality 8 (Arrow's default). */
+                status = carquet_brotli_compress(input, input_size,
+                                                  compressed, bound, &local_compressed_size,
+                                                  compression_level);
                 break;
             default:
                 status = CARQUET_ERROR_UNSUPPORTED_CODEC;
@@ -1655,6 +1676,10 @@ static carquet_status_t finalize_v2_to_buffer(
         is_compressed = false;
     }
 
+    if (levels_len + value_size > (size_t)INT32_MAX ||
+        levels_len + out_values_size > (size_t)INT32_MAX) {
+        return CARQUET_ERROR_ENCODE;  /* page header sizes are i32 */
+    }
     *uncompressed_size = (int32_t)(levels_len + value_size);
     *compressed_size = (int32_t)(levels_len + out_values_size);
 
@@ -1981,6 +2006,9 @@ carquet_status_t carquet_page_writer_finalize_to_buffer(
     if (status != CARQUET_OK) {
         return status;
     }
+    if (payload_size > (size_t)INT32_MAX) {
+        return CARQUET_ERROR_ENCODE;  /* page header sizes are i32 */
+    }
 
     *uncompressed_size = (int32_t)payload_size;
     status = compress_data(writer->compression,
@@ -2055,6 +2083,9 @@ carquet_status_t carquet_page_writer_emit_dictionary_page(
         return status;
     }
 
+    if (payload_size > (size_t)INT32_MAX || compressed_data_size > (size_t)INT32_MAX) {
+        return CARQUET_ERROR_ENCODE;  /* page header sizes are i32 */
+    }
     *uncompressed_size = (int32_t)payload_size;
     *compressed_size = (int32_t)compressed_data_size;
 
@@ -2149,14 +2180,12 @@ carquet_status_t carquet_page_writer_add_dictionary_indices(
 
     writer->num_values = num_values_total;
     writer->num_nulls = num_nulls;
-    if (writer->data_page_v2) {
-        if (writer->max_rep_level > 0 && rep_levels) {
-            for (int64_t i = 0; i < num_values_total; i++) {
-                if (rep_levels[i] == 0) writer->num_rows++;
-            }
-        } else {
-            writer->num_rows += num_values_total;
+    if (writer->max_rep_level > 0 && rep_levels) {
+        for (int64_t i = 0; i < num_values_total; i++) {
+            if (rep_levels[i] == 0) writer->num_rows++;
         }
+    } else {
+        writer->num_rows += num_values_total;
     }
 
     /* Per-page level histograms for the single RLE_DICTIONARY data page
@@ -2193,8 +2222,10 @@ carquet_status_t carquet_page_writer_set_min_max(
     const uint8_t* min_value, size_t min_size,
     const uint8_t* max_value, size_t max_size) {
     if (!writer) return CARQUET_ERROR_INVALID_ARGUMENT;
-    if (!writer->write_statistics || !min_value || !max_value ||
-        min_size == 0 || max_size == 0) {
+    /* A zero-length value is the empty BYTE_ARRAY, a real minimum (possibly
+     * with a NULL pointer); only a NULL pointer with a length is invalid. */
+    if (!writer->write_statistics ||
+        (!min_value && min_size > 0) || (!max_value && max_size > 0)) {
         return CARQUET_OK;
     }
     carquet_status_t s = stats_set_min(writer, min_value, min_size);
@@ -2227,6 +2258,12 @@ size_t carquet_page_writer_estimated_size(const carquet_page_writer_t* writer) {
 
 int64_t carquet_page_writer_num_values(const carquet_page_writer_t* writer) {
     return writer ? writer->num_values : 0;
+}
+
+/* Logical rows (rep_level == 0 entries) in the current page; equals
+ * num_values for a non-repeated column. */
+int64_t carquet_page_writer_num_rows(const carquet_page_writer_t* writer) {
+    return writer ? writer->num_rows : 0;
 }
 
 /* Unencoded BYTE_ARRAY value bytes accumulated for the current (not-yet-flushed)

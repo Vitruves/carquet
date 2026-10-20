@@ -45,6 +45,10 @@ typedef struct carquet_page_task {
     int64_t def_hist0;          /* Level histograms: a flat REQUIRED column has one bucket */
     int64_t rep_hist0;
     bool has_stats;
+    /* Wall-clock seconds the encode of this page took, recorded by the
+     * scheduler so the next row group can order its work (see
+     * finalize_columns_parallel). */
+    double elapsed;
     uint8_t* min_value;
     size_t min_size;
     size_t min_capacity;
@@ -75,14 +79,19 @@ void carquet_column_writer_run_page_task(
     carquet_page_writer_t* scratch);
 
 /**
- * Append the column's page tasks to its chunk buffer in order and fold their
- * statistics into the column totals, exactly as flushing each page would.
- * Consumes the deferred stash. Must run on one thread per column.
+ * Fold the column's page tasks into the column totals in order, exactly as
+ * flushing each page would, and consume the deferred stash. With
+ * @p copy_pages the page bytes are also appended to the column's chunk
+ * buffer; without it they stay in the task buffers (the caller writes them
+ * from there, see carquet_row_group_writer_column_pages) and only their total
+ * size is reported in @p page_bytes. Must run on one thread per column.
  */
 carquet_status_t carquet_column_writer_assemble_page_tasks(
     carquet_column_writer_internal_t* writer,
     carquet_page_task_t* tasks,
-    int32_t count);
+    int32_t count,
+    bool copy_pages,
+    size_t* page_bytes);
 
 /** Release the min/max copies a task may hold. The task struct itself and
  *  task->out are owned by the caller. */

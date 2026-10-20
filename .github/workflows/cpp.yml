@@ -32,11 +32,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build ccache pkg-config \
-            zlib1g-dev libzstd-dev liblz4-dev
+            zlib1g-dev libzstd-dev liblz4-dev libbrotli-dev
 
       - name: Install deps (macOS)
         if: runner.os == 'macOS'
-        run: brew install ninja ccache pkg-config zstd lz4
+        run: brew install ninja ccache pkg-config zstd lz4 brotli
 
       # ccache on Linux/macOS, sccache on Windows (ccache doesn't support MSVC).
       # sccache caches both the FetchContent codec builds and carquet's objects.

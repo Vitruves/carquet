@@ -1,5 +1,85 @@
 # Changelog
 
+## v0.7.2
+
+**In short:** built-in **BROTLI** codec and an explicit error for encrypted files; 35 bug fixes (writer statistics and page index, batch reader, decoders, Arrow bridge, SIMD, CLI); 8 performance improvements (reference benchmark, 10M rows on Apple M3: compressed reads −10 to −17 %, compressed writes −10 to −15 %; nullable columns read in small batches 270× faster; level / dictionary-index streams −7 % on disk), a broader Arrow C Data import (sliced arrays, DECIMAL, `date64` / second-precision temporals, fixed-size lists), a new regression test file, and an Agent Skill for integrators. Additive API only. Output bytes change where the previous output was wrong or strictly larger: NaN min/max on some SIMD backends and on the dictionary path, RLE bit-packed runs (one header per 63 groups instead of per 8 values), `BYTE_ARRAY` columns written in one call (now split at `page_size`), repeated columns (pages end on record boundaries, OffsetIndex counts rows). PyArrow and DuckDB read every file (`interop/run_interop.py`: 17/17 write, 19/19 read, 59 corpus files).
+
+### API
+
+- **BROTLI (codec 4) is built in** (`src/compression/brotli.c`; libbrotli found on the system, taken from `CARQUET_BROTLI_TARGET`, or fetched like zstd/lz4; `CARQUET_ENABLE_BROTLI`, default ON, OFF keeps the slot for `carquet_register_codec()`). The writer level maps to Brotli quality (0 selects 8, Arrow's default; window 22), so files match pyarrow's; `interop/run_interop.py` adds a `brotli` file (PyArrow and DuckDB read it). The `carquet_register_codec()` test now uses the LZO slot.
+- **Encrypted files are reported explicitly**: a `PARE` trailing magic (Parquet modular encryption) returns `CARQUET_ERROR_NOT_IMPLEMENTED` with a message naming the feature instead of `INVALID_MAGIC`, on the file, buffer and mmap paths.
+- Arrow import (`carquet_arrow_import_schema()` / `carquet_writer_write_arrow()`): sliced arrays (`offset != 0` at any level, struct offsets applied to children); `decimal32/64/128/256` → `FIXED_LEN_BYTE_ARRAY DECIMAL(p, s)` with parquet-cpp's byte length (LE→BE); `date64` → `DATE`, `time32[s]` → `TIME(MILLIS)`, `timestamp[s]` → `TIMESTAMP(MILLIS)`; fixed-size lists `+w:n` → `LIST`; a null dictionary slot yields a null row; a child shorter than `offset + length` is rejected.
+- `carquet_page_stats_t.has_null_count` (appended): `false` when the ColumnIndex has no `null_counts`.
+- Page filters on a column with an OffsetIndex but no ColumnIndex read the row group in full instead of failing; `CARQUET_ERROR_PAGE_INDEX_REQUIRED` now means "no OffsetIndex".
+
+### Bug fixes
+
+Writer:
+- Wrong `FLOAT` / `DOUBLE` min/max with NaN on NEON (`DOUBLE`), AVX (non-AVX2) and SVE ([#35](https://github.com/Vitruves/carquet/pull/35), reported and partly fixed by @jburnhams): the dispatched min/max must return NaN or the exact NaN-skipping result; `copy_minmax_double` and the two other backends now honour it.
+- Dictionary-encoded `FLOAT` / `DOUBLE` chunks recorded NaN as min/max when the first distinct value was NaN, and never normalised `-0.0` / `+0.0`.
+- `BYTE_ARRAY` chunks whose minimum is `""` lost their footer statistics (three layers plus the Thrift writer required a non-zero length); on the dictionary path the ColumnIndex also reported `min = max = ""`.
+- A dictionary fallback (all-unique chunk, or dictionary over `dictionary_page_size`) left the column PLAIN for every later row group.
+- `OffsetIndex.first_row_index` counted levels instead of rows for repeated columns, and pages could be cut inside a list (also invalid for Data Page V2).
+- A ColumnIndex with empty bounds was written for pages without statistics (stats disabled, undefined sort order, all-NaN page); it is now withheld, as parquet-cpp does.
+- `page_size` was ignored for `BYTE_ARRAY` columns written in one `write_batch` call (one page of any size; a 2 GB batch would have wrapped the `int32` header sizes).
+- `{data = NULL, length = 0}` byte arrays were excluded from min/max.
+- Dictionary encoder: buffer-append failures were ignored (short dictionary page on OOM); negative `carquet_byte_array_t.length` on the dictionary and `DELTA_LENGTH_BYTE_ARRAY` paths now returns `INVALID_ARGUMENT`.
+- RLE runs above 2³¹ − 1 values are split instead of truncating the varint header (AUDIT 25).
+
+Reader:
+- An empty list in a REQUIRED `LIST` / `MAP` was reported as a null list by the batch reader (`carquet_row_batch_column_list()`, `carquet_arrow_export_batch()`).
+- `batch_size <= 0` made the sequential / pipeline paths spin on empty batches (negative sizes wrapped a buffer offset); the sequential and filtered paths now also check that every column produced column 0's row count.
+- Deprecated `min` / `max` statistics are no longer trusted for `BYTE_ARRAY` / `FIXED_LEN_BYTE_ARRAY` / `INT96` (parquet-mr < 1.10 computed them with signed byte order); INT96 is never used for pruning.
+- A NaN stored as a bound (older parquet-cpp) no longer prunes row groups or pages.
+- `IS_NULL` page filtering pruned every page when the ColumnIndex had no `null_counts`.
+- Dictionary index bit width above 32 decoded every value as entry 0 instead of failing.
+- Data Page V2 on a non-repeated / REQUIRED column: an out-of-range level byte length left the pointer in place and decoded values from the wrong offset.
+- `carquet_reader_prebuffer()` did not clamp chunk ranges to the file size (multi-GB allocation from a bad footer).
+- `BYTE_ARRAY` dictionary pages: `num_values` is bounded by `page_size / 4` before the offset table is allocated (fuzzer OOM artifact, 6.9 GB request).
+- Nullable columns read in small batches were quadratic (see Performance).
+- DELTA_BYTE_ARRAY reconstructed length computed in `size_t` (AUDIT 23); `carquet_dictionary_decode_byte_array()` bounds `dict_count` before allocating (AUDIT 22); `carquet_column_index_page_might_match()` compares floats numerically (AUDIT 30).
+- BYTE_STREAM_SPLIT decode tiles moved from a 256 KB stack buffer to the heap (macOS secondary threads have 512 KB stacks, AUDIT 21).
+- Big-endian scalar dictionary gather now bounds-checks every index.
+- `carquet_column_read_batch_ex()` keeps a reusable per-reader scratch buffer for definition levels when the caller passes `def_levels = NULL`, and guards the allocation size on 32-bit `size_t`.
+- `cmp_bytes_lex` no longer calls `memcmp` with a zero length (UB for an empty-string predicate value).
+
+CLI, SIMD, misc:
+- A `BYTE_ARRAY` value `{data = NULL, length > 0}` crashed the dictionary writer on `assert(data != NULL)` (segfault in Release); it is now rejected with `CARQUET_ERROR_INVALID_ARGUMENT` before any state changes, on the dictionary and PLAIN/DELTA paths alike (`{NULL, 0}` stays a valid empty string; documented on `carquet_writer_write_batch()`).
+- SSE `pack_bools` corrupted the neighbouring boolean's bit when an input byte was not 0 or 1 (`_mm_slli_epi32` by 7 shifts across byte lanes); now `cmpeq` + `movemask`, byte-exact with the scalar reference for any byte value.
+- `carquet sample` overflowed a 128-byte stack buffer on `FIXED_LEN_BYTE_ARRAY` columns longer than 128 bytes.
+- NEON and SSE `match_copy` produced wrong bytes for overlap offsets 3, 5, 6, 7 (no in-tree caller yet; fixed before one appears).
+- `carquet_bit_reader_read_bits()` no longer drives its bit count negative past the end; a malformed bloom filter header reports `INVALID_METADATA` instead of `OUT_OF_MEMORY`.
+
+Windows (cross-built with MinGW and run under Wine, 52 test runs green; MSVC paths checked by inspection):
+- `carquet_writer_create_buffer()` freed the `_tempnam()` string with `carquet_mem_free()`, which corrupts the heap when a custom allocator is installed; it now uses the CRT `free()`.
+- ZSTD and GZIP per-thread codec contexts use fiber-local storage (`FlsAlloc` with a destructor) instead of `TlsAlloc`, so worker-thread contexts are freed on thread exit instead of leaking at pool teardown.
+- The pipelined-encode `PIPE_WAIT` macro collided with `<winbase.h>`'s named-pipe constant under MSVC + OpenMP (renamed `PIPELINE_*`); a `%zu` in a batch-reader diagnostic (msvcrt prints garbage); the `/dev/full` async-write-error test now skips explicitly on Windows (Wine terminated the process inside `fopen` while reporting success); `benchmark/generate_test_files.c` includes `<direct.h>`.
+
+### Performance
+
+- Compressed reads: page-range segment tasks per column chunk (no column reader shared between tasks; a short segment triggers a consumer-side re-read with full error detail), `MAP_SHARED` mappings + `madvise(MADV_WILLNEED)` on the fill thread, direct NEON BYTE_STREAM_SPLIT transpose on ARM64 for pages up to 1M values. Reference benchmark read: snappy 14.9 → 12.4 ms, lz4 10.2 → 8.4 ms, zstd 21.5 → 19.3 ms; a single-row-group 10M-row Snappy file 28–30 → 10 ms.
+- Compressed writes: row groups encoded in a pipeline on a persistent worker pool (two alternating row-group writers; mixed/serial columns keep the OpenMP path), pages written straight from the encode buffers (no row-group copy), heaviest pages scheduled first. Reference benchmark write: snappy 53.6 → 48.4 ms, zstd 64.4 → 55.0 ms, lz4 57.2 → 49.3 ms; `none` stays at the kernel `write()` floor. Peak memory grows by about one row group of raw input.
+- Nullable columns read in small batches: the dense-value offset is carried by a cursor instead of recounting the consumed levels on every call. 2M-row OPTIONAL INT32 read 256 values at a time: 497 ms → 1.8 ms.
+- RLE encoder: bit-packed groups share one header per 63 groups (parquet-mr behaviour); every level stream and `RLE_DICTIONARY` index stream shrinks (uncompressed file with a 50 %-null INT32 column and a 200-value dictionary string column: −7 %).
+- Batch-reader pipeline waits for its head slot only instead of draining the whole pool at every row-group transition (structural; unchanged wall time on the reference file).
+- DELTA_BYTE_ARRAY: length streams decoded once instead of twice; encoder no longer rescans each common prefix.
+- GZIP: zlib streams cached per thread (`inflateReset` / `deflateReset`), freed by `carquet_cleanup()`.
+- AVX2 `pack_bools`: 32 booleans per iteration with `cmpeq` + `movemask` instead of an 8-wide multiply / horizontal-add sequence (2.3× faster in a differential harness under Rosetta; byte-exact with scalar).
+
+### Packaging & Docs
+
+- Agent Skill for integrators at `.agents/skills/carquet/` (`SKILL.md` + references: integration, API map of all 131 public functions, recipes, pitfalls, types); copy it into `.claude/skills/` or `.agents/skills/` of the consuming repository.
+- README reorganised (build options back under Installation, advanced material folded, live release badge, cumulative clone-counter badge driven by `.github/workflows/clone-count.yml` + a `TRAFFIC_TOKEN` secret).
+- **Python package** (`python/`, `pip install carquet` once published): scikit-build-core builds the shared library with the codecs statically bundled (no external dependency; 931 KB wheel on macOS arm64) and a ctypes layer exposes `read_table()` / `write_table()` / `schema()` / `open_reader()` through the Arrow C Data Interface (PyArrow optional at runtime), plus `info()`, `validate()`, `lib_version()`. 19 pytest round trips incl. every codec, nested types and a PyArrow cross-read; `.github/workflows/wheels.yml` (cibuildwheel cp39–cp313 on Linux / macOS / Windows, sdist, trusted publishing on tags) is written but not yet run.
+- README translated into 简体中文, 日本語, 한국어, Deutsch, Français and Português (Brasil) (`README.<lang>.md`, language bar at the top of each); benchmark figure regenerated from the 2026-10-20 run (`res/img/bench_10m_m3_{light,dark}.png`, dark variant via `<picture>`), tables centred, "Where carquet fits" paragraph, 30-second code teaser.
+- AUDIT.md checkboxes updated.
+
+### Testing
+
+- New `tests/test_fixes_0_7_2.c`, one test per fix: `required_list_empty_not_null`, `dict_nan_first_stats`, `empty_string_chunk_stats`, `dict_fallback_not_sticky`, `list_offset_index_rows` (V1 + V2), `column_index_withheld`, `byte_array_page_size`, `rle_bitpacked_grouping`, `batch_size_zero_config`, `dispatch_match_copy`, `bss_large_tiled_decode`.
+- `tests/test_arrow_c_data.c`: `sliced_arrays`, `decimal_import`, `temporal_coercions`, `fixed_size_list`, `dictionary_null_slot`. `tests/test_mmap.c`: `mmap_segment_read_exact`, `mmap_segment_corruption`. `test_core`: `dispatch_minmax_nan` (20 000 random NaN-laced arrays per backend). `test_p2_conformance`: `nan_minmax_stats`.
+- Full suite clean under AddressSanitizer + UndefinedBehaviorSanitizer; `fuzz/run_fuzzer.py all` without crashes; interop against PyArrow 23 and DuckDB.
+
 ## v0.7.1
 
 Additive read-side release closing two P3 Arrow-parity gaps (a predicate-independent row-range read and the module-level dictionary decode API for the byte types), plus a batch of memory-safety and correctness fixes and internal performance improvements to the encode / decode hot paths (no output-byte change). No breaking API change (new functions are appended, and one field, `async_io`, is appended to `carquet_writer_options_t`, which grows the struct: rebuild against the new header). **Default output bytes are unchanged except for two corrected-behaviour cases**: byte-backed `DECIMAL` columns containing negative values now record spec-correct signed min/max statistics (previously an unsigned-lexicographic comparison inverted them), and dictionary-encoded (categorical) Arrow arrays written via `carquet_writer_write_arrow()` now emit their resolved values instead of the raw index buffer.

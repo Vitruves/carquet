@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(carquet VERSION 0.7.1 LANGUAGES C)
+project(carquet VERSION 0.7.2 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -54,7 +54,11 @@ include(FetchContent)
 # When ON, ignore any system/conda zstd/zlib/lz4 and always fetch + statically
 # bundle them into libcarquet. Produces a self-contained static archive suitable
 # for prebuilt release artifacts (see .github/workflows/release.yml).
-option(CARQUET_BUNDLE_DEPS "Always fetch and static-bundle zstd/zlib/lz4 (portable release artifacts)" OFF)
+option(CARQUET_BUNDLE_DEPS "Always fetch and static-bundle zstd/zlib/lz4/brotli (portable release artifacts)" OFF)
+# BROTLI (Parquet codec 4). Resolved like the other three (target / system /
+# fetch); OFF leaves the slot to carquet_register_codec() and drops the
+# dependency (libbrotli's encoder is noticeably larger than lz4 or zstd).
+option(CARQUET_ENABLE_BROTLI "Build the BROTLI codec (needs libbrotli; found or fetched)" ON)
 
 # Which zstd / zlib / lz4 carquet links, in order of precedence:
 #
@@ -71,7 +75,7 @@ option(CARQUET_BUNDLE_DEPS "Always fetch and static-bundle zstd/zlib/lz4 (portab
 #
 # A target taken from 1 or 3 may be imported or built in-tree, static or
 # shared; it must carry its include directories as a usage requirement.
-foreach(_carquet_dep ZSTD ZLIB LZ4)
+foreach(_carquet_dep ZSTD ZLIB LZ4 BROTLI)
     # Not declared when already defined: before CMake 3.21 (CMP0126) creating a
     # cache entry discards a same-named normal variable, which is exactly how
     # an enclosing project sets these before add_subdirectory(carquet).
@@ -150,6 +154,79 @@ else()
     FetchContent_MakeAvailable(zstd)
     set(ZSTD_LIBRARIES libzstd_static)
     set(ZSTD_INCLUDE_DIRS ${zstd_SOURCE_DIR}/lib)
+endif()
+
+# BROTLI: target / system (pkg-config libbrotlienc+libbrotlidec, or vcpkg's
+# unofficial-brotli config) / fetch google/brotli. BROTLI_LIBRARIES empty means
+# "built without brotli": the codec then reports UNSUPPORTED_CODEC.
+set(BROTLI_LIBRARIES "")
+set(BROTLI_INCLUDE_DIRS "")
+set(BROTLI_FOUND FALSE)
+if(CARQUET_ENABLE_BROTLI)
+    if(CARQUET_BROTLI_TARGET)
+        message(STATUS "Using brotli target ${CARQUET_BROTLI_TARGET} (CARQUET_BROTLI_TARGET)")
+        set(BROTLI_LIBRARIES ${CARQUET_BROTLI_TARGET})
+        set(BROTLI_FOUND TRUE)
+    elseif(NOT CARQUET_BUNDLE_DEPS)
+        find_package(unofficial-brotli CONFIG QUIET)
+        if(unofficial-brotli_FOUND AND TARGET unofficial::brotli::brotlienc
+           AND TARGET unofficial::brotli::brotlidec)
+            message(STATUS "Found brotli via CMake config (unofficial-brotli)")
+            set(BROTLI_LIBRARIES unofficial::brotli::brotlienc unofficial::brotli::brotlidec)
+            set(BROTLI_FOUND TRUE)
+        else()
+            find_package(PkgConfig QUIET)
+            if(PkgConfig_FOUND)
+                pkg_check_modules(BROTLI QUIET libbrotlienc libbrotlidec)
+                if(BROTLI_FOUND)
+                    message(STATUS "Found system libbrotli via pkg-config")
+                    if(BROTLI_LINK_LIBRARIES)
+                        set(BROTLI_LIBRARIES ${BROTLI_LINK_LIBRARIES})
+                    endif()
+                endif()
+            endif()
+        endif()
+    endif()
+    FetchContent_GetProperties(brotli POPULATED _carquet_brotli_populated)
+    if(BROTLI_FOUND)
+        # resolved above
+    elseif(TARGET brotlienc AND TARGET brotlidec AND NOT _carquet_brotli_populated)
+        message(STATUS "Reusing the enclosing project's brotli targets: brotlienc / brotlidec")
+        set(BROTLI_LIBRARIES brotlienc brotlidec)
+    else()
+        message(STATUS "Fetching brotli...")
+        FetchContent_Declare(
+            brotli
+            GIT_REPOSITORY https://github.com/google/brotli.git
+            GIT_TAG        v1.1.0
+            GIT_SHALLOW    TRUE
+            GIT_PROGRESS   FALSE
+        )
+        set(BROTLI_DISABLE_TESTS ON CACHE BOOL "" FORCE)
+        # brotli follows BUILD_SHARED_LIBS; shadow it with a normal variable for
+        # the duration of the add so the enclosing project's setting is untouched.
+        # EXCLUDE_FROM_ALL: brotli 1.1.0 always declares its `brotli` CLI target;
+        # only the three libraries carquet links get built this way.
+        set(_carquet_saved_bsl "${BUILD_SHARED_LIBS}")
+        set(BUILD_SHARED_LIBS OFF)
+        FetchContent_GetProperties(brotli)
+        if(NOT brotli_POPULATED)
+            FetchContent_Populate(brotli)
+            add_subdirectory(${brotli_SOURCE_DIR} ${brotli_BINARY_DIR} EXCLUDE_FROM_ALL)
+        endif()
+        set(BUILD_SHARED_LIBS "${_carquet_saved_bsl}")
+        set(BROTLI_LIBRARIES brotlienc brotlidec brotlicommon)
+        set(BROTLI_INCLUDE_DIRS ${brotli_SOURCE_DIR}/c/include)
+        if(NOT MSVC)
+            # brotli's CMake does not add -fPIC to its static objects; a shared
+            # libcarquet needs it.
+            foreach(_bt brotlienc brotlidec brotlicommon)
+                set_target_properties(${_bt} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+            endforeach()
+        endif()
+    endif()
+else()
+    message(STATUS "BROTLI codec disabled (CARQUET_ENABLE_BROTLI=OFF)")
 endif()
 
 # Try to find system zlib first, fetch if not found
@@ -371,6 +448,7 @@ set(CARQUET_COMPRESSION_SOURCES
     src/compression/snappy.c
     src/compression/zstd.c
     src/compression/gzip.c
+    src/compression/brotli.c
     src/compression/custom.c
 )
 
@@ -567,10 +645,14 @@ target_include_directories(carquet
         ${ZSTD_INCLUDE_DIRS}
         ${ZLIB_INCLUDE_DIRS}
         ${LZ4_INCLUDE_DIRS}
+        ${BROTLI_INCLUDE_DIRS}
 )
+if(BROTLI_LIBRARIES)
+    target_compile_definitions(carquet PRIVATE CARQUET_HAVE_BROTLI=1)
+endif()
 
 # Link external compression libraries
-set(CARQUET_COMPRESSION_LIBS ${ZSTD_LIBRARIES} ${LZ4_LIBRARIES})
+set(CARQUET_COMPRESSION_LIBS ${ZSTD_LIBRARIES} ${LZ4_LIBRARIES} ${BROTLI_LIBRARIES})
 
 function(carquet_private_link_libraries_for_export out_var)
     set(_result)
@@ -678,6 +760,7 @@ if(CARQUET_BUILD_TESTS)
     endfunction()
 
     add_carquet_test(test_core tests/test_core.c)
+    add_carquet_test(test_fixes_0_7_2 tests/test_fixes_0_7_2.c)
     add_carquet_test(test_thrift tests/test_thrift.c)
     add_carquet_test(test_encodings tests/test_encodings.c)
     add_carquet_test(test_reader tests/test_reader.c)
@@ -992,6 +1075,9 @@ if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
         if(NOT LZ4_FOUND AND TARGET lz4_static)
             list(APPEND _carquet_fetched_deps lz4_static)
         endif()
+        if(BROTLI_LIBRARIES AND NOT BROTLI_FOUND AND TARGET brotlienc)
+            list(APPEND _carquet_fetched_deps brotlienc brotlidec brotlicommon)
+        endif()
         if(_carquet_fetched_deps)
             # Their INTERFACE_INCLUDE_DIRECTORIES point at build-tree paths
             # which CMake refuses to install. Consumers of carquet only need
@@ -1074,6 +1160,9 @@ if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
     # not for CARQUET_BUNDLE_DEPS/FetchContent artifacts whose archives carry
     # mangled names (those are meant for CMake export consumption, not .pc).
     set(CARQUET_PC_PRIVATE_LIBS "-lzstd -lz -llz4")
+    if(BROTLI_LIBRARIES)
+        string(APPEND CARQUET_PC_PRIVATE_LIBS " -lbrotlienc -lbrotlidec -lbrotlicommon")
+    endif()
     if(UNIX)
         string(APPEND CARQUET_PC_PRIVATE_LIBS " -lm")
     endif()

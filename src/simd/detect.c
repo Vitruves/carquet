@@ -36,6 +36,7 @@ static volatile int g_init_lock = 0;
 extern void carquet_gzip_init_tables(void);
 extern void carquet_zstd_init_tables(void);
 extern void carquet_zstd_cleanup(void);
+extern void carquet_gzip_cleanup(void);
 
 static void carquet_clear_initialized(void) {
 #if defined(__GNUC__) || defined(__clang__)
@@ -256,6 +257,7 @@ carquet_status_t carquet_init(void) {
 
 void carquet_cleanup(void) {
     carquet_zstd_cleanup();
+    carquet_gzip_cleanup();
     carquet_clear_initialized();
 }
 

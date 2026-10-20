@@ -938,15 +938,20 @@ void carquet_sse_unpack_bools(const uint8_t* input, uint8_t* output, int64_t cou
 void carquet_sse_pack_bools(const uint8_t* input, uint8_t* output, int64_t count) {
     int64_t i = 0;
 
-    /* Process 8 bools (1 output byte) at a time using movemask trick:
-     * 1. Load 8 bytes (each 0 or 1)
-     * 2. Shift left by 7 within 32-bit lanes: moves bit 0 of each byte to bit 7
-     * 3. movemask extracts bit 7 from each byte position
-     */
+    /* Process 8 bools (1 output byte) at a time using the compare + movemask
+     * trick: cmpeq(v, 0) is 0xFF for zero bytes, movemask gathers bit 7 of
+     * each byte (byte k -> mask bit k), so ~mask has bit k set iff byte k is
+     * non-zero — the scalar reference rule, for any non-zero byte. The earlier
+     * `_mm_slli_epi32(bools, 7)` form was only correct for 0/1 inputs: a byte
+     * such as 0x02 shifted its set bit into the neighbouring lane's bit 7 and
+     * corrupted the *next* bool's bit (verified against the scalar reference
+     * under Rosetta). loadl_epi64 zero-fills the upper 8 lanes; their mask
+     * bits land above bit 7 and are dropped by the uint8_t cast. */
+    const __m128i zero = _mm_setzero_si128();
     for (; i + 8 <= count; i += 8) {
         __m128i bools = _mm_loadl_epi64((const __m128i*)(input + i));
-        __m128i shifted = _mm_slli_epi32(bools, 7);
-        output[i / 8] = (uint8_t)_mm_movemask_epi8(shifted);
+        int eq = _mm_movemask_epi8(_mm_cmpeq_epi8(bools, zero));
+        output[i / 8] = (uint8_t)~eq;
     }
 
     /* Handle remaining */
@@ -1052,26 +1057,13 @@ void carquet_sse_match_copy(uint8_t* dst, const uint8_t* src, size_t len, size_t
             len--;
         }
     } else {
-        /* Offset 3, 5, 6, 7: expand pattern then use SSE fill */
-        uint8_t pattern[16];
-        /* Copy base pattern bytes */
-        for (size_t i = 0; i < offset && i < 16; i++) {
-            pattern[i] = src[i];
-        }
-        /* Tile pattern to fill 16 bytes; offset is 3..7 here */
-        for (size_t i = offset; i < 16; i++) {
-            pattern[i] = pattern[i % offset];
-        }
-        __m128i v = _mm_loadu_si128((const __m128i*)pattern);
-
-        while (len >= 16) {
-            _mm_storeu_si128((__m128i*)dst, v);
-            dst += 16;
-            len -= 16;
-        }
-        /* Remaining bytes from pattern */
-        for (size_t i = 0; i < len; i++) {
-            dst[i] = pattern[i % offset];
+        /* Offset 3, 5, 6, 7: the period does not divide 16, so a tiled
+         * 16-byte vector restarts the pattern at the wrong phase on every
+         * store after the first. Copy byte by byte (src trails dst by
+         * `offset`, so the overlap reproduces the pattern exactly). */
+        while (len > 0) {
+            *dst++ = *src++;
+            len--;
         }
     }
 }

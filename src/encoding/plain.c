@@ -425,7 +425,10 @@ carquet_status_t carquet_encode_plain_byte_array(
                 memcpy(p, input[i].data, len);
             } else {
                 /* Malformed input (length > 0, NULL data): zero-fill rather than
-                 * leak the reserved-but-unwritten bytes into the output. */
+                 * leak the reserved-but-unwritten bytes into the output. The
+                 * writer API rejects such entries upstream with
+                 * CARQUET_ERROR_INVALID_ARGUMENT (carquet_column_writer_write_batch),
+                 * so this only guards direct callers of the encoder. */
                 memset(p, 0, len);
             }
         }

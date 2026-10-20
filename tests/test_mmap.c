@@ -812,6 +812,149 @@ static int test_mmap_pipeline_corruption(void) {
     return 0;
 }
 
+/* ============================================================================
+ * Page-range segment reads (intra-chunk parallel decode)
+ * ============================================================================
+ * A file with one large row group gives the pipeline only one task per
+ * column, so it cuts each coalescable chunk into page-aligned segments that
+ * decode concurrently. These tests pin down that path: every value must come
+ * back exactly (including the BYTE_STREAM_SPLIT double column, whose segment
+ * tasks stage through the shared scratch pool), and damage inside one
+ * segment must surface as an error with detail, never as silently wrong or
+ * missing rows.
+ */
+
+/* One row group of `rows` REQUIRED (INT64 id = 3*i, DOUBLE value = 0.5*i)
+ * under Snappy. */
+static int write_segment_file(const char* path, int64_t rows) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t* schema = carquet_schema_create(&err);
+    if (!schema) return 1;
+    if (carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT64, NULL,
+                                  CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK) return 1;
+    if (carquet_schema_add_column(schema, "value", CARQUET_PHYSICAL_DOUBLE, NULL,
+                                  CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK) return 1;
+    carquet_writer_options_t opts;
+    carquet_writer_options_init(&opts);
+    opts.compression = CARQUET_COMPRESSION_SNAPPY;
+    opts.row_group_size = rows * 64;   /* everything in one row group */
+    carquet_writer_t* w = carquet_writer_create(path, schema, &opts, &err);
+    if (!w) { carquet_schema_free(schema); return 1; }
+    int64_t* ids = malloc((size_t)rows * sizeof(int64_t));
+    double* vals = malloc((size_t)rows * sizeof(double));
+    if (!ids || !vals) { free(ids); free(vals); return 1; }
+    for (int64_t i = 0; i < rows; i++) { ids[i] = 3 * i; vals[i] = 0.5 * (double)i; }
+    int rc = 0;
+    if (carquet_writer_write_batch(w, 0, ids, rows, NULL, NULL) != CARQUET_OK) rc = 1;
+    if (carquet_writer_write_batch(w, 1, vals, rows, NULL, NULL) != CARQUET_OK) rc = 1;
+    if (carquet_writer_close(w) != CARQUET_OK) rc = 1;
+    carquet_schema_free(schema);
+    free(ids); free(vals);
+    return rc;
+}
+
+/* Read the segment file back through the mmap batch reader, checking every
+ * value against its formula. *rows counts rows delivered; *bad counts
+ * mismatches. */
+static carquet_status_t verify_segment_file(const char* path, int64_t* rows,
+                                            int64_t* bad, bool* detail) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_reader_options_t ropts;
+    carquet_reader_options_init(&ropts);
+    ropts.use_mmap = true;
+    *rows = 0; *bad = 0; *detail = false;
+    carquet_reader_t* r = carquet_reader_open(path, &ropts, &err);
+    if (!r) return CARQUET_ERROR_FILE_OPEN;
+    carquet_batch_reader_config_t cfg;
+    carquet_batch_reader_config_init(&cfg);
+    cfg.batch_size = 70000;   /* not a divisor of the page size: batches straddle segments */
+    carquet_batch_reader_t* br = carquet_batch_reader_create(r, &cfg, &err);
+    if (!br) { carquet_reader_close(r); return err.code; }
+    carquet_row_batch_t* batch = NULL;
+    carquet_status_t st;
+    while ((st = carquet_batch_reader_next(br, &batch)) == CARQUET_OK && batch) {
+        const void* ids; const void* vals; const uint8_t* nulls; int64_t n, n2;
+        if (carquet_row_batch_column(batch, 0, &ids, &nulls, &n) != CARQUET_OK ||
+            carquet_row_batch_column(batch, 1, &vals, &nulls, &n2) != CARQUET_OK ||
+            n != n2) { *bad += 1; break; }
+        for (int64_t i = 0; i < n; i++) {
+            int64_t row = *rows + i;
+            if (rd_i64(ids, i) != 3 * row) (*bad)++;
+            if (rd_f64(vals, i) != 0.5 * (double)row) (*bad)++;
+        }
+        *rows += n;
+        carquet_row_batch_free(batch);
+        batch = NULL;
+    }
+    *detail = carquet_batch_reader_last_error(br) != NULL;
+    carquet_batch_reader_free(br);
+    carquet_reader_close(r);
+    return st;
+}
+
+static int test_mmap_segment_read_exact(void) {
+    const char* path = "test_mmap_segments.parquet";
+    const int64_t ROWS = 600000;   /* ~5 default-size pages per column */
+    if (write_segment_file(path, ROWS) != 0)
+        TEST_FAIL("mmap_segment_read_exact", "write failed");
+    int64_t rows, bad; bool detail;
+    carquet_status_t st = verify_segment_file(path, &rows, &bad, &detail);
+    remove(path);
+    if (st != CARQUET_ERROR_END_OF_DATA && st != CARQUET_OK)
+        TEST_FAIL("mmap_segment_read_exact", "read failed");
+    if (rows != ROWS)
+        TEST_FAIL("mmap_segment_read_exact", "row count mismatch");
+    if (bad != 0)
+        TEST_FAIL("mmap_segment_read_exact", "value mismatch");
+    TEST_PASS("mmap_segment_read_exact");
+    return 0;
+}
+
+/* Same as test_mmap_pipeline_corruption but with a single large row group,
+ * so the damaged page sits inside one of several concurrently decoded
+ * segments of the same chunk. The segment cannot recover on its own (its
+ * siblings share the column reader); the consumer must detect the short
+ * column, re-read it through the checked page reader, and report. */
+static int test_mmap_segment_corruption(void) {
+    const char* path = "test_mmap_segment_corrupt.parquet";
+    const int64_t ROWS = 600000;
+    if (write_pipeline_file(path, 1, ROWS, 0) != 0)
+        TEST_FAIL("mmap_segment_corruption", "write failed");
+
+    int64_t rows; uint64_t good_sum; bool detail;
+    carquet_status_t st = drain_mmap_batches(path, &rows, &good_sum, &detail);
+    if ((st != CARQUET_ERROR_END_OF_DATA && st != CARQUET_OK) || rows != ROWS) {
+        remove(path);
+        TEST_FAIL("mmap_segment_corruption", "clean read failed");
+    }
+
+    FILE* f = fopen(path, "r+b");
+    if (!f) { remove(path); TEST_FAIL("mmap_segment_corruption", "reopen failed"); }
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    long at = size / 2;   /* inside the chunk: the third of ~five pages */
+    unsigned char junk[64];
+    fseek(f, at, SEEK_SET);
+    if (fread(junk, 1, sizeof(junk), f) != sizeof(junk)) { fclose(f); remove(path);
+        TEST_FAIL("mmap_segment_corruption", "read for corruption failed"); }
+    for (size_t i = 0; i < sizeof(junk); i++) junk[i] = (unsigned char)~junk[i];
+    fseek(f, at, SEEK_SET);
+    fwrite(junk, 1, sizeof(junk), f);
+    fclose(f);
+
+    uint64_t sum;
+    st = drain_mmap_batches(path, &rows, &sum, &detail);
+    remove(path);
+    if (st == CARQUET_OK || st == CARQUET_ERROR_END_OF_DATA)
+        TEST_FAIL("mmap_segment_corruption", "corruption was not reported");
+    if (!detail)
+        TEST_FAIL("mmap_segment_corruption", "no error detail");
+    if (rows != 0)
+        TEST_FAIL("mmap_segment_corruption", "rows of the corrupt row group were delivered");
+    TEST_PASS("mmap_segment_corruption");
+    return 0;
+}
+
 int main(void) {
     printf("=== Memory-Mapped I/O Tests ===\n\n");
 
@@ -827,6 +970,8 @@ int main(void) {
     failures += test_fread_fallback();
     failures += test_mmap_highly_compressible();
     failures += test_mmap_pipeline_corruption();
+    failures += test_mmap_segment_read_exact();
+    failures += test_mmap_segment_corruption();
 
     /* Cleanup */
     remove(TEST_FILE);

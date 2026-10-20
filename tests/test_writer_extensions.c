@@ -1076,7 +1076,7 @@ static int test_column_page_size_override(void) {
 /* ---- Custom codec registration ---- */
 /* Trivial "identity" codec: stores values uncompressed but goes through the
  * codec dispatch path so we can prove user callbacks are reached. We register
- * it against the BROTLI slot, which has no built-in — that proves the API can
+ * it against the LZO slot, which has no built-in — that proves the API can
  * fill an otherwise-unsupported slot. */
 static int g_identity_compress_calls;
 static int g_identity_decompress_calls;
@@ -1119,7 +1119,7 @@ static int test_custom_codec(void) {
     /* Validation: NULL function pointer, UNCOMPRESSED slot, out-of-range
      * slot all rejected; NULL impl is the documented unregister path. */
     carquet_custom_codec_t bad = { 0 };
-    if (carquet_register_codec(CARQUET_COMPRESSION_BROTLI, &bad) !=
+    if (carquet_register_codec(CARQUET_COMPRESSION_LZO, &bad) !=
             CARQUET_ERROR_INVALID_ARGUMENT)
         TEST_FAIL("custom_codec", "NULL fn ptrs should be rejected");
     carquet_custom_codec_t ok_codec = {
@@ -1135,9 +1135,9 @@ static int test_custom_codec(void) {
             CARQUET_ERROR_INVALID_ARGUMENT)
         TEST_FAIL("custom_codec", "out-of-range slot should be rejected");
 
-    /* Register on the BROTLI slot — no built-in, so this proves the slot is
+    /* Register on the LZO slot — no built-in, so this proves the slot is
      * truly reachable through the user callback. */
-    if (carquet_register_codec(CARQUET_COMPRESSION_BROTLI, &ok_codec) != CARQUET_OK)
+    if (carquet_register_codec(CARQUET_COMPRESSION_LZO, &ok_codec) != CARQUET_OK)
         TEST_FAIL("custom_codec", "register failed");
 
     g_identity_compress_calls = 0;
@@ -1154,7 +1154,7 @@ static int test_custom_codec(void) {
         { carquet_schema_free(s); TEST_FAIL("custom_codec", "add col"); }
 
     carquet_writer_options_t wo; carquet_writer_options_init(&wo);
-    wo.compression = CARQUET_COMPRESSION_BROTLI;
+    wo.compression = CARQUET_COMPRESSION_LZO;
     carquet_writer_t* w = carquet_writer_create(path, s, &wo, &err);
     if (!w) { carquet_schema_free(s); carquet_test_cleanup(path);
               TEST_FAIL("custom_codec", "writer create"); }
@@ -1177,9 +1177,9 @@ static int test_custom_codec(void) {
     carquet_column_reader_free(c); carquet_reader_close(r);
     carquet_test_cleanup(path);
 
-    /* Unregister; subsequent BROTLI writes must now fail with UNSUPPORTED_CODEC,
+    /* Unregister; subsequent LZO writes must now fail with UNSUPPORTED_CODEC,
      * proving NULL really clears the slot. */
-    if (carquet_register_codec(CARQUET_COMPRESSION_BROTLI, NULL) != CARQUET_OK)
+    if (carquet_register_codec(CARQUET_COMPRESSION_LZO, NULL) != CARQUET_OK)
         TEST_FAIL("custom_codec", "unregister failed");
 
     char path2[512]; carquet_test_temp_path(path2, sizeof(path2), "ext_custom_codec2");
@@ -1187,7 +1187,7 @@ static int test_custom_codec(void) {
     carquet_schema_add_column(s2, "v", CARQUET_PHYSICAL_INT32, NULL,
                               CARQUET_REPETITION_REQUIRED, 0, 0);
     carquet_writer_options_t wo2; carquet_writer_options_init(&wo2);
-    wo2.compression = CARQUET_COMPRESSION_BROTLI;
+    wo2.compression = CARQUET_COMPRESSION_LZO;
     carquet_writer_t* w2 = carquet_writer_create(path2, s2, &wo2, &err);
     int unregister_ok = 1;
     if (w2) {

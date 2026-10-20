@@ -579,6 +579,8 @@ int main(int argc, char** argv) {
         /* v0.7.0: codec 5 (deprecated Hadoop-framed LZ4), distinct from LZ4_RAW. */
         {"lz4",          {CARQUET_COMPRESSION_LZ4,          ENC_DEFAULT, 1, false, false, 0}},
         {"zstd",         {CARQUET_COMPRESSION_ZSTD,         ENC_DEFAULT, 1, false, false, 0}},
+        /* v0.7.2: built-in BROTLI (codec 4). */
+        {"brotli",       {CARQUET_COMPRESSION_BROTLI,       ENC_DEFAULT, 1, false, false, 0}},
         {"zstd+dict",    {CARQUET_COMPRESSION_ZSTD,         ENC_DICT,    1, false, false, 0}},
         {"zstd+delta",   {CARQUET_COMPRESSION_ZSTD,         ENC_DELTA,   1, false, false, 0}},
         {"zstd+bss",     {CARQUET_COMPRESSION_ZSTD,         ENC_BSS,     1, false, false, 0}},

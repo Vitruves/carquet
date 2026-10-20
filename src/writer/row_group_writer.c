@@ -199,10 +199,26 @@ typedef struct carquet_row_group_writer {
     carquet_page_writer_t** scratch_writers;  /* one per OpenMP thread */
     int32_t num_scratch;
     carquet_page_task_t* page_tasks;
-    carquet_buffer_t* task_bufs;
+    /* Page output buffers. In page_io mode (see
+     * carquet_row_group_writer_set_page_io) the file writer's I/O thread
+     * writes the pages straight from these buffers instead of a stitched
+     * copy, so the row group alternates between two banks: the bank of the
+     * row group still being written must not be touched while the next one
+     * is encoded. Without page_io only bank 0 is used. */
+    carquet_buffer_t* task_bufs[2];
+    int bank;
+    bool page_io;
+    bool pages_ready;   /* the last finalize left its pages in task_bufs[bank] */
     int32_t page_task_capacity;
     int32_t* col_task_counts;    /* [num_columns] pages per column, 0 = serial */
     int32_t* col_task_offsets;   /* [num_columns] first task index */
+    /* Work ordering (longest-page-first). col_page_cost[i] is the measured
+     * wall time per page of column i in the previous row group (0 = not yet
+     * measured); col_order is scratch for sorting columns by it; work_order
+     * maps the w-th page work item to a task index. */
+    double* col_page_cost;       /* [num_columns] */
+    int32_t* col_order;          /* [num_columns] */
+    int32_t* work_order;         /* [page_task_capacity] */
 } carquet_row_group_writer_t;
 
 typedef struct finalized_column_chunk {
@@ -252,12 +268,14 @@ static void capture_column_statistics(carquet_row_group_writer_t* writer, int i)
     info->max_value_size = 0;
     info->has_min_max = false;
 
-    if (has_min_max && min_size > 0 && max_size > 0) {
-        info->min_value = carquet_mem_malloc(min_size);
-        info->max_value = carquet_mem_malloc(max_size);
+    /* A zero-length bound is the empty BYTE_ARRAY, a real value: a column
+     * whose minimum is "" must still publish its statistics. */
+    if (has_min_max) {
+        info->min_value = carquet_mem_malloc(min_size > 0 ? min_size : 1);
+        info->max_value = carquet_mem_malloc(max_size > 0 ? max_size : 1);
         if (info->min_value && info->max_value) {
-            memcpy(info->min_value, min_v, min_size);
-            memcpy(info->max_value, max_v, max_size);
+            if (min_size > 0) memcpy(info->min_value, min_v, min_size);
+            if (max_size > 0) memcpy(info->max_value, max_v, max_size);
             info->min_value_size = min_size;
             info->max_value_size = max_size;
             info->has_min_max = true;
@@ -309,18 +327,26 @@ static void release_parallel_scratch(carquet_row_group_writer_t* writer) {
         carquet_mem_free(writer->page_tasks);
         writer->page_tasks = NULL;
     }
-    if (writer->task_bufs) {
+    for (int b = 0; b < 2; b++) {
+        if (!writer->task_bufs[b]) continue;
         for (int32_t i = 0; i < writer->page_task_capacity; i++) {
-            carquet_buffer_destroy(&writer->task_bufs[i]);
+            carquet_buffer_destroy(&writer->task_bufs[b][i]);
         }
-        carquet_mem_free(writer->task_bufs);
-        writer->task_bufs = NULL;
+        carquet_mem_free(writer->task_bufs[b]);
+        writer->task_bufs[b] = NULL;
     }
+    writer->pages_ready = false;
     writer->page_task_capacity = 0;
+    carquet_mem_free(writer->work_order);
+    writer->work_order = NULL;
     carquet_mem_free(writer->col_task_counts);
     carquet_mem_free(writer->col_task_offsets);
+    carquet_mem_free(writer->col_page_cost);
+    carquet_mem_free(writer->col_order);
     writer->col_task_counts = NULL;
     writer->col_task_offsets = NULL;
+    writer->col_page_cost = NULL;
+    writer->col_order = NULL;
 }
 
 #ifdef _OPENMP
@@ -337,16 +363,87 @@ static carquet_status_t ensure_page_task_capacity(
         writer->page_tasks, (size_t)new_cap * sizeof(*tasks));
     if (!tasks) return CARQUET_ERROR_OUT_OF_MEMORY;
     writer->page_tasks = tasks;
-    carquet_buffer_t* bufs = carquet_mem_realloc(
-        writer->task_bufs, (size_t)new_cap * sizeof(*bufs));
-    if (!bufs) return CARQUET_ERROR_OUT_OF_MEMORY;
-    writer->task_bufs = bufs;
+    /* Growing a bank moves its carquet_buffer_t array, not the page bytes
+     * the other bank's in-flight I/O job may still be reading: that job
+     * holds copies of the data pointers, never a pointer into the array. */
+    for (int b = 0; b < 2; b++) {
+        carquet_buffer_t* bufs = carquet_mem_realloc(
+            writer->task_bufs[b], (size_t)new_cap * sizeof(*bufs));
+        if (!bufs) return CARQUET_ERROR_OUT_OF_MEMORY;
+        writer->task_bufs[b] = bufs;
+        for (int32_t i = writer->page_task_capacity; i < new_cap; i++) {
+            carquet_buffer_init(&writer->task_bufs[b][i]);
+        }
+    }
+    int32_t* order = carquet_mem_realloc(
+        writer->work_order, (size_t)new_cap * sizeof(*order));
+    if (!order) return CARQUET_ERROR_OUT_OF_MEMORY;
+    writer->work_order = order;
     for (int32_t i = writer->page_task_capacity; i < new_cap; i++) {
         memset(&writer->page_tasks[i], 0, sizeof(writer->page_tasks[i]));
-        carquet_buffer_init(&writer->task_bufs[i]);
     }
     writer->page_task_capacity = new_cap;
     return CARQUET_OK;
+}
+
+/* Sort columns by descending measured per-page cost (ties and unmeasured
+ * columns keep schema order). qsort needs the costs in the comparator, so
+ * the keys are packed next to the index. */
+typedef struct col_cost_key {
+    double cost;
+    int32_t col;
+} col_cost_key_t;
+
+static int compare_col_cost_desc(const void* a, const void* b) {
+    const col_cost_key_t* x = (const col_cost_key_t*)a;
+    const col_cost_key_t* y = (const col_cost_key_t*)b;
+    if (x->cost > y->cost) return -1;
+    if (x->cost < y->cost) return 1;
+    return (x->col < y->col) ? -1 : (x->col > y->col);
+}
+
+/*
+ * Fill writer->work_order with the page tasks of every page-parallel column,
+ * heaviest column first. The dynamic schedule then hands out the expensive
+ * pages while every thread is still busy and keeps the cheap ones for the
+ * end, so the join waits on a short page rather than a long one: with three
+ * numeric columns whose pages cost 1.5 / 0.2 / 2.5 ms on eight threads this
+ * takes the row group from ~4 ms to ~3 ms of wall time. Costs come from the
+ * previous row group of this writer (col_page_cost); the first row group
+ * runs in schema order. The order only changes which thread encodes a page
+ * when: each column still stitches its pages together in page order.
+ */
+static void build_work_order(carquet_row_group_writer_t* writer) {
+    int nc = writer->num_columns;
+    col_cost_key_t* keys = (col_cost_key_t*)writer->col_order;  /* see alloc */
+    int32_t n_keys = 0;
+    for (int i = 0; i < nc; i++) {
+        if (writer->col_task_counts[i] == 0) continue;
+        keys[n_keys].cost = writer->col_page_cost[i];
+        keys[n_keys].col = i;
+        n_keys++;
+    }
+    qsort(keys, (size_t)n_keys, sizeof(*keys), compare_col_cost_desc);
+    int32_t w = 0;
+    for (int32_t k = 0; k < n_keys; k++) {
+        int i = keys[k].col;
+        int32_t off = writer->col_task_offsets[i];
+        for (int32_t p = 0; p < writer->col_task_counts[i]; p++) {
+            writer->work_order[w++] = off + p;
+        }
+    }
+}
+
+/* Remember how long a page of each column took, for the next row group. */
+static void record_page_costs(carquet_row_group_writer_t* writer) {
+    for (int i = 0; i < writer->num_columns; i++) {
+        int32_t n = writer->col_task_counts[i];
+        if (n == 0) continue;
+        const carquet_page_task_t* t = &writer->page_tasks[writer->col_task_offsets[i]];
+        double sum = 0.0;
+        for (int32_t k = 0; k < n; k++) sum += t[k].elapsed;
+        writer->col_page_cost[i] = sum / (double)n;
+    }
 }
 
 static carquet_status_t ensure_scratch_writers(
@@ -388,23 +485,43 @@ static void finalize_whole_column(carquet_row_group_writer_t* writer, int i,
  * column then stitches its pages together in order; that pass is a memcpy
  * per column and runs column-parallel.
  */
-static carquet_status_t finalize_columns_parallel(
-    carquet_row_group_writer_t* writer,
-    finalized_column_chunk_t* chunks) {
 #ifdef _OPENMP
-    int num_threads = omp_get_max_threads();
-    if (num_threads < 1) num_threads = 1;
+/* Plan the row group's work: page tasks for every column that allows them
+ * (counted in col_task_counts, 0 = one serial task), output buffers in the
+ * bank of this finalize, and the work order. */
+static carquet_status_t plan_row_group_work(
+    carquet_row_group_writer_t* writer,
+    int num_threads,
+    int32_t* total_tasks_out,
+    int32_t* whole_columns_out) {
     int nc = writer->num_columns;
+    *total_tasks_out = 0;
+    *whole_columns_out = 0;
 
-    if (!writer->col_task_counts || !writer->col_task_offsets) {
+    if (!writer->col_task_counts || !writer->col_task_offsets ||
+        !writer->col_page_cost || !writer->col_order) {
         carquet_mem_free(writer->col_task_counts);
         carquet_mem_free(writer->col_task_offsets);
+        carquet_mem_free(writer->col_page_cost);
+        carquet_mem_free(writer->col_order);
         writer->col_task_counts = carquet_mem_calloc((size_t)nc, sizeof(int32_t));
         writer->col_task_offsets = carquet_mem_calloc((size_t)nc, sizeof(int32_t));
-        if (!writer->col_task_counts || !writer->col_task_offsets) {
+        writer->col_page_cost = carquet_mem_calloc((size_t)nc, sizeof(double));
+        /* col_order doubles as the qsort key array of build_work_order. */
+        writer->col_order = carquet_mem_calloc((size_t)nc, sizeof(col_cost_key_t));
+        if (!writer->col_task_counts || !writer->col_task_offsets ||
+            !writer->col_page_cost || !writer->col_order) {
             return CARQUET_ERROR_OUT_OF_MEMORY;
         }
     }
+
+    /* A row group whose pages were handed out (pages_ready) may still be
+     * being written by the I/O thread: encode the next one into the other
+     * bank. Keyed on pages_ready rather than on each call, so a plan that is
+     * abandoned (begin_page_tasks finding a serial column) and redone by the
+     * ordinary finalize does not flip back onto the bank in flight. */
+    if (writer->pages_ready) writer->bank ^= 1;
+    writer->pages_ready = false;
 
     /* Plan: count page tasks per column (0 = finalize serially as one task). */
     int32_t total_tasks = 0;
@@ -433,14 +550,80 @@ static carquet_status_t finalize_columns_parallel(
                 writer->column_writers[i], t, n);
             if (got != n) return CARQUET_ERROR_INTERNAL;
             for (int32_t k = 0; k < n; k++) {
-                t[k].out = &writer->task_bufs[writer->col_task_offsets[i] + k];
+                t[k].out = &writer->task_bufs[writer->bank][writer->col_task_offsets[i] + k];
                 t[k].status = CARQUET_OK;
+                t[k].elapsed = 0.0;
             }
         }
+        build_work_order(writer);
+    }
+    *total_tasks_out = total_tasks;
+    *whole_columns_out = whole_columns;
+    return CARQUET_OK;
+}
+
+/* After every page task has run: stitch each page-parallel column back
+ * together in page order (or, in page_io mode, just account for its pages,
+ * which stay in the bank) and finalize it. Columns are independent; with
+ * @p use_omp they run column-parallel, otherwise on the calling thread. */
+static carquet_status_t assemble_row_group_work(
+    carquet_row_group_writer_t* writer,
+    finalized_column_chunk_t* chunks,
+    int32_t total_tasks,
+    int num_threads,
+    bool use_omp) {
+    int nc = writer->num_columns;
+    if (total_tasks > 0) {
+        record_page_costs(writer);
+        int cteam = num_threads < nc ? num_threads : nc;
+        if (!use_omp) cteam = 1;
+        int i;
+        #pragma omp parallel for num_threads(cteam) schedule(dynamic, 1) if(cteam > 1)
+        for (i = 0; i < nc; i++) {
+            if (writer->col_task_counts[i] == 0) continue;
+            size_t page_bytes = 0;
+            chunks[i].status = carquet_column_writer_assemble_page_tasks(
+                writer->column_writers[i],
+                &writer->page_tasks[writer->col_task_offsets[i]],
+                writer->col_task_counts[i],
+                !writer->page_io, &page_bytes);
+            if (chunks[i].status == CARQUET_OK) {
+                finalize_whole_column(writer, i, &chunks[i]);
+            }
+            if (chunks[i].status == CARQUET_OK && writer->page_io) {
+                chunks[i].size += page_bytes;
+            }
+        }
+        writer->pages_ready = writer->page_io;
+    }
+    for (int i = 0; i < nc; i++) {
+        if (chunks[i].status != CARQUET_OK) {
+            return chunks[i].status;
+        }
+    }
+    return CARQUET_OK;
+}
+#endif
+
+static carquet_status_t finalize_columns_parallel(
+    carquet_row_group_writer_t* writer,
+    finalized_column_chunk_t* chunks) {
+#ifdef _OPENMP
+    int num_threads = omp_get_max_threads();
+    if (num_threads < 1) num_threads = 1;
+    int nc = writer->num_columns;
+    int32_t total_tasks = 0;
+    int32_t whole_columns = 0;
+    carquet_status_t status = plan_row_group_work(
+        writer, num_threads, &total_tasks, &whole_columns);
+    if (status != CARQUET_OK) return status;
+    if (total_tasks > 0) {
+        status = ensure_scratch_writers(writer, num_threads);
+        if (status != CARQUET_OK) return status;
     }
 
     /* Encode. Work item w < whole_columns is the w-th serial column; the rest
-     * are page tasks in column order. */
+     * are page tasks, heaviest column first (work_order). */
     int32_t work_items = whole_columns + total_tasks;
     int team = num_threads < work_items ? num_threads : work_items;
     if (team < 1) team = 1;
@@ -459,39 +642,20 @@ static carquet_status_t finalize_columns_parallel(
         } else {
             int tid = omp_get_thread_num();
             if (tid < 0 || tid >= writer->num_scratch) tid = 0;
-            carquet_column_writer_run_page_task(
-                &writer->page_tasks[w - whole_columns],
-                writer->scratch_writers[tid]);
+            carquet_page_task_t* task =
+                &writer->page_tasks[writer->work_order[w - whole_columns]];
+            double t0 = omp_get_wtime();
+            carquet_column_writer_run_page_task(task, writer->scratch_writers[tid]);
+            task->elapsed = omp_get_wtime() - t0;
         }
     }
 
-    /* Stitch each page-parallel column back together, in page order. */
-    if (total_tasks > 0) {
-        int cteam = num_threads < nc ? num_threads : nc;
-        int i;
-        #pragma omp parallel for num_threads(cteam) schedule(dynamic, 1)
-        for (i = 0; i < nc; i++) {
-            if (writer->col_task_counts[i] == 0) continue;
-            chunks[i].status = carquet_column_writer_assemble_page_tasks(
-                writer->column_writers[i],
-                &writer->page_tasks[writer->col_task_offsets[i]],
-                writer->col_task_counts[i]);
-            if (chunks[i].status == CARQUET_OK) {
-                finalize_whole_column(writer, i, &chunks[i]);
-            }
-        }
-    }
-
-    for (int i = 0; i < nc; i++) {
-        if (chunks[i].status != CARQUET_OK) {
-            return chunks[i].status;
-        }
-    }
+    return assemble_row_group_work(writer, chunks, total_tasks, num_threads, true);
 #else
     (void)writer;
     (void)chunks;
-#endif
     return CARQUET_OK;
+#endif
 }
 
 /* ============================================================================
@@ -695,6 +859,25 @@ carquet_status_t carquet_row_group_writer_write_column(
  * ============================================================================
  */
 
+/* Per-column chunk info (file offsets from writer->file_offset, sizes,
+ * statistics) for finalized columns. */
+static void fill_column_infos(
+    carquet_row_group_writer_t* writer,
+    const finalized_column_chunk_t* chunks) {
+    int64_t current_offset = writer->file_offset;
+    writer->total_byte_size = 0;
+    for (int i = 0; i < writer->num_columns; i++) {
+        writer->column_infos[i].file_offset = current_offset;
+        writer->column_infos[i].total_compressed_size = chunks[i].size;
+        writer->column_infos[i].total_uncompressed_size = chunks[i].uncompressed_size;
+        writer->column_infos[i].num_values = chunks[i].total_values;
+        capture_column_statistics(writer, i);
+        capture_dictionary_info(writer, i);
+        current_offset += chunks[i].size;
+        writer->total_byte_size += chunks[i].size;
+    }
+}
+
 /* Encode and compress every column of the row group, fill in the per-column
  * chunk info (file offsets, sizes, statistics) and report the column bytes
  * in chunks[]. No I/O: each column's bytes stay in its chunk buffer. */
@@ -712,16 +895,7 @@ static carquet_status_t finalize_all_columns(
         if (status != CARQUET_OK) {
             return status;
         }
-        for (int i = 0; i < writer->num_columns; i++) {
-            writer->column_infos[i].file_offset = current_offset;
-            writer->column_infos[i].total_compressed_size = chunks[i].size;
-            writer->column_infos[i].total_uncompressed_size = chunks[i].uncompressed_size;
-            writer->column_infos[i].num_values = chunks[i].total_values;
-            capture_column_statistics(writer, i);
-            capture_dictionary_info(writer, i);
-            current_offset += chunks[i].size;
-            writer->total_byte_size += chunks[i].size;
-        }
+        fill_column_infos(writer, chunks);
         return CARQUET_OK;
     }
 
@@ -842,6 +1016,113 @@ carquet_status_t carquet_row_group_writer_finalize_columns(
     }
     if (total_size) *total_size = total;
     return CARQUET_OK;
+}
+
+void carquet_row_group_writer_set_page_io(
+    carquet_row_group_writer_t* writer, bool enabled) {
+    if (writer) writer->page_io = enabled;
+}
+
+/*
+ * Pipelined finalize (driven by file_writer.c): the file writer runs the page
+ * tasks on its own thread pool so a row group's encode can overlap the next
+ * row group's input and the previous one's stragglers, instead of the
+ * fork/join of finalize_columns_parallel. begin plans the tasks; the caller
+ * runs each carquet_row_group_writer_page_task(k), in that order, on any
+ * thread; complete does the rest of carquet_row_group_writer_finalize_columns.
+ * Only a row group whose every column is page-parallel (and page_io) can be
+ * pipelined: begin returns 0 otherwise and the caller takes the usual path.
+ */
+int32_t carquet_row_group_writer_begin_page_tasks(
+    carquet_row_group_writer_t* writer) {
+#ifdef _OPENMP
+    if (!writer || !writer->page_io || !can_parallel_finalize(writer)) return 0;
+    int num_threads = omp_get_max_threads();
+    if (num_threads < 2) return 0;
+    /* Every column must be page-parallel; check before planning so a row
+     * group that is not leaves no half-planned state behind. */
+    for (int i = 0; i < writer->num_columns; i++) {
+        if (carquet_column_writer_plan_page_tasks(writer->column_writers[i], NULL, 0) <= 0) {
+            return 0;
+        }
+    }
+    int32_t total_tasks = 0;
+    int32_t whole_columns = 0;
+    if (plan_row_group_work(writer, num_threads, &total_tasks, &whole_columns) !=
+        CARQUET_OK) {
+        return 0;
+    }
+    if (whole_columns > 0 || total_tasks <= 0) return 0;
+    return total_tasks;
+#else
+    (void)writer;
+    return 0;
+#endif
+}
+
+carquet_page_task_t* carquet_row_group_writer_page_task(
+    carquet_row_group_writer_t* writer, int32_t k) {
+    if (!writer || !writer->page_tasks || !writer->work_order ||
+        k < 0 || k >= writer->page_task_capacity) {
+        return NULL;
+    }
+    return &writer->page_tasks[writer->work_order[k]];
+}
+
+carquet_status_t carquet_row_group_writer_complete_page_tasks(
+    carquet_row_group_writer_t* writer,
+    int64_t file_offset,
+    int64_t num_rows,
+    size_t* total_size) {
+#ifdef _OPENMP
+    if (!writer) return CARQUET_ERROR_INVALID_ARGUMENT;
+    writer->num_rows = num_rows;
+    writer->file_offset = file_offset;
+    writer->total_byte_size = 0;
+    int32_t total_tasks = 0;
+    for (int i = 0; i < writer->num_columns; i++) {
+        total_tasks += writer->col_task_counts ? writer->col_task_counts[i] : 0;
+    }
+    finalized_column_chunk_t* chunks = carquet_mem_calloc(
+        (size_t)writer->num_columns, sizeof(*chunks));
+    if (!chunks) return CARQUET_ERROR_OUT_OF_MEMORY;
+    carquet_status_t status = assemble_row_group_work(
+        writer, chunks, total_tasks, 1, false);
+    size_t total = 0;
+    if (status == CARQUET_OK) {
+        fill_column_infos(writer, chunks);
+        for (int i = 0; i < writer->num_columns; i++) total += chunks[i].size;
+    }
+    carquet_mem_free(chunks);
+    if (total_size) *total_size = total;
+    return status;
+#else
+    (void)writer; (void)file_offset; (void)num_rows; (void)total_size;
+    return CARQUET_ERROR_INVALID_ARGUMENT;
+#endif
+}
+
+/* The pages the last page_io finalize left for column `column_index`, in
+ * file order, or NULL (count 0) when that column was stitched into its chunk
+ * buffer instead. They follow whatever carquet_row_group_writer_detach_column
+ * hands out for the same column and stay valid until the second-next
+ * finalize of this writer (see task_bufs). */
+const carquet_buffer_t* carquet_row_group_writer_column_pages(
+    const carquet_row_group_writer_t* writer,
+    int column_index,
+    int32_t* count) {
+
+    if (count) *count = 0;
+    if (!writer || !count || !writer->pages_ready ||
+        column_index < 0 || column_index >= writer->num_columns ||
+        !writer->col_task_counts || !writer->col_task_offsets ||
+        !writer->task_bufs[writer->bank]) {
+        return NULL;
+    }
+    int32_t n = writer->col_task_counts[column_index];
+    if (n <= 0) return NULL;
+    *count = n;
+    return &writer->task_bufs[writer->bank][writer->col_task_offsets[column_index]];
 }
 
 void carquet_row_group_writer_detach_column(

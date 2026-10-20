@@ -9,12 +9,14 @@
  *   - OffsetIndex field 2 = unencoded_byte_array_data_bytes (list<i64>)
  *   - RLE as a value encoding for BOOLEAN
  *   - Hadoop-framed LZ4 (codec 5) round-trip
+ *   - FLOAT/DOUBLE min/max statistics skip NaN without losing real extremes
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <math.h>
 
 #include <carquet/carquet.h>
 #include "reader/reader_internal.h"
@@ -333,6 +335,73 @@ static int test_hadoop_lz4(void) {
     return 0;
 }
 
+/* ---- NaN-skipping FLOAT/DOUBLE min/max statistics ------------------------- */
+
+/* NaN must never be a min/max, and must not hide the real extreme either. The
+ * NEON double reduction let a NaN lane swallow the 9 below and then dropped
+ * the NaN, recording max 4 (#35). PLAIN takes the copy+minmax path, the other
+ * encodings the plain minmax path, so cover all three. */
+static int test_nan_minmax_stats(void) {
+    static const double dvals[8] = {1, 9, 2, NAN, 4, 3, 2, 1};
+    static const float fvals[8] = {1, 9, 2, NAN, 4, 3, 2, 1};
+    static const carquet_encoding_t encs[3] = {
+        CARQUET_ENCODING_PLAIN, CARQUET_ENCODING_BYTE_STREAM_SPLIT,
+        CARQUET_ENCODING_RLE_DICTIONARY,
+    };
+
+    for (int e = 0; e < 3; e++) {
+        char path[512];
+        carquet_test_temp_path(path, sizeof(path), "p2_nan_minmax");
+        carquet_error_t err = CARQUET_ERROR_INIT;
+        carquet_schema_t* s = carquet_schema_create(&err);
+        carquet_schema_add_column(s, "d", CARQUET_PHYSICAL_DOUBLE, NULL,
+                                  CARQUET_REPETITION_REQUIRED, 0, 0);
+        carquet_schema_add_column(s, "f", CARQUET_PHYSICAL_FLOAT, NULL,
+                                  CARQUET_REPETITION_REQUIRED, 0, 0);
+        carquet_writer_options_t wo; carquet_writer_options_init(&wo);
+        wo.write_statistics = true;
+        carquet_writer_t* w = carquet_writer_create(path, s, &wo, &err);
+        if (!w) { carquet_schema_free(s); TEST_FAIL("nan_minmax_stats", "create failed"); }
+        carquet_writer_set_column_encoding(w, 0, encs[e]);
+        carquet_writer_set_column_encoding(w, 1, encs[e]);
+        if (carquet_writer_write_batch(w, 0, dvals, 8, NULL, NULL) != CARQUET_OK ||
+            carquet_writer_write_batch(w, 1, fvals, 8, NULL, NULL) != CARQUET_OK) {
+            carquet_writer_close(w); carquet_schema_free(s);
+            TEST_FAIL("nan_minmax_stats", "write_batch failed");
+        }
+        if (carquet_writer_close(w) != CARQUET_OK) {
+            carquet_schema_free(s); TEST_FAIL("nan_minmax_stats", "close failed");
+        }
+        carquet_schema_free(s);
+
+        carquet_reader_t* r = carquet_reader_open(path, NULL, &err);
+        if (!r) { carquet_test_cleanup(path); TEST_FAIL("nan_minmax_stats", "open failed"); }
+        carquet_column_statistics_t ds, fs;
+        int ok = carquet_reader_column_statistics(r, 0, 0, &ds) == CARQUET_OK &&
+                 carquet_reader_column_statistics(r, 0, 1, &fs) == CARQUET_OK &&
+                 ds.has_min_max && fs.has_min_max &&
+                 ds.min_value_size == 8 && fs.min_value_size == 4;
+        double dmin = 0, dmax = 0;
+        float fmin = 0, fmax = 0;
+        if (ok) {
+            memcpy(&dmin, ds.min_value, 8); memcpy(&dmax, ds.max_value, 8);
+            memcpy(&fmin, fs.min_value, 4); memcpy(&fmax, fs.max_value, 4);
+        }
+        carquet_reader_close(r); carquet_test_cleanup(path);
+        if (!ok) TEST_FAIL("nan_minmax_stats", "no statistics");
+        if (dmin != 1.0 || dmax != 9.0) {
+            printf("  encoding %d: double min=%g max=%g\n", (int)encs[e], dmin, dmax);
+            TEST_FAIL("nan_minmax_stats", "DOUBLE min/max wrong next to a NaN");
+        }
+        if (fmin != 1.0f || fmax != 9.0f) {
+            printf("  encoding %d: float min=%g max=%g\n", (int)encs[e], fmin, fmax);
+            TEST_FAIL("nan_minmax_stats", "FLOAT min/max wrong next to a NaN");
+        }
+    }
+    TEST_PASS("nan_minmax_stats");
+    return 0;
+}
+
 int main(void) {
     int failures = 0;
     failures += test_flba_dictionary();
@@ -341,6 +410,7 @@ int main(void) {
     failures += test_offset_index_field2();
     failures += test_rle_boolean();
     failures += test_hadoop_lz4();
+    failures += test_nan_minmax_stats();
     if (failures == 0) printf("\nAll P2 conformance tests passed\n");
     return failures ? 1 : 0;
 }

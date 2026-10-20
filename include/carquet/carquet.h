@@ -202,10 +202,10 @@ extern "C" {
 #define CARQUET_VERSION_MINOR 7
 
 /** @brief Patch version number */
-#define CARQUET_VERSION_PATCH 1
+#define CARQUET_VERSION_PATCH 2
 
 /** @brief Version string in "MAJOR.MINOR.PATCH" format */
-#define CARQUET_VERSION_STRING "0.7.1"
+#define CARQUET_VERSION_STRING "0.7.2"
 
 /** @brief Numeric version for compile-time comparisons: (MAJOR * 10000 + MINOR * 100 + PATCH) */
 #define CARQUET_VERSION_NUMBER (CARQUET_VERSION_MAJOR * 10000 + CARQUET_VERSION_MINOR * 100 + CARQUET_VERSION_PATCH)
@@ -443,10 +443,12 @@ const carquet_allocator_t* carquet_get_allocator(void);
  * ============================================================================
  *
  * Carquet ships built-in compress/decompress implementations for SNAPPY, GZIP,
- * LZ4, LZ4_RAW, and ZSTD. The remaining Parquet codec slots (LZO, BROTLI) have
- * no built-in. Users can register their own implementation against any codec
- * enum value to either fill an unsupported slot or override a built-in (for
- * example, swap in a hardware-accelerated GZIP).
+ * LZ4, LZ4_RAW, ZSTD and BROTLI (the latter only when built with libbrotli,
+ * CARQUET_ENABLE_BROTLI, default ON). LZO has no built-in (GPL-only reference
+ * implementations; Arrow C++ has none either). Users can register their own
+ * implementation against any codec enum value to either fill an unsupported
+ * slot or override a built-in (for example, swap in a hardware-accelerated
+ * GZIP).
  *
  * Registrations are process-wide and are not safe to mutate while reader or
  * writer threads are mid-compress / mid-decompress; install codecs at startup
@@ -2369,7 +2371,7 @@ typedef struct carquet_writer_options {
     /**
      * @brief Compression codec for all columns.
      *
-     * Default: CARQUET_COMPRESSION_SNAPPY
+     * Default: CARQUET_COMPRESSION_UNCOMPRESSED (set by carquet_writer_options_init)
      */
     carquet_compression_t compression;
 
@@ -2435,7 +2437,9 @@ typedef struct carquet_writer_options {
     /**
      * @brief Dictionary encoding mode.
      *
-     * Default: CARQUET_ENCODING_PLAIN_DICTIONARY
+     * Default: CARQUET_ENCODING_RLE_DICTIONARY (the encoding used when a column opts
+     * into dictionary encoding; columns are PLAIN unless carquet_writer_set_column_encoding
+     * selects otherwise)
      */
     carquet_encoding_t dictionary_encoding;
 
@@ -2679,7 +2683,11 @@ carquet_writer_t* carquet_writer_open_append(
  * @param[in] def_levels Definition levels (NULL if all values defined).
  *                        One entry per logical row.
  * @param[in] rep_levels Repetition levels (NULL if no repetition)
- * @return CARQUET_OK on success
+ * @return CARQUET_OK on success. For BYTE_ARRAY columns every non-null
+ *         carquet_byte_array_t must have `length >= 0` and a non-NULL `data`
+ *         pointer whenever `length > 0`; otherwise the whole batch is rejected
+ *         with CARQUET_ERROR_INVALID_ARGUMENT before any state is modified,
+ *         on every encoding path (PLAIN, dictionary, DELTA_*).
  *
  * @note Thread-safe: No
  *
@@ -2993,6 +3001,8 @@ typedef struct carquet_page_stats {
     const void* max_value;      /**< Maximum value (type depends on column) */
     int32_t max_value_size;     /**< Size of max_value in bytes */
     bool is_null_page;          /**< True if page contains only nulls */
+    bool has_null_count;        /**< False when the ColumnIndex carries no null_counts
+                                 *   (optional field): null_count is then unknown, not 0 */
 } carquet_page_stats_t;
 
 /**
@@ -3202,8 +3212,12 @@ typedef struct carquet_filter_clause {
  * @return CARQUET_OK on success;
  *         CARQUET_ERROR_INVALID_ARGUMENT for an out-of-range column,
  *         a type/size mismatch, or an INT96 predicate;
- *         CARQUET_ERROR_PAGE_INDEX_REQUIRED if any referenced column lacks
- *         a column index (file was not written with write_page_index = true).
+ *         CARQUET_ERROR_PAGE_INDEX_REQUIRED (surfacing from
+ *         carquet_batch_reader_next) if any referenced column lacks an
+ *         offset index (file was not written with write_page_index = true).
+ *         A column with an offset index but no column index (no page bounds
+ *         were available to the writer, e.g. statistics disabled) is not
+ *         pruned: every row of its row groups is read.
  *
  * @note Thread-safe: No
  */
@@ -3852,7 +3866,14 @@ carquet_status_t carquet_arrow_export_batch(
  * ARROW_FLAG_NULLABLE flag selects OPTIONAL vs REQUIRED.
  *
  * Consumes @p schema: its `release` callback is called before returning
- * (success or failure). Nested children are rejected with
+ * (success or failure). Nested children (struct, list, large list, fixed-size
+ * list, map) are imported to any depth; dictionary-encoded fields take the
+ * dictionary's value type. Arrow types with no Parquet physical equivalent are
+ * coerced as pyarrow does: `decimal32/64/128/256` ("d:p,s[,bits]") to
+ * FIXED_LEN_BYTE_ARRAY DECIMAL(p, s) with parquet-cpp's byte length, `date64`
+ * ("tdm") to DATE, `time32[s]` ("tts") to TIME(MILLIS), `timestamp[s]`
+ * ("tss:tz") to TIMESTAMP(MILLIS), and 8/16-bit integers to INT32 with an
+ * INTEGER annotation. Unions and run-end-encoded arrays are rejected with
  * CARQUET_ERROR_NOT_IMPLEMENTED.
  *
  * @param[in] schema Arrow struct schema to import (consumed).
@@ -3876,8 +3897,12 @@ carquet_status_t carquet_arrow_import_schema(
  * columns; the child count must equal the writer column count.
  *
  * Consumes both @p array and @p schema: their `release` callbacks are called
- * before returning (success or failure). Nested / dictionary children are
- * rejected.
+ * before returning (success or failure). Nested children are shredded to any
+ * depth (see docs/nested-data.md), dictionary-encoded children are resolved to
+ * their values, sliced arrays (`offset != 0` at any level) write exactly the
+ * slice, and the type coercions listed at @ref carquet_arrow_import_schema are
+ * applied to the values. Every child's `length` must cover the struct's
+ * `offset + length`.
  *
  * @param[in] writer Target writer.
  * @param[in] array Arrow struct array to write (consumed).

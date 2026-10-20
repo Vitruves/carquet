@@ -1144,14 +1144,17 @@ void parquet_file_metadata_free(parquet_file_metadata_t* metadata) {
 static void write_statistics(thrift_encoder_t* enc, const parquet_statistics_t* stats) {
     thrift_write_struct_begin(enc);
 
+    /* A zero-length min/max is the empty BYTE_ARRAY, a real bound: the field
+     * is written whenever the caller supplied a value (non-NULL pointer).
+     * Readers take presence from the field, not from its length. */
     /* Field 1: max (deprecated) */
-    if (stats->max_deprecated && stats->max_deprecated_len > 0) {
+    if (stats->max_deprecated && stats->max_deprecated_len >= 0) {
         thrift_write_field_header(enc, THRIFT_TYPE_BINARY, 1);
         thrift_write_binary(enc, stats->max_deprecated, stats->max_deprecated_len);
     }
 
     /* Field 2: min (deprecated) */
-    if (stats->min_deprecated && stats->min_deprecated_len > 0) {
+    if (stats->min_deprecated && stats->min_deprecated_len >= 0) {
         thrift_write_field_header(enc, THRIFT_TYPE_BINARY, 2);
         thrift_write_binary(enc, stats->min_deprecated, stats->min_deprecated_len);
     }
@@ -1169,13 +1172,13 @@ static void write_statistics(thrift_encoder_t* enc, const parquet_statistics_t* 
     }
 
     /* Field 5: max_value */
-    if (stats->max_value && stats->max_value_len > 0) {
+    if (stats->max_value && stats->max_value_len >= 0) {
         thrift_write_field_header(enc, THRIFT_TYPE_BINARY, 5);
         thrift_write_binary(enc, stats->max_value, stats->max_value_len);
     }
 
     /* Field 6: min_value */
-    if (stats->min_value && stats->min_value_len > 0) {
+    if (stats->min_value && stats->min_value_len >= 0) {
         thrift_write_field_header(enc, THRIFT_TYPE_BINARY, 6);
         thrift_write_binary(enc, stats->min_value, stats->min_value_len);
     }

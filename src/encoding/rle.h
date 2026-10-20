@@ -130,10 +130,17 @@ typedef struct carquet_rle_encoder {
     int64_t repeat_count;    /* Count of repeated values */
     bool has_prev;
 
-    /* Bit-pack buffer */
+    /* Bit-pack buffer: the next (incomplete) group of 8 values. */
     uint32_t bitpack_buffer[8];
     int bitpack_count;
     int64_t bitpack_total;   /* Total values in current bit-pack sequence */
+
+    /* Complete packed groups waiting for a shared header. One bit-packed
+     * run may hold up to 63 groups (header = (groups << 1) | 1, a 7-bit
+     * varint), so a run-free stream costs one header byte per 504 values
+     * instead of one per 8. */
+    uint8_t staged[63 * 32];
+    int staged_groups;
 
     carquet_status_t status;
 } carquet_rle_encoder_t;

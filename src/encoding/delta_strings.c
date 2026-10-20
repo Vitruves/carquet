@@ -67,6 +67,153 @@ static int32_t common_prefix_length(
  */
 
 /**
+ * Decode the two DELTA_BINARY_PACKED length sub-streams of a DELTA_BYTE_ARRAY
+ * page once. Returns the prefix/suffix length arrays (heap, caller frees
+ * both with carquet_mem_free), the number of header bytes they occupied and
+ * the exact reconstruction size (sum of prefix + suffix over all values).
+ * Every length is validated non-negative and the suffix payload is checked
+ * to fit in `data_size`.
+ */
+carquet_status_t carquet_delta_strings_decode_lengths(
+    const uint8_t* data,
+    size_t data_size,
+    int32_t num_values,
+    int32_t** prefix_out,
+    int32_t** suffix_out,
+    size_t* header_bytes,
+    size_t* total_size) {
+
+    if (!data || !prefix_out || !suffix_out || !header_bytes || !total_size ||
+        num_values <= 0) {
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+    *prefix_out = NULL;
+    *suffix_out = NULL;
+
+    /* num_values comes from the (untrusted) page header; guard the multiply
+     * so it cannot overflow size_t (only reachable where size_t is 32-bit). */
+    if ((size_t)num_values > SIZE_MAX / sizeof(int32_t)) {
+        return CARQUET_ERROR_DECODE;
+    }
+    int32_t* prefix_lengths = carquet_mem_malloc((size_t)num_values * sizeof(int32_t));
+    int32_t* suffix_lengths = carquet_mem_malloc((size_t)num_values * sizeof(int32_t));
+    if (!prefix_lengths || !suffix_lengths) {
+        carquet_mem_free(prefix_lengths);
+        carquet_mem_free(suffix_lengths);
+        return CARQUET_ERROR_OUT_OF_MEMORY;
+    }
+
+    size_t pos = 0;
+    size_t consumed = 0;
+    carquet_status_t status = carquet_delta_decode_int32(
+        data, data_size, prefix_lengths, num_values, &consumed);
+    if (status == CARQUET_OK) {
+        pos += consumed;
+        status = carquet_delta_decode_int32(
+            data + pos, data_size - pos, suffix_lengths, num_values, &consumed);
+    }
+    if (status == CARQUET_OK) {
+        pos += consumed;
+        size_t total = 0, total_suffix = 0;
+        for (int32_t i = 0; i < num_values; i++) {
+            if (prefix_lengths[i] < 0 || suffix_lengths[i] < 0) {
+                status = CARQUET_ERROR_DECODE;
+                break;
+            }
+            total += (size_t)prefix_lengths[i] + (size_t)suffix_lengths[i];
+            total_suffix += (size_t)suffix_lengths[i];
+        }
+        /* The suffix payload must be present in the page. */
+        if (status == CARQUET_OK && total_suffix > data_size - pos) {
+            status = CARQUET_ERROR_DECODE;
+        }
+        if (status == CARQUET_OK) {
+            *prefix_out = prefix_lengths;
+            *suffix_out = suffix_lengths;
+            *header_bytes = pos;
+            *total_size = total;
+            return CARQUET_OK;
+        }
+    }
+    carquet_mem_free(prefix_lengths);
+    carquet_mem_free(suffix_lengths);
+    return status;
+}
+
+/**
+ * Reconstruct the strings from lengths obtained with
+ * carquet_delta_strings_decode_lengths(). `work_buffer` must hold at least
+ * the `total_size` that call reported; every value points into it.
+ */
+carquet_status_t carquet_delta_strings_reconstruct(
+    const uint8_t* data,
+    size_t data_size,
+    size_t header_bytes,
+    const int32_t* prefix_lengths,
+    const int32_t* suffix_lengths,
+    carquet_byte_array_t* values,
+    int32_t num_values,
+    uint8_t* work_buffer,
+    size_t work_buffer_size,
+    size_t* bytes_consumed) {
+
+    if (!data || !prefix_lengths || !suffix_lengths || num_values <= 0 || !values ||
+        header_bytes > data_size || (!work_buffer && work_buffer_size > 0)) {
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    const uint8_t* suffix_data = data + header_bytes;
+    size_t suffix_avail = data_size - header_bytes;
+    size_t suffix_offset = 0;
+    size_t work_offset = 0;
+    uint8_t* prev_string = NULL;
+    uint32_t prev_len = 0;
+
+    for (int32_t i = 0; i < num_values; i++) {
+        int32_t prefix_len = prefix_lengths[i];
+        int32_t suffix_len = suffix_lengths[i];
+        if (prefix_len < 0 || suffix_len < 0) return CARQUET_ERROR_DECODE;
+        /* Sum in size_t so two near-INT32_MAX lengths cannot overflow. */
+        size_t total_len = (size_t)prefix_len + (size_t)suffix_len;
+
+        if (total_len > UINT32_MAX || total_len > work_buffer_size - work_offset) {
+            return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
+        if ((size_t)suffix_len > suffix_avail - suffix_offset) {
+            return CARQUET_ERROR_DECODE;
+        }
+
+        uint8_t* dest = work_buffer + work_offset;
+
+        /* Copy prefix from previous string */
+        if (prefix_len > 0) {
+            if (!prev_string || prefix_len > (int32_t)prev_len) {
+                return CARQUET_ERROR_DECODE;
+            }
+            memcpy(dest, prev_string, (size_t)prefix_len);
+        }
+
+        /* Copy suffix from encoded data */
+        if (suffix_len > 0) {
+            memcpy(dest + prefix_len, suffix_data + suffix_offset, (size_t)suffix_len);
+            suffix_offset += (size_t)suffix_len;
+        }
+
+        values[i].data = dest;
+        values[i].length = (uint32_t)total_len;
+
+        prev_string = dest;
+        prev_len = (uint32_t)total_len;
+        work_offset += total_len;
+    }
+
+    if (bytes_consumed) {
+        *bytes_consumed = header_bytes + suffix_offset;
+    }
+    return CARQUET_OK;
+}
+
+/**
  * Decode DELTA_BYTE_ARRAY encoded data.
  *
  * @param data Input buffer containing encoded data
@@ -106,127 +253,27 @@ carquet_status_t carquet_delta_strings_decode(
         return CARQUET_OK;
     }
 
-    /* Allocate arrays for prefix and suffix lengths. num_values comes from the
-     * (untrusted) page header; guard the multiply so it cannot overflow size_t
-     * and yield an undersized buffer (only reachable where size_t is 32-bit). */
-    if ((size_t)num_values > SIZE_MAX / sizeof(int32_t)) {
-        return CARQUET_ERROR_DECODE;
-    }
-    int32_t* prefix_lengths = carquet_mem_malloc((size_t)num_values * sizeof(int32_t));
-    int32_t* suffix_lengths = carquet_mem_malloc((size_t)num_values * sizeof(int32_t));
+    int32_t* prefix_lengths = NULL;
+    int32_t* suffix_lengths = NULL;
+    size_t header_bytes = 0, total = 0;
+    carquet_status_t status = carquet_delta_strings_decode_lengths(
+        data, data_size, num_values, &prefix_lengths, &suffix_lengths,
+        &header_bytes, &total);
+    if (status != CARQUET_OK) return status;
 
-    if (!prefix_lengths || !suffix_lengths) {
-        carquet_mem_free(prefix_lengths);
-        carquet_mem_free(suffix_lengths);
-        return CARQUET_ERROR_OUT_OF_MEMORY;
-    }
-
-    size_t pos = 0;
-
-    /* Decode prefix lengths */
-    size_t consumed = 0;
-    carquet_status_t status = carquet_delta_decode_int32(
-        data + pos, data_size - pos, prefix_lengths, num_values, &consumed);
-
-    if (status != CARQUET_OK) {
-        carquet_mem_free(prefix_lengths);
-        carquet_mem_free(suffix_lengths);
-        return status;
-    }
-    pos += consumed;
-
-    /* Decode suffix lengths */
-    status = carquet_delta_decode_int32(
-        data + pos, data_size - pos, suffix_lengths, num_values, &consumed);
-
-    if (status != CARQUET_OK) {
-        carquet_mem_free(prefix_lengths);
-        carquet_mem_free(suffix_lengths);
-        return status;
-    }
-    pos += consumed;
-
-    /* Calculate total suffix data size */
-    size_t total_suffix_size = 0;
-    for (int32_t i = 0; i < num_values; i++) {
-        if (suffix_lengths[i] < 0 || prefix_lengths[i] < 0) {
-            carquet_mem_free(prefix_lengths);
-            carquet_mem_free(suffix_lengths);
-            return CARQUET_ERROR_DECODE;
-        }
-        total_suffix_size += (size_t)suffix_lengths[i];
-    }
-
-    /* Check bounds */
-    if (pos + total_suffix_size > data_size) {
-        carquet_mem_free(prefix_lengths);
-        carquet_mem_free(suffix_lengths);
-        return CARQUET_ERROR_DECODE;
-    }
-
-    /* Reconstruct strings */
-    const uint8_t* suffix_data = data + pos;
-    size_t suffix_offset = 0;
-    size_t work_offset = 0;
-    uint8_t* prev_string = NULL;
-    uint32_t prev_len = 0;
-
-    for (int32_t i = 0; i < num_values; i++) {
-        int32_t prefix_len = prefix_lengths[i];
-        int32_t suffix_len = suffix_lengths[i];
-        uint32_t total_len = (uint32_t)(prefix_len + suffix_len);
-
-        /* Check work buffer space */
-        if (work_offset + total_len > work_buffer_size) {
-            carquet_mem_free(prefix_lengths);
-            carquet_mem_free(suffix_lengths);
-            return CARQUET_ERROR_OUT_OF_MEMORY;
-        }
-
-        uint8_t* dest = work_buffer + work_offset;
-
-        /* Copy prefix from previous string */
-        if (prefix_len > 0) {
-            if (!prev_string || prefix_len > (int32_t)prev_len) {
-                carquet_mem_free(prefix_lengths);
-                carquet_mem_free(suffix_lengths);
-                return CARQUET_ERROR_DECODE;
-            }
-            memcpy(dest, prev_string, prefix_len);
-        }
-
-        /* Copy suffix from encoded data */
-        if (suffix_len > 0) {
-            memcpy(dest + prefix_len, suffix_data + suffix_offset, suffix_len);
-            suffix_offset += suffix_len;
-        }
-
-        values[i].data = dest;
-        values[i].length = total_len;
-
-        prev_string = dest;
-        prev_len = total_len;
-        work_offset += total_len;
-    }
-
+    status = carquet_delta_strings_reconstruct(
+        data, data_size, header_bytes, prefix_lengths, suffix_lengths,
+        values, num_values, work_buffer, work_buffer_size, bytes_consumed);
     carquet_mem_free(prefix_lengths);
     carquet_mem_free(suffix_lengths);
-
-    if (bytes_consumed) {
-        *bytes_consumed = pos + total_suffix_size;
-    }
-
-    return CARQUET_OK;
+    return status;
 }
 
 /**
  * Compute the exact work buffer size required to decode a DELTA_BYTE_ARRAY
- * page, without reconstructing the strings.
- *
- * It decodes only the prefix/suffix length headers and sums (prefix+suffix)
- * over all values, which is exactly the number of bytes the reconstruction
- * step writes into the work buffer. This gives a precise, safe size so the
- * caller never under-allocates (avoids OUT_OF_MEMORY) nor wildly over-allocates.
+ * page, without reconstructing the strings. Callers that go on to decode
+ * should prefer carquet_delta_strings_decode_lengths() +
+ * carquet_delta_strings_reconstruct(), which decode the length streams once.
  *
  * @param data Input buffer containing encoded data
  * @param data_size Size of input buffer
@@ -243,47 +290,15 @@ carquet_status_t carquet_delta_strings_decoded_size(
     if (!data || !required_size || num_values <= 0) {
         return CARQUET_ERROR_INVALID_ARGUMENT;
     }
-
-    int32_t* prefix_lengths = carquet_mem_malloc((size_t)num_values * sizeof(int32_t));
-    int32_t* suffix_lengths = carquet_mem_malloc((size_t)num_values * sizeof(int32_t));
-    if (!prefix_lengths || !suffix_lengths) {
-        carquet_mem_free(prefix_lengths);
-        carquet_mem_free(suffix_lengths);
-        return CARQUET_ERROR_OUT_OF_MEMORY;
-    }
-
-    size_t pos = 0;
-    size_t consumed = 0;
-    carquet_status_t status = carquet_delta_decode_int32(
-        data + pos, data_size - pos, prefix_lengths, num_values, &consumed);
-    if (status != CARQUET_OK) {
-        carquet_mem_free(prefix_lengths);
-        carquet_mem_free(suffix_lengths);
-        return status;
-    }
-    pos += consumed;
-
-    status = carquet_delta_decode_int32(
-        data + pos, data_size - pos, suffix_lengths, num_values, &consumed);
-    if (status != CARQUET_OK) {
-        carquet_mem_free(prefix_lengths);
-        carquet_mem_free(suffix_lengths);
-        return status;
-    }
-
-    size_t total = 0;
-    for (int32_t i = 0; i < num_values; i++) {
-        if (prefix_lengths[i] < 0 || suffix_lengths[i] < 0) {
-            carquet_mem_free(prefix_lengths);
-            carquet_mem_free(suffix_lengths);
-            return CARQUET_ERROR_DECODE;
-        }
-        total += (size_t)prefix_lengths[i] + (size_t)suffix_lengths[i];
-    }
-
+    int32_t* prefix_lengths = NULL;
+    int32_t* suffix_lengths = NULL;
+    size_t header_bytes = 0, total = 0;
+    carquet_status_t status = carquet_delta_strings_decode_lengths(
+        data, data_size, num_values, &prefix_lengths, &suffix_lengths,
+        &header_bytes, &total);
+    if (status != CARQUET_OK) return status;
     carquet_mem_free(prefix_lengths);
     carquet_mem_free(suffix_lengths);
-
     *required_size = total;
     return CARQUET_OK;
 }
@@ -386,9 +401,8 @@ carquet_status_t carquet_delta_strings_encode(
     status = carquet_delta_encode_int32(
         suffix_lengths, num_values, delta_buffer, delta_capacity, &bytes_written);
 
-    carquet_mem_free(prefix_lengths);
-
     if (status != CARQUET_OK) {
+        carquet_mem_free(prefix_lengths);
         carquet_mem_free(suffix_lengths);
         carquet_mem_free(delta_buffer);
         return status;
@@ -398,29 +412,31 @@ carquet_status_t carquet_delta_strings_encode(
     carquet_mem_free(delta_buffer);
 
     if (status != CARQUET_OK) {
+        carquet_mem_free(prefix_lengths);
         carquet_mem_free(suffix_lengths);
         return status;
     }
 
-    /* Write suffix data */
+    /* Write suffix data (prefix lengths were computed above: no second
+     * common-prefix scan per value). */
     prev_len = 0;
     for (int32_t i = 0; i < num_values; i++) {
-        int32_t prefix_len = (i == 0) ? 0 : (int32_t)common_prefix_length(
-            values[i-1].data, values[i-1].length,
-            values[i].data, values[i].length);
+        int32_t prefix_len = prefix_lengths[i];
         int32_t suffix_len = suffix_lengths[i];
 
         if (suffix_len > 0 && values[i].data) {
             status = carquet_buffer_append(output,
                 values[i].data + prefix_len, suffix_len);
             if (status != CARQUET_OK) {
+                carquet_mem_free(prefix_lengths);
                 carquet_mem_free(suffix_lengths);
                 return status;
             }
         }
     }
 
-    carquet_mem_free(suffix_lengths);
+    carquet_mem_free(prefix_lengths);
+                carquet_mem_free(suffix_lengths);
     return CARQUET_OK;
 }
 

@@ -426,6 +426,13 @@ uint32_t carquet_bit_reader_read_bits(carquet_bit_reader_t* reader, int num_bits
     if (reader->buffer_bits < num_bits) {
         refill_buffer(reader);
     }
+    /* Past the end of the data: hand back whatever bits remain (zero-padded)
+     * instead of driving buffer_bits negative, which would make the next
+     * refill shift by a negative count. */
+    if (reader->buffer_bits < num_bits) {
+        num_bits = reader->buffer_bits;
+        if (num_bits == 0) return 0;
+    }
 
     uint32_t result = (uint32_t)(reader->buffer & ((1ULL << num_bits) - 1));
     reader->buffer >>= num_bits;

@@ -169,6 +169,10 @@ carquet_status_t carquet_delta_length_encode(
     }
 
     for (int32_t i = 0; i < num_values; i++) {
+        if (values[i].length < 0 || (!values[i].data && values[i].length > 0)) {
+            carquet_mem_free(lengths);
+            return CARQUET_ERROR_INVALID_ARGUMENT;
+        }
         lengths[i] = (int32_t)values[i].length;
     }
 
