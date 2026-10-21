@@ -40,10 +40,10 @@ jobs:
           gh api "repos/${REPO}/traffic/clones" > clones-api.json
           gh api "repos/${REPO}/traffic/views"  > views-api.json
 
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
           git init -q work
           cd work
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${REPO}.git"
           if git fetch -q origin traffic 2>/dev/null; then
             git checkout -q -b traffic FETCH_HEAD
