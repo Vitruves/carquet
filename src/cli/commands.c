@@ -317,6 +317,39 @@ const char* cli_format_value(carquet_physical_type_t type,
     return buf;
 }
 
+const char* cli_format_stat_value(carquet_physical_type_t type,
+                                  const void* raw, int32_t raw_size,
+                                  int32_t type_len,
+                                  const carquet_logical_type_t* logical,
+                                  char* buf, size_t buf_size)
+{
+    /* Raw stat bytes come straight from the file: check the width before
+     * cli_format_value() dereferences a fixed-size value, and copy numeric
+     * values into an aligned buffer (arena bytes carry no alignment). */
+    size_t need;
+    switch (type) {
+        case CARQUET_PHYSICAL_BOOLEAN: need = 1; break;
+        case CARQUET_PHYSICAL_INT32:
+        case CARQUET_PHYSICAL_FLOAT:   need = 4; break;
+        case CARQUET_PHYSICAL_INT64:
+        case CARQUET_PHYSICAL_DOUBLE:  need = 8; break;
+        case CARQUET_PHYSICAL_INT96:   need = 12; break;
+        case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY:
+            need = type_len > 0 ? (size_t)type_len : SIZE_MAX; break;
+        default: need = SIZE_MAX; break;  /* BYTE_ARRAY: caller wraps it */
+    }
+    if (!raw || raw_size < 0 || (size_t)raw_size < need) {
+        snprintf(buf, buf_size, "(invalid)");
+        return buf;
+    }
+    if (type == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY) {
+        return cli_format_value(type, raw, type_len, logical, buf, buf_size);
+    }
+    uint64_t aligned[2] = {0, 0};
+    memcpy(aligned, raw, need);
+    return cli_format_value(type, aligned, type_len, logical, buf, buf_size);
+}
+
 static carquet_reader_t* open_or_die(const char* path, carquet_error_t* err) {
     carquet_reader_t* reader = carquet_reader_open(path, NULL, err);
     if (!reader) {
@@ -681,10 +714,12 @@ int cmd_stat(const char* path) {
                         cli_format_value(phys, &max_ba, tl, lt,
                                          max_buf, sizeof(max_buf));
                     } else {
-                        cli_format_value(phys, stats.min_value, tl, lt,
-                                         min_buf, sizeof(min_buf));
-                        cli_format_value(phys, stats.max_value, tl, lt,
-                                         max_buf, sizeof(max_buf));
+                        cli_format_stat_value(phys, stats.min_value,
+                                              stats.min_value_size, tl, lt,
+                                              min_buf, sizeof(min_buf));
+                        cli_format_stat_value(phys, stats.max_value,
+                                              stats.max_value_size, tl, lt,
+                                              max_buf, sizeof(max_buf));
                     }
                 }
             }
@@ -935,8 +970,13 @@ int cmd_head(const char* path, int64_t n, const char* filter) {
             schema->leaf_indices[c]);
         const carquet_logical_type_t* lt = carquet_schema_node_logical_type(node);
         int32_t tl = carquet_schema_node_type_length(node);
-        bool nullable = carquet_schema_node_repetition(node) != CARQUET_REPETITION_REQUIRED;
-        int16_t max_def = carquet_schema_node_max_def_level(node);
+        /* Accumulated level: carquet_schema_node_max_def_level() is only
+         * this node's own 0/1 contribution. */
+        int16_t max_def = carquet_schema_max_def_level(schema, c);
+        /* max_def, not the leaf's own repetition: a REQUIRED leaf under an
+         * optional/repeated parent still has null slots, and without def
+         * levels the dense value indexing below runs past the values. */
+        bool nullable = max_def > 0;
 
         int64_t rows_read = 0;
         for (int32_t rg = 0; rg < carquet_reader_num_row_groups(reader) && rows_read < n; rg++) {
@@ -947,6 +987,12 @@ int cmd_head(const char* path, int64_t n, const char* filter) {
 
             /* Allocate buffer based on type */
             int32_t elem_size = carquet_physical_type_size(phys);
+            if (phys != CARQUET_PHYSICAL_BYTE_ARRAY &&
+                (phys == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY ? tl <= 0 : elem_size <= 0)) {
+                /* Malformed schema type: nothing sensible to size or print. */
+                carquet_column_reader_free(col);
+                continue;
+            }
             void* buf;
             int16_t* def = NULL;
             if (phys == CARQUET_PHYSICAL_BYTE_ARRAY) {
@@ -960,6 +1006,7 @@ int cmd_head(const char* path, int64_t n, const char* filter) {
                 def = calloc((size_t)want, sizeof(int16_t));
 
             int64_t got = carquet_column_read_batch(col, buf, want, def, NULL);
+            if (got < 0) got = 0;   /* decode error: -1 would index row -1 */
 
             /* read_batch packs non-null values densely (no slot for nulls),
              * so buffer addressing advances only on present rows. */
@@ -1036,8 +1083,13 @@ int cmd_tail(const char* path, int64_t n, const char* filter) {
             schema->leaf_indices[c]);
         const carquet_logical_type_t* lt = carquet_schema_node_logical_type(node);
         int32_t tl = carquet_schema_node_type_length(node);
-        bool nullable = carquet_schema_node_repetition(node) != CARQUET_REPETITION_REQUIRED;
-        int16_t max_def = carquet_schema_node_max_def_level(node);
+        /* Accumulated level: carquet_schema_node_max_def_level() is only
+         * this node's own 0/1 contribution. */
+        int16_t max_def = carquet_schema_max_def_level(schema, c);
+        /* max_def, not the leaf's own repetition: a REQUIRED leaf under an
+         * optional/repeated parent still has null slots, and without def
+         * levels the dense value indexing below runs past the values. */
+        bool nullable = max_def > 0;
 
         int64_t rows_seen = 0;
         int64_t rows_output = 0;
@@ -1063,6 +1115,12 @@ int cmd_tail(const char* path, int64_t n, const char* filter) {
 
             int64_t want = n - rows_output;
             int32_t elem_size = carquet_physical_type_size(phys);
+            if (phys != CARQUET_PHYSICAL_BYTE_ARRAY &&
+                (phys == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY ? tl <= 0 : elem_size <= 0)) {
+                /* Malformed schema type: nothing sensible to size or print. */
+                carquet_column_reader_free(col);
+                continue;
+            }
             void* buf;
             int16_t* def = NULL;
             if (phys == CARQUET_PHYSICAL_BYTE_ARRAY) {
@@ -1076,6 +1134,7 @@ int cmd_tail(const char* path, int64_t n, const char* filter) {
                 def = calloc((size_t)want, sizeof(int16_t));
 
             int64_t got = carquet_column_read_batch(col, buf, want, def, NULL);
+            if (got < 0) got = 0;   /* decode error: -1 would index row -1 */
 
             /* read_batch packs non-null values densely (no slot for nulls),
              * so buffer addressing advances only on present rows. */
@@ -1174,8 +1233,13 @@ int cmd_sample(const char* path, int64_t n, const char* filter) {
             schema->leaf_indices[c]);
         const carquet_logical_type_t* lt = carquet_schema_node_logical_type(node);
         int32_t tl = carquet_schema_node_type_length(node);
-        bool nullable = carquet_schema_node_repetition(node) != CARQUET_REPETITION_REQUIRED;
-        int16_t max_def = carquet_schema_node_max_def_level(node);
+        /* Accumulated level: carquet_schema_node_max_def_level() is only
+         * this node's own 0/1 contribution. */
+        int16_t max_def = carquet_schema_max_def_level(schema, c);
+        /* max_def, not the leaf's own repetition: a REQUIRED leaf under an
+         * optional/repeated parent still has null slots, and without def
+         * levels the dense value indexing below runs past the values. */
+        bool nullable = max_def > 0;
         int32_t num_rgs = carquet_reader_num_row_groups(reader);
 
         int64_t sample_idx = 0;     /* Index into sorted indices[] */
@@ -1220,6 +1284,9 @@ int cmd_sample(const char* path, int64_t n, const char* filter) {
                     valbuf = nb; valbuf_cap = val_cap;
                 }
                 int16_t def_level = 0;
+                /* Never format a stale value: a null slot or a failed read
+                 * leaves the buffer untouched (BYTE_ARRAY holds a pointer). */
+                memset(valbuf, 0, valbuf_cap);
 
                 int64_t got = carquet_column_read_batch(col, valbuf, 1,
                     nullable ? &def_level : NULL, NULL);
@@ -1380,8 +1447,8 @@ static int64_t read_column_strings(carquet_reader_t* reader,
         schema->leaf_indices[col_index]);
     const carquet_logical_type_t* lt = carquet_schema_node_logical_type(node);
     int32_t tl = carquet_schema_node_type_length(node);
-    bool nullable = carquet_schema_node_repetition(node) != CARQUET_REPETITION_REQUIRED;
-    int16_t max_def = carquet_schema_node_max_def_level(node);
+    int16_t max_def = carquet_schema_max_def_level(schema, col_index);
+    bool nullable = max_def > 0;  /* see cmd_head */
 
     int32_t num_rgs = carquet_reader_num_row_groups(reader);
     int64_t rows_seen = 0;
@@ -1407,8 +1474,19 @@ static int64_t read_column_strings(carquet_reader_t* reader,
         int64_t want = limit - rows_output;
         int64_t rg_remaining = rgm.num_rows - skip_in_rg;
         if (want > rg_remaining) want = rg_remaining;
+        if (want <= 0) {   /* malformed (negative) row-group row count */
+            carquet_column_reader_free(col);
+            rows_seen += rgm.num_rows;
+            continue;
+        }
 
         int32_t elem_size = carquet_physical_type_size(phys);
+        if (phys != CARQUET_PHYSICAL_BYTE_ARRAY &&
+            (phys == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY ? tl <= 0 : elem_size <= 0)) {
+            carquet_column_reader_free(col);   /* malformed schema type */
+            rows_seen += rgm.num_rows;
+            continue;
+        }
         void* buf;
         int16_t* def = NULL;
         if (phys == CARQUET_PHYSICAL_BYTE_ARRAY)
@@ -1420,6 +1498,7 @@ static int64_t read_column_strings(carquet_reader_t* reader,
         if (nullable) def = calloc((size_t)want, sizeof(int16_t));
 
         int64_t got = carquet_column_read_batch(col, buf, want, def, NULL);
+        if (got < 0) got = 0;   /* decode error */
 
         /* read_batch packs non-null values densely (no slot for nulls),
          * so buffer addressing advances only on present rows. */
@@ -1918,7 +1997,7 @@ static int read_rows_filtered(carquet_reader_t* reader,
             schema->leaf_indices[file_col]);
         lts[c] = carquet_schema_node_logical_type(node);
         tls[c] = carquet_schema_node_type_length(node);
-        max_defs[c] = carquet_schema_node_max_def_level(node);
+        max_defs[c] = carquet_schema_max_def_level(schema, file_col);
     }
 
     int64_t skipped = 0;

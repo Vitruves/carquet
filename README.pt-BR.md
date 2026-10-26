@@ -58,10 +58,10 @@
 
 **Rápida**
 
-- **Leituras 39x mais rápidas** que o Arrow C++ em dados não comprimidos (mmap zero-copy), **100x mais rápidas** que o PyArrow
-- **Leituras comprimidas 1,3–2,1x mais rápidas** que o Arrow C++ sobre o mesmo arquivo (benchmark de leitura cruzada, Apple M3; 1,6–2,6x em x86)
-- **Escritas 1,8–5,7x mais rápidas** que o Arrow C++ em Apple M3 (1,0–1,6x na execução x86 mais antiga)
-- Lê 10M de linhas não comprimidas em **0,36 ms** (mmap zero-copy em Apple M3)
+- **Leituras 49x mais rápidas** que o Arrow C++ em dados não comprimidos (mmap zero-copy), **120x mais rápidas** que o PyArrow
+- **Leituras comprimidas 1,5–2,1x mais rápidas** que o Arrow C++ sobre o mesmo arquivo (benchmark de leitura cruzada, Apple M3; 1,6–2,6x em x86)
+- **Escritas 2,5–5,8x mais rápidas** que o Arrow C++ em Apple M3 (1,0–1,6x na execução x86 mais antiga)
+- Lê 10M de linhas não comprimidas em **0,27 ms** (mmap zero-copy em Apple M3)
 - Otimizada com SIMD (SSE4.2, AVX2, AVX-512, NEON, SVE) com detecção em tempo de execução e fallbacks escalares
 
 **Completa e compatível**
@@ -109,7 +109,7 @@ Os loops completos de escrita e leitura, com batches e colunas anuláveis, estã
 
 ### Onde o carquet se encaixa
 
-O carquet é a opção pequena e embarcável: uma biblioteca C11 de ~500 KB com quatro dependências baixadas automaticamente que compila em menos de um minuto, enquanto o Arrow C++ pesa 50 MB+ e um wheel do PyArrow cerca de 100 MB. No benchmark de 10M de linhas abaixo, ele escreve arquivos comprimidos 1,8–5,7x mais rápido que o Arrow C++ e os lê 1,3–2,1x mais rápido a partir do mesmíssimo arquivo; dados não comprimidos são servidos diretamente do mmap em 0,36 ms. O Arrow continua sendo a escolha certa quando você precisa do ecossistema dele (kernels de computação, datasets, Flight, criptografia); o carquet é para os programas em C e C++, sistemas embarcados e runtimes de linguagens que só precisam ler e escrever Parquet com rapidez e correção.
+O carquet é a opção pequena e embarcável: uma biblioteca C11 de ~500 KB com quatro dependências baixadas automaticamente que compila em menos de um minuto, enquanto o Arrow C++ pesa 50 MB+ e um wheel do PyArrow cerca de 100 MB. No benchmark de 10M de linhas abaixo, ele escreve arquivos comprimidos 4,6–5,8x mais rápido que o Arrow C++ e os lê 1,5–2,1x mais rápido a partir do mesmíssimo arquivo; dados não comprimidos são servidos diretamente do mmap em 0,27 ms. O Arrow continua sendo a escolha certa quando você precisa do ecossistema dele (kernels de computação, datasets, Flight, criptografia); o carquet é para os programas em C e C++, sistemas embarcados e runtimes de linguagens que só precisam ler e escrever Parquet com rapidez e correção.
 
 <br/>
 
@@ -601,23 +601,23 @@ carquet codegen -f data.parquet -o reader.c
 
 Com 10M de linhas (o tamanho mais representativo); razão maior = carquet mais rápido.
 
-ARM (Apple M3): Carquet 0.7.2 vs Arrow C++ 24.0.0, medido em 2026-10-20. x86 (Xeon D-1531): Carquet 0.4.4 vs Arrow C++ 23.0.1; essa execução é anterior ao paralelismo do writer da 0.7.1 e não foi medida novamente desde então.
+ARM (Apple M3): Carquet 0.7.3 vs Arrow C++ 24.0.0, medido em 2026-10-25. x86 (Xeon D-1531): Carquet 0.4.4 vs Arrow C++ 23.0.1; essa execução é anterior ao paralelismo do writer da 0.7.1 e não foi medida novamente desde então.
 
 <div align="center">
 
 | | x86 (Xeon D-1531) | | ARM (Apple M3) | |
 |---|---|---|---|---|
 | **Codec** | **Escrita** | **Leitura** | **Escrita** | **Leitura** |
-| snappy | **1.55x** | **1.25x** | **4.63x** | **1.66x** |
-| zstd | **1.31x** | **1.04x** | **5.66x** | **1.36x** |
-| lz4 | **1.02x** | 0.83x | **4.47x** | **1.76x** |
-| none | **1.13x** | **40.6x**\* | **1.83x** | **38.9x**\* |
+| snappy | **1.55x** | **1.25x** | **4.78x** | **1.78x** |
+| zstd | **1.31x** | **1.04x** | **5.76x** | **1.41x** |
+| lz4 | **1.02x** | 0.83x | **4.64x** | **1.97x** |
+| none | **1.13x** | **40.6x**\* | **2.46x** | **49.4x**\* |
 
 </div>
 
 \* As leituras não comprimidas usam mmap zero-copy, veja a nota de metodologia.
 
-As leituras comprimidas envolvem descompressão e decodificação completas de cada valor, sem atalhos, e ambas as bibliotecas usam as mesmas bibliotecas compartilhadas lz4/zstd do sistema, de modo que a velocidade bruta do codec é idêntica. A comparação mais significativa é a tabela de **leitura cruzada do mesmo arquivo** (nos resultados completos), em que ambas as bibliotecas leem exatamente o mesmo arquivo Parquet: o carquet lê dados comprimidos **1,3–2,1x mais rápido** que o Arrow C++ nesse teste em condições idênticas (execução x86: 1,6–2,6x).
+As leituras comprimidas envolvem descompressão e decodificação completas de cada valor, sem atalhos, e ambas as bibliotecas usam as mesmas bibliotecas compartilhadas lz4/zstd do sistema, de modo que a velocidade bruta do codec é idêntica. A comparação mais significativa é a tabela de **leitura cruzada do mesmo arquivo** (nos resultados completos), em que ambas as bibliotecas leem exatamente o mesmo arquivo Parquet: o carquet lê dados comprimidos **1,5–2,1x mais rápido** que o Arrow C++ nesse teste em condições idênticas (execução x86: 1,6–2,6x).
 
 <details>
 <summary><b>Metodologia dos benchmarks</b></summary>
@@ -727,7 +727,7 @@ Ambas as bibliotecas leem o **mesmo** arquivo Parquet, a comparação mais justa
 
 <br/>
 
-*Carquet 0.7.2, MacBook Air M3, 16GB de RAM, macOS 26.5, Arrow C++ 24.0.0, PyArrow 23.0.1, ZSTD nível 1. As tabelas de 10M de linhas foram medidas em 2026-10-20; as tabelas de 1M e 100K são da execução da 0.7.1 de 2026-10-08 (não medidas novamente).*
+*Carquet 0.7.3, MacBook Air M3, 16GB de RAM, macOS 26.5, Arrow C++ 24.0.0, PyArrow 23.0.1, ZSTD nível 1, medido em 2026-10-25.*
 
 #### 10M de linhas vs Arrow C++
 
@@ -735,10 +735,10 @@ Ambas as bibliotecas leem o **mesmo** arquivo Parquet, a comparação mais justa
 
 | Codec | Escrita Carquet | Escrita Arrow C++ | Razão E | Leitura Carquet | Leitura Arrow C++ | Razão L | Tamanho |
 |-------|--------------|-----------------|---------|-------------|----------------|---------|------|
-| none | **74.7ms** | 137ms | **1.83x** | **0.36ms** | 14.0ms | **38.9x**\* | 200.0MB |
-| snappy | **52.7ms** | 244ms | **4.63x** | **12.4ms** | 20.6ms | **1.66x** | 131.2MB |
-| zstd | **60.4ms** | 342ms | **5.66x** | **19.8ms** | 26.9ms | **1.36x** | 99.9MB |
-| lz4 | **57.2ms** | 256ms | **4.47x** | **9.22ms** | 16.2ms | **1.76x** | 128.9MB |
+| none | **48.9ms** | 121ms | **2.46x** | **0.27ms** | 13.3ms | **49.4x**\* | 200.0MB |
+| snappy | **49.3ms** | 236ms | **4.78x** | **12.5ms** | 22.2ms | **1.78x** | 131.2MB |
+| zstd | **57.8ms** | 333ms | **5.76x** | **19.4ms** | 27.3ms | **1.41x** | 99.9MB |
+| lz4 | **51.4ms** | 238ms | **4.64x** | **8.10ms** | 15.9ms | **1.97x** | 128.9MB |
 
 </div>
 
@@ -750,10 +750,10 @@ Ambas as bibliotecas leem o **mesmo** arquivo Parquet, a comparação mais justa
 
 | Codec | Escrita Carquet | Escrita Arrow C++ | Razão E | Leitura Carquet | Leitura Arrow C++ | Razão L |
 |-------|--------------|-----------------|---------|-------------|----------------|---------|
-| none | **6.48ms** | 14.82ms | **2.29x** | **0.06ms** | 1.63ms | **27.2x**\* |
-| snappy | **14.28ms** | 26.44ms | **1.85x** | **2.14ms** | 2.85ms | **1.33x** |
-| zstd | **14.76ms** | 36.17ms | **2.45x** | **2.70ms** | 3.46ms | **1.28x** |
-| lz4 | **12.30ms** | 26.10ms | **2.12x** | **1.04ms** | 1.87ms | **1.80x** |
+| none | **5.55ms** | 12.40ms | **2.23x** | **0.05ms** | 1.48ms | **29.6x**\* |
+| snappy | **6.18ms** | 24.52ms | **3.97x** | **1.27ms** | 2.38ms | **1.87x** |
+| zstd | **7.62ms** | 33.86ms | **4.44x** | **2.16ms** | 2.99ms | **1.38x** |
+| lz4 | **6.66ms** | 24.76ms | **3.72x** | **0.81ms** | 1.71ms | **2.11x** |
 
 </div>
 
@@ -765,10 +765,10 @@ Ambas as bibliotecas leem o **mesmo** arquivo Parquet, a comparação mais justa
 
 | Codec | Escrita Carquet | Escrita Arrow C++ | Razão E | Leitura Carquet | Leitura Arrow C++ | Razão L |
 |-------|--------------|-----------------|---------|-------------|----------------|---------|
-| none | **1.07ms** | 1.79ms | **1.67x** | **0.02ms** | 0.25ms | **12.5x**\* |
-| snappy | **1.60ms** | 2.63ms | **1.64x** | **0.34ms** | 0.91ms | **2.68x** |
-| zstd | **1.73ms** | 3.63ms | **2.10x** | **0.63ms** | 1.26ms | **2.00x** |
-| lz4 | **1.52ms** | 2.62ms | **1.72x** | **0.25ms** | 0.55ms | **2.20x** |
+| none | **1.11ms** | 1.53ms | **1.38x** | **0.02ms** | 0.22ms | **11.0x**\* |
+| snappy | **1.48ms** | 2.51ms | **1.70x** | **0.34ms** | 0.90ms | **2.65x** |
+| zstd | **1.78ms** | 3.50ms | **1.97x** | **0.64ms** | 1.24ms | **1.94x** |
+| lz4 | **1.58ms** | 2.44ms | **1.54x** | **0.24ms** | 0.54ms | **2.25x** |
 
 </div>
 
@@ -782,14 +782,14 @@ Ambas as bibliotecas leem o **mesmo** arquivo Parquet, a comparação mais justa
 
 | Codec | Escritor | Leitura Carquet | Leitura Arrow C++ | Razão |
 |-------|--------|-------------|----------------|-------|
-| none | Carquet | **0.31ms** | 15.7ms | **50.7x**\* |
-| none | Arrow | **0.93ms** | 13.7ms | **14.8x**\* |
-| snappy | Carquet | **12.6ms** | 22.0ms | **1.74x** |
-| snappy | Arrow | **14.3ms** | 21.8ms | **1.52x** |
-| zstd | Carquet | **21.3ms** | 28.0ms | **1.31x** |
-| zstd | Arrow | **21.1ms** | 30.4ms | **1.44x** |
-| lz4 | Carquet | **8.48ms** | 17.7ms | **2.09x** |
-| lz4 | Arrow | **7.90ms** | 16.3ms | **2.06x** |
+| none | Carquet | **0.27ms** | 14.9ms | **55.3x**\* |
+| none | Arrow | **0.90ms** | 13.2ms | **14.6x**\* |
+| snappy | Carquet | **11.4ms** | 22.5ms | **1.98x** |
+| snappy | Arrow | **11.4ms** | 22.1ms | **1.94x** |
+| zstd | Carquet | **18.9ms** | 27.5ms | **1.45x** |
+| zstd | Arrow | **18.3ms** | 27.2ms | **1.49x** |
+| lz4 | Carquet | **8.02ms** | 17.1ms | **2.13x** |
+| lz4 | Arrow | **7.62ms** | 16.0ms | **2.10x** |
 
 </div>
 
@@ -801,10 +801,10 @@ Ambas as bibliotecas leem o **mesmo** arquivo Parquet, a comparação mais justa
 
 | Codec | Escrita Carquet | Escrita PyArrow | Razão E | Leitura Carquet | Leitura PyArrow | Razão L |
 |-------|--------------|---------------|---------|-------------|--------------|---------|
-| none | **74.7ms** | 202ms | **2.71x** | **0.36ms** | 36.2ms | **100.5x**\* |
-| snappy | **52.7ms** | 312ms | **5.93x** | **12.4ms** | 46.6ms | **3.75x** |
-| zstd | **60.4ms** | 410ms | **6.78x** | **19.8ms** | 75.6ms | **3.82x** |
-| lz4 | **57.2ms** | 321ms | **5.62x** | **9.22ms** | 40.0ms | **4.33x** |
+| none | **48.9ms** | 171ms | **3.50x** | **0.27ms** | 32.4ms | **120.0x**\* |
+| snappy | **49.3ms** | 291ms | **5.91x** | **12.5ms** | 44.5ms | **3.57x** |
+| zstd | **57.8ms** | 395ms | **6.84x** | **19.4ms** | 55.8ms | **2.87x** |
+| lz4 | **51.4ms** | 301ms | **5.86x** | **8.10ms** | 37.4ms | **4.61x** |
 
 </div>
 
@@ -816,10 +816,10 @@ Ambas as bibliotecas leem o **mesmo** arquivo Parquet, a comparação mais justa
 
 | Codec | Escrita Carquet | Escrita PyArrow | Razão E | Leitura Carquet | Leitura PyArrow | Razão L |
 |-------|--------------|-----------------|---------|-------------|--------------|---------|
-| none | **6.48ms** | 20.17ms | **3.11x** | **0.06ms** | 2.79ms | **46.5x**\* |
-| snappy | **14.28ms** | 31.54ms | **2.21x** | **2.14ms** | 4.01ms | **1.87x** |
-| zstd | **14.76ms** | 42.51ms | **2.88x** | **2.70ms** | 4.42ms | **1.64x** |
-| lz4 | **12.30ms** | 32.03ms | **2.60x** | **1.04ms** | 3.22ms | **3.10x** |
+| none | **5.55ms** | 17.03ms | **3.07x** | **0.05ms** | 2.55ms | **51.0x**\* |
+| snappy | **6.18ms** | 30.09ms | **4.87x** | **1.27ms** | 3.56ms | **2.80x** |
+| zstd | **7.62ms** | 40.05ms | **5.26x** | **2.16ms** | 4.37ms | **2.02x** |
+| lz4 | **6.66ms** | 30.78ms | **4.62x** | **0.81ms** | 3.04ms | **3.75x** |
 
 </div>
 
@@ -831,10 +831,10 @@ Ambas as bibliotecas leem o **mesmo** arquivo Parquet, a comparação mais justa
 
 | Codec | Escrita Carquet | Escrita PyArrow | Razão E | Leitura Carquet | Leitura PyArrow | Razão L |
 |-------|--------------|---------------|---------|-------------|--------------|---------|
-| none | **1.07ms** | 2.12ms | **1.98x** | **0.02ms** | 0.24ms | **12.0x**\* |
-| snappy | **1.60ms** | 3.17ms | **1.98x** | **0.34ms** | 0.60ms | **1.76x** |
-| zstd | **1.73ms** | 4.16ms | **2.40x** | **0.63ms** | 0.81ms | **1.29x** |
-| lz4 | **1.52ms** | 3.21ms | **2.11x** | **0.25ms** | 0.42ms | **1.68x** |
+| none | **1.11ms** | 1.96ms | **1.77x** | **0.02ms** | 0.23ms | **11.5x**\* |
+| snappy | **1.48ms** | 2.98ms | **2.01x** | **0.34ms** | 0.59ms | **1.74x** |
+| zstd | **1.78ms** | 4.06ms | **2.28x** | **0.64ms** | 0.81ms | **1.27x** |
+| lz4 | **1.58ms** | 3.06ms | **1.94x** | **0.24ms** | 0.41ms | **1.71x** |
 
 </div>
 

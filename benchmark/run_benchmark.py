@@ -528,6 +528,11 @@ def main():
                         help="Override iteration count for all sizes (default: auto)")
     parser.add_argument("--no-crossread", action="store_true",
                         help="Skip same-file cross-read benchmarks")
+    parser.add_argument("--build-dir",
+                        help="CMake build directory holding benchmark_carquet "
+                             "(default: <project>/build)")
+    parser.add_argument("--no-save", action="store_true",
+                        help="Do not write the bench_*.json report (smoke runs)")
     args = parser.parse_args()
 
     if args.iterations > 0:
@@ -542,7 +547,8 @@ def main():
 
     # Locate binaries
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    build_dir = os.path.join(script_dir, "..", "build")
+    build_dir = (os.path.abspath(args.build_dir) if args.build_dir
+                 else os.path.join(script_dir, "..", "build"))
     carquet_bin = os.path.join(build_dir, "benchmark_carquet")
     arrow_cpp_bin = os.path.join(build_dir, "benchmark_arrow_cpp")
 
@@ -821,6 +827,10 @@ def main():
             if "arrow_read_ms" in cr:
                 entry["arrow_read_ms"] = round(cr["arrow_read_ms"], 2)
             report["crossread_results"].append(entry)
+
+    if args.no_save:
+        print()
+        return
 
     date_str = datetime.date.today().strftime("%Y%m%d")
     os_tag = f"{platform.system().lower()}_{platform.machine()}"

@@ -225,12 +225,13 @@ static int test_page_parallel_identical(const cfg_t* c, const char* tag) {
     return 0;
 }
 
-static int test_async_io_identical(carquet_compression_t codec, const char* tag) {
+static int test_async_io_identical(carquet_compression_t codec, int64_t rg_rows,
+                                   const char* tag) {
     data_t d; data_init(&d);
     char a[512], b[512];
     carquet_test_temp_path(a, sizeof(a), "aio_on");
     carquet_test_temp_path(b, sizeof(b), "aio_off");
-    cfg_t on = {codec, 0, 0, 1, true, 70000};
+    cfg_t on = {codec, 0, 0, 1, true, rg_rows};
     cfg_t off = on; off.async_io = false;
     int ok = write_file(a, &d, 3, &on) && write_file(b, &d, 3, &off);
     if (ok) {
@@ -417,8 +418,10 @@ int main(void) {
     failures += test_page_parallel_identical(&v2, "page_parallel_gzip_v2");
     cfg_t unc = base; unc.codec = CARQUET_COMPRESSION_UNCOMPRESSED;
     failures += test_page_parallel_identical(&unc, "page_parallel_uncompressed");
-    failures += test_async_io_identical(CARQUET_COMPRESSION_ZSTD, "async_io_identical_zstd");
-    failures += test_async_io_identical(CARQUET_COMPRESSION_UNCOMPRESSED, "async_io_identical_none");
+    failures += test_async_io_identical(CARQUET_COMPRESSION_ZSTD, 70000, "async_io_identical_zstd");
+    failures += test_async_io_identical(CARQUET_COMPRESSION_UNCOMPRESSED, 70000, "async_io_identical_none");
+    /* 20 small row groups: more than the pipeline's slots stay in flight. */
+    failures += test_async_io_identical(CARQUET_COMPRESSION_SNAPPY, 15000, "async_io_identical_snappy_20rg");
     failures += test_async_buffer_writer();
     failures += test_mixed_nullable();
     failures += test_async_write_error();

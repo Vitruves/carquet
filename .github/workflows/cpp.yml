@@ -72,6 +72,44 @@ jobs:
       - name: Test
         run: ctest --test-dir build -VV --rerun-failed --output-on-failure
 
+  # 32-bit MSVC (issue #36): catches x64-only intrinsics (_BitScanForward64,
+  # _mm_extract_epi64, ...). Default options, so SSE/AVX2 stay on and AVX-512
+  # must auto-disable.
+  windows-x86:
+    name: Windows Win32 (MSVC x86)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Support longpaths
+        run: git config --system core.longpaths true
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          variant: sccache
+          key: windows-x86
+
+      - name: Configure
+        shell: bash
+        run: |
+          export CC=cl.exe CXX=cl.exe
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCARQUET_BUILD_TESTS=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+
+      - name: Compile
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build -VV --rerun-failed --output-on-failure
+
   redhat-build:
     name: Rocky Linux 9
     runs-on: ubuntu-latest

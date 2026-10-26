@@ -85,6 +85,12 @@ option("avx512")
     on_check(function (option)
         if not is_arch("x86_64", "x64", "i386", "x86") then return end
         if not option:enabled() then return end
+        -- avx512_ops.c is x86-64 only (64-bit mask / bit-scan intrinsics).
+        if is_arch("i386", "x86") then
+            option:enable(false)
+            cprint("${yellow}32-bit x86 target — disabling AVX-512${clear}")
+            return
+        end
         local ok, has = pcall(function ()
             import("lib.detect.check_cxsnippets")
             return check_cxsnippets({[[
@@ -317,6 +323,16 @@ target("carquet")
     if is_plat("linux", "macosx", "bsd") then
         add_syslinks("m", "pthread", {public = true})
     end
+
+    -- Fuzz builds: coverage-instrument (and sanitize) the library itself, not
+    -- only the harnesses, or libFuzzer sees no library edges (mirrors
+    -- fuzz/CMakeLists.txt). AFL's compiler wrapper instruments everything.
+    if has_config("fuzz") and (get_config("fuzz_engine") or "libFuzzer") == "libFuzzer" then
+        add_cflags("-fsanitize=fuzzer-no-link")
+        if get_config("fuzz_sanitizers") ~= false then
+            add_cflags("-fsanitize=address", "-fsanitize=undefined", "-fno-omit-frame-pointer")
+        end
+    end
 target_end()
 
 --------------------------------------------------------------------------------
@@ -387,7 +403,8 @@ if want("tests") then
         "test_float16", "test_geo_wkb", "test_worker_pool", "test_custom_codec",
         "test_real_world", "test_arrow_c_data", "test_batch_nested",
         "test_nested_write", "test_arrow_nested", "test_p2_conformance",
-        "test_cli_format", "test_fixes_0_7_2",
+        "test_cli_format", "test_fixes_0_7_2", "test_security_hardening",
+        "test_fuzz_regressions",
     }
     -- Tests that link extra non-library sources (the CLI helpers live in the
     -- carquet_cli target, not in libcarquet).
@@ -516,7 +533,7 @@ if has_config("fuzz") then
         "fuzz_reader", "fuzz_compression", "fuzz_encodings", "fuzz_thrift",
         "fuzz_roundtrip", "fuzz_writer", "fuzz_page_filter", "fuzz_append",
         "fuzz_arrow_schema", "fuzz_arrow_c_data", "fuzz_nested_write",
-        "fuzz_arrow_read",
+        "fuzz_arrow_read", "fuzz_reader_file", "fuzz_arrow_write",
     }
     for _, f in ipairs(fuzzers) do
         target(f)

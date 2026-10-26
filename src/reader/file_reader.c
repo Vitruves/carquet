@@ -181,8 +181,12 @@ static bool compute_levels(
     int16_t* max_def,
     int16_t* max_rep,
     int32_t* leaf_indices,
-    int32_t* parent_indices) {
+    int32_t* parent_indices,
+    int32_t* leaves_visited,
+    int32_t* elements_visited) {
 
+    *leaves_visited = 0;
+    *elements_visited = num_elements;
     if (num_elements <= 1) {
         return true;  /* Empty or root-only schema */
     }
@@ -220,6 +224,8 @@ static bool compute_levels(
         next_idx = traverse_schema_recursive(&ctx, next_idx, 0, 0, 0, 1);
     }
 
+    *leaves_visited = ctx.leaf_idx;
+    *elements_visited = next_idx;
     return !ctx.depth_exceeded;
 }
 
@@ -250,13 +256,53 @@ carquet_schema_t* build_schema(
         return NULL;
     }
 
+    int32_t leaves_visited = 0;
+    int32_t elements_visited = 0;
     if (!compute_levels(schema->elements, schema->num_elements,
                         schema->max_def_levels, schema->max_rep_levels,
-                        schema->leaf_indices, schema->parent_indices)) {
+                        schema->leaf_indices, schema->parent_indices,
+                        &leaves_visited, &elements_visited)) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_SCHEMA,
                           "Schema nesting exceeds maximum depth of %d",
                           CARQUET_MAX_SCHEMA_DEPTH);
         return NULL;
+    }
+
+    /* The num_children counts must describe exactly the flat element list.
+     * Otherwise some leaves are never reached by the walk and keep a zeroed
+     * leaf_indices slot, i.e. they alias the root element with levels 0. */
+    if (schema->num_elements > 1 &&
+        (leaves_visited != schema->num_leaves ||
+         elements_visited != schema->num_elements)) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_SCHEMA,
+                          "Schema tree is inconsistent: num_children covers %d "
+                          "of %d elements (%d of %d leaves)",
+                          elements_visited, schema->num_elements,
+                          leaves_visited, schema->num_leaves);
+        return NULL;
+    }
+
+    /* Leaf type sanity: an FLBA width drives every value-size computation,
+     * and FLOAT16 consumers read exactly 2 bytes per value. */
+    for (int32_t c = 0; c < schema->num_leaves; c++) {
+        const parquet_schema_element_t* leaf =
+            &schema->elements[schema->leaf_indices[c]];
+        bool is_flba = leaf->has_type &&
+                       leaf->type == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY;
+        if (is_flba && leaf->type_length <= 0) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_SCHEMA,
+                              "Column %d: FIXED_LEN_BYTE_ARRAY with invalid "
+                              "type_length %d", c, leaf->type_length);
+            return NULL;
+        }
+        if (leaf->has_logical_type &&
+            leaf->logical_type.id == CARQUET_LOGICAL_FLOAT16 &&
+            !(is_flba && leaf->type_length == 2)) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_SCHEMA,
+                              "Column %d: FLOAT16 requires "
+                              "FIXED_LEN_BYTE_ARRAY(2)", c);
+            return NULL;
+        }
     }
 
     /* Recover Arrow per-field custom_metadata (variable labels/descriptions)
@@ -657,6 +703,27 @@ carquet_status_t carquet_validate_file(
     if (!reader) {
         if (error) *error = local;
         return local.code;
+    }
+
+    /* The fread open path reads only the file tail (a single speculative
+     * I/O), so it never sees the leading magic; the buffer and mmap paths do
+     * check it. A validator must not accept a file without "PAR1" up front. */
+    {
+        uint8_t head[PARQUET_MAGIC_LEN] = {0};
+        bool have_head = false;
+        if (reader->mmap_data) {
+            memcpy(head, reader->mmap_data, PARQUET_MAGIC_LEN);  /* size >= 12 */
+            have_head = true;
+        } else if (reader->file) {
+            have_head = carquet_fseek64(reader->file, 0, SEEK_SET) == 0 &&
+                fread(head, 1, PARQUET_MAGIC_LEN, reader->file) == PARQUET_MAGIC_LEN;
+        }
+        if (!have_head || memcmp(head, PARQUET_MAGIC, PARQUET_MAGIC_LEN) != 0) {
+            CARQUET_SET_ERROR(&local, CARQUET_ERROR_INVALID_MAGIC, "Invalid header magic");
+            if (error) *error = local;
+            carquet_reader_close(reader);
+            return CARQUET_ERROR_INVALID_MAGIC;
+        }
     }
 
     carquet_status_t result = CARQUET_OK;

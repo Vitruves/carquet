@@ -123,7 +123,9 @@ void carquet_sse_bitunpack8_3bit(const uint8_t* input, uint32_t* values) {
  */
 void carquet_sse_bitunpack32_1bit(const uint8_t* input, uint32_t* values) {
     /* Load 4 bytes and expand */
-    __m128i bytes = _mm_cvtsi32_si128(*(const int32_t*)input);
+    int32_t in32;
+    memcpy(&in32, input, sizeof(in32));  /* input is byte-aligned */
+    __m128i bytes = _mm_cvtsi32_si128(in32);
 
     /* Shuffle to repeat each byte 8 times for masking */
     static const int8_t shuffle_mask[16] = {
@@ -186,7 +188,9 @@ void carquet_sse_bitunpack32_1bit(const uint8_t* input, uint32_t* values) {
  */
 void carquet_sse_bitunpack8_4bit(const uint8_t* input, uint32_t* values) {
     /* Load 4 bytes containing 8 x 4-bit values */
-    __m128i bytes = _mm_cvtsi32_si128(*(const int32_t*)input);
+    int32_t in32;
+    memcpy(&in32, input, sizeof(in32));  /* input is byte-aligned */
+    __m128i bytes = _mm_cvtsi32_si128(in32);
 
     /* Split into low and high nibbles */
     __m128i lo_nibbles = _mm_and_si128(bytes, _mm_set1_epi8(0x0F));
@@ -540,8 +544,13 @@ void carquet_sse_prefix_sum_i64(int64_t* values, int64_t count, int64_t initial)
         v = _mm_add_epi64(v, sums);
         _mm_storeu_si128((__m128i*)(values + i), v);
 
-        /* Update running sum without spilling the whole vector */
+        /* Update running sum without spilling the whole vector
+         * (_mm_extract_epi64 is x86-64 only) */
+#if defined(__x86_64__) || defined(_M_X64)
         sum = (uint64_t)_mm_extract_epi64(v, 1);
+#else
+        _mm_storel_epi64((__m128i*)&sum, _mm_unpackhi_epi64(v, v));
+#endif
     }
 
     /* Handle remaining values */

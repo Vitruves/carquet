@@ -468,6 +468,34 @@ static void parse_schema_element(thrift_decoder_t* dec, carquet_arena_t* arena,
  * ============================================================================
  */
 
+/* Wire type of each ColumnMetaData field (index = field id). A field whose
+ * wire type disagrees is skipped instead of being decoded as the spec type:
+ * pre-standard writers reused ids now assigned (Dremio's parquet-mr 1.12 fork
+ * wrote a list<struct> as field 15, bloom_filter_length), and decoding it as
+ * an i32 desynchronised the whole footer (parquet-testing's
+ * dict-page-offset-zero.parquet failed to open). Generated Thrift code does
+ * the same check. 0 = no constraint. */
+static const uint8_t k_column_metadata_wire_type[] = {
+    0,
+    THRIFT_TYPE_I32,    /*  1 type */
+    THRIFT_TYPE_LIST,   /*  2 encodings */
+    THRIFT_TYPE_LIST,   /*  3 path_in_schema */
+    THRIFT_TYPE_I32,    /*  4 codec */
+    THRIFT_TYPE_I64,    /*  5 num_values */
+    THRIFT_TYPE_I64,    /*  6 total_uncompressed_size */
+    THRIFT_TYPE_I64,    /*  7 total_compressed_size */
+    THRIFT_TYPE_LIST,   /*  8 key_value_metadata */
+    THRIFT_TYPE_I64,    /*  9 data_page_offset */
+    THRIFT_TYPE_I64,    /* 10 index_page_offset */
+    THRIFT_TYPE_I64,    /* 11 dictionary_page_offset */
+    THRIFT_TYPE_STRUCT, /* 12 statistics */
+    THRIFT_TYPE_LIST,   /* 13 encoding_stats */
+    THRIFT_TYPE_I64,    /* 14 bloom_filter_offset */
+    THRIFT_TYPE_I32,    /* 15 bloom_filter_length */
+    THRIFT_TYPE_STRUCT, /* 16 size_statistics */
+    THRIFT_TYPE_STRUCT, /* 17 geospatial_statistics */
+};
+
 static void parse_column_metadata(thrift_decoder_t* dec, carquet_arena_t* arena,
                                    parquet_column_metadata_t* meta) {
     memset(meta, 0, sizeof(*meta));
@@ -477,6 +505,13 @@ static void parse_column_metadata(thrift_decoder_t* dec, carquet_arena_t* arena,
     int16_t field_id;
 
     while (thrift_read_field_begin(dec, &type, &field_id)) {
+        if (field_id > 0 &&
+            (size_t)field_id < sizeof(k_column_metadata_wire_type) &&
+            k_column_metadata_wire_type[field_id] != 0 &&
+            (thrift_type_t)k_column_metadata_wire_type[field_id] != type) {
+            thrift_skip(dec, type);
+            continue;
+        }
         switch (field_id) {
             case 1:  /* type */
                 meta->type = (carquet_physical_type_t)thrift_read_i32(dec);
@@ -657,7 +692,10 @@ static void parse_column_metadata(thrift_decoder_t* dec, carquet_arena_t* arena,
                         thrift_read_list_begin(dec, &et, &cnt);
                         for (int32_t i = 0; i < cnt; i++) {
                             int32_t code = thrift_read_i32(dec);
-                            if (i < CARQUET_GEO_MAX_TYPES) {
+                            /* Bound on the running count, not the list index:
+                             * a repeated field 2 would otherwise append past
+                             * types[] (and over num_types itself). */
+                            if (g->num_types < CARQUET_GEO_MAX_TYPES) {
                                 g->types[g->num_types++] = code;
                             }
                         }

@@ -1,5 +1,69 @@
 # Changelog
 
+## Unreleased
+
+**In short:** a memory-safety pass (14 fixes, 3 high severity: a heap overwrite from a crafted footer, an out-of-bounds write in multi-threaded mmap reads, a double free after a background write error), files from older writers that carquet could not read (parquet-mr without `dictionary_page_offset`, multi-member gzip, raw LZ4 under the Hadoop codec id, mistyped footer fields), a batch-reader hang on fuzzed input, fuzzers that now actually instrument the library, and faster compressed I/O (Apple M3, 1M rows: writes −11 to −19 %, Snappy / LZ4 reads −17 / −23 %; 10M rows: uncompressed writes −14 %, compressed I/O mostly within noise). Output bytes unchanged. PyArrow and DuckDB read every file (`interop/run_interop.py`: 25/25 PyArrow, 23/23 DuckDB write; 26/26 read, 57/75 parquet-testing files verified value for value, 0 failures).
+
+### Security / Bug Fixes
+
+Memory safety (crafted input; every fix below except the hardening items has a test in `tests/test_security_hardening.c` that fails on the previous sources):
+- **High**: a repeated geospatial_types field in a column's metadata wrote past `types[64]` and over `num_types`, letting the file choose the write position (`parquet_types.c`); the bound now uses the running count.
+- **High**: multi-threaded mmap reads summed page `num_values` without a bound, so a split segment could write megabytes past its buffer (`batch_reader.c` `plan_coalesced_column_splits`); splits are rejected unless the page counts sum to the row count, and the chunk range check is overflow-safe.
+- **High**: after a pipelined flush failed, the in-flight row group stayed referenced as current, so close/abort freed it twice and later writes raced with the encode tasks (`file_writer.c` `flush_row_group`); the reference is dropped on failure, the I/O error is sticky, and `carquet_writer_write_batch()` returns it.
+- DELTA_BYTE_ARRAY prefix lengths were not validated (a 24-byte page could request 16 GiB; on 32-bit the size wrapped into a heap overflow); prefixes are checked, sums are checked and the total is capped at `INT32_MAX`. DELTA_LENGTH_BYTE_ARRAY bounds each length incrementally (the 32-bit sum wrapped past the bounds check).
+- Schema validation at open: `num_children` must cover the element list (unreached leaves aliased the root), FLBA needs `type_length > 0`, FLOAT16 must be FLBA(2); the page filter takes the float16 path only for 2-byte FLBA (1-byte over-read).
+- Arrow import rejects leaf types or levels that do not match the writer column (an int32 leaf into an INT64 column over-read the heap), struct child-count mismatches, NULL `children`, non-empty values without a data buffer, lengths above `INT32_MAX` and offset overflow.
+- `ARROW:schema` decoding matches field names in place, caps the field loop and budgets the copied bytes (memory amplification).
+- `carquet stat` read raw statistics as full INT64 / DOUBLE / INT96 / FLBA values without checking their length (unaligned over-read); it prints `(invalid)` for short values.
+- Hardening: OffsetIndex rows are clamped into the row group and a negative `first_row_index` is rejected; 32-bit size wraps fixed in the PLAIN, BYTE_STREAM_SPLIT and dictionary size checks and in `carquet_column_retain_page()`; a failed `pthread_key_create` for the ZSTD context falls back to the context-free API instead of using an invalid key; unaligned `*(const int32_t*)` loads in SSE/AVX2 bit-unpack replaced by `memcpy`; the nested-list allocation cap counts the level arrays; an int32 truncation in a zero-copy check.
+
+Reader (found by the corrected interop check and the fuzzers; tests in `tests/test_fuzz_regressions.c`):
+- The batch reader looped forever on a nested file whose row group declares 0 rows while its columns hold values (`carquet_validate_file()` never returned); each row group is emitted once and empty ones are skipped.
+- A dictionary page with `dictionary_page_offset` missing (old parquet-mr) failed with "Expected data page", and an offset of 0 was mishandled; `page_reader.c` detects the dictionary page itself.
+- GZIP pages made of several concatenated gzip members decoded only the first.
+- Plain LZ4 data under the Hadoop-LZ4 codec id was rejected; it now falls back to raw LZ4.
+- A footer field written with the wrong type (Dremio's field 15) desynchronised the whole footer parse; such fields are skipped.
+- `carquet_validate_file()` accepted files without the leading `PAR1` magic.
+- `carquet_schema_column_name()` returns `""` instead of NULL for an unnamed column.
+
+Writer:
+- `carquet_writer_set_column_bloom_filter()` had no effect on its own: enabling a column with the global option off wrote no filter, disabling one with it on was ignored (test in `test_writer_extensions`).
+
+CLI:
+- `head`, `tail`, `sample` and `cat` used the node's own definition level instead of the column's accumulated maximum (crash in `sample` on nested files); negative row counts, invalid types and failed reads led to bad allocations or writes before the buffer. Same level mistake fixed in the generated reader code (`codegen_read.c`). 4,800+ sanitizer CLI runs over the corpus and fuzz inputs are clean.
+
+### API / Docs
+
+- `carquet_schema_node_max_def_level()` / `carquet_schema_node_max_rep_level()` were documented as the column's maximum level; they return the node's own contribution (0 or 1). The docs now say so and point to `carquet_schema_max_def_level()` / `carquet_schema_max_rep_level()`.
+
+### Performance
+
+All numbers below are from the reference benchmark (`benchmark_carquet`, 3 REQUIRED columns, Release + LTO + `-march=native`) on a quiet Apple M3, as the median of 5 interleaved rounds; "each change alone" compares the full tree with a copy where only that change is reverted. Medium is 1M rows in 10 row groups of 100k, large is 10M rows in 10 row groups of 1M.
+- Snappy compressor: after a short match the next hash lookup reuses words already loaded for the comparison, and literals of up to 60 bytes followed by a copy move in 16-byte chunks; byte-identical output. Alone: Snappy write −7 % large (52.0 → 48.3 ms), −8 % medium (6.86 → 6.29 ms); the end-to-end gain is smaller than the compressor's own because compression overlaps with the rest of the pipeline.
+- Snappy decompressor: the two copy-offset checks merged into one unsigned compare, the output-length check moved off the fast paths (300k-case differential mutation fuzz identical to the previous decoder). Alone: Snappy read −6 % large (12.6 → 11.9 ms), −3 % medium (1.32 → 1.28 ms).
+- Pipelined write: up to 8 row groups in flight instead of 2, while everything in flight fits a 64 MB raw budget (a 20 MB row group allows 3 in flight; row groups above 32 MB keep the one-behind pipeline); finished row groups are completed at the next flush so their I/O starts promptly. Peak memory can grow by up to 64 MB of raw input. Alone: write medium snappy −10 %, zstd −16 %, lz4 −12 %, none ±0; large none −17 % (60.5 → 50.5 ms), compressed large within noise (±3 %).
+- Batch reader: pipeline workers read from the reader's existing file mapping instead of one `mmap` / `munmap` per row group, and the main thread prefaults each row group with `madvise(MADV_WILLNEED)`. Alone: read medium snappy −15 % (1.51 → 1.28 ms), lz4 −20 % (1.11 → 0.89 ms), zstd −2 %; large lz4 −6 %, snappy −3 %, zstd within noise.
+- Whole tree vs v0.7.2, same interleaved runs: medium write snappy −19 % (7.77 → 6.29 ms), zstd −16 % (9.31 → 7.83 ms), lz4 −11 % (7.91 → 7.01 ms), none ±0; medium read snappy −17 % (1.54 → 1.28 ms), lz4 −23 % (1.16 → 0.89 ms), zstd −3 %; large write none −14 % (58.5 → 50.5 ms), compressed large writes and reads within ±5 % except snappy read −6 %. `run_benchmark.py --skip-xlarge` against the v0.7.2 reference JSON (large, W / R ms): none 74.7 / 0.36 → 60.5 / 0.27, snappy 52.7 / 12.4 → 45.4 / 11.5, zstd 60.4 / 19.8 → 59.0 / 19.9, lz4 57.2 / 9.2 → 50.9 / 8.3. Output bytes of every benchmark file are identical to v0.7.2 (`cmp`).
+
+### Fuzzing / Tooling
+
+- **The fuzzers instrumented only their harness, never libcarquet** (`fuzz_reader` plateaued at 70 edges, ~2,400–3,000 now): the library is built with `-fsanitize=fuzzer-no-link` in `fuzz/CMakeLists.txt` and `xmake.lua`. Fuzz results from earlier releases carry little weight.
+- New targets: `fuzz_reader_file` (file path, `validate_file`, `get_file_info`, statistics / predicates, mmap batch reads) and `fuzz_arrow_write` (valid Arrow arrays of every main type incl. list, large list, struct, map, dictionary, validity and slices, random codecs / encodings / page versions / bloom / page index; `write_arrow` → `read_arrow` compared value for value, bloom filters must never miss a written value). `fuzz_compression` covers BROTLI and Hadoop-framed LZ4.
+- `fuzz/run_fuzzer.py` loads the checked-in seeds under `fuzz/corpus/fuzz_<target>/` (wrong directory name before) and uses `fuzz/lsan.supp` for the per-thread ZSTD / zlib contexts that LeakSanitizer flags on macOS.
+- Clean ASan + UBSan runs (5 min each, some 10 min more): reader, reader_file, compression, encodings, thrift, roundtrip, writer, page_filter, append, arrow_schema, arrow_c_data, nested_write, arrow_read, arrow_write.
+- Interop: the read check compared only the first 5 values and counted an empty carquet result as a match (the "59 corpus files" of v0.7.2 were really 52); it now compares every value and the value counts. The writer side checks that the requested codec, encodings, page index and bloom filters are in each file's metadata. New carquet-written files: dictionary on V2 pages, DELTA_LENGTH_BYTE_ARRAY + RLE booleans, BYTE_STREAM_SPLIT on integers, bloom filters (probed through DuckDB), combined variants, `logical2`; basic files have 3 row groups. New PyArrow-written files: DELTA, BYTE_STREAM_SPLIT, V2 pages, page index with checksum, BROTLI, wide types, nested.
+- `examples/compression_codecs.c` covers BROTLI and LZ4_RAW and exits non-zero on failure; `benchmark/run_benchmark.py` takes `--build-dir` and `--no-save`.
+
+### Build / Portability
+
+Checked locally (full suite green on each): AppleClang static and shared, Homebrew clang 22 ASan + UBSan and TSan, GCC 16 (RelWithDebInfo with `-Wshadow -Wvla -Wcast-align -Wstrict-prototypes`, Release LTO), no OpenMP + `CARQUET_ENABLE_BROTLI=OFF`, x86_64 under Rosetta (SSE and AVX2 dispatch, static and shared), MinGW-w64 x86_64 and i686 under Wine, xmake `--dev=y`. Not covered locally: MSVC, AVX-512 execution, big-endian.
+
+### Testing
+
+- New `tests/test_security_hardening.c` (footer geospatial overwrite, mmap split overflow, pipelined write-error double free, DELTA_BYTE_ARRAY / DELTA_LENGTH_BYTE_ARRAY lengths, schema validation, Arrow import validation).
+- New `tests/test_fuzz_regressions.c` (minimised 573-byte zero-row nested file, missing / zero `dictionary_page_offset`, multi-member gzip, raw LZ4 under the Hadoop id, mistyped footer field).
+- `test_parallel_write`: `async_io_identical_snappy_20rg` (20 row groups, more than the 8 pipeline slots, byte-identical with background I/O on and off). `test_cli_format`: `stat_value_width` and the CLI level fixes. `test_writer_extensions`: per-column bloom setter.
+
 ## v0.7.2
 
 **In short:** built-in **BROTLI** codec and an explicit error for encrypted files; 35 bug fixes (writer statistics and page index, batch reader, decoders, Arrow bridge, SIMD, CLI); 8 performance improvements (reference benchmark, 10M rows on Apple M3: compressed reads −10 to −17 %, compressed writes −10 to −15 %; nullable columns read in small batches 270× faster; level / dictionary-index streams −7 % on disk), a broader Arrow C Data import (sliced arrays, DECIMAL, `date64` / second-precision temporals, fixed-size lists), a new regression test file, and an Agent Skill for integrators. Additive API only. Output bytes change where the previous output was wrong or strictly larger: NaN min/max on some SIMD backends and on the dictionary path, RLE bit-packed runs (one header per 63 groups instead of per 8 values), `BYTE_ARRAY` columns written in one call (now split at `page_size`), repeated columns (pages end on record boundaries, OffsetIndex counts rows). PyArrow and DuckDB read every file (`interop/run_interop.py`: 17/17 write, 19/19 read, 59 corpus files).

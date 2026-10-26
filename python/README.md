@@ -30,11 +30,21 @@ print(carquet.__version__, carquet.lib_version())
 
 ## API
 
-### `carquet.read_table(path, *, columns=None, use_mmap=True) -> pyarrow.Table`
+### `read_table`
+
+```python
+carquet.read_table(path, *, columns=None, use_mmap=True) -> pyarrow.Table
+```
 
 Reads every row group with `carquet_reader_read_arrow()`; each row group becomes one chunk of the returned table, nested `struct` / `list` / `map` columns included. `columns` selects (and orders) top-level fields by name after the read. `use_mmap=False` reads through buffered I/O instead of a memory map.
 
-### `carquet.write_table(table, path, *, compression="zstd", compression_level=None, row_group_size=None, write_page_index=False, write_statistics=True, data_page_version=1, store_schema=True, write_crc=True) -> None`
+### `write_table`
+
+```python
+carquet.write_table(table, path, *, compression="zstd", compression_level=None,
+                    row_group_size=None, write_page_index=False, write_statistics=True,
+                    data_page_version=1, store_schema=True, write_crc=True) -> None
+```
 
 Writes a `pyarrow.Table` (or a single `RecordBatch`). The Arrow schema is converted with `carquet_arrow_import_schema()` and every row group is handed over as a struct `ArrowArray` to `carquet_writer_write_arrow()`.
 
@@ -51,19 +61,36 @@ Writes a `pyarrow.Table` (or a single `RecordBatch`). The Arrow schema is conver
 
 Brotli is compiled into the published wheels. A build of the library without it makes `write_table(..., compression="brotli")` raise `CarquetError` with `status == StatusCode.UNSUPPORTED_CODEC`.
 
-### `carquet.schema(path) -> pyarrow.Schema`
+### `schema`
+
+```python
+carquet.schema(path) -> pyarrow.Schema
+```
 
 The file schema via `carquet_arrow_export_schema()`, without reading data.
 
-### `carquet.info(path) -> FileInfo`
+### `info`
+
+```python
+carquet.info(path) -> FileInfo
+```
 
 Dataclass with `path`, `num_rows`, `num_row_groups`, `num_columns` (leaf columns), `file_size`, `version` (Parquet format version in the footer) and `created_by`. Only the footer is read (`carquet_get_file_info`). Works without PyArrow.
 
-### `carquet.validate(path) -> None`
+### `validate`
+
+```python
+carquet.validate(path) -> None
+```
 
 Structural validation (`carquet_validate_file`: magic bytes, footer, metadata). Raises `CarquetError` on failure. Works without PyArrow.
 
-### `carquet.open_reader(path, *, use_mmap=True, verify_checksums=True, num_threads=0) -> Reader`
+### `open_reader`
+
+```python
+carquet.open_reader(path, *, use_mmap=True, verify_checksums=True,
+                    num_threads=0) -> Reader
+```
 
 Keeps the file open for row-group-level access:
 

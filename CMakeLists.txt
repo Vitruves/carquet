@@ -518,6 +518,13 @@ set(CARQUET_UTIL_SOURCES
 
 # x86 SIMD sources — only compile files for enabled instruction sets
 if(CARQUET_ARCH_X86)
+    # avx512_ops.c is x86-64 only (64-bit mask / bit-scan intrinsics); on a
+    # 32-bit target it compiles empty and the dispatch table fails to link.
+    if(CARQUET_ENABLE_AVX512 AND CMAKE_SIZEOF_VOID_P EQUAL 4)
+        message(STATUS "32-bit x86 target — disabling AVX-512")
+        set(CARQUET_ENABLE_AVX512 OFF)
+    endif()
+
     # Auto-detect: disable AVX-512 if compiler lacks _mm512_set_epi8 (GCC < 9)
     if(CARQUET_ENABLE_AVX512 AND CARQUET_COMPILER_GCC_LIKE)
         include(CheckCSourceCompiles)
@@ -842,6 +849,13 @@ if(CARQUET_BUILD_TESTS)
 
     # CLI value/type formatting (DATE, TIME, TIMESTAMP rendering)
     add_carquet_test(test_cli_format "tests/test_cli_format.c;src/cli/commands.c")
+
+    # Memory-safety regressions: crafted footers / pages, pipelined write
+    # error path, Arrow import validation (Oct 2026 security audit)
+    add_carquet_test(test_security_hardening tests/test_security_hardening.c)
+
+    # File-level regressions for minimised fuzzer inputs (fuzz/)
+    add_carquet_test(test_fuzz_regressions tests/test_fuzz_regressions.c)
 
     # Append row groups to an existing file (metadata carryover, bloom/page-index
     # preservation, nullable + multi-column append, structural-mismatch rejection)

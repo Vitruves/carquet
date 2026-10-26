@@ -134,15 +134,6 @@ typedef struct {
     carquet_row_range_list_t ranges;
     bool filter_ranges_valid;
     carquet_offset_index_t** col_offset_indexes;  /* [num_projected], may be NULL entries */
-
-    /* Per-slot independent mmap for this row group's byte range.
-     * Avoids page table lock contention when 12+ threads fault pages
-     * from the same shared mmap simultaneously. */
-#if !defined(_WIN32)
-    uint8_t* slot_mmap;         /* independent mmap for this RG, or NULL */
-    size_t   slot_mmap_size;    /* mmap length */
-    int64_t  slot_mmap_offset;  /* file offset corresponding to slot_mmap[0] */
-#endif
 } rg_slot_t;
 
 /* Forward decl shared with filtered bulk-read task (defined later). */
@@ -453,7 +444,7 @@ static bool column_can_zero_copy_batch(
     }
 
     int32_t page_available = col_reader->page_num_values - col_reader->page_values_read;
-    return page_available > 0 && page_available >= (int32_t)rows_to_read;
+    return page_available > 0 && (int64_t)page_available >= rows_to_read;
 }
 
 static int64_t column_zero_copy_rows_available(
@@ -797,9 +788,11 @@ static void read_nested_list_column(
         return;
     }
 
-    /* Bound allocations. */
+    /* Bound allocations: values plus one def and one rep level per slot
+     * (total_slots comes from the untrusted chunk metadata). */
     if (total_slots > 0 &&
-        value_size > CARQUET_MAX_BATCH_ALLOC / (size_t)total_slots) {
+        value_size + 2 * sizeof(int16_t) >
+            CARQUET_MAX_BATCH_ALLOC / (size_t)total_slots) {
         BR_COLUMN_FAIL(col_reader, read_error, CARQUET_ERROR_OUT_OF_MEMORY,
             "Column %d: %lld leaf slots x %llu bytes exceeds the 1 GiB cap",
             col_i, (long long)total_slots, (unsigned long long)value_size);
@@ -1945,8 +1938,10 @@ static int32_t plan_coalesced_column_splits(
     const carquet_reader_t* fr = cr->file_reader;
     const parquet_column_metadata_t* meta = cr->col_meta;
     int64_t offset = meta->data_page_offset;
+    if (offset < 0 || meta->total_compressed_size < 0 ||
+        offset > (int64_t)fr->file_size ||
+        meta->total_compressed_size > (int64_t)fr->file_size - offset) return 0;
     int64_t chunk_end = offset + meta->total_compressed_size;
-    if (offset < 0 || chunk_end > (int64_t)fr->file_size) return 0;
 
     /* First segment starts at the beginning */
     split_offsets[0] = offset;
@@ -1990,6 +1985,10 @@ static int32_t plan_coalesced_column_splits(
         if (num_values <= 0) return 0;
 
         values_so_far += num_values;
+        /* Page headers are untrusted: each segment's destination is
+         * col_values + split_values[k] * value_size inside a buffer of
+         * max_values values, so the page counts must never exceed it. */
+        if (values_so_far > max_values) return 0;
         offset += (int64_t)hdr_size + (int64_t)hdr.compressed_page_size;
 
         /* Place a split boundary when we've accumulated enough values,
@@ -2002,6 +2001,10 @@ static int32_t plan_coalesced_column_splits(
             next_target = values_so_far + target_per_split;
         }
     }
+
+    /* A chunk whose pages do not add up to exactly max_values is not split
+     * (the unsplit path checks every page against its own bound). */
+    if (values_so_far != max_values) return 0;
 
     /* Close the final segment */
     split_offsets[num_segments] = chunk_end;
@@ -2208,14 +2211,16 @@ static void pipeline_fill(carquet_batch_reader_t* br) {
             slot->col_num_values[i] = 0;
         }
 
-        /* Create an independent mmap for this row group's byte range.
-         * Each slot gets its own virtual mapping, so worker threads fault
-         * pages into independent page tables without contending on the
-         * shared mmap's page table lock.  Falls back to the shared mmap
-         * if the per-slot mmap fails. */
-        const uint8_t* slot_data = br->reader->mmap_data;  /* fallback */
+        /* Tasks read the row group straight from the reader's file mapping.
+         * Pre-fault its byte range from this (otherwise idle) thread: demand
+         * faults taken by eight workers on the same file object serialise in
+         * the kernel and cost ~2 us each, one WILLNEED pass maps the cached
+         * pages at a fraction of that. A hint only: failure is fine. (A
+         * private mmap per row group was measured slower: the extra
+         * mmap/munmap pair per slot costs more than it saves.) */
+        const uint8_t* slot_data = br->reader->mmap_data;
 #if !defined(_WIN32)
-        if (br->reader->mmap_info && br->reader->mmap_info->fd >= 0) {
+        if (slot_data && br->reader->mmap_info && br->reader->mmap_info->fd >= 0) {
             /* Find byte range spanning all projected column chunks */
             int64_t range_lo = INT64_MAX, range_hi = 0;
             for (int32_t i = 0; i < br->num_projected; i++) {
@@ -2227,34 +2232,16 @@ static void pipeline_fill(carquet_batch_reader_t* br) {
                     if (hi > range_hi) range_hi = hi;
                 }
             }
-            if (range_lo < range_hi) {
-                /* Page-align the offset for mmap. mmap requires the offset to be
-                 * a multiple of the system page size, which is 16K on Apple
-                 * Silicon and up to 64K on some Linux arm64/ppc64 configs — a
-                 * hardcoded 4K mask would EINVAL there. Query it at runtime. */
+            if (range_lo < range_hi &&
+                (uint64_t)range_hi <= (uint64_t)br->reader->mmap_info->size) {
+                /* madvise wants a page-aligned start; the page is 16K on
+                 * Apple Silicon and up to 64K on some Linux arm64/ppc64
+                 * configs, so query it at runtime. */
                 long ps = sysconf(_SC_PAGESIZE);
                 int64_t page_mask = (ps > 0) ? (int64_t)ps - 1 : (int64_t)4095;
                 int64_t page_lo = range_lo & ~page_mask;
-                size_t mmap_len = (size_t)(range_hi - page_lo);
-                uint8_t* m = (uint8_t*)mmap(NULL, mmap_len, PROT_READ, MAP_SHARED,
-                                             br->reader->mmap_info->fd, (off_t)page_lo);
-                if (m != MAP_FAILED) {
-                    /* Pre-fault the slot's range from this (otherwise idle)
-                     * thread. Demand faults taken by eight workers on the
-                     * same file object serialise in the kernel and cost
-                     * ~2 us each; one WILLNEED pass maps the cached pages
-                     * at a fraction of that. A hint only: failure is fine. */
-                    (void)madvise(m, mmap_len, MADV_WILLNEED);
-                    /* Unmap previous slot mmap if it exists (reuse across fills) */
-                    if (slot->slot_mmap && slot->slot_mmap_size > 0)
-                        munmap(slot->slot_mmap, slot->slot_mmap_size);
-                    slot->slot_mmap = m;
-                    slot->slot_mmap_size = mmap_len;
-                    slot->slot_mmap_offset = page_lo;
-                    /* data_base[file_offset] = slot_mmap[file_offset - page_lo]
-                     * so data_base = slot_mmap - page_lo */
-                    slot_data = m - page_lo;
-                }
+                (void)madvise((void*)(uintptr_t)(slot_data + page_lo),
+                              (size_t)(range_hi - page_lo), MADV_WILLNEED);
             }
         }
 #endif
@@ -2435,6 +2422,9 @@ static int32_t find_page_for_row(
         } else if (target_row >= end_row) {
             lo = mid + 1;
         } else {
+            /* A negative first_row_index (malformed OffsetIndex) would make
+             * the callers' `target_row - page_first_row` overflow. */
+            if (loc.first_row_index < 0) return -1;
             *page_first_row_out = loc.first_row_index;
             return mid;
         }
@@ -2960,7 +2950,12 @@ static carquet_status_t batch_reader_next_nested(
      * row_group_filter callback is honoured the same way. */
     bool have_page_filter = batch_reader->filter_clauses &&
                             batch_reader->filter_clause_count > 0;
+    /* A row group is emitted as exactly one batch (rows_read_in_group is set
+     * once it has been), so advance after that even if the first column
+     * still reports values: a malformed chunk whose num_values exceeds what
+     * the row group's rows consume would otherwise be re-read forever. */
     if (batch_reader->current_row_group < 0 ||
+        batch_reader->rows_read_in_group > 0 ||
         !carquet_column_has_next(batch_reader->col_readers[0])) {
 
         int32_t num_row_groups = carquet_reader_num_row_groups(batch_reader->reader);
@@ -2969,6 +2964,13 @@ static carquet_status_t batch_reader_next_nested(
             if (batch_reader->current_row_group >= num_row_groups) {
                 *batch = NULL;
                 return CARQUET_ERROR_END_OF_DATA;
+            }
+            /* Empty row groups carry no rows to emit (the flat paths skip
+             * them too). Returning an empty batch here without consuming the
+             * column readers spun forever when the chunk still had values. */
+            if (batch_reader->reader->metadata.row_groups[
+                    batch_reader->current_row_group].num_rows <= 0) {
+                continue;
             }
             if (batch_reader->config.row_group_filter &&
                 !batch_reader->config.row_group_filter(
@@ -3055,6 +3057,7 @@ static carquet_status_t batch_reader_next_nested(
 
     new_batch->num_rows = rg_rows;
     batch_reader->total_rows_read += rg_rows;
+    batch_reader->rows_read_in_group = rg_rows;
     *batch = new_batch;
     return CARQUET_OK;
 }
@@ -3596,10 +3599,6 @@ void carquet_batch_reader_free(carquet_batch_reader_t* batch_reader) {
             carquet_mem_free(slot->col_num_values);
             carquet_mem_free(slot->col_task_first);
             carquet_mem_free(slot->col_task_count);
-#if !defined(_WIN32)
-            if (slot->slot_mmap && slot->slot_mmap_size > 0)
-                munmap(slot->slot_mmap, slot->slot_mmap_size);
-#endif
         }
         carquet_mem_free(batch_reader->pipeline);
     }

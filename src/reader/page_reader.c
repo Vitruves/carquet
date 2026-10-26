@@ -245,11 +245,22 @@ carquet_status_t carquet_decompress_page(
                 compressed, compressed_size,
                 decompressed, decompressed_capacity, decompressed_size);
 
-        case CARQUET_COMPRESSION_LZ4:
-            /* Codec 5 is the deprecated Hadoop-framed LZ4. */
-            return carquet_lz4_hadoop_decompress(
+        case CARQUET_COMPRESSION_LZ4: {
+            /* Codec 5 is the deprecated Hadoop-framed LZ4. Some writers
+             * (older parquet-cpp, parquet-testing's
+             * non_hadoop_lz4_compressed.parquet) put a raw LZ4 block under
+             * the same id; like parquet-cpp, fall back to it when the Hadoop
+             * framing does not parse. */
+            carquet_status_t st = carquet_lz4_hadoop_decompress(
                 compressed, compressed_size,
                 decompressed, decompressed_capacity, decompressed_size);
+            if (st != CARQUET_OK) {
+                st = carquet_lz4_decompress(
+                    compressed, compressed_size,
+                    decompressed, decompressed_capacity, decompressed_size);
+            }
+            return st;
+        }
 
         case CARQUET_COMPRESSION_LZ4_RAW:
             return carquet_lz4_decompress(
@@ -533,6 +544,7 @@ uint8_t* carquet_column_retain_page(
     carquet_column_reader_t* reader,
     const uint8_t* src,
     size_t size) {
+    if (size > SIZE_MAX - sizeof(carquet_retained_page_t)) return NULL;
     carquet_retained_page_t* node =
         (carquet_retained_page_t*)carquet_mem_malloc(sizeof(carquet_retained_page_t) + size);
     if (!node) return NULL;
@@ -1957,8 +1969,9 @@ static carquet_status_t prepare_data_page_payload(
  * ============================================================================
  */
 
-static carquet_status_t load_dictionary_page_mmap(
+static carquet_status_t load_dictionary_page_mmap_at(
     carquet_column_reader_t* reader,
+    int64_t dict_offset,
     carquet_error_t* error) {
 
     carquet_reader_t* file_reader = reader->file_reader;
@@ -1966,7 +1979,6 @@ static carquet_status_t load_dictionary_page_mmap(
     const parquet_column_metadata_t* col_meta = reader->col_meta;
 
     /* Parse page header directly from mmap */
-    int64_t dict_offset = col_meta->dictionary_page_offset;
     if (dict_offset < 0 || (size_t)dict_offset >= file_reader->file_size) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Dictionary page offset out of range");
         return CARQUET_ERROR_INVALID_PAGE;
@@ -2141,13 +2153,13 @@ static carquet_status_t read_and_parse_page_header_fread(
  * ============================================================================
  */
 
-static carquet_status_t load_dictionary_page_fread(
+static carquet_status_t load_dictionary_page_fread_at(
     carquet_column_reader_t* reader,
+    int64_t dict_offset,
     carquet_error_t* error) {
 
     carquet_reader_t* file_reader = reader->file_reader;
     const parquet_column_metadata_t* col_meta = reader->col_meta;
-    int64_t dict_offset = col_meta->dictionary_page_offset;
 
     /* Read page header (from prebuffer cache or file) */
     parquet_page_header_t page_header;
@@ -2234,7 +2246,7 @@ static carquet_status_t load_dictionary_page_fread(
             CARQUET_SET_ERROR(error, status,
                 "Failed to decompress dictionary page at file offset %lld%s%s "
                 "(codec=%d, compressed=%d, uncompressed=%d)",
-                (long long)col_meta->dictionary_page_offset,
+                (long long)dict_offset,
                 diag[0] ? ": " : "", diag,
                 (int)col_meta->codec,
                 page_header.compressed_page_size, page_header.uncompressed_page_size);
@@ -2250,7 +2262,7 @@ static carquet_status_t load_dictionary_page_fread(
 
     if (status == CARQUET_OK) {
         int64_t dict_end;
-        if (!checked_add_i64(col_meta->dictionary_page_offset,
+        if (!checked_add_i64(dict_offset,
                              (int64_t)header_size, &dict_end) ||
             !checked_add_i64(dict_end, (int64_t)page_header.compressed_page_size,
                              &dict_end)) {
@@ -2272,6 +2284,74 @@ static carquet_status_t load_dictionary_page_fread(
     return status;
 }
 
+static carquet_status_t load_dictionary_page_mmap(
+    carquet_column_reader_t* reader,
+    carquet_error_t* error) {
+    return load_dictionary_page_mmap_at(
+        reader, reader->col_meta->dictionary_page_offset, error);
+}
+
+static carquet_status_t load_dictionary_page_fread(
+    carquet_column_reader_t* reader,
+    carquet_error_t* error) {
+    return load_dictionary_page_fread_at(
+        reader, reader->col_meta->dictionary_page_offset, error);
+}
+
+static carquet_status_t parse_header_at_offset(
+    carquet_reader_t* file_reader, int64_t offset,
+    parquet_page_header_t* hdr, size_t* hdr_size,
+    carquet_error_t* error);
+
+/* dictionary_page_offset == 0 cannot be real (offset 0 is the "PAR1" magic);
+ * some writers emit it instead of leaving the field unset
+ * (parquet-testing's dict-page-offset-zero.parquet). Treat it as absent. */
+static inline bool chunk_has_dictionary_offset(const parquet_column_metadata_t* m) {
+    return m->has_dictionary_page_offset && m->dictionary_page_offset > 0;
+}
+
+/* Older parquet-mr (and the files it wrote into apache/parquet-testing, e.g.
+ * alltypes_tiny_pages / hadoop_lz4_compressed) omit dictionary_page_offset:
+ * the dictionary page then leads the data stream at data_page_offset, which
+ * readers must detect by its page type (parquet-cpp does the same). Only
+ * chunks that list a dictionary encoding are probed, so modern files pay
+ * nothing. A chunk whose first page is not a dictionary page is left alone. */
+static carquet_status_t load_inferred_dictionary(
+    carquet_column_reader_t* reader,
+    carquet_error_t* error) {
+
+    const parquet_column_metadata_t* m = reader->col_meta;
+    if (reader->has_dictionary || chunk_has_dictionary_offset(m)) {
+        return CARQUET_OK;
+    }
+    bool lists_dict = false;
+    for (int32_t i = 0; i < m->num_encodings && m->encodings; i++) {
+        if (m->encodings[i] == CARQUET_ENCODING_PLAIN_DICTIONARY ||
+            m->encodings[i] == CARQUET_ENCODING_RLE_DICTIONARY) {
+            lists_dict = true;
+            break;
+        }
+    }
+    if (!lists_dict) return CARQUET_OK;
+
+    parquet_page_header_t hdr;
+    size_t hdr_size;
+    carquet_error_t probe_err = CARQUET_ERROR_INIT;
+    if (parse_header_at_offset(reader->file_reader, m->data_page_offset,
+                               &hdr, &hdr_size, &probe_err) != CARQUET_OK ||
+        hdr.type != CARQUET_PAGE_DICTIONARY) {
+        return CARQUET_OK;  /* the normal page path reports real problems */
+    }
+    if (reader->file_reader->mmap_data != NULL) {
+        return load_dictionary_page_mmap_at(reader, m->data_page_offset, error);
+    }
+    if (reader->file_reader->file == NULL) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_STATE, "No data source");
+        return CARQUET_ERROR_INVALID_STATE;
+    }
+    return load_dictionary_page_fread_at(reader, m->data_page_offset, error);
+}
+
 /* ============================================================================
  * Helper: Load and decode a new page (mmap path with zero-copy support)
  * ============================================================================
@@ -2286,8 +2366,13 @@ static carquet_status_t load_next_page_mmap(
     const parquet_column_metadata_t* col_meta = reader->col_meta;
 
     /* Load dictionary if needed (may update data_start_offset) */
-    if (col_meta->has_dictionary_page_offset && !reader->has_dictionary) {
+    if (chunk_has_dictionary_offset(col_meta) && !reader->has_dictionary) {
         carquet_status_t status = load_dictionary_page_mmap(reader, error);
+        if (status != CARQUET_OK) {
+            return status;
+        }
+    } else if (!reader->has_dictionary && reader->current_page == 0) {
+        carquet_status_t status = load_inferred_dictionary(reader, error);
         if (status != CARQUET_OK) {
             return status;
         }
@@ -2534,8 +2619,13 @@ static carquet_status_t load_next_page_fread(
     const parquet_column_metadata_t* col_meta = reader->col_meta;
 
     /* Load dictionary if needed (may update data_start_offset) */
-    if (col_meta->has_dictionary_page_offset && !reader->has_dictionary) {
+    if (chunk_has_dictionary_offset(col_meta) && !reader->has_dictionary) {
         carquet_status_t status = load_dictionary_page_fread(reader, error);
+        if (status != CARQUET_OK) {
+            return status;
+        }
+    } else if (!reader->has_dictionary && reader->current_page == 0) {
+        carquet_status_t status = load_inferred_dictionary(reader, error);
         if (status != CARQUET_OK) {
             return status;
         }
@@ -2784,8 +2874,11 @@ carquet_status_t carquet_column_ensure_dictionary_loaded(
         return CARQUET_ERROR_INVALID_ARGUMENT;
     }
 
-    if (!reader->col_meta->has_dictionary_page_offset || reader->has_dictionary) {
+    if (reader->has_dictionary) {
         return CARQUET_OK;
+    }
+    if (!chunk_has_dictionary_offset(reader->col_meta)) {
+        return load_inferred_dictionary(reader, error);
     }
 
     if (reader->file_reader->mmap_data != NULL) {

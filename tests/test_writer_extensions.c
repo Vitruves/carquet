@@ -780,6 +780,64 @@ static int test_bloom_api_mix(void) {
     return 0;
 }
 
+/* ---- Legacy per-column bloom setter on its own ----
+ * Regression (found by interop/run_interop.py's bloom probe): without the
+ * ndv/fpp options API, carquet_writer_set_column_bloom_filter() was a no-op —
+ * enabling a column with the global flag off wrote no filter at all, and
+ * disabling one with the global flag on was ignored. */
+static int bloom_flags_for(bool global, int32_t col, bool enable, bool out[2]) {
+    char path[512]; carquet_test_temp_path(path, sizeof(path), "ext_bloom_legacy");
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    enum { M = 300 };
+    static int64_t a[M], b[M];
+    for (int i = 0; i < M; i++) { a[i] = i; b[i] = 7 * i; }
+    carquet_schema_t* s = carquet_schema_create(&err);
+    carquet_schema_add_column(s, "a", CARQUET_PHYSICAL_INT64, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
+    carquet_schema_add_column(s, "b", CARQUET_PHYSICAL_INT64, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
+    carquet_writer_options_t wo; carquet_writer_options_init(&wo);
+    wo.write_bloom_filters = global;
+    carquet_writer_t* w = carquet_writer_create(path, s, &wo, &err);
+    int rc = 1;
+    if (w && carquet_writer_set_column_bloom_filter(w, col, enable) == CARQUET_OK &&
+        carquet_writer_write_batch(w, 0, a, M, NULL, NULL) == CARQUET_OK &&
+        carquet_writer_write_batch(w, 1, b, M, NULL, NULL) == CARQUET_OK &&
+        carquet_writer_close(w) == CARQUET_OK) {
+        w = NULL;
+        carquet_reader_t* r = carquet_reader_open(path, NULL, &err);
+        if (r) {
+            carquet_column_chunk_metadata_t m0, m1;
+            if (carquet_reader_column_chunk_metadata(r, 0, 0, &m0) == CARQUET_OK &&
+                carquet_reader_column_chunk_metadata(r, 0, 1, &m1) == CARQUET_OK) {
+                out[0] = m0.has_bloom_filter;
+                out[1] = m1.has_bloom_filter;
+                /* An emitted filter must also contain the written values. */
+                carquet_bloom_filter_t* bf = carquet_reader_get_bloom_filter(r, 0, col, NULL);
+                rc = (enable && (!bf || !carquet_bloom_filter_check_i64(bf, col ? 7 * 123 : 123)))
+                     ? 1 : 0;
+                if (bf) carquet_bloom_filter_destroy(bf);
+            }
+            carquet_reader_close(r);
+        }
+    }
+    if (w) (void)carquet_writer_close(w);
+    carquet_schema_free(s);
+    carquet_test_cleanup(path);
+    return rc;
+}
+
+static int test_bloom_legacy_setter_alone(void) {
+    bool f[2] = {false, false};
+    /* Global off, enable column 0 only. */
+    if (bloom_flags_for(false, 0, true, f) != 0 || !f[0] || f[1])
+        TEST_FAIL("bloom_legacy_setter_alone", "enable with global off wrote no filter (or leaked one)");
+    /* Global on, disable column 1 only. */
+    f[0] = f[1] = false;
+    if (bloom_flags_for(true, 1, false, f) != 0 || !f[0] || f[1])
+        TEST_FAIL("bloom_legacy_setter_alone", "disable with global on was ignored");
+    TEST_PASS("bloom_legacy_setter_alone");
+    return 0;
+}
+
 /* ---- Append row groups to existing file ---- */
 static int test_append_row_groups(void) {
     char path[512]; carquet_test_temp_path(path, sizeof(path), "ext_append");
@@ -1706,6 +1764,7 @@ int main(void) {
     failures += test_column_page_size_override();
     failures += test_max_statistics_size();
     failures += test_bloom_api_mix();
+    failures += test_bloom_legacy_setter_alone();
     failures += test_append_row_groups();
     if (failures) { printf("\n%d test(s) FAILED\n", failures); return 1; }
     printf("\nAll writer-extension tests passed\n");

@@ -632,7 +632,7 @@ carquet_status_t carquet_dictionary_decode_int32(
         return CARQUET_ERROR_DECODE;
     }
 
-    if (dict_size < (size_t)dict_count * sizeof(int32_t)) {
+    if (dict_size / sizeof(int32_t) < (size_t)dict_count) {  /* no 32-bit wrap */
         return CARQUET_ERROR_DECODE;
     }
 
@@ -708,7 +708,7 @@ carquet_status_t carquet_dictionary_decode_int64(
         return CARQUET_ERROR_DECODE;
     }
 
-    if (dict_size < (size_t)dict_count * sizeof(int64_t)) {
+    if (dict_size / sizeof(int64_t) < (size_t)dict_count) {  /* no 32-bit wrap */
         return CARQUET_ERROR_DECODE;
     }
 
@@ -781,7 +781,7 @@ carquet_status_t carquet_dictionary_decode_float(
         return CARQUET_ERROR_DECODE;
     }
 
-    if (dict_size < (size_t)dict_count * sizeof(float)) {
+    if (dict_size / sizeof(float) < (size_t)dict_count) {  /* no 32-bit wrap */
         return CARQUET_ERROR_DECODE;
     }
 
@@ -854,7 +854,7 @@ carquet_status_t carquet_dictionary_decode_double(
         return CARQUET_ERROR_DECODE;
     }
 
-    if (dict_size < (size_t)dict_count * sizeof(double)) {
+    if (dict_size / sizeof(double) < (size_t)dict_count) {  /* no 32-bit wrap */
         return CARQUET_ERROR_DECODE;
     }
 

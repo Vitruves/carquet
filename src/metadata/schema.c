@@ -612,7 +612,10 @@ const char* carquet_schema_column_name(
         return NULL;
     }
     int32_t elem_idx = schema->leaf_indices[leaf_index];
-    return schema->elements[elem_idx].name;
+    /* A malformed footer can omit the (required) name; callers strlen() the
+     * result, so match carquet_schema_node_name() and return "". */
+    const char* name = schema->elements[elem_idx].name;
+    return name ? name : "";
 }
 
 carquet_physical_type_t carquet_schema_column_type(

@@ -1183,13 +1183,16 @@ carquet_field_repetition_t carquet_schema_node_repetition(
     const carquet_schema_node_t* node);
 
 /**
- * @brief Get the maximum definition level for a column.
+ * @brief Get this node's own contribution to the definition level.
  *
- * The definition level indicates how many optional/repeated ancestors
- * are defined for a value. Used for reconstructing nested structures.
+ * Returns 1 for an OPTIONAL or REPEATED node and 0 for a REQUIRED one: the
+ * node's own share only, NOT the column's accumulated maximum. A REQUIRED leaf
+ * under an optional or repeated parent returns 0 here yet still has null
+ * slots; size definition-level buffers and test for nulls with
+ * carquet_schema_max_def_level(schema, leaf_index) instead.
  *
- * @param[in] node Schema node (must be a leaf)
- * @return Maximum definition level
+ * @param[in] node Schema node
+ * @return 0 or 1
  *
  * @note Thread-safe: Yes (read-only)
  */
@@ -1197,13 +1200,13 @@ CARQUET_API CARQUET_PURE CARQUET_NONNULL(1)
 int16_t carquet_schema_node_max_def_level(const carquet_schema_node_t* node);
 
 /**
- * @brief Get the maximum repetition level for a column.
+ * @brief Get this node's own contribution to the repetition level.
  *
- * The repetition level indicates which repeated ancestor started a new
- * list element. Used for reconstructing nested repeated structures.
+ * Returns 1 for a REPEATED node and 0 otherwise — the node's own share, not
+ * the column's accumulated maximum (use carquet_schema_max_rep_level()).
  *
- * @param[in] node Schema node (must be a leaf)
- * @return Maximum repetition level
+ * @param[in] node Schema node
+ * @return 0 or 1
  *
  * @note Thread-safe: Yes (read-only)
  */

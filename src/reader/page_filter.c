@@ -127,7 +127,12 @@ static carquet_status_t lookup_column_type(
             !elem->logical_type.params.integer.is_signed) {
             out->is_unsigned = true;
         } else if (elem->logical_type.id == CARQUET_LOGICAL_FLOAT16) {
-            out->is_float16 = true;
+            /* Only a 2-byte FLBA is a valid FLOAT16; any other width from a
+             * malformed schema would make decode_float16() over-read the
+             * type_length-sized stat buffers. */
+            out->is_float16 =
+                out->physical_type == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY &&
+                out->type_length == 2;
         } else if (elem->logical_type.id == CARQUET_LOGICAL_DECIMAL &&
                    (out->physical_type == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY ||
                     out->physical_type == CARQUET_PHYSICAL_BYTE_ARRAY)) {
@@ -816,6 +821,13 @@ static carquet_status_t eval_clause_to_ranges(
 
     carquet_row_range_list_clear(out);
 
+    /* first_row_index values come straight from the file. Clamp them into
+     * [0, num_rows] and keep the derived ranges sorted and disjoint, so the
+     * int64 range arithmetic here, in carquet_row_range_list_append() and in
+     * intersect_lists() cannot overflow and its ordering assumption holds. */
+    int64_t rg_rows = row_group_num_rows > 0 ? row_group_num_rows : 0;
+    int64_t prev_end = 0;
+
     for (int32_t i = 0; i < n_pages; i++) {
         carquet_page_stats_t stats;
         if (carquet_column_index_get_page_stats(ci, i, &stats) != CARQUET_OK) {
@@ -833,10 +845,14 @@ static carquet_status_t eval_clause_to_ranges(
             (void)carquet_offset_index_get_page_location(oi, i + 1, &next);
             end_row = next.first_row_index;
         } else {
-            end_row = row_group_num_rows;
+            end_row = rg_rows;
         }
+        if (first_row < prev_end) first_row = prev_end;
+        if (first_row > rg_rows) first_row = rg_rows;
+        if (end_row > rg_rows) end_row = rg_rows;
+        if (end_row <= first_row) continue;
+        prev_end = end_row;
         int64_t page_rows = end_row - first_row;
-        if (page_rows <= 0) continue;
 
         if (page_matches_clause(&ti, &stats, clause, first_row, page_rows)) {
             st = carquet_row_range_list_append(out, first_row, page_rows);

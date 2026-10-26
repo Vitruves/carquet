@@ -169,12 +169,107 @@ static int test_type_names(void) {
     return 0;
 }
 
+/* `carquet stat` renders raw footer statistics: a malformed file can give an
+ * INT64 / DOUBLE / INT96 / FLBA column a stat shorter than the type, which
+ * used to be dereferenced as a full value (heap over-read). Exact-size heap
+ * buffers make the old over-read visible under ASan. */
+static int test_stat_value_width(void) {
+    int before = failures;
+    char buf[64];
+    uint8_t* one = (uint8_t*)malloc(1);
+    one[0] = 7;
+    check("stat int64 1 byte",
+          cli_format_stat_value(CARQUET_PHYSICAL_INT64, one, 1, 0, NULL, buf, sizeof(buf)),
+          "(invalid)");
+    check("stat double 1 byte",
+          cli_format_stat_value(CARQUET_PHYSICAL_DOUBLE, one, 1, 0, NULL, buf, sizeof(buf)),
+          "(invalid)");
+    check("stat int96 1 byte",
+          cli_format_stat_value(CARQUET_PHYSICAL_INT96, one, 1, 0, NULL, buf, sizeof(buf)),
+          "(invalid)");
+    check("stat flba(16) 1 byte",
+          cli_format_stat_value(CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY, one, 1, 16, NULL,
+                                buf, sizeof(buf)),
+          "(invalid)");
+    check("stat negative size",
+          cli_format_stat_value(CARQUET_PHYSICAL_INT32, one, -1, 0, NULL, buf, sizeof(buf)),
+          "(invalid)");
+    free(one);
+
+    /* Correct widths still render, from deliberately misaligned storage. */
+    uint8_t* raw = (uint8_t*)malloc(9);
+    int64_t v = -42;
+    memcpy(raw + 1, &v, 8);
+    check("stat int64 misaligned",
+          cli_format_stat_value(CARQUET_PHYSICAL_INT64, raw + 1, 8, 0, NULL, buf, sizeof(buf)),
+          "-42");
+    int32_t v32 = 123;
+    memcpy(raw + 1, &v32, 4);
+    check("stat int32",
+          cli_format_stat_value(CARQUET_PHYSICAL_INT32, raw + 1, 4, 0, NULL, buf, sizeof(buf)),
+          "123");
+    raw[1] = 0xAB; raw[2] = 0xCD;
+    check("stat flba(2)",
+          cli_format_stat_value(CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY, raw + 1, 2, 2, NULL,
+                                buf, sizeof(buf)),
+          "abcd");
+    free(raw);
+
+    if (failures == before) TEST_PASS("stat_value_width");
+    return failures != before;
+}
+
+/* Regression (CLI sweep over parquet-testing, nonnullable.impala.parquet):
+ * the row printers took "nullable" from the leaf's own repetition and the
+ * null threshold from carquet_schema_node_max_def_level() (the node's 0/1
+ * share), so a REQUIRED leaf under an OPTIONAL group read no def levels, the
+ * dense value index ran past the decoded values and `sample` formatted a stale
+ * BYTE_ARRAY pointer (bus error). Every printer must handle such a column. */
+static int test_required_leaf_under_optional_group(void) {
+    char path[512];
+    carquet_test_temp_path(path, sizeof(path), "cli_req_under_opt");
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t* s = carquet_schema_create(&err);
+    int32_t g = carquet_schema_add_group(s, "g", CARQUET_REPETITION_OPTIONAL, 0);
+    carquet_schema_add_column(s, "name", CARQUET_PHYSICAL_BYTE_ARRAY, NULL,
+                              CARQUET_REPETITION_REQUIRED, 0, g);
+    carquet_writer_t* w = carquet_writer_create(path, s, NULL, &err);
+    enum { N = 64 };
+    carquet_byte_array_t vals[N];
+    int16_t def[N];
+    int nv = 0;
+    for (int i = 0; i < N; i++) {
+        def[i] = (i % 2) ? 1 : 0;              /* every other group is null */
+        if (def[i]) { vals[nv].data = (uint8_t*)"abc"; vals[nv].length = 3; nv++; }
+    }
+    int ok = w && carquet_writer_write_batch(w, 0, vals, N, def, NULL) == CARQUET_OK &&
+             carquet_writer_close(w) == CARQUET_OK;
+    carquet_schema_free(s);
+    if (!ok) { printf("[FAIL] required_leaf_under_optional_group: write\n"); failures++; return 1; }
+
+    /* Output goes to stdout; only the return codes / absence of a crash or
+     * sanitizer report are checked. */
+    fflush(stdout);
+    int rc = cmd_head(path, 10, NULL) | cmd_tail(path, 10, NULL) |
+             cmd_sample(path, N, NULL);
+    carquet_test_cleanup(path);
+    if (rc != 0) {
+        printf("[FAIL] required_leaf_under_optional_group: printer returned %d\n", rc);
+        failures++;
+        return 1;
+    }
+    printf("[PASS] required_leaf_under_optional_group\n");
+    return 0;
+}
+
 int main(void) {
     printf("=== CLI formatting tests ===\n");
     int rc = 0;
     rc |= test_time_values();
     rc |= test_timestamp_and_date_values();
     rc |= test_type_names();
+    rc |= test_stat_value_width();
+    rc |= test_required_leaf_under_optional_group();
     if (rc) {
         printf("=== %d failure(s) ===\n", failures);
         return 1;

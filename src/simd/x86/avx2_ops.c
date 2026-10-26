@@ -104,7 +104,9 @@ void carquet_avx2_bitunpack8_3bit(const uint8_t* input, uint32_t* values) {
  * Unpack 8 4-bit values using AVX2.
  */
 void carquet_avx2_bitunpack8_4bit(const uint8_t* input, uint32_t* values) {
-    __m128i bytes = _mm_cvtsi32_si128(*(const int32_t*)input);
+    int32_t in32;
+    memcpy(&in32, input, sizeof(in32));  /* input is byte-aligned */
+    __m128i bytes = _mm_cvtsi32_si128(in32);
     __m128i lo_nibbles = _mm_and_si128(bytes, _mm_set1_epi8(0x0F));
     __m128i hi_nibbles = _mm_and_si128(_mm_srli_epi16(bytes, 4), _mm_set1_epi8(0x0F));
     __m128i interleaved = _mm_unpacklo_epi8(lo_nibbles, hi_nibbles);
@@ -316,15 +318,11 @@ void carquet_avx2_byte_stream_split_decode_float(
 
     /* 8-float fallback using 128-bit ops */
     for (; i + 8 <= count; i += 8) {
-        uint64_t t0, t1, t2, t3;
-        memcpy(&t0, data + 0 * count + i, sizeof(uint64_t));
-        memcpy(&t1, data + 1 * count + i, sizeof(uint64_t));
-        memcpy(&t2, data + 2 * count + i, sizeof(uint64_t));
-        memcpy(&t3, data + 3 * count + i, sizeof(uint64_t));
-        __m128i b0 = _mm_cvtsi64_si128((long long)t0);
-        __m128i b1 = _mm_cvtsi64_si128((long long)t1);
-        __m128i b2 = _mm_cvtsi64_si128((long long)t2);
-        __m128i b3 = _mm_cvtsi64_si128((long long)t3);
+        /* movq loads (unaligned-safe, also available on 32-bit x86) */
+        __m128i b0 = _mm_loadl_epi64((const __m128i*)(data + 0 * count + i));
+        __m128i b1 = _mm_loadl_epi64((const __m128i*)(data + 1 * count + i));
+        __m128i b2 = _mm_loadl_epi64((const __m128i*)(data + 2 * count + i));
+        __m128i b3 = _mm_loadl_epi64((const __m128i*)(data + 3 * count + i));
 
         __m128i lo01 = _mm_unpacklo_epi8(b0, b1);
         __m128i lo23 = _mm_unpacklo_epi8(b2, b3);
@@ -638,8 +636,13 @@ void carquet_avx2_prefix_sum_i64(int64_t* values, int64_t count, int64_t initial
         v = _mm256_add_epi64(v, sums);
         _mm256_storeu_si256((__m256i*)(values + i), v);
 
-        /* Update running sum */
+        /* Update running sum (_mm256_extract_epi64 is x86-64 only) */
+#if defined(__x86_64__) || defined(_M_X64)
         sum = (uint64_t)_mm256_extract_epi64(v, 3);
+#else
+        _mm_storel_epi64((__m128i*)&sum,
+                         _mm_srli_si128(_mm256_extracti128_si256(v, 1), 8));
+#endif
     }
 
     /* Handle remaining values */
