@@ -11,7 +11,7 @@
 -- Enable optional pieces individually, e.g. `xmake f --tests=y --fuzz=y`.
 
 set_project("carquet")
-set_version("0.7.2")
+set_version("0.7.3")
 -- gnu11, not strict c11: matches CMake's `set(CMAKE_C_STANDARD 11)` (GNU
 -- extensions stay on by default). Under strict -std=c11 the POSIX feature-test
 -- macros are off, so functions like strdup/posix_memalign aren't declared and

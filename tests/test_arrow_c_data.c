@@ -1046,6 +1046,118 @@ static int test_narrow_ints(void) {
     return 0;
 }
 
+
+/* ------------------------------------------------------------------ */
+/* Projected / reordered batches: the exporter maps batch columns back
+ * onto the file schema through the batch reader's projection.          */
+static int read_projected(void* buf, size_t sz, const int32_t* cols, int32_t ncols,
+                          carquet_reader_t** r, carquet_batch_reader_t** br,
+                          carquet_row_batch_t** batch) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    *r = carquet_reader_open_buffer(buf, sz, NULL, &err);
+    if (!*r) return -1;
+    carquet_batch_reader_config_t cfg;
+    carquet_batch_reader_config_init(&cfg);
+    cfg.column_indices = cols;
+    cfg.num_columns = ncols;
+    *br = carquet_batch_reader_create(*r, &cfg, &err);
+    if (!*br) { carquet_reader_close(*r); return -1; }
+    *batch = NULL;
+    if (carquet_batch_reader_next(*br, batch) != CARQUET_OK || !*batch) {
+        carquet_batch_reader_free(*br); carquet_reader_close(*r); return -1;
+    }
+    return 0;
+}
+
+static int test_export_projected(void) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    void* buf = NULL; size_t sz = 0;
+    if (write_dataset(&buf, &sz) != 0) TEST_FAIL("export_projected", "write");
+
+    /* name, id: a subset, in a different order than the file. */
+    int32_t cols[2] = {2, 0};
+    carquet_reader_t* r; carquet_batch_reader_t* br; carquet_row_batch_t* batch;
+    if (read_projected(buf, sz, cols, 2, &r, &br, &batch) != 0) { free(buf); TEST_FAIL("export_projected", "read"); }
+    struct ArrowSchema as; struct ArrowArray aa;
+    if (carquet_arrow_export_batch(batch, carquet_reader_schema(r), &as, &aa, &err) != CARQUET_OK)
+        { free_one_batch(r, br); free(buf); TEST_FAIL("export_projected", err.message); }
+    assert(as.n_children == 2 && aa.n_children == 2 && aa.length == 5);
+    assert(strcmp(as.children[0]->name, "name") == 0 && strcmp(as.children[0]->format, "u") == 0);
+    assert(strcmp(as.children[1]->name, "id") == 0 && strcmp(as.children[1]->format, "l") == 0);
+    const int32_t* off = (const int32_t*)aa.children[0]->buffers[1];
+    const char* chars = (const char*)aa.children[0]->buffers[2];
+    assert(off[1] - off[0] == 2 && memcmp(chars + off[0], "aa", 2) == 0);
+    assert(aa.children[0]->null_count == 1);
+    const int64_t* ids = (const int64_t*)aa.children[1]->buffers[1];
+    assert(ids[0] == 10 && ids[4] == 50);
+    aa.release(&aa); as.release(&as);
+    free_one_batch(r, br);
+
+    /* every column, reversed: same values, reversed field order (no schema). */
+    int32_t rev[4] = {3, 2, 1, 0};
+    if (read_projected(buf, sz, rev, 4, &r, &br, &batch) != 0) { free(buf); TEST_FAIL("export_projected", "read rev"); }
+    if (carquet_arrow_export_batch(batch, carquet_reader_schema(r), NULL, &aa, &err) != CARQUET_OK)
+        { free_one_batch(r, br); free(buf); TEST_FAIL("export_projected", err.message); }
+    assert(aa.n_children == 4);
+    const uint8_t* flags = (const uint8_t*)aa.children[0]->buffers[1];
+    assert((flags[0] & 1) == 1 && (flags[0] & 2) == 0);         /* flag: true, false */
+    const int64_t* ids2 = (const int64_t*)aa.children[3]->buffers[1];
+    assert(ids2[1] == 20);
+    aa.release(&aa);
+    free_one_batch(r, br);
+    free(buf);
+    TEST_PASS("export_projected");
+    return 0;
+}
+
+/* A MAP projected without its value leaf cannot be exported. */
+static int test_export_partial_field_rejected(void) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t* s = carquet_schema_create(NULL);
+    carquet_schema_add_column(s, "id", CARQUET_PHYSICAL_INT32, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
+    carquet_schema_add_map(s, "m", CARQUET_PHYSICAL_INT32, NULL, 0,
+                           CARQUET_PHYSICAL_INT64, NULL, 0, CARQUET_REPETITION_OPTIONAL, 0);
+    carquet_writer_t* w = carquet_writer_create_buffer(s, NULL, &err);
+    if (!w) { carquet_schema_free(s); TEST_FAIL("export_partial_field", "writer"); }
+    int32_t ids[2] = {1, 2};
+    int32_t offsets[3] = {0, 1, 2};
+    int32_t keys[2] = {7, 8};
+    int64_t vals[2] = {70, 80};
+    if (carquet_writer_write_batch(w, 0, ids, 2, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_write_list_column(w, 1, 2, offsets, NULL, keys, NULL, &err) != CARQUET_OK ||
+        carquet_writer_write_list_column(w, 2, 2, offsets, NULL, vals, NULL, &err) != CARQUET_OK ||
+        carquet_writer_close(w) != CARQUET_OK)
+        { carquet_schema_free(s); TEST_FAIL("export_partial_field", "write"); }
+    void* buf = NULL; size_t sz = 0;
+    carquet_writer_get_buffer(w, &buf, &sz);
+    carquet_schema_free(s);
+
+    int32_t key_only[2] = {1, 0};
+    carquet_reader_t* r; carquet_batch_reader_t* br; carquet_row_batch_t* batch;
+    if (read_projected(buf, sz, key_only, 2, &r, &br, &batch) != 0) { free(buf); TEST_FAIL("export_partial_field", "read"); }
+    struct ArrowSchema as; struct ArrowArray aa;
+    as.release = NULL; aa.release = NULL;
+    assert(carquet_arrow_export_batch(batch, carquet_reader_schema(r), &as, &aa, &err) == CARQUET_ERROR_INVALID_ARGUMENT);
+    assert(aa.release == NULL && as.release == NULL);
+    free_one_batch(r, br);
+
+    /* key + value + id: the whole map, ordered after id as projected. */
+    int32_t all[3] = {0, 2, 1};
+    if (read_projected(buf, sz, all, 3, &r, &br, &batch) != 0) { free(buf); TEST_FAIL("export_partial_field", "read2"); }
+    if (carquet_arrow_export_batch(batch, carquet_reader_schema(r), &as, &aa, &err) != CARQUET_OK)
+        { free_one_batch(r, br); free(buf); TEST_FAIL("export_partial_field", err.message); }
+    assert(as.n_children == 2);
+    assert(strcmp(as.children[0]->name, "id") == 0 && strcmp(as.children[1]->format, "+m") == 0);
+    const struct ArrowArray* ent = aa.children[1]->children[0];
+    assert(((const int32_t*)ent->children[0]->buffers[1])[1] == 8);
+    assert(((const int64_t*)ent->children[1]->buffers[1])[0] == 70);
+    aa.release(&aa); as.release(&as);
+    free_one_batch(r, br);
+    free(buf);
+    TEST_PASS("export_partial_field");
+    return 0;
+}
+
 int main(void) {
     int rc = 0;
     rc |= test_export_bytes();
@@ -1064,6 +1176,8 @@ int main(void) {
     rc |= test_export_list();
     rc |= test_export_map();
     rc |= test_export_struct_rejected();
+    rc |= test_export_projected();
+    rc |= test_export_partial_field_rejected();
     if (rc == 0) printf("\nAll Arrow C Data Interface tests passed.\n");
     return rc;
 }

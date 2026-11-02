@@ -5,7 +5,7 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "carquet"
 dynamic = ["version"]
-description = "Fast Apache Parquet reader/writer in pure C, exposed to Python through the Arrow C Data Interface"
+description = "Fast Apache Parquet reader/writer in pure C for Python: Arrow tables, pandas, filters with pushdown, metadata and statistics"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
@@ -32,13 +32,14 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
     "Typing :: Typed",
 ]
-# pyarrow is only needed by read_table / write_table / schema / open_reader;
-# info(), validate() and the version helpers work without it.
+# pyarrow is only needed for Arrow data (read_table / write_table / ParquetFile.read...);
+# metadata, schema, statistics, info(), validate() and cpu_info() work without it.
+# numpy converts DECIMAL / INT96 storage to decimal128 / timestamp on read.
 dependencies = []
 
 [project.optional-dependencies]
-arrow = ["pyarrow>=14"]
-test = ["pytest", "pyarrow>=14"]
+arrow = ["pyarrow>=14", "numpy"]
+test = ["pytest", "pyarrow>=14", "numpy"]
 
 [project.urls]
 Homepage = "https://github.com/Vitruves/carquet"
@@ -123,7 +124,7 @@ build = ["cp39-*", "cp310-*", "cp311-*", "cp312-*", "cp313-*"]
 # not run there; PyPy is untested.
 skip = ["*-musllinux_*", "*_i686", "*-win32", "pp*"]
 build-verbosity = 1
-test-requires = ["pytest", "pyarrow"]
+test-requires = ["pytest", "pyarrow", "numpy"]
 test-command = "pytest {project}/python/tests"
 
 [tool.pytest.ini_options]

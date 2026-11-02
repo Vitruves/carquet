@@ -286,6 +286,35 @@ carquet_status_t carquet_arrow_build_schema_tree(
     return CARQUET_OK;
 }
 
+carquet_status_t carquet_arrow_schema_select_children(
+    struct ArrowSchema* schema, const int32_t* keep, int32_t n) {
+    if (!schema || !schema->release || n < 0 || n > schema->n_children || (n && !keep))
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    int64_t old_n = schema->n_children;
+    struct ArrowSchema** old = schema->children;
+    struct ArrowSchema** kept = n ? (struct ArrowSchema**)calloc((size_t)n, sizeof(void*)) : NULL;
+    if (n && !kept) return CARQUET_ERROR_OUT_OF_MEMORY;
+    for (int32_t i = 0; i < n; i++) {
+        if (keep[i] < 0 || keep[i] >= old_n || !old[keep[i]]) { free(kept); return CARQUET_ERROR_INVALID_ARGUMENT; }
+        for (int32_t j = 0; j < i; j++) {
+            if (keep[j] == keep[i]) { free(kept); return CARQUET_ERROR_INVALID_ARGUMENT; }
+        }
+        kept[i] = old[keep[i]];
+    }
+    for (int64_t i = 0; i < old_n; i++) {
+        bool used = false;
+        for (int32_t j = 0; j < n && !used; j++) used = (keep[j] == i);
+        if (!used && old[i]) {
+            if (old[i]->release) old[i]->release(old[i]);
+            free(old[i]);
+        }
+    }
+    free(old);
+    schema->children = kept;
+    schema->n_children = n;
+    return CARQUET_OK;
+}
+
 /* ============================================================================
  * Leaf reading
  * ============================================================================
@@ -627,6 +656,18 @@ carquet_status_t carquet_reader_read_arrow(
     struct ArrowSchema* out_schema,
     struct ArrowArray* out_array,
     carquet_error_t* error) {
+    return carquet_reader_read_arrow_fields(reader, row_group_index, NULL, 0,
+                                            out_schema, out_array, error);
+}
+
+carquet_status_t carquet_reader_read_arrow_fields(
+    carquet_reader_t* reader,
+    int32_t row_group_index,
+    const int32_t* field_indices,
+    int32_t num_fields,
+    struct ArrowSchema* out_schema,
+    struct ArrowArray* out_array,
+    carquet_error_t* error) {
 
     if (!reader || !out_array) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT, "NULL reader or out_array");
@@ -640,14 +681,55 @@ carquet_status_t carquet_reader_read_arrow(
     const carquet_schema_t* cs = reader->schema;
     int32_t num_leaves = cs->num_leaves;
 
+    int32_t top[1024]; int32_t nt = elem_children(cs, 0, top, 1024);
+    if (nt > 1024) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT, "too many top-level fields");
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+    /* Field projection: `fields` lists the top-level field ordinals to emit, in
+     * output order (all of them when the caller passes none). */
+    int32_t all_fields[1024];
+    const int32_t* fields = field_indices;
+    int32_t nf = num_fields;
+    if (!field_indices || num_fields <= 0) {
+        for (int32_t i = 0; i < nt; i++) all_fields[i] = i;
+        fields = all_fields; nf = nt;
+    } else {
+        if (num_fields > nt) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT,
+                "%d fields requested but the schema has %d", num_fields, nt);
+            return CARQUET_ERROR_INVALID_ARGUMENT;
+        }
+        for (int32_t i = 0; i < num_fields; i++) {
+            if (fields[i] < 0 || fields[i] >= nt) {
+                CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT,
+                    "field index %d out of range (schema has %d top-level fields)", fields[i], nt);
+                return CARQUET_ERROR_INVALID_ARGUMENT;
+            }
+            for (int32_t j = 0; j < i; j++) {
+                if (fields[j] == fields[i]) {
+                    CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT,
+                        "field index %d requested twice", fields[i]);
+                    return CARQUET_ERROR_INVALID_ARGUMENT;
+                }
+            }
+        }
+    }
+    /* First leaf column of every top-level field (leaves are numbered in
+     * schema order, so field i owns [field_base[i], field_base[i+1])). */
+    int32_t field_base[1025];
+    field_base[0] = 0;
+    for (int32_t i = 0; i < nt; i++) field_base[i + 1] = field_base[i] + count_leaves(cs, top[i]);
+
     rctx_t ctx = { cs, NULL, num_leaves, error };
     ctx.leaves = (rleaf_t*)calloc((size_t)(num_leaves > 0 ? num_leaves : 1), sizeof(rleaf_t));
     if (!ctx.leaves) { CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "alloc"); return CARQUET_ERROR_OUT_OF_MEMORY; }
 
     carquet_status_t rc = CARQUET_OK;
 
-    /* Read every leaf column's full (rep, def, value) stream. */
-    for (int32_t l = 0; l < num_leaves; l++) {
+    /* Read the (rep, def, value) stream of every leaf of a selected field. */
+    for (int32_t fi = 0; fi < nf; fi++)
+    for (int32_t l = field_base[fields[fi]]; l < field_base[fields[fi] + 1] && l < num_leaves; l++) {
         rleaf_t* L = &ctx.leaves[l];
         int32_t elem = cs->leaf_indices[l];
         const parquet_schema_element_t* el = &cs->elements[elem];
@@ -721,8 +803,6 @@ carquet_status_t carquet_reader_read_arrow(
 
     /* Assemble the top-level struct array. */
     {
-        int32_t top[1024]; int32_t nt = elem_children(cs, 0, top, 1024);
-        if (nt > 1024) { rc = CARQUET_ERROR_INVALID_ARGUMENT; goto cleanup; }
         int64_t num_rows = reader->metadata.row_groups[row_group_index].num_rows;
 
         memset(out_array, 0, sizeof(*out_array));
@@ -731,20 +811,20 @@ carquet_status_t carquet_reader_read_arrow(
         out_array->offset = 0;
         out_array->n_buffers = 1;
         out_array->buffers = (const void**)calloc(1, sizeof(void*));  /* struct validity (absent) */
-        out_array->n_children = nt;
-        out_array->children = nt ? (struct ArrowArray**)calloc((size_t)nt, sizeof(void*)) : NULL;
+        out_array->n_children = nf;
+        out_array->children = nf ? (struct ArrowArray**)calloc((size_t)nf, sizeof(void*)) : NULL;
         out_array->release = release_array;
-        if (!out_array->buffers || (nt && !out_array->children)) {
+        if (!out_array->buffers || (nf && !out_array->children)) {
             release_array(out_array); rc = CARQUET_ERROR_OUT_OF_MEMORY;
             CARQUET_SET_ERROR(error, rc, "alloc"); goto cleanup;
         }
 
-        int32_t base = 0;
-        for (int32_t i = 0; i < nt; i++) {
-            rc = build_node(&ctx, top[i], 0, 0, 0, base, &out_array->children[i]);
+        for (int32_t i = 0; i < nf; i++) {
+            int32_t f = fields[i];
+            rc = build_node(&ctx, top[f], 0, 0, 0, field_base[f], &out_array->children[i]);
             if (rc != CARQUET_OK) {
                 release_array(out_array);
-                CARQUET_SET_ERROR(error, rc, "Arrow read: failed to assemble field %d", i);
+                CARQUET_SET_ERROR(error, rc, "Arrow read: failed to assemble field %d", f);
                 goto cleanup;
             }
             int64_t got_len = out_array->children[i]->length;
@@ -752,15 +832,21 @@ carquet_status_t carquet_reader_read_arrow(
                 release_array(out_array);
                 CARQUET_SET_ERROR(error, CARQUET_ERROR_INTERNAL,
                     "Arrow read: field %d length %lld != %lld rows",
-                    i, (long long)got_len, (long long)num_rows);
+                    f, (long long)got_len, (long long)num_rows);
                 rc = CARQUET_ERROR_INTERNAL; goto cleanup;
             }
-            base += count_leaves(cs, top[i]);
         }
     }
 
     if (out_schema) {
         rc = carquet_arrow_build_schema_tree(cs, out_schema, error);
+        if (rc == CARQUET_OK && field_indices && num_fields > 0) {
+            rc = carquet_arrow_schema_select_children(out_schema, fields, nf);
+            if (rc != CARQUET_OK) {
+                out_schema->release(out_schema);
+                CARQUET_SET_ERROR(error, rc, "Arrow read: schema projection failed");
+            }
+        }
         if (rc != CARQUET_OK) { release_array(out_array); goto cleanup; }
     }
 

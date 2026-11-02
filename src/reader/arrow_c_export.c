@@ -22,6 +22,11 @@
 #include <string.h>
 
 #include "reader_internal.h"  /* struct carquet_schema (leaf_indices) */
+#include "worker_pool.h"
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 /* ============================================================================
  * Release callbacks (ownership: producer allocates, consumer releases)
@@ -520,11 +525,15 @@ static carquet_status_t build_leaf_child(struct ArrowArray* child,
 static carquet_status_t export_field_array(
     const carquet_schema_t* cs, int32_t e,
     const carquet_row_batch_t* batch, int64_t num_rows,
+    const int32_t* leaf_to_col,
     struct ArrowArray* out, carquet_error_t* error) {
+
+/* Batch column holding leaf `leaf` (identity for an unprojected batch). */
+#define EX_BATCH_COL(leaf) ((leaf) < 0 ? -1 : leaf_to_col ? leaf_to_col[(leaf)] : (leaf))
 
     switch (ex_elem_kind(cs, e)) {
     case EK_LEAF: {
-        int32_t lc = ex_elem_to_leaf(cs, e);
+        int32_t lc = EX_BATCH_COL(ex_elem_to_leaf(cs, e));
         const void* data = NULL; const uint8_t* validity = NULL; int64_t n = 0;
         carquet_status_t st = carquet_row_batch_column(batch, lc, &data, &validity, &n);
         if (st != CARQUET_OK) {
@@ -556,7 +565,7 @@ static carquet_status_t export_field_array(
                 "Arrow export: nested LIST element (use carquet_reader_read_arrow)");
             return CARQUET_ERROR_NOT_IMPLEMENTED;
         }
-        int32_t lc = ex_elem_to_leaf(cs, elem[0]);
+        int32_t lc = EX_BATCH_COL(ex_elem_to_leaf(cs, elem[0]));
         const int32_t* offsets = NULL; int64_t num_lists = 0;
         const void* values = NULL; const uint8_t* value_validity = NULL;
         int64_t num_values = 0; const uint8_t* list_validity = NULL;
@@ -620,8 +629,8 @@ static carquet_status_t export_field_array(
                 "Arrow export: nested MAP key/value (use carquet_reader_read_arrow)");
             return CARQUET_ERROR_NOT_IMPLEMENTED;
         }
-        int32_t kc = ex_elem_to_leaf(cs, pair[0]);
-        int32_t vc = ex_elem_to_leaf(cs, pair[1]);
+        int32_t kc = EX_BATCH_COL(ex_elem_to_leaf(cs, pair[0]));
+        int32_t vc = EX_BATCH_COL(ex_elem_to_leaf(cs, pair[1]));
         const int32_t* off_k = NULL; int64_t nl_k = 0; const void* keys = NULL;
         const uint8_t* key_validity = NULL; int64_t nk = 0; const uint8_t* map_null_k = NULL;
         const int32_t* off_v = NULL; int64_t nl_v = 0; const void* vals = NULL;
@@ -707,6 +716,38 @@ static carquet_status_t export_field_array(
             "(use carquet_reader_read_arrow)");
         return CARQUET_ERROR_NOT_IMPLEMENTED;
     }
+#undef EX_BATCH_COL
+}
+
+/* Leaf column ordinals [first, first + count) covered by element `e`. */
+static void ex_leaf_span(const carquet_schema_t* cs, int32_t e, int32_t* first, int32_t* count) {
+    *first = -1; *count = 0;
+    for (int32_t l = 0; l < cs->num_leaves; l++) {
+        int32_t x = cs->leaf_indices[l];
+        while (x > 0 && x != e) x = cs->parent_indices[x];
+        if (x == e) {
+            if (*first < 0) *first = l;
+            (*count)++;
+        }
+    }
+}
+
+typedef struct {
+    const carquet_schema_t* cs;
+    int32_t e;
+    const carquet_row_batch_t* batch;
+    int64_t num_rows;
+    const int32_t* leaf_to_col;
+    struct ArrowArray* out;
+    carquet_status_t status;
+    carquet_error_t error;
+} ex_field_task_t;
+
+static void ex_field_task(void* arg) {
+    ex_field_task_t* t = (ex_field_task_t*)arg;
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    t->status = export_field_array(t->cs, t->e, t->batch, t->num_rows, t->leaf_to_col, t->out, &err);
+    t->error = err;
 }
 
 carquet_status_t carquet_arrow_export_batch(
@@ -722,10 +763,12 @@ carquet_status_t carquet_arrow_export_batch(
     }
 
     int32_t ncols = carquet_row_batch_num_columns(batch);
-    if (ncols != carquet_schema_num_columns(schema)) {
+    int32_t nleaves = carquet_schema_num_columns(schema);
+    const int32_t* projection = carquet_row_batch_projection(batch);
+    if (!projection && ncols != nleaves) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT,
             "batch has %d columns but schema has %d leaves (projection not supported)",
-            ncols, carquet_schema_num_columns(schema));
+            ncols, nleaves);
         return CARQUET_ERROR_INVALID_ARGUMENT;
     }
 
@@ -736,11 +779,65 @@ carquet_status_t carquet_arrow_export_batch(
      * a LIST / MAP field consumes one / two leaf columns and expands into an
      * Arrow list / map child. */
     int32_t top[1024];
-    int32_t nfields = ex_elem_children(schema, 0, top, 1024);
-    if (nfields > 1024) {
+    int32_t ntop = ex_elem_children(schema, 0, top, 1024);
+    if (ntop > 1024) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT,
-            "Arrow export: too many top-level fields (%d)", nfields);
+            "Arrow export: too many top-level fields (%d)", ntop);
         return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    /* A batch from carquet_batch_reader_next() may be projected or reordered:
+     * map each file leaf to its batch column, then export the top-level fields
+     * whose leaves are all present, ordered by where the projection first
+     * names them. Without a projection every field is exported in schema order. */
+    int32_t sel[1024];          /* selected top-level field ordinals, in output order */
+    int32_t nfields = ntop;
+    int32_t* leaf_to_col = NULL;
+    if (projection) {
+        leaf_to_col = (int32_t*)malloc((size_t)(nleaves > 0 ? nleaves : 1) * sizeof(int32_t));
+        if (!leaf_to_col) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Arrow export: alloc failed");
+            return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
+        for (int32_t l = 0; l < nleaves; l++) leaf_to_col[l] = -1;
+        for (int32_t c = ncols - 1; c >= 0; c--) {   /* first occurrence wins */
+            int32_t l = projection[c];
+            if (l < 0 || l >= nleaves) {
+                free(leaf_to_col);
+                CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT,
+                    "Arrow export: projected leaf %d out of range", l);
+                return CARQUET_ERROR_INVALID_ARGUMENT;
+            }
+            leaf_to_col[l] = c;
+        }
+        int32_t first_col[1024];
+        nfields = 0;
+        for (int32_t f = 0; f < ntop; f++) {
+            int32_t first = 0, count = 0, present = 0, min_col = INT32_MAX;
+            ex_leaf_span(schema, top[f], &first, &count);
+            for (int32_t l = first; count > 0 && l < first + count; l++) {
+                if (leaf_to_col[l] >= 0) {
+                    present++;
+                    if (leaf_to_col[l] < min_col) min_col = leaf_to_col[l];
+                }
+            }
+            if (present == 0) continue;
+            if (present != count) {
+                free(leaf_to_col);
+                CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT,
+                    "Arrow export: projection covers %d of the %d leaves of field %d; "
+                    "project all of them or none", present, count, f);
+                return CARQUET_ERROR_INVALID_ARGUMENT;
+            }
+            /* insertion sort by first projected column */
+            int32_t k = nfields++;
+            while (k > 0 && first_col[k - 1] > min_col) {
+                first_col[k] = first_col[k - 1]; sel[k] = sel[k - 1]; k--;
+            }
+            first_col[k] = min_col; sel[k] = f;
+        }
+    } else {
+        for (int32_t f = 0; f < ntop; f++) sel[f] = f;
     }
 
     memset(out_array, 0, sizeof(*out_array));
@@ -759,25 +856,73 @@ carquet_status_t carquet_arrow_export_batch(
 
     if (!out_array->buffers || (nfields > 0 && !out_array->children)) {
         arrow_array_release(out_array);
+        free(leaf_to_col);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Arrow array alloc failed");
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
 
     for (int32_t f = 0; f < nfields; f++) {
-        struct ArrowArray* child = (struct ArrowArray*)calloc(1, sizeof(struct ArrowArray));
-        if (!child) {
+        out_array->children[f] = (struct ArrowArray*)calloc(1, sizeof(struct ArrowArray));
+        if (!out_array->children[f]) {
             arrow_array_release(out_array);
+            free(leaf_to_col);
             CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Arrow child alloc failed");
             return CARQUET_ERROR_OUT_OF_MEMORY;
         }
-        out_array->children[f] = child;
+    }
 
-        carquet_status_t st = export_field_array(schema, top[f], batch, num_rows, child, error);
-        if (st != CARQUET_OK) {
+    /* Fields are independent copies: export them in parallel when the batch
+     * is large enough for the fan-out to pay (OpenMP, or the batch reader's
+     * column pool in builds without it). */
+    ex_field_task_t* tasks = (ex_field_task_t*)calloc((size_t)(nfields > 0 ? nfields : 1), sizeof(*tasks));
+    if (!tasks) {
+        arrow_array_release(out_array);
+        free(leaf_to_col);
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Arrow export: alloc failed");
+        return CARQUET_ERROR_OUT_OF_MEMORY;
+    }
+    for (int32_t f = 0; f < nfields; f++) {
+        ex_field_task_t* t = &tasks[f];
+        t->cs = schema;
+        t->e = top[sel[f]];
+        t->batch = batch;
+        t->num_rows = num_rows;
+        t->leaf_to_col = leaf_to_col;
+        t->out = out_array->children[f];
+        t->status = CARQUET_OK;
+    }
+    bool parallel = nfields > 1 && num_rows * (int64_t)nfields >= CARQUET_PARALLEL_MIN_VALUES;
+#ifdef _OPENMP
+    if (parallel) {
+        int32_t f;
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (f = 0; f < nfields; f++) ex_field_task(&tasks[f]);
+    } else {
+        for (int32_t f = 0; f < nfields; f++) ex_field_task(&tasks[f]);
+    }
+#else
+    carquet_worker_pool_t* pool = parallel ? carquet_row_batch_pool(batch) : NULL;
+    void** args = pool ? (void**)malloc((size_t)nfields * sizeof(void*)) : NULL;
+    if (args) {
+        for (int32_t f = 0; f < nfields; f++) args[f] = &tasks[f];
+        carquet_worker_pool_parallel_for(pool, ex_field_task, args, nfields);
+        free(args);
+    } else {
+        for (int32_t f = 0; f < nfields; f++) ex_field_task(&tasks[f]);
+    }
+#endif
+    for (int32_t f = 0; f < nfields; f++) {
+        if (tasks[f].status != CARQUET_OK) {
+            carquet_status_t st = tasks[f].status;
+            if (error) *error = tasks[f].error;
+            free(tasks);
             arrow_array_release(out_array);
+            free(leaf_to_col);
             return st;
         }
     }
+    free(tasks);
+    free(leaf_to_col);
 
     /* Schema last, so an earlier array failure leaves nothing for the caller to
      * release. A flat schema keeps the byte-identical flat builder; a nested one
@@ -786,6 +931,13 @@ carquet_status_t carquet_arrow_export_batch(
         carquet_status_t st = ex_schema_is_flat(schema)
             ? build_struct_schema(schema, out_schema, error)
             : carquet_arrow_build_schema_tree(schema, out_schema, error);
+        if (st == CARQUET_OK && projection) {
+            st = carquet_arrow_schema_select_children(out_schema, sel, nfields);
+            if (st != CARQUET_OK) {
+                out_schema->release(out_schema);
+                CARQUET_SET_ERROR(error, st, "Arrow export: schema projection failed");
+            }
+        }
         if (st != CARQUET_OK) {
             arrow_array_release(out_array);
             return st;

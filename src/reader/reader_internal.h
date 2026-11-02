@@ -341,6 +341,31 @@ carquet_status_t carquet_decompress_page_diag(
     char* diag,
     size_t diag_size);
 
+/**
+ * File leaf-column index behind each column of a batch produced by a batch
+ * reader (length carquet_row_batch_num_columns()), or NULL for a batch that
+ * did not come from carquet_batch_reader_next(). Lets the Arrow exporter map
+ * a projected (or reordered) batch back onto the file schema.
+ */
+const int32_t* carquet_row_batch_projection(const carquet_row_batch_t* batch);
+
+/* Below this many values (rows x columns) a batch is exported to Arrow on the
+ * calling thread, and builds without OpenMP also decode it there: handing the
+ * columns to other threads costs more than the work. */
+#define CARQUET_PARALLEL_MIN_VALUES 65536
+
+/**
+ * Worker pool the Arrow exporter may use to export a batch's columns in
+ * parallel (builds without OpenMP), or NULL to export serially.
+ */
+struct carquet_worker_pool* carquet_row_batch_pool(const carquet_row_batch_t* batch);
+
+/* Select and reorder the children of a top-level struct ArrowSchema in place:
+ * children keep[0..n-1] (indices into the current children) become the new
+ * children, every other child is released. Implemented in arrow_c_read.c. */
+carquet_status_t carquet_arrow_schema_select_children(
+    struct ArrowSchema* schema, const int32_t* keep, int32_t n);
+
 #ifdef __cplusplus
 }
 #endif

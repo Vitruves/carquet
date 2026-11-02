@@ -105,6 +105,10 @@ struct carquet_row_batch {
     int64_t num_rows;
     carquet_arena_t arena;
     bool pooled;                /* If true, data buffers are from batch_reader pool */
+    const int32_t* projection;  /* File leaf index per column (owned by the batch
+                                 * reader); NULL outside carquet_batch_reader_next */
+    carquet_worker_pool_t* pool; /* owner's column pool for a parallel Arrow
+                                 * export (non-OpenMP builds), else NULL */
 };
 
 /* Pipeline ring buffer slot: holds pre-read column data for one RG */
@@ -238,6 +242,13 @@ struct carquet_batch_reader {
     /* Persistent worker pool for cross-RG parallel decompression */
     carquet_worker_pool_t* pool;
     bool pool_is_borrowed;  /* true when pool comes from config.thread_pool */
+
+    /* Column-parallel decode for builds without OpenMP: the per-batch column
+     * loops run on this pool (created on first use; unused with OpenMP). */
+    carquet_worker_pool_t* col_pool;
+    struct br_col_task* col_tasks;  /* [num_projected] task slots */
+    void** col_task_args;           /* [num_projected] pointers into col_tasks */
+    bool col_pool_unavailable;      /* serial: 1 thread, 1 column, or alloc failed */
 
     /* Pipeline ring buffer for multi-RG parallel decompression.
      * Pre-decompresses pages for upcoming row groups so that by the time
@@ -701,6 +712,85 @@ static void read_projected_column(
                                            max_def, col_data->null_bitmap);
     }
 }
+
+#ifndef _OPENMP
+/* ============================================================================
+ * Column-parallel fallback without OpenMP
+ * ============================================================================
+ * The prefetch and read loops of batch_reader_next_impl() run one column per
+ * thread under OpenMP. Builds without OpenMP (e.g. the macOS / Windows Python
+ * wheels) run the same per-column work on a persistent worker pool instead,
+ * under the same conditions (mmap-backed data, more than one column).
+ */
+typedef struct br_col_task {
+    carquet_batch_reader_t* br;
+    carquet_row_batch_t* batch;
+    int32_t col;
+    int64_t rows;
+    bool error;
+} br_col_task_t;
+
+static int32_t br_cpu_count(void) {
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return (int32_t)si.dwNumberOfProcessors;
+#else
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (int32_t)n : 1;
+#endif
+}
+
+/* The reader's column pool, or NULL to run the loop serially. */
+static carquet_worker_pool_t* br_column_pool(carquet_batch_reader_t* br) {
+    if (br->col_pool) return br->col_pool;
+    if (br->col_pool_unavailable) return NULL;
+    int32_t n = br->config.num_threads;
+    if (n <= 0) n = br_cpu_count();
+    if (n > br->num_projected) n = br->num_projected;
+    if (n < 2) { br->col_pool_unavailable = true; return NULL; }
+    br->col_tasks = carquet_mem_calloc((size_t)br->num_projected, sizeof(br_col_task_t));
+    br->col_task_args = carquet_mem_calloc((size_t)br->num_projected, sizeof(void*));
+    br->col_pool = (br->col_tasks && br->col_task_args) ? carquet_worker_pool_create(n) : NULL;
+    if (!br->col_pool) {
+        carquet_mem_free(br->col_tasks);
+        carquet_mem_free(br->col_task_args);
+        br->col_tasks = NULL;
+        br->col_task_args = NULL;
+        br->col_pool_unavailable = true;
+        return NULL;
+    }
+    for (int32_t i = 0; i < br->num_projected; i++) br->col_task_args[i] = &br->col_tasks[i];
+    return br->col_pool;
+}
+
+static void br_prefetch_task(void* arg) {
+    br_col_task_t* t = (br_col_task_t*)arg;
+    carquet_column_reader_t* col_reader = t->br->col_readers[t->col];
+    if (col_reader && !col_reader->page_loaded && col_reader->values_remaining > 0) {
+        (void)carquet_column_read_batch(col_reader, NULL, 0, NULL, NULL);
+    }
+}
+
+static void br_read_task(void* arg) {
+    br_col_task_t* t = (br_col_task_t*)arg;
+    read_projected_column(t->br, t->batch, t->col, t->rows, true, &t->error);
+}
+
+/* Run `fn` once per projected column on the column pool. */
+static void br_column_parallel_for(carquet_batch_reader_t* br, carquet_task_fn fn,
+                                   carquet_row_batch_t* batch, int64_t rows) {
+    for (int32_t i = 0; i < br->num_projected; i++) {
+        br_col_task_t* t = &br->col_tasks[i];
+        t->br = br;
+        t->batch = batch;
+        t->col = i;
+        t->rows = rows;
+        t->error = false;
+    }
+    carquet_worker_pool_parallel_for(br->col_pool, fn, br->col_task_args, br->num_projected);
+}
+#endif /* !_OPENMP */
 
 /* ============================================================================
  * Nested (single-level LIST) reconstruction
@@ -3383,12 +3473,16 @@ static carquet_status_t batch_reader_next_impl(
         }
     }
 #else
-    (void)is_mmap;
-    (void)needs_decompression;   /* only steer the OpenMP `if` clause above */
-    for (int32_t pi = 0; pi < batch_reader->num_projected; pi++) {
-        carquet_column_reader_t* col_reader = batch_reader->col_readers[pi];
-        if (col_reader && !col_reader->page_loaded && col_reader->values_remaining > 0) {
-            (void)carquet_column_read_batch(col_reader, NULL, 0, NULL, NULL);
+    bool big_batch = rows_to_read * (int64_t)batch_reader->num_projected >= CARQUET_PARALLEL_MIN_VALUES;
+    if (is_mmap && needs_decompression && batch_reader->num_projected > 1 && big_batch &&
+        br_column_pool(batch_reader)) {
+        br_column_parallel_for(batch_reader, br_prefetch_task, NULL, 0);
+    } else {
+        for (int32_t pi = 0; pi < batch_reader->num_projected; pi++) {
+            carquet_column_reader_t* col_reader = batch_reader->col_readers[pi];
+            if (col_reader && !col_reader->page_loaded && col_reader->values_remaining > 0) {
+                (void)carquet_column_read_batch(col_reader, NULL, 0, NULL, NULL);
+            }
         }
     }
 #endif
@@ -3428,7 +3522,6 @@ static carquet_status_t batch_reader_next_impl(
         }
     }
 
-    (void)all_zero_copy_ready;   /* consulted only by the OpenMP branch below */
 
     int32_t col_i;
 #ifdef _OPENMP
@@ -3464,8 +3557,16 @@ static carquet_status_t batch_reader_next_impl(
         }
     }
 #else
-    for (col_i = 0; col_i < batch_reader->num_projected; col_i++) {
-        read_projected_column(batch_reader, new_batch, col_i, rows_to_read, true, &read_error);
+    if (is_mmap && batch_reader->num_projected > 1 && !all_zero_copy_ready && big_batch &&
+        br_column_pool(batch_reader)) {
+        br_column_parallel_for(batch_reader, br_read_task, new_batch, rows_to_read);
+        for (col_i = 0; col_i < batch_reader->num_projected; col_i++) {
+            if (batch_reader->col_tasks[col_i].error) read_error = true;
+        }
+    } else {
+        for (col_i = 0; col_i < batch_reader->num_projected; col_i++) {
+            read_projected_column(batch_reader, new_batch, col_i, rows_to_read, true, &read_error);
+        }
     }
 #endif
 
@@ -3526,6 +3627,16 @@ carquet_status_t carquet_batch_reader_next(
     batch_reader_clear_errors(batch_reader);
 
     carquet_status_t status = batch_reader_next_impl(batch_reader, batch);
+
+    if (status == CARQUET_OK && *batch) {
+        (*batch)->projection = batch_reader->projected_columns;
+#ifdef _OPENMP
+        (*batch)->pool = NULL;   /* the exporter parallelises with OpenMP */
+#else
+        bool big = (*batch)->num_rows * (int64_t)batch_reader->num_projected >= CARQUET_PARALLEL_MIN_VALUES;
+        (*batch)->pool = (batch_reader->num_projected > 1 && big) ? br_column_pool(batch_reader) : NULL;
+#endif
+    }
 
     /* END_OF_DATA is the normal terminator, not a failure. */
     if (status == CARQUET_OK || status == CARQUET_ERROR_END_OF_DATA) {
@@ -3618,6 +3729,11 @@ void carquet_batch_reader_free(carquet_batch_reader_t* batch_reader) {
     if (!batch_reader->pool_is_borrowed) {
         carquet_worker_pool_destroy(batch_reader->pool);
     }
+    if (batch_reader->col_pool) {
+        carquet_worker_pool_destroy(batch_reader->col_pool);
+    }
+    carquet_mem_free(batch_reader->col_tasks);
+    carquet_mem_free(batch_reader->col_task_args);
 
     /* Free column readers */
     if (batch_reader->col_readers) {
@@ -3697,6 +3813,14 @@ int64_t carquet_row_batch_num_rows(const carquet_row_batch_t* batch) {
 int32_t carquet_row_batch_num_columns(const carquet_row_batch_t* batch) {
     /* batch is nonnull per API contract */
     return batch->num_columns;
+}
+
+const int32_t* carquet_row_batch_projection(const carquet_row_batch_t* batch) {
+    return batch ? batch->projection : NULL;
+}
+
+struct carquet_worker_pool* carquet_row_batch_pool(const carquet_row_batch_t* batch) {
+    return batch ? batch->pool : NULL;
 }
 
 carquet_status_t carquet_row_batch_column(

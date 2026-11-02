@@ -680,6 +680,7 @@ static bool rg_stats_might_match(const column_type_info_t* ti,
     if (null_op && !s->has_null_count) return true;
 
     carquet_page_stats_t ps;
+    ps.has_null_count = s->has_null_count;
     ps.null_count = s->has_null_count ? s->null_count : 0;
     ps.min_value = s->has_min_max ? s->min_value : NULL;
     ps.min_value_size = s->has_min_max ? s->min_value_size : 0;

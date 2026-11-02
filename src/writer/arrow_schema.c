@@ -205,6 +205,23 @@ static void fbb_finish(fbb* b, size_t root) {
  * ============================================================================
  */
 
+/* Arrow Decimal type table. The precision/scale live in the DECIMAL logical
+ * type; the legacy SchemaElement.precision/scale fields are only a fallback
+ * (they are unset for schemas built from logical types, and a precision of 0
+ * makes the whole ARROW:schema blob unreadable for Arrow C++ / PyArrow). */
+static int build_decimal_type(fbb* b, const parquet_schema_element_t* e,
+                              size_t* type_off, uint8_t* type_tag) {
+    int32_t precision = e->logical_type.params.decimal.precision;
+    int32_t scale = e->logical_type.params.decimal.scale;
+    if (precision <= 0) { precision = e->precision; scale = e->scale; }
+    if (precision <= 0 || precision > 76) return 0;  /* not Arrow-representable */
+    fbb_start_table(b, 3);
+    fbb_add_i32(b, 0, precision);
+    fbb_add_i32(b, 1, scale);
+    fbb_add_i32(b, 2, precision > 38 ? 256 : 128);
+    *type_off = fbb_end_table(b); *type_tag = AT_DECIMAL; return 1;
+}
+
 /* Returns 0 on unsupported type (caller aborts ARROW:schema emission). */
 static int build_arrow_type(fbb* b, const parquet_schema_element_t* e,
                             uint8_t* type_tag, size_t* type_off) {
@@ -258,11 +275,7 @@ static int build_arrow_type(fbb* b, const parquet_schema_element_t* e,
             *type_off = fbb_end_table(b); *type_tag = AT_TIME; return 1;
         }
         if (has_lt && lt == CARQUET_LOGICAL_DECIMAL) {
-            fbb_start_table(b, 3);
-            fbb_add_i32(b, 0, e->precision);
-            fbb_add_i32(b, 1, e->scale);
-            fbb_add_i32(b, 2, 128);
-            *type_off = fbb_end_table(b); *type_tag = AT_DECIMAL; return 1;
+            return build_decimal_type(b, e, type_off, type_tag);
         }
         {
             int32_t bw = is64 ? 64 : 32;
@@ -304,11 +317,7 @@ static int build_arrow_type(fbb* b, const parquet_schema_element_t* e,
 
     case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY:
         if (has_lt && lt == CARQUET_LOGICAL_DECIMAL) {
-            fbb_start_table(b, 3);
-            fbb_add_i32(b, 0, e->precision);
-            fbb_add_i32(b, 1, e->scale);
-            fbb_add_i32(b, 2, 128);
-            *type_off = fbb_end_table(b); *type_tag = AT_DECIMAL; return 1;
+            return build_decimal_type(b, e, type_off, type_tag);
         }
         fbb_start_table(b, 1);
         fbb_add_i32(b, 0, e->type_length);

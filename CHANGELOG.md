@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## v0.7.3
 
-**In short:** a memory-safety pass (14 fixes, 3 high severity: a heap overwrite from a crafted footer, an out-of-bounds write in multi-threaded mmap reads, a double free after a background write error), files from older writers that carquet could not read (parquet-mr without `dictionary_page_offset`, multi-member gzip, raw LZ4 under the Hadoop codec id, mistyped footer fields), a batch-reader hang on fuzzed input, fuzzers that now actually instrument the library, and faster compressed I/O (Apple M3, 1M rows: writes −11 to −19 %, Snappy / LZ4 reads −17 / −23 %; 10M rows: uncompressed writes −14 %, compressed I/O mostly within noise). Output bytes unchanged. PyArrow and DuckDB read every file (`interop/run_interop.py`: 25/25 PyArrow, 23/23 DuckDB write; 26/26 read, 57/75 parquet-testing files verified value for value, 0 failures).
+**In short:** a memory-safety pass (14 fixes, 3 high severity: a heap overwrite from a crafted footer, an out-of-bounds write in multi-threaded mmap reads, a double free after a background write error), files from older writers that carquet could not read (parquet-mr without `dictionary_page_offset`, multi-member gzip, raw LZ4 under the Hadoop codec id, mistyped footer fields), a batch-reader hang on fuzzed input, fuzzers that now actually instrument the library, and faster compressed I/O (Apple M3, 1M rows: writes −11 to −19 %, Snappy / LZ4 reads −17 / −23 %; 10M rows: uncompressed writes −14 %, compressed I/O mostly within noise). Output bytes unchanged. PyArrow and DuckDB read every file (`interop/run_interop.py`: 25/25 PyArrow, 23/23 DuckDB write; 26/26 read, 57/75 parquet-testing files verified value for value, 0 failures). The Python package is rewritten around the batch reader (column projection, filters with statistics / page-index pushdown, streaming, metadata / statistics / page index / bloom filter access, every writer option) and reads 2-3x faster than 0.7.2 (more than 10x for column subsets).
 
 ### Security / Bug Fixes
 
@@ -25,15 +25,23 @@ Reader (found by the corrected interop check and the fuzzers; tests in `tests/te
 - A footer field written with the wrong type (Dremio's field 15) desynchronised the whole footer parse; such fields are skipped.
 - `carquet_validate_file()` accepted files without the leading `PAR1` magic.
 - `carquet_schema_column_name()` returns `""` instead of NULL for an unnamed column.
+- Row-group pruning for `IS_NULL` / `IS_NOT_NULL` page-filter clauses read an uninitialised `has_null_count` (`page_filter.c` `rg_stats_might_match`, found by the Python suite under UBSan).
 
 Writer:
+- The `ARROW:schema` footer entry stored DECIMAL columns with precision 0 (the precision was taken from the legacy `SchemaElement` field, unset for schemas built from logical types), so Arrow C++ / PyArrow rejected the whole file ("Decimal precision out of range"); the Python package writes this entry by default, so every decimal file it wrote was affected. Precision and scale now come from the logical type, and precisions above 38 are tagged decimal256 (`arrow_schema.c`, test in `test_writer_extensions`).
 - `carquet_writer_set_column_bloom_filter()` had no effect on its own: enabling a column with the global option off wrote no filter, disabling one with it on was ignored (test in `test_writer_extensions`).
+
+Threading:
+- `carquet_worker_pool_create()` could hang forever when thread creation failed after some workers had started (address-space or commit exhaustion, `ulimit -u` / cgroup `pids.max`, …): the failure path set `shutdown` and broadcast without the pool lock, so a worker between its check and its wait missed the wake-up and the creator blocked joining it ([#37](https://github.com/Vitruves/carquet/issues/37)). Writer close (pipelined encode pool) and the non-OpenMP batch-reader column pool were affected. The failure path now tears down the started threads through `carquet_worker_pool_destroy()`, which signals under the lock (`worker_pool.c`).
 
 CLI:
 - `head`, `tail`, `sample` and `cat` used the node's own definition level instead of the column's accumulated maximum (crash in `sample` on nested files); negative row counts, invalid types and failed reads led to bad allocations or writes before the buffer. Same level mistake fixed in the generated reader code (`codegen_read.c`). 4,800+ sanitizer CLI runs over the corpus and fuzz inputs are clean.
 
 ### API / Docs
 
+- New `carquet_reader_read_arrow_fields()`: `carquet_reader_read_arrow()` restricted to some top-level fields (in the order given); only the leaf columns under them are read and decoded. Tests in `test_arrow_nested`.
+- `carquet_arrow_export_batch()` accepts batches from a projected (or reordered) batch reader when given the reader's schema: the fields whose leaves are all projected are exported in projection order, a partly projected field (a MAP key without its value) is rejected. Before, any projection was refused, and a full projection in another order was exported under the wrong names. Tests in `test_arrow_c_data`.
+- `carquet_filter_clause_t`: the header said FIXED_LEN_BYTE_ARRAY `IN` values are `carquet_byte_array_t` entries; the page filter reads them as raw values packed at `type_length` stride (the implementation's documented layout), so the header now says that.
 - `carquet_schema_node_max_def_level()` / `carquet_schema_node_max_rep_level()` were documented as the column's maximum level; they return the node's own contribution (0 or 1). The docs now say so and point to `carquet_schema_max_def_level()` / `carquet_schema_max_rep_level()`.
 
 ### Performance
@@ -44,6 +52,18 @@ All numbers below are from the reference benchmark (`benchmark_carquet`, 3 REQUI
 - Pipelined write: up to 8 row groups in flight instead of 2, while everything in flight fits a 64 MB raw budget (a 20 MB row group allows 3 in flight; row groups above 32 MB keep the one-behind pipeline); finished row groups are completed at the next flush so their I/O starts promptly. Peak memory can grow by up to 64 MB of raw input. Alone: write medium snappy −10 %, zstd −16 %, lz4 −12 %, none ±0; large none −17 % (60.5 → 50.5 ms), compressed large within noise (±3 %).
 - Batch reader: pipeline workers read from the reader's existing file mapping instead of one `mmap` / `munmap` per row group, and the main thread prefaults each row group with `madvise(MADV_WILLNEED)`. Alone: read medium snappy −15 % (1.51 → 1.28 ms), lz4 −20 % (1.11 → 0.89 ms), zstd −2 %; large lz4 −6 %, snappy −3 %, zstd within noise.
 - Whole tree vs v0.7.2, same interleaved runs: medium write snappy −19 % (7.77 → 6.29 ms), zstd −16 % (9.31 → 7.83 ms), lz4 −11 % (7.91 → 7.01 ms), none ±0; medium read snappy −17 % (1.54 → 1.28 ms), lz4 −23 % (1.16 → 0.89 ms), zstd −3 %; large write none −14 % (58.5 → 50.5 ms), compressed large writes and reads within ±5 % except snappy read −6 %. `run_benchmark.py --skip-xlarge` against the v0.7.2 reference JSON (large, W / R ms): none 74.7 / 0.36 → 60.5 / 0.27, snappy 52.7 / 12.4 → 45.4 / 11.5, zstd 60.4 / 19.8 → 59.0 / 19.9, lz4 57.2 / 9.2 → 50.9 / 8.3. Output bytes of every benchmark file are identical to v0.7.2 (`cmp`).
+- Builds without OpenMP (the macOS and Windows Python wheels) decoded a batch's columns one after another; the prefetch and read loops of the batch reader now run one column per thread on a persistent worker pool under the same conditions as the OpenMP path, and `carquet_arrow_export_batch()` exports large batches field-parallel (OpenMP, or that pool). PyArrow-written 5M-row file with 5 nullable columns, Apple M3, no OpenMP: zstd 167 → 78 ms, snappy 106 → 56 ms, uncompressed 95 → 53 ms (full read through the Python package).
+
+### Python package
+
+Rewritten (`python/README.md`); 102 tests (`python/tests/`), also run against an ASan + UBSan build of the library, plus a randomised write/read/filter/slice differential check against PyArrow.
+- Reading goes through the batch reader with the projection pushed down (flat and single-level list / map columns), or `carquet_reader_read_arrow_fields()` for structs and deeper nesting; 0.7.2 read every column of every row group and selected afterwards. Same file as above: 1 column of 5 read in 10 ms instead of 153 ms.
+- `ParquetFile` (replaces `Reader`, kept as an alias): `read`, `read_row_group(s)`, `iter_batches(batch_size)`, `iter_row_groups`, `slice` / `head` (row windows through `carquet_batch_reader_set_row_range`), `count_rows`, `filter_row_groups`, `metadata`, `parquet_schema`, `key_value_metadata`, `bloom_filter`, `column_index`, `offset_index`; sources can be paths, bytes-like objects (read in place), file objects, directories or lists of files.
+- `filters=` in `pyarrow.parquet` DNF form (or a `pyarrow.compute.Expression`): row groups pruned with `carquet_reader_row_group_matches`, pages with `carquet_batch_reader_set_page_filter`, rows filtered exactly with `pyarrow.compute`.
+- Metadata without PyArrow: `read_metadata` (`FileMetaData` / `RowGroupMetaData` / `ColumnChunkMetaData`, statistics decoded with the logical type, geospatial statistics), `read_parquet_schema` (`ParquetSchema`, `ColumnSchema`, `LogicalType`), `ColumnIndex`, `OffsetIndex`, `BloomFilter` (`value in bf`), `cpu_info()`.
+- Writing: `ParquetWriter` (incremental, rows packed into `row_group_size` row groups whatever the input chunking, `append=True`, file-object sinks via `carquet_writer_create_buffer`) and `write_table` with every writer option, per column where the C API allows it (compression and level, page size, encodings, dictionary, byte-stream-split, statistics, bloom filters with NDV / FPP, sorting columns, timestamp coercion, page version, footer version, page index, CRC, key/value metadata). Inputs: Arrow tables / batches / readers, pandas, any Arrow PyCapsule stream (polars, DuckDB), dicts.
+- Type fidelity: `ARROW:schema` is written with PyArrow's serializer and applied on read (time zones, dictionaries, large types, list child names, field and pandas metadata), DECIMAL storage is converted to `decimal128` / `decimal256` and INT96 to `timestamp[ns]` with NumPy; `duration`, view types and `null` are written as their storage type and restored. Tables written by carquet read back with `Table.equals`, through carquet and PyArrow; PyArrow-written files read with PyArrow's own types.
+- 0.7.2 incompatibilities: `read_row_group()` returns a `Table`, `iter_batches()` yields `batch_size` batches (`iter_row_groups()` keeps one per row group), `use_mmap=` is spelled `memory_map=` (still accepted).
 
 ### Fuzzing / Tooling
 

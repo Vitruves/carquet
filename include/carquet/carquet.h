@@ -202,10 +202,10 @@ extern "C" {
 #define CARQUET_VERSION_MINOR 7
 
 /** @brief Patch version number */
-#define CARQUET_VERSION_PATCH 2
+#define CARQUET_VERSION_PATCH 3
 
 /** @brief Version string in "MAJOR.MINOR.PATCH" format */
-#define CARQUET_VERSION_STRING "0.7.2"
+#define CARQUET_VERSION_STRING "0.7.3"
 
 /** @brief Numeric version for compile-time comparisons: (MAJOR * 10000 + MINOR * 100 + PATCH) */
 #define CARQUET_VERSION_NUMBER (CARQUET_VERSION_MAJOR * 10000 + CARQUET_VERSION_MINOR * 100 + CARQUET_VERSION_PATCH)
@@ -3168,8 +3168,9 @@ typedef enum carquet_filter_op {
  *
  * For IN: `values` points to a packed array of `value_count` entries.
  * For fixed-width numeric types, the entries are native-width scalars laid
- * out contiguously (stride = sizeof(physical type)). For BYTE_ARRAY and
- * FIXED_LEN_BYTE_ARRAY, `values` is a contiguous array of
+ * out contiguously (stride = sizeof(physical type)). For FIXED_LEN_BYTE_ARRAY
+ * they are the raw values packed back to back (stride = the column's
+ * type_length). For BYTE_ARRAY, `values` is a contiguous array of
  * carquet_byte_array_t entries.
  *
  * For IS_NULL / IS_NOT_NULL, all value fields are ignored.
@@ -3840,9 +3841,15 @@ carquet_status_t carquet_arrow_export_schema(
  * - UTF8 / binary (BYTE_ARRAY): `[validity, offsets(int32), data]`
  * - fixed-size binary (FIXED_LEN_BYTE_ARRAY): `[validity, data]`
  *
- * The @p schema supplies column names, logical types, and nullability; its leaf
- * column count must equal the batch column count (batch read without column
- * projection). Dictionary-preserved batch columns are rejected.
+ * The @p schema supplies column names, logical types, and nullability. For a
+ * batch returned by carquet_batch_reader_next() it must be the reader's schema
+ * (carquet_reader_schema()); the batch may then be projected and/or reordered:
+ * the top-level fields whose leaves are all projected are exported, ordered by
+ * the position of their first leaf in the projection, and a field only partly
+ * projected (e.g. a MAP's key without its value) is rejected with
+ * CARQUET_ERROR_INVALID_ARGUMENT. Any other batch must have exactly one column
+ * per schema leaf, in schema order. Dictionary-preserved batch columns are
+ * rejected.
  *
  * @param[in] batch Source row batch.
  * @param[in] schema Matching flat schema (leaf count == batch columns).
@@ -3946,6 +3953,38 @@ CARQUET_API CARQUET_WARN_UNUSED_RESULT
 carquet_status_t carquet_reader_read_arrow(
     carquet_reader_t* reader,
     int32_t row_group_index,
+    struct ArrowSchema* out_schema,
+    struct ArrowArray* out_array,
+    carquet_error_t* error);
+
+/**
+ * @brief Read selected top-level fields of one row group into an Arrow array.
+ *
+ * Same as @ref carquet_reader_read_arrow, but only the leaf columns under the
+ * requested top-level fields are read and decoded (column projection for the
+ * nested Arrow path). The output struct's children are those fields, in the
+ * order given; @p out_schema (when requested) describes the same projection.
+ *
+ * @param[in] reader Open reader.
+ * @param[in] row_group_index Row group to read (0-based).
+ * @param[in] field_indices Top-level field ordinals (0 to number of top-level
+ *                          fields - 1, i.e. the children of the schema root),
+ *                          without duplicates. NULL or @p num_fields <= 0
+ *                          reads every field (same as carquet_reader_read_arrow).
+ * @param[in] num_fields Number of entries in @p field_indices.
+ * @param[out] out_schema Optional ArrowSchema for the projection (may be NULL).
+ * @param[out] out_array ArrowArray to populate; caller must release.
+ * @param[out] error Error details (may be NULL).
+ * @return CARQUET_OK, CARQUET_ERROR_INVALID_ARGUMENT for an out-of-range or
+ *         duplicate field index, or a read error. On error nothing is left
+ *         owned by the caller.
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT
+carquet_status_t carquet_reader_read_arrow_fields(
+    carquet_reader_t* reader,
+    int32_t row_group_index,
+    const int32_t* field_indices,
+    int32_t num_fields,
     struct ArrowSchema* out_schema,
     struct ArrowArray* out_array,
     carquet_error_t* error);

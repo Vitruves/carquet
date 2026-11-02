@@ -1737,6 +1737,47 @@ static int test_deferred_nullable_batches(void) {
     return 0;
 }
 
+
+/* ---- ARROW:schema carries DECIMAL precision/scale from the logical type ---- */
+static int test_arrow_schema_decimal(void) {
+    char path[512]; carquet_test_temp_path(path, sizeof(path), "ext_arrow_decimal");
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t* s = carquet_schema_create(&err);
+    carquet_logical_type_t dec = { .id = CARQUET_LOGICAL_DECIMAL };
+    dec.params.decimal.precision = 9;
+    dec.params.decimal.scale = 2;
+    if (!s || carquet_schema_add_column(s, "amount", CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY, &dec,
+                                        CARQUET_REPETITION_REQUIRED, 4, 0) != CARQUET_OK)
+        { carquet_schema_free(s); TEST_FAIL("arrow_schema_decimal", "schema"); }
+    carquet_writer_options_t wo; carquet_writer_options_init(&wo);
+    wo.write_arrow_schema = true;
+    carquet_writer_t* w = carquet_writer_create(path, s, &wo, &err);
+    if (!w) { carquet_schema_free(s); TEST_FAIL("arrow_schema_decimal", "writer"); }
+    uint8_t v[8] = {0, 0, 0x04, 0xD2, 0xFF, 0xFF, 0xFF, 0x9C};  /* 12.34, -1.00 */
+    if (carquet_writer_write_batch(w, 0, v, 2, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_close(w) != CARQUET_OK)
+        { carquet_schema_free(s); TEST_FAIL("arrow_schema_decimal", "write"); }
+    carquet_schema_free(s);
+
+    carquet_reader_t* r = carquet_reader_open(path, NULL, &err);
+    if (!r) { carquet_test_cleanup(path); TEST_FAIL("arrow_schema_decimal", "open"); }
+    const char* b64 = carquet_reader_find_metadata(r, "ARROW:schema");
+    size_t n = 0;
+    uint8_t* blob = b64 ? fm_b64_decode(b64, &n) : NULL;
+    /* The Decimal table's three int32 fields (precision 9, scale 2, bitWidth
+     * 128) are laid out contiguously; precision used to be written as 0. */
+    static const uint8_t fwd[12] = {9,0,0,0, 2,0,0,0, 128,0,0,0};
+    static const uint8_t bwd[12] = {128,0,0,0, 2,0,0,0, 9,0,0,0};
+    int ok = 0;
+    for (size_t i = 0; blob && i + 12 <= n && !ok; i++)
+        ok = memcmp(blob + i, fwd, 12) == 0 || memcmp(blob + i, bwd, 12) == 0;
+    free(blob);
+    carquet_reader_close(r); carquet_test_cleanup(path);
+    if (!ok) TEST_FAIL("arrow_schema_decimal", "Decimal(9, 2) not found in ARROW:schema");
+    TEST_PASS("arrow_schema_decimal");
+    return 0;
+}
+
 int main(void) {
     int failures = 0;
     failures += test_int96_roundtrip();
@@ -1753,6 +1794,7 @@ int main(void) {
     failures += test_field_metadata_errors();
     failures += test_arrow_schema_skipped_when_off();
     failures += test_arrow_schema_nested();
+    failures += test_arrow_schema_decimal();
     failures += test_arrow_type_refinement_read();
     failures += test_float16_stats();
     failures += test_bitpacked_levels();

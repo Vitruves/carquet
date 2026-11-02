@@ -15,7 +15,7 @@ authors:
 repository-code: "https://github.com/Vitruves/carquet"
 url: "https://github.com/Vitruves/carquet"
 license: MIT
-version: 0.7.2
+version: 0.7.3
 date-released: "2026-10-20"
 keywords:
   - parquet
