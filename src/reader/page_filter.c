@@ -843,8 +843,10 @@ static carquet_status_t eval_clause_to_ranges(
         int64_t end_row;
         if (i + 1 < n_pages) {
             carquet_page_location_t next;
-            (void)carquet_offset_index_get_page_location(oi, i + 1, &next);
-            end_row = next.first_row_index;
+            /* (void) does not silence GCC's warn_unused_result, and on failure
+             * `next` would be read uninitialized. */
+            end_row = carquet_offset_index_get_page_location(oi, i + 1, &next) == CARQUET_OK
+                ? next.first_row_index : rg_rows;
         } else {
             end_row = rg_rows;
         }

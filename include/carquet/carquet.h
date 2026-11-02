@@ -438,6 +438,27 @@ void carquet_set_allocator(const carquet_allocator_t* allocator);
 CARQUET_API CARQUET_PURE
 const carquet_allocator_t* carquet_get_allocator(void);
 
+/**
+ * @brief Free a memory block that Carquet handed to the caller.
+ *
+ * Use this for buffers whose ownership Carquet transfers to the caller, such
+ * as the one returned by carquet_writer_get_buffer(). It releases the block
+ * through the allocator that produced it (the current carquet_allocator_t),
+ * from inside the library.
+ *
+ * Prefer it over the C library's free(): on Windows a DLL build of Carquet
+ * and the application can use different C runtime heaps (a Debug application
+ * links ucrtbased.dll, a /MT build has its own static CRT, MinGW may use
+ * msvcrt.dll), and freeing across heaps corrupts memory or aborts. It is also
+ * required when a custom allocator is installed.
+ *
+ * @param[in] ptr Block to free (NULL is a no-op)
+ *
+ * @note Thread-safe: Yes
+ */
+CARQUET_API
+void carquet_free(void* ptr);
+
 /* ============================================================================
  * Custom Codec Registration
  * ============================================================================
@@ -3722,8 +3743,12 @@ carquet_writer_t* carquet_writer_create_buffer(
 /**
  * @brief Get the buffer contents after writing.
  *
- * Must be called after carquet_writer_close(). The buffer is owned by the
- * caller and must be freed with free().
+ * Must be called after carquet_writer_close(). On success the writer is
+ * released (do not call carquet_writer_abort() on it afterwards). The buffer
+ * is owned by the caller and must be freed with carquet_free(). (Plain free()
+ * only works when the application and Carquet share one C runtime heap and
+ * no custom allocator is set; on Windows a carquet DLL and the application
+ * can each link a different CRT heap, /MT vs /MD or debug vs release.)
  *
  * @param[in] writer Writer (must have been created with create_buffer)
  * @param[out] buffer Output pointer to buffer data

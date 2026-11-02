@@ -2547,7 +2547,11 @@ static carquet_status_t position_projected_column(
             return CARQUET_ERROR_INTERNAL;
         }
         carquet_page_location_t loc;
-        (void)carquet_offset_index_get_page_location(oi, page_idx, &loc);
+        if (carquet_offset_index_get_page_location(oi, page_idx, &loc) != CARQUET_OK) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_INTERNAL,
+                "Could not read page location %d in column %d", (int)page_idx, file_col);
+            return CARQUET_ERROR_INTERNAL;
+        }
 
         carquet_status_t st = carquet_column_reader_seek_to_data_page(
             cr, loc.offset, 0, error);

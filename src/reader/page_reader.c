@@ -145,30 +145,21 @@ static bool checked_add_i64(int64_t a, int64_t b, int64_t* out);
  */
 static size_t prebuf_read_at(carquet_reader_t* file_reader,
                              int64_t offset, void* buf, size_t size) {
-    if (offset < 0 || size > (size_t)INT64_MAX) {
+    /* Compare in 64 bits: on 32-bit builds a (size_t) cast of the file offset
+     * would truncate it and could match the wrong prebuffer range. */
+    if (offset < 0 || (uint64_t)size > (uint64_t)INT64_MAX - (uint64_t)offset) {
         return 0;
     }
-
-    size_t start = (size_t)offset;
-    size_t end = 0;
-    if (!checked_add_size(start, size, &end)) {
-        return 0;
-    }
-    size_t prebuf_start = file_reader->prebuffer.file_offset >= 0
-                        ? (size_t)file_reader->prebuffer.file_offset : 0;
-    size_t prebuf_end = 0;
-    bool prebuf_end_ok = checked_add_size(prebuf_start, file_reader->prebuffer.size,
-                                          &prebuf_end);
 
     /* Check prebuffer cache first */
-    if (file_reader->prebuffer.data &&
-        offset >= file_reader->prebuffer.file_offset &&
-        prebuf_end_ok &&
-        start >= prebuf_start &&
-        end <= prebuf_end) {
-        memcpy(buf, file_reader->prebuffer.data +
-               (offset - file_reader->prebuffer.file_offset), size);
-        return size;
+    if (file_reader->prebuffer.data && file_reader->prebuffer.file_offset >= 0 &&
+        offset >= file_reader->prebuffer.file_offset) {
+        uint64_t rel = (uint64_t)offset - (uint64_t)file_reader->prebuffer.file_offset;
+        uint64_t cached = (uint64_t)file_reader->prebuffer.size;
+        if (rel <= cached && (uint64_t)size <= cached - rel) {
+            memcpy(buf, file_reader->prebuffer.data + (size_t)rel, size);
+            return size;
+        }
     }
 
     /* Fall back to 64-bit aware seek + fread */
@@ -374,7 +365,7 @@ static carquet_status_t validate_page_payload_span(
     int32_t compressed_size,
     carquet_error_t* error) {
 
-    if (page_offset < 0 || (size_t)page_offset > file_reader->file_size) {
+    if (page_offset < 0 || (uint64_t)page_offset > (uint64_t)file_reader->file_size) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Page offset out of range");
         return CARQUET_ERROR_INVALID_PAGE;
     }
@@ -1979,7 +1970,7 @@ static carquet_status_t load_dictionary_page_mmap_at(
     const parquet_column_metadata_t* col_meta = reader->col_meta;
 
     /* Parse page header directly from mmap */
-    if (dict_offset < 0 || (size_t)dict_offset >= file_reader->file_size) {
+    if (dict_offset < 0 || (uint64_t)dict_offset >= (uint64_t)file_reader->file_size) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Dictionary page offset out of range");
         return CARQUET_ERROR_INVALID_PAGE;
     }
@@ -2384,7 +2375,7 @@ static carquet_status_t load_next_page_mmap(
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Data page offset overflow");
         return CARQUET_ERROR_INVALID_PAGE;
     }
-    if (page_offset < 0 || (size_t)page_offset >= file_reader->file_size) {
+    if (page_offset < 0 || (uint64_t)page_offset >= (uint64_t)file_reader->file_size) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Data page offset out of range");
         return CARQUET_ERROR_INVALID_PAGE;
     }
@@ -2910,7 +2901,7 @@ static carquet_status_t parse_header_at_offset(
     parquet_page_header_t* hdr, size_t* hdr_size,
     carquet_error_t* error) {
 
-    if (offset < 0 || (size_t)offset >= file_reader->file_size) {
+    if (offset < 0 || (uint64_t)offset >= (uint64_t)file_reader->file_size) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE,
             "Page header offset out of file");
         return CARQUET_ERROR_INVALID_PAGE;

@@ -267,6 +267,14 @@ else()
         GIT_PROGRESS   FALSE
     )
     set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    # Keep zlib's own install() rules out of carquet's install: they put a
+    # shared zlib.dll + zlib.lib, zlib.h, zlib.pc and a man page in the
+    # prefix. On Windows the default prefix (C:/Program Files (x86)/carquet)
+    # is searched by find_package(), so the next carquet configure then took
+    # that shared zlib as the "system" zlib and every test failed to start
+    # (zlib.dll not found). A static carquet still installs zlibstatic via its
+    # own export set below. (Normal variable: scoped to this directory.)
+    set(SKIP_INSTALL_ALL ON)
     FetchContent_MakeAvailable(zlib)
     set(ZLIB_LIBRARIES zlibstatic)
     set(ZLIB_INCLUDE_DIRS ${zlib_SOURCE_DIR} ${zlib_BINARY_DIR})
@@ -356,8 +364,22 @@ if(NOT LZ4_FOUND)
 endif()
 
 # Compiler detection
-if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+# clang-cl reports CMAKE_C_COMPILER_ID "Clang" but takes MSVC-style options
+# (-flto=auto, -O3 are rejected), so it follows the MSVC path for warnings and
+# optimisation flags. For per-file ISA flags it is GNU-like: clang only
+# exposes SSE4.2/AVX2/BMI2 intrinsics when the target feature is enabled, and
+# clang-cl accepts -msse4.2/-mavx2/... directly. CARQUET_ISA_FLAGS_GNU covers
+# both GCC-like compilers and clang-cl; CARQUET_NO_LTO_FLAG is empty for
+# clang-cl (no LTO there to opt out of).
+if(CMAKE_C_COMPILER_ID MATCHES "Clang" AND CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    set(CARQUET_COMPILER_MSVC TRUE)
+    set(CARQUET_COMPILER_CLANG_CL TRUE)
+    set(CARQUET_ISA_FLAGS_GNU TRUE)
+    set(CARQUET_NO_LTO_FLAG "")
+elseif(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     set(CARQUET_COMPILER_GCC_LIKE TRUE)
+    set(CARQUET_ISA_FLAGS_GNU TRUE)
+    set(CARQUET_NO_LTO_FLAG "-fno-lto")
 elseif(CMAKE_C_COMPILER_ID MATCHES "MSVC")
     set(CARQUET_COMPILER_MSVC TRUE)
 endif()
@@ -401,6 +423,15 @@ if(CARQUET_COMPILER_GCC_LIKE)
         if(_LLVM_RANLIB)
             set(CMAKE_RANLIB "${_LLVM_RANLIB}" CACHE FILEPATH "Ranlib" FORCE)
         endif()
+    elseif(CMAKE_C_COMPILER_ID STREQUAL "GNU" AND CMAKE_C_COMPILER_AR AND CMAKE_C_COMPILER_RANLIB)
+        # GCC LTO objects carry only GIMPLE, so the archive symbol index must be
+        # written through the LTO plugin: use gcc-ar/gcc-ranlib (what CMake's
+        # own IPO support uses). Plain `ar` works only where binutils has the
+        # plugin installed in lib/bfd-plugins; MinGW-w64 builds commonly don't,
+        # and a Release libcarquet.a then links with "undefined reference to
+        # carquet_dispatch_*".
+        set(CMAKE_AR "${CMAKE_C_COMPILER_AR}" CACHE FILEPATH "Archiver" FORCE)
+        set(CMAKE_RANLIB "${CMAKE_C_COMPILER_RANLIB}" CACHE FILEPATH "Ranlib" FORCE)
     endif()
 elseif(CARQUET_COMPILER_MSVC)
     # MSVC warning levels and options
@@ -434,6 +465,7 @@ set(CARQUET_CORE_SOURCES
     src/core/endian.c
     src/core/error.c
     src/core/geo_wkb.c
+    src/core/file_io.c
 )
 
 set(CARQUET_THRIFT_SOURCES
@@ -464,7 +496,7 @@ set(CARQUET_COMPRESSION_SOURCES
 # Snappy uses SSSE3 (pshufb) for pattern extension on x86.
 # SSSE3 is baseline since Core 2 (2006) / x86-64-v2.
 if(CARQUET_ARCH_X86 AND CARQUET_ENABLE_SSE)
-    if(CARQUET_COMPILER_GCC_LIKE)
+    if(CARQUET_ISA_FLAGS_GNU)
         set_source_files_properties(src/compression/snappy.c PROPERTIES
             COMPILE_FLAGS "-mssse3")
     endif()
@@ -526,7 +558,7 @@ if(CARQUET_ARCH_X86)
     endif()
 
     # Auto-detect: disable AVX-512 if compiler lacks _mm512_set_epi8 (GCC < 9)
-    if(CARQUET_ENABLE_AVX512 AND CARQUET_COMPILER_GCC_LIKE)
+    if(CARQUET_ENABLE_AVX512 AND CARQUET_ISA_FLAGS_GNU)
         include(CheckCSourceCompiles)
         set(CMAKE_REQUIRED_FLAGS "-mavx512f -mavx512bw -mavx512vl")
         check_c_source_compiles("
@@ -557,17 +589,17 @@ if(CARQUET_ARCH_X86)
     # only reached through the dispatch table's function pointers.
     if(CARQUET_ENABLE_SSE)
         list(APPEND CARQUET_SIMD_X86_SOURCES src/simd/x86/sse_ops.c)
-        if(CARQUET_COMPILER_GCC_LIKE)
+        if(CARQUET_ISA_FLAGS_GNU)
             set_source_files_properties(src/simd/x86/sse_ops.c PROPERTIES
-                COMPILE_FLAGS "-msse4.2 -fno-lto")
+                COMPILE_FLAGS "-msse4.2 ${CARQUET_NO_LTO_FLAG}")
         endif()
     endif()
 
     if(CARQUET_ENABLE_AVX)
         list(APPEND CARQUET_SIMD_X86_SOURCES src/simd/x86/avx_ops.c)
-        if(CARQUET_COMPILER_GCC_LIKE)
+        if(CARQUET_ISA_FLAGS_GNU)
             set_source_files_properties(src/simd/x86/avx_ops.c PROPERTIES
-                COMPILE_FLAGS "-mavx -msse4.2 -fno-lto")
+                COMPILE_FLAGS "-mavx -msse4.2 ${CARQUET_NO_LTO_FLAG}")
         elseif(CARQUET_COMPILER_MSVC)
             set_source_files_properties(src/simd/x86/avx_ops.c PROPERTIES
                 COMPILE_FLAGS "/arch:AVX")
@@ -576,9 +608,9 @@ if(CARQUET_ARCH_X86)
 
     if(CARQUET_ENABLE_AVX2)
         list(APPEND CARQUET_SIMD_X86_SOURCES src/simd/x86/avx2_ops.c)
-        if(CARQUET_COMPILER_GCC_LIKE)
+        if(CARQUET_ISA_FLAGS_GNU)
             set_source_files_properties(src/simd/x86/avx2_ops.c PROPERTIES
-                COMPILE_FLAGS "-mavx2 -mbmi2 -fno-lto")
+                COMPILE_FLAGS "-mavx2 -mbmi2 ${CARQUET_NO_LTO_FLAG}")
         elseif(CARQUET_COMPILER_MSVC)
             set_source_files_properties(src/simd/x86/avx2_ops.c PROPERTIES
                 COMPILE_FLAGS "/arch:AVX2")
@@ -587,9 +619,9 @@ if(CARQUET_ARCH_X86)
 
     if(CARQUET_ENABLE_AVX512)
         list(APPEND CARQUET_SIMD_X86_SOURCES src/simd/x86/avx512_ops.c)
-        if(CARQUET_COMPILER_GCC_LIKE)
+        if(CARQUET_ISA_FLAGS_GNU)
             set_source_files_properties(src/simd/x86/avx512_ops.c PROPERTIES
-                COMPILE_FLAGS "-mavx512f -mavx512bw -mavx512vl -fno-lto")
+                COMPILE_FLAGS "-mavx512f -mavx512bw -mavx512vl ${CARQUET_NO_LTO_FLAG}")
         elseif(CARQUET_COMPILER_MSVC)
             set_source_files_properties(src/simd/x86/avx512_ops.c PROPERTIES
                 COMPILE_FLAGS "/arch:AVX512")
@@ -648,6 +680,17 @@ if(CARQUET_BUILD_SHARED)
         PUBLIC CARQUET_BUILD_SHARED
         PRIVATE CARQUET_BUILDING_DLL
     )
+    if((MINGW OR CYGWIN) AND CARQUET_COMPILER_GCC_LIKE)
+        # GNU ld auto-exports every global from the DLL, but from LTO objects
+        # it cannot tell functions from data and exports them all as DATA, so
+        # the import library has no call thunks. Callers that do not see
+        # __declspec(dllimport) (tests, the CLI, consumers without
+        # -DCARQUET_BUILD_SHARED) then get 32-bit pseudo-relocations into the
+        # DLL and abort at startup under high-entropy ASLR ("32 bit pseudo
+        # relocation ... out of range"). Build the DLL itself without LTO.
+        target_compile_options(carquet PRIVATE -fno-lto)
+        target_link_options(carquet PRIVATE -fno-lto)
+    endif()
 else()
     add_library(carquet STATIC ${CARQUET_SOURCES})
 endif()
@@ -665,6 +708,50 @@ target_include_directories(carquet
 )
 if(BROTLI_LIBRARIES)
     target_compile_definitions(carquet PRIVATE CARQUET_HAVE_BROTLI=1)
+endif()
+
+# MSVC: the library itself is held to /W4 with the truncation warnings
+# (C4244/C4267) live, unlike tests/examples which keep the directory-wide
+# /W3 + /wd4244 /wd4267. The parser handles untrusted sizes, and on 32-bit
+# targets C4244 (int64_t -> size_t) is exactly the class of bug that wraps an
+# allocation size. Only C4200 (C99 flexible array member, standard C) is off.
+if(CARQUET_COMPILER_MSVC)
+    get_target_property(_carquet_opts carquet COMPILE_OPTIONS)
+    if(_carquet_opts)
+        list(REMOVE_ITEM _carquet_opts /W3 /wd4244 /wd4267)
+        set_target_properties(carquet PROPERTIES COMPILE_OPTIONS "${_carquet_opts}")
+    endif()
+    target_compile_options(carquet PRIVATE /W4 /wd4200)
+    # The x86 SIMD kernels pass byte/word constants such as (char)0x80 to
+    # _mm_set1_*; the C4310 "cast truncates constant value" there is intended.
+    foreach(_simd_src IN LISTS CARQUET_SIMD_X86_SOURCES)
+        set_property(SOURCE ${_simd_src} APPEND PROPERTY COMPILE_OPTIONS /wd4310)
+    endforeach()
+endif()
+
+# Windows exploit mitigations for MSVC builds (no effect elsewhere).
+#  /guard:cf   Control Flow Guard: indirect calls (SIMD dispatch tables,
+#              allocator and codec callbacks) are checked against valid
+#              targets. Compiled into the library objects so a CFG-enabled
+#              consumer is fully covered; linked into the DLL and CLI. Measured
+#              read throughput (20M rows, dictionary + delta + plain columns,
+#              x64 Release): within run-to-run noise of a non-CFG build.
+#  /CETCOMPAT  Marks the DLL/CLI as compatible with CET shadow stacks
+#              (hardware return-address protection). Link-time flag only, no
+#              code change; x86/x64 only.
+# /GS, /DYNAMICBASE, /NXCOMPAT and (x64) /HIGHENTROPYVA are MSVC defaults.
+# /sdl is not used: it promotes several warnings to errors, which would make
+# the build fragile for consumers on other MSVC versions.
+option(CARQUET_MSVC_HARDENING "MSVC: build with /guard:cf and link with /CETCOMPAT" ON)
+if(CARQUET_COMPILER_MSVC AND CARQUET_MSVC_HARDENING)
+    target_compile_options(carquet PRIVATE /guard:cf)
+    set(CARQUET_MSVC_HARDEN_LINK_OPTIONS /guard:cf)
+    if(CARQUET_ARCH_X86)
+        list(APPEND CARQUET_MSVC_HARDEN_LINK_OPTIONS /CETCOMPAT)
+    endif()
+    if(CARQUET_BUILD_SHARED)
+        target_link_options(carquet PRIVATE ${CARQUET_MSVC_HARDEN_LINK_OPTIONS})
+    endif()
 endif()
 
 # Link external compression libraries
@@ -765,11 +852,13 @@ if(CARQUET_BUILD_TESTS)
         target_include_directories(${TEST_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         # Tests use assert() for validation — keep assertions enabled in all build types
         if(MSVC)
-            target_compile_options(${TEST_NAME} PRIVATE /UNDEBUG)
+            # /UNDEBUG would trigger D9025 ("overriding /DNDEBUG") on every file.
+            target_compile_options(${TEST_NAME} PRIVATE
+                "/FI${CMAKE_CURRENT_SOURCE_DIR}/tests/force_asserts.h")
         else()
             target_compile_options(${TEST_NAME} PRIVATE -UNDEBUG)
         endif()
-        if(CARQUET_COMPILER_GCC_LIKE)
+        if(CARQUET_COMPILER_GCC_LIKE OR CARQUET_COMPILER_CLANG_CL)
             target_compile_options(${TEST_NAME} PRIVATE -Wno-unused-result)
         endif()
         add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
@@ -793,6 +882,7 @@ if(CARQUET_BUILD_TESTS)
     add_carquet_test(test_edge_malformed tests/test_edge_malformed.c)
     add_carquet_test(test_edge_boundaries tests/test_edge_boundaries.c)
     add_carquet_test(test_edge_io tests/test_edge_io.c)
+    add_carquet_test(test_platform_io tests/test_platform_io.c)
 
     # Nested schema tests
     add_carquet_test(test_nested tests/test_nested.c)
@@ -866,7 +956,7 @@ if(CARQUET_BUILD_TESTS)
     add_carquet_test(test_geo_wkb tests/test_geo_wkb.c)          # WKB geospatial stats walker
     add_carquet_test(test_worker_pool tests/test_worker_pool.c)  # persistent reader thread pool
     # This test uses C11 <stdatomic.h> directly; MSVC only enables it under an opt-in flag.
-    if(MSVC)
+    if(MSVC AND NOT CARQUET_COMPILER_CLANG_CL)  # clang-cl has <stdatomic.h> natively
         target_compile_options(test_worker_pool PRIVATE /experimental:c11atomics)
     endif()
     add_carquet_test(test_custom_codec tests/test_custom_codec.c) # pluggable compression codec API
@@ -882,7 +972,7 @@ if(CARQUET_BUILD_EXAMPLES)
     function(add_carquet_example EXAMPLE_NAME EXAMPLE_SOURCE)
         add_executable(${EXAMPLE_NAME} ${EXAMPLE_SOURCE})
         target_link_libraries(${EXAMPLE_NAME} PRIVATE carquet)
-        if(CARQUET_COMPILER_GCC_LIKE)
+        if(CARQUET_COMPILER_GCC_LIKE OR CARQUET_COMPILER_CLANG_CL)
             target_compile_options(${EXAMPLE_NAME} PRIVATE -Wno-unused-result)
         endif()
     endfunction()
@@ -905,14 +995,14 @@ if(CARQUET_BUILD_BENCHMARKS)
     if(UNIX AND NOT APPLE)
         target_link_libraries(benchmark_carquet PRIVATE m)  # libm for math functions
     endif()
-    if(CARQUET_COMPILER_GCC_LIKE)
+    if(CARQUET_COMPILER_GCC_LIKE OR CARQUET_COMPILER_CLANG_CL)
         target_compile_options(benchmark_carquet PRIVATE -Wno-unused-result)
     endif()
 
     # Test file generator (C replacement for generate_test_files.py - no extra deps)
     add_executable(generate_test_files benchmark/generate_test_files.c)
     target_link_libraries(generate_test_files PRIVATE carquet)
-    if(CARQUET_COMPILER_GCC_LIKE)
+    if(CARQUET_COMPILER_GCC_LIKE OR CARQUET_COMPILER_CLANG_CL)
         target_compile_options(generate_test_files PRIVATE -Wno-unused-result)
     endif()
 
@@ -957,7 +1047,7 @@ if(CARQUET_BUILD_BENCHMARKS)
                     CXX_STANDARD 20
                     CXX_STANDARD_REQUIRED YES
                 )
-                if(CARQUET_COMPILER_GCC_LIKE)
+                if(CARQUET_COMPILER_GCC_LIKE OR CARQUET_COMPILER_CLANG_CL)
                     target_compile_options(benchmark_arrow_cpp PRIVATE -Wno-unused-result)
                 endif()
             else()
@@ -1009,13 +1099,13 @@ if(CARQUET_BUILD_INTEROP)
         add_executable(test_interop interop/test_interop.c)
         target_link_libraries(test_interop PRIVATE carquet)
         target_include_directories(test_interop PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        if(CARQUET_COMPILER_GCC_LIKE)
+        if(CARQUET_COMPILER_GCC_LIKE OR CARQUET_COMPILER_CLANG_CL)
             target_compile_options(test_interop PRIVATE -Wno-unused-result)
         endif()
 
         add_executable(roundtrip_writer interop/roundtrip_writer.c)
         target_link_libraries(roundtrip_writer PRIVATE carquet)
-        if(CARQUET_COMPILER_GCC_LIKE)
+        if(CARQUET_COMPILER_GCC_LIKE OR CARQUET_COMPILER_CLANG_CL)
             target_compile_options(roundtrip_writer PRIVATE -Wno-unused-result)
         endif()
     endif()
@@ -1066,8 +1156,19 @@ if(CARQUET_BUILD_CLI)
     )
     set_target_properties(carquet_cli PROPERTIES OUTPUT_NAME carquet)
     target_link_libraries(carquet_cli PRIVATE carquet)
+    if(WIN32)
+        # CommandLineToArgvW (UTF-8 argv, src/cli/main.c)
+        target_link_libraries(carquet_cli PRIVATE shell32)
+    endif()
+    if(CARQUET_COMPILER_MSVC AND CARQUET_MSVC_HARDENING)
+        target_compile_options(carquet_cli PRIVATE /guard:cf)
+        target_link_options(carquet_cli PRIVATE ${CARQUET_MSVC_HARDEN_LINK_OPTIONS})
+    endif()
     target_include_directories(carquet_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    if(CARQUET_COMPILER_GCC_LIKE)
+    if(WIN32)
+        target_link_libraries(carquet_cli PRIVATE shell32)  # CommandLineToArgvW (UTF-8 argv)
+    endif()
+    if(CARQUET_COMPILER_GCC_LIKE OR CARQUET_COMPILER_CLANG_CL)
         target_compile_options(carquet_cli PRIVATE -Wno-unused-result)
     endif()
 endif()
@@ -1194,6 +1295,32 @@ if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
     endif()
     if(CARQUET_NEEDS_OPENMP AND OpenMP_C_FLAGS)
         string(APPEND CARQUET_PC_PRIVATE_LIBS " ${OpenMP_C_FLAGS}")
+    endif()
+
+    # Consumers of the shared library need CARQUET_BUILD_SHARED so carquet.h
+    # declares the API __declspec(dllimport) on Windows (the CMake target
+    # carries it as a PUBLIC definition; mirror that here).
+    set(CARQUET_PC_CFLAGS "")
+    if(CARQUET_BUILD_SHARED)
+        set(CARQUET_PC_CFLAGS " -DCARQUET_BUILD_SHARED")
+    endif()
+
+    # Prefix written into the .pc. On Windows the configure-time default
+    # ("C:/Program Files (x86)/carquet") is rarely where the files end up
+    # (`cmake --install --prefix`, unzipped release archives) and contains
+    # spaces, so make it relative to the .pc file itself (${pcfiledir},
+    # understood by pkg-config >= 0.27 and pkgconf).
+    set(CARQUET_PC_PREFIX "${CMAKE_INSTALL_PREFIX}")
+    set(CARQUET_PC_LIBDIR "${CMAKE_INSTALL_FULL_LIBDIR}")
+    set(CARQUET_PC_INCLUDEDIR "${CMAKE_INSTALL_FULL_INCLUDEDIR}")
+    if(WIN32 AND NOT IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}"
+             AND NOT IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
+        file(RELATIVE_PATH _carquet_pc_up
+            "/carquet_prefix/${CMAKE_INSTALL_LIBDIR}/pkgconfig" "/carquet_prefix")
+        string(REGEX REPLACE "/$" "" _carquet_pc_up "${_carquet_pc_up}")
+        set(CARQUET_PC_PREFIX "\${pcfiledir}/${_carquet_pc_up}")
+        set(CARQUET_PC_LIBDIR "\${prefix}/${CMAKE_INSTALL_LIBDIR}")
+        set(CARQUET_PC_INCLUDEDIR "\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}")
     endif()
 
     configure_file(

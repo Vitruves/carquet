@@ -555,6 +555,20 @@ extern void carquet_avx2_bitunpack8_8bit(const uint8_t* input, uint32_t* values)
 extern void carquet_avx2_bitunpack8_16bit(const uint8_t* input, uint32_t* values);
 extern void carquet_avx2_bitunpack16_4bit(const uint8_t* input, uint32_t* values);
 extern void carquet_avx2_bitunpack16_8bit(const uint8_t* input, uint32_t* values);
+/* Generic shuffle/variable-shift kernels (avx2_ops.c): 8-value slot for
+ * 9-15, 17-25 and 32 bits; 32-value wide kernels for 5-7, 9-25 bits. */
+#define CQ_AVX2_BU_DECL(W)     extern void carquet_avx2_bitunpack8_##W##bit(const uint8_t* input, uint32_t* values);     extern void carquet_avx2_bitunpack32_##W##bit(const uint8_t* input, uint32_t* values);
+CQ_AVX2_BU_DECL(9)  CQ_AVX2_BU_DECL(10) CQ_AVX2_BU_DECL(11) CQ_AVX2_BU_DECL(12)
+CQ_AVX2_BU_DECL(13) CQ_AVX2_BU_DECL(14) CQ_AVX2_BU_DECL(15)
+CQ_AVX2_BU_DECL(17) CQ_AVX2_BU_DECL(18) CQ_AVX2_BU_DECL(19) CQ_AVX2_BU_DECL(20)
+CQ_AVX2_BU_DECL(21) CQ_AVX2_BU_DECL(22) CQ_AVX2_BU_DECL(23) CQ_AVX2_BU_DECL(24)
+CQ_AVX2_BU_DECL(25)
+#undef CQ_AVX2_BU_DECL
+extern void carquet_avx2_bitunpack32_5bit(const uint8_t* input, uint32_t* values);
+extern void carquet_avx2_bitunpack32_6bit(const uint8_t* input, uint32_t* values);
+extern void carquet_avx2_bitunpack32_7bit(const uint8_t* input, uint32_t* values);
+extern void carquet_avx2_bitunpack32_16bit(const uint8_t* input, uint32_t* values);
+extern void carquet_avx2_bitunpack8_32bit(const uint8_t* input, uint32_t* values);
 extern void carquet_avx2_unpack_bools(const uint8_t* input, uint8_t* output, int64_t count);
 extern void carquet_avx2_pack_bools(const uint8_t* input, uint8_t* output, int64_t count);
 extern void carquet_avx2_match_copy(uint8_t* dst, const uint8_t* src, size_t len, size_t offset);
@@ -1017,6 +1031,23 @@ void carquet_simd_dispatch_init(void) {
         g_dispatch.bitunpack_wide_vals[4] = 16;
         g_dispatch.bitunpack_wide_fn[8] = carquet_avx2_bitunpack16_8bit;
         g_dispatch.bitunpack_wide_vals[8] = 16;
+        /* Shuffle + variable-shift kernels for the remaining widths (the
+         * scalar fallback handles these one byte at a time). Verified
+         * against an independent oracle by test_bitunpack_wide. */
+#define CQ_AVX2_BU_SET8(W)  g_dispatch.bitunpack8_u32[W] = carquet_avx2_bitunpack8_##W##bit;
+#define CQ_AVX2_BU_SET32(W) g_dispatch.bitunpack_wide_fn[W] = carquet_avx2_bitunpack32_##W##bit;                             g_dispatch.bitunpack_wide_vals[W] = 32;
+#define CQ_AVX2_BU_SET(W)   CQ_AVX2_BU_SET8(W) CQ_AVX2_BU_SET32(W)
+        CQ_AVX2_BU_SET32(5) CQ_AVX2_BU_SET32(6) CQ_AVX2_BU_SET32(7)
+        CQ_AVX2_BU_SET(9)  CQ_AVX2_BU_SET(10) CQ_AVX2_BU_SET(11) CQ_AVX2_BU_SET(12)
+        CQ_AVX2_BU_SET(13) CQ_AVX2_BU_SET(14) CQ_AVX2_BU_SET(15)
+        CQ_AVX2_BU_SET32(16)
+        CQ_AVX2_BU_SET(17) CQ_AVX2_BU_SET(18) CQ_AVX2_BU_SET(19) CQ_AVX2_BU_SET(20)
+        CQ_AVX2_BU_SET(21) CQ_AVX2_BU_SET(22) CQ_AVX2_BU_SET(23) CQ_AVX2_BU_SET(24)
+        CQ_AVX2_BU_SET(25)
+        CQ_AVX2_BU_SET8(32)
+#undef CQ_AVX2_BU_SET
+#undef CQ_AVX2_BU_SET32
+#undef CQ_AVX2_BU_SET8
         g_dispatch.find_run_length_i32 = carquet_avx2_find_run_length_i32;
     }
 #endif

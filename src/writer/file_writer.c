@@ -15,6 +15,7 @@
 #include "core/buffer.h"
 #include "core/arena.h"
 #include "core/compat.h"
+#include "core/file_io.h"
 #include "reader/reader_internal.h"
 #include "reader/worker_pool.h"
 #include "thrift/thrift_encode.h"
@@ -858,7 +859,8 @@ static bool leaf_statistics_sort_order_defined(
 
 static carquet_status_t ensure_column_overrides(carquet_writer_t* writer) {
     if (writer->column_overrides_allocated) return CARQUET_OK;
-    int32_t n = writer->num_columns;
+    if (writer->num_columns < 0) return CARQUET_ERROR_INVALID_ARGUMENT;
+    size_t n = (size_t)writer->num_columns;
     writer->column_encoding_overrides = carquet_mem_calloc(n, sizeof(carquet_encoding_t));
     writer->column_encoding_override_set = carquet_mem_calloc(n, sizeof(bool));
     writer->column_compression_overrides = carquet_mem_calloc(n, sizeof(carquet_compression_t));
@@ -881,7 +883,7 @@ static carquet_status_t ensure_column_overrides(carquet_writer_t* writer) {
         !writer->column_page_size_overrides || !writer->column_page_size_override_set) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
-    for (int32_t i = 0; i < n; i++) {
+    for (size_t i = 0; i < n; i++) {
         writer->column_statistics_overrides[i] = writer->options.write_statistics;
         writer->column_bloom_filter_overrides[i] = writer->options.write_bloom_filters;
     }
@@ -2494,7 +2496,7 @@ carquet_writer_t* carquet_writer_create(
     }
 
     /* Open file */
-    writer->file = fopen(path, "wb");
+    writer->file = carquet_fopen(path, "wb");
     if (!writer->file) {
         carquet_arena_destroy(&writer->arena);
         carquet_mem_free(writer);
@@ -2994,7 +2996,7 @@ carquet_writer_t* carquet_writer_open_append(
     }
 
     /* "r+b": read+write, do not truncate, fail if missing. */
-    writer->file = fopen(path, "r+b");
+    writer->file = carquet_fopen(path, "r+b");
     if (!writer->file) {
         carquet_arena_destroy(&writer->arena);
         carquet_mem_free(writer);
@@ -3530,6 +3532,12 @@ carquet_status_t carquet_writer_close(carquet_writer_t* writer) {
         int64_t file_size = -1;
         if (carquet_fseek64(writer->file, 0, SEEK_END) == 0)
             file_size = carquet_ftell64(writer->file);
+        if (file_size > 0 && (uint64_t)file_size > (uint64_t)SIZE_MAX) {
+            /* 32-bit build: the (size_t) casts below would truncate and
+             * return a silently shortened buffer with CARQUET_OK. */
+            status = CARQUET_ERROR_OUT_OF_MEMORY;
+            goto cleanup;
+        }
         if (file_size > 0) {
             writer->output_buffer = carquet_mem_malloc((size_t)file_size);
             if (!writer->output_buffer) {
@@ -3648,7 +3656,7 @@ void carquet_writer_abort(carquet_writer_t* writer) {
         writer->file = NULL;
 
         if (writer->path && !writer->is_append) {
-            remove(writer->path);
+            carquet_remove(writer->path);
         }
     }
 

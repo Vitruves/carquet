@@ -5,6 +5,7 @@
 
 #include "core/allocator.h"
 #include "core/compat.h"
+#include "core/file_io.h"
 #include <carquet/carquet.h>
 #include "reader_internal.h"
 #include "thrift/parquet_types.h"
@@ -354,6 +355,15 @@ static carquet_status_t read_footer(carquet_reader_t* reader, carquet_error_t* e
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_READ, "Failed to get file size");
         return CARQUET_ERROR_FILE_READ;
     }
+    /* file_size and every bounds check against it are size_t. On a 32-bit
+     * build a file over SIZE_MAX would be truncated here, so the footer would
+     * be looked for at the wrong offset and chunk offsets beyond 4 GiB could
+     * alias into the checked range. Refuse it instead. */
+    if ((uint64_t)file_size > (uint64_t)SIZE_MAX) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_READ,
+            "File too large for this platform (%lld bytes)", (long long)file_size);
+        return CARQUET_ERROR_FILE_READ;
+    }
     reader->file_size = (size_t)file_size;
 
     /* Check minimum size */
@@ -579,7 +589,7 @@ carquet_reader_t* carquet_reader_open(
     }
 
     /* Standard fread path */
-    FILE* file = fopen(path, "rb");
+    FILE* file = carquet_fopen(path, "rb");
     if (!file) {
         carquet_arena_destroy(&reader->arena);
         carquet_mem_free(reader);
@@ -1192,7 +1202,7 @@ static carquet_status_t reader_read_bytes(
 
     /* Bounds check */
     if (offset < 0 || offset > INT64_MAX - (int64_t)size ||
-        (size_t)offset > reader->file_size ||
+        (uint64_t)offset > (uint64_t)reader->file_size ||
         (size_t)size > reader->file_size - (size_t)offset) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_READ,
             "Read at offset %lld size %d exceeds file size %lld",

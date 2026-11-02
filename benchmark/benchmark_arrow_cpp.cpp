@@ -11,8 +11,16 @@
 #include <vector>
 
 #ifdef _WIN32
+/* windows.h's min/max macros break Arrow's std::numeric_limits<>::max() calls. */
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <sys/stat.h>
+#include "bench_purge_win32.h"
 #else
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -147,6 +155,8 @@ static void purge_file_cache(const char* filename) {
         posix_fadvise(fd, 0, st.st_size, POSIX_FADV_DONTNEED);
     }
     close(fd);
+#elif defined(_WIN32)
+    bench_purge_file_cache_win32(filename);
 #else
     (void)filename;
 #endif

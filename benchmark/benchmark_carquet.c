@@ -4,7 +4,8 @@
  *
  * Methodology:
  *   - Write and read are benchmarked separately
- *   - Page cache is purged between write and read phases (macOS: F_NOCACHE)
+ *   - Page cache is purged between write and read phases (macOS: F_NOCACHE,
+ *     Windows: unbuffered copy, see bench_purge_win32.h)
  *   - 3 warmup + 11 measured iterations, trimmed mean (drop min + max, median of 9)
  *   - Data is pre-generated outside timing loops
  */
@@ -18,6 +19,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <sys/stat.h>
+#include "bench_purge_win32.h"
 #else
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -129,6 +131,7 @@ static const char* get_temp_dir(void) {
  *        We copy the file to a new path with F_NOCACHE, delete the original,
  *        and rename. The new fd's pages won't be in cache.
  * Linux: posix_fadvise DONTNEED.
+ * Windows: same copy-and-replace as macOS with unbuffered I/O (bench_purge_win32.h).
  */
 static void purge_file_cache(const char* filename) {
 #if defined(__APPLE__)
@@ -166,6 +169,8 @@ static void purge_file_cache(const char* filename) {
         posix_fadvise(fd, 0, st.st_size, POSIX_FADV_DONTNEED);
     }
     close(fd);
+#elif defined(_WIN32)
+    bench_purge_file_cache_win32(filename);
 #else
     (void)filename;
 #endif

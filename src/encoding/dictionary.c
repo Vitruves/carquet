@@ -609,6 +609,15 @@ carquet_status_t carquet_dictionary_encode_capped(
     return status;
 }
 
+/* output_count is an int64_t from the caller; on a 32-bit target
+ * `output_count * sizeof(uint32_t)` can exceed SIZE_MAX and the converted
+ * malloc size wraps to a small buffer that the RLE index decode then
+ * overruns. Reject counts whose index array cannot be addressed. */
+static inline bool indices_count_fits(int64_t output_count) {
+    return output_count >= 0 &&
+           (uint64_t)output_count <= (uint64_t)(SIZE_MAX / sizeof(uint32_t));
+}
+
 /* ============================================================================
  * Dictionary Decoding
  * ============================================================================
@@ -643,7 +652,10 @@ carquet_status_t carquet_dictionary_decode_int32(
     int bit_width = indices_data[0];
 
     /* Decode RLE indices */
-    uint32_t* indices = carquet_mem_malloc(output_count * sizeof(uint32_t));
+    if (!indices_count_fits(output_count)) {
+        return CARQUET_ERROR_DECODE;
+    }
+    uint32_t* indices = carquet_mem_malloc((size_t)output_count * sizeof(uint32_t));
     if (!indices) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
@@ -717,7 +729,10 @@ carquet_status_t carquet_dictionary_decode_int64(
     }
     int bit_width = indices_data[0];
 
-    uint32_t* indices = carquet_mem_malloc(output_count * sizeof(uint32_t));
+    if (!indices_count_fits(output_count)) {
+        return CARQUET_ERROR_DECODE;
+    }
+    uint32_t* indices = carquet_mem_malloc((size_t)output_count * sizeof(uint32_t));
     if (!indices) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
@@ -790,7 +805,10 @@ carquet_status_t carquet_dictionary_decode_float(
     }
     int bit_width = indices_data[0];
 
-    uint32_t* indices = carquet_mem_malloc(output_count * sizeof(uint32_t));
+    if (!indices_count_fits(output_count)) {
+        return CARQUET_ERROR_DECODE;
+    }
+    uint32_t* indices = carquet_mem_malloc((size_t)output_count * sizeof(uint32_t));
     if (!indices) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
@@ -863,7 +881,10 @@ carquet_status_t carquet_dictionary_decode_double(
     }
     int bit_width = indices_data[0];
 
-    uint32_t* indices = carquet_mem_malloc(output_count * sizeof(uint32_t));
+    if (!indices_count_fits(output_count)) {
+        return CARQUET_ERROR_DECODE;
+    }
+    uint32_t* indices = carquet_mem_malloc((size_t)output_count * sizeof(uint32_t));
     if (!indices) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
@@ -967,6 +988,10 @@ carquet_status_t carquet_dictionary_decode_byte_array(
     }
 
     int bit_width = indices_data[0];
+    if (!indices_count_fits(output_count)) {
+        carquet_mem_free(entries);
+        return CARQUET_ERROR_DECODE;
+    }
     uint32_t* indices =
         carquet_mem_malloc((size_t)output_count * sizeof(uint32_t));
     if (!indices) {
@@ -1032,6 +1057,9 @@ carquet_status_t carquet_dictionary_decode_fixed_len_byte_array(
     }
 
     int bit_width = indices_data[0];
+    if (!indices_count_fits(output_count)) {
+        return CARQUET_ERROR_DECODE;
+    }
     uint32_t* indices =
         carquet_mem_malloc((size_t)output_count * sizeof(uint32_t));
     if (!indices) {

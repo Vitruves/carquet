@@ -60,7 +60,10 @@ typedef enum {
 static int64_t fixed_list_size(const char* fmt) {
     if (!fmt || fmt[0] != '+' || fmt[1] != 'w' || fmt[2] != ':' || fmt[3] == '\0') return 0;
     char* end = NULL;
-    long n = strtol(fmt + 3, &end, 10);
+    /* strtoll, not strtol: long is 32-bit on Windows, where strtol would
+     * saturate an out-of-range count to LONG_MAX == INT32_MAX and slip past
+     * the range check below. */
+    long long n = strtoll(fmt + 3, &end, 10);
     if (n <= 0 || n > INT32_MAX || !end || *end != '\0') return 0;
     return (int64_t)n;
 }

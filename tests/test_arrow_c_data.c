@@ -704,6 +704,29 @@ static int test_fixed_size_list(void) {
     return 0;
 }
 
+/* A fixed_size_list count beyond INT32_MAX must be rejected on every
+ * platform. With strtol on Windows (32-bit long) it saturated to INT32_MAX
+ * and was accepted. */
+static int test_fixed_size_list_overflow(void) {
+    const char* fmts[] = {"+w:4294967298", "+w:9223372036854775807", "+w:2147483648"};
+    for (size_t i = 0; i < sizeof(fmts) / sizeof(fmts[0]); i++) {
+        carquet_error_t err = CARQUET_ERROR_INIT;
+        struct ArrowSchema* sc = SB("+s", "schema", 0, 1);
+        sc->children[0] = SB(fmts[i], "big", 1, 1);
+        sc->children[0]->children[0] = SB("i", "item", 0, 0);
+        carquet_schema_t* cs = NULL;
+        carquet_status_t st = carquet_arrow_import_schema(sc, &cs, &err);
+        if (sc->release) sc->release(sc);
+        free(sc);
+        if (st == CARQUET_OK) {
+            carquet_schema_free(cs);
+            TEST_FAIL("fixed_size_list_overflow", fmts[i]);
+        }
+    }
+    TEST_PASS("fixed_size_list_overflow");
+    return 0;
+}
+
 /* A dictionary whose value slot is itself null yields a null row. */
 static int test_dictionary_null_slot(void) {
     carquet_error_t err = CARQUET_ERROR_INIT;
@@ -1171,6 +1194,7 @@ int main(void) {
     rc |= test_decimal_import();
     rc |= test_temporal_coercions();
     rc |= test_fixed_size_list();
+    rc |= test_fixed_size_list_overflow();
     rc |= test_dictionary_null_slot();
     rc |= test_all_null();
     rc |= test_export_list();

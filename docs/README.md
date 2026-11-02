@@ -30,7 +30,7 @@ For runnable code, start with:
 - `carquet_writer_create()`, `carquet_writer_create_file()`, and `carquet_writer_create_buffer()` copy the schema. You can free the schema after writer creation.
 - `carquet_reader_schema()` returns a pointer owned by the reader. It stays valid until `carquet_reader_close()`.
 - `carquet_reader_open_buffer()` does not copy the source buffer. The buffer must stay alive and unchanged for the full reader lifetime.
-- `carquet_writer_get_buffer()` transfers a heap buffer to the caller after `carquet_writer_close()`. Free it with `free()`.
+- `carquet_writer_get_buffer()` transfers a heap buffer to the caller after `carquet_writer_close()` and releases the writer (do not call `carquet_writer_abort()` on it afterwards). Free the buffer with `carquet_free()`: plain `free()` breaks across C runtime heaps on Windows DLL builds and with a custom allocator.
 - For nullable writes, `num_values` is the logical row count, but the `values` array contains only present values packed contiguously.
 - Batch column pointers returned by `carquet_row_batch_column()` and `carquet_row_batch_column_dictionary()` should be treated as valid only until `carquet_row_batch_free()`.
 - All columns in a writer must advance by the same logical row count before `carquet_writer_new_row_group()` or `carquet_writer_close()`.

@@ -205,7 +205,32 @@ int64_t carquet_rle_decoder_get_batch(
             dec->run_remaining -= to_fill;
 
         } else {
-            /* Bit-packed run */
+            /* Bit-packed run. Bulk fast path: while the 8-value staging
+             * buffer is empty, unpack whole groups straight into the output
+             * through carquet_bitunpack_32 (wide SIMD kernels, one dispatch
+             * lookup per call) instead of one dispatched group + copy loop
+             * per 8 values. Only groups fully present in the input are taken;
+             * a truncated tail falls through to the per-group loop below,
+             * which reports the error exactly as before. */
+            if (dec->bitpack_pos >= dec->bitpack_count && dec->bit_width > 0 &&
+                dec->pos < dec->size) {
+                int64_t want = count - read;
+                if (want > dec->run_remaining) {
+                    want = dec->run_remaining;
+                }
+                size_t groups = (size_t)(want / 8);
+                size_t avail = (dec->size - dec->pos) / (size_t)dec->bit_width;
+                if (groups > avail) {
+                    groups = avail;
+                }
+                if (groups > 0) {
+                    carquet_bitunpack_32(dec->data + dec->pos, groups * 8,
+                                         dec->bit_width, output + read);
+                    dec->pos += groups * (size_t)dec->bit_width;
+                    read += (int64_t)(groups * 8);
+                    dec->run_remaining -= (int64_t)(groups * 8);
+                }
+            }
             while (read < count && dec->run_remaining > 0) {
                 if (dec->bitpack_pos >= dec->bitpack_count) {
                     if (!fill_bitpack_buffer(dec)) {
@@ -605,9 +630,13 @@ int64_t carquet_rle_decode_levels(
                     size_t used = carquet_bitunpack_32(input + pos,
                                         (size_t)chunk, bit_width, tmp);
                     pos += used;
+                    /* Base-pointer form: MSVC refuses to vectorize the
+                     * output[count++] shape (C5002 reason 1203). */
+                    int16_t* dst = output + count;
                     for (int64_t k = 0; k < chunk; k++) {
-                        output[count++] = (int16_t)tmp[k];
+                        dst[k] = (int16_t)tmp[k];
                     }
+                    count += chunk;
                     done += chunk;
                 }
                 continue;

@@ -29,6 +29,7 @@
 #include <sys/stat.h>
 
 #include <carquet/carquet.h>
+#include "example_paths.h"
 
 #define NUM_ROWS 10000
 
@@ -284,7 +285,8 @@ int main(int argc, char* argv[]) {
     /* Test each codec */
     printf("Writing files with different compression codecs:\n\n");
 
-    const char* base_path = "/tmp/compression_test";
+    char base_path[1024];
+    example_temp_path(base_path, sizeof(base_path), "compression_test");
 
     typedef struct {
         carquet_compression_t codec;

@@ -60,8 +60,8 @@
 **Fast**
 
 - **49x faster reads** than Arrow C++ on uncompressed data (mmap zero-copy), **120x faster** than PyArrow
-- **1.5–2.1x faster compressed reads** than Arrow C++ on the same file (cross-read benchmark, Apple M3; 1.6–2.6x on x86)
-- **Writes 2.5–5.8x faster** than Arrow C++ on Apple M3 (1.0–1.6x on the older x86 run)
+- **1.5–2.1x faster compressed reads** than Arrow C++ on the same file (cross-read benchmark, Apple M3; 1.6–2.6x on x86 Linux, 1.04–1.30x on Windows/MSVC)
+- **Writes 2.5–5.8x faster** than Arrow C++ on Apple M3 (2.1–3.8x on Windows/MSVC, 1.0–1.6x on the older x86 Linux run)
 - Reads 10M uncompressed rows in **0.27 ms** (mmap zero-copy on Apple M3)
 - SIMD-optimized (SSE4.2, AVX2, AVX-512, NEON, SVE) with runtime detection and scalar fallbacks
 
@@ -162,6 +162,26 @@ Either path installs:
 - `carquet.pc` (pkg-config) and CMake package config for `find_package(carquet)`
 
 After installation, link with `-lcarquet`, or resolve flags via `pkg-config --cflags --libs carquet`.
+
+<br/>
+
+### Windows (MSVC, clang-cl, MinGW-w64)
+
+MSVC (x64 and Win32), clang-cl and MinGW-w64 GCC are all supported, static or shared. `CMakePresets.json` has `msvc`, `msvc-shared`, `clang-cl` and `mingw` presets:
+
+```powershell
+# from a Developer PowerShell for VS (or with MinGW-w64 gcc + ninja on PATH for "mingw")
+cmake --preset msvc
+cmake --build --preset msvc
+ctest --preset msvc
+```
+
+- When configuring by hand, set the C++ compiler as well as the C one (for example `CC=clang-cl CXX=clang-cl`): the fetched zstd project enables C++, and CMake otherwise picks a mismatched driver.
+- With `-DCARQUET_BUILD_SHARED=ON` you get `carquet.dll` plus the `carquet.lib` import library (`libcarquet.dll` / `libcarquet.dll.a` with MinGW). Consumers must define `CARQUET_BUILD_SHARED`; `find_package(carquet)` and `carquet.pc` add it for you. Put the DLL next to your executable or on `PATH`.
+- Release memory that carquet hands you, such as `carquet_writer_get_buffer()` output, with `carquet_free()` and not `free()`. The DLL and your program may use different C runtime heaps (Debug vs Release CRT, `/MT`, MinGW vs MSVC).
+- File paths may be UTF-8 (non-ASCII names work). The `carquet` CLI accepts Unicode arguments and prints UTF-8 to the console.
+- MinGW builds with OpenMP need `libgomp-1.dll` and `libwinpthread-1.dll` at runtime. MSVC builds need `vcomp140.dll` (from the Visual C++ Redistributable). Pass `-DCMAKE_DISABLE_FIND_PACKAGE_OpenMP=ON` for a build without that dependency.
+- Windows Defender's machine-learning heuristic may quarantine `test_encoding_roundtrip.exe` and `test_fuzz_regressions.exe` as `Trojan:Win64/CobaltStrike.RDH!MTB` (a false positive on their embedded binary test data; ctest then reports them as "Not Run"). Exclude the build directory from scanning to run the full suite.
 
 <br/>
 
@@ -602,23 +622,23 @@ carquet codegen -f data.parquet -o reader.c
 
 At 10M rows (the most representative size); higher ratio = Carquet faster.
 
-ARM (Apple M3): Carquet 0.7.3 vs Arrow C++ 24.0.0, measured 2026-10-25. x86 (Xeon D-1531): Carquet 0.4.4 vs Arrow C++ 23.0.1; that run predates the writer parallelism of 0.7.1 and has not been re-measured since.
+ARM (Apple M3): Carquet 0.7.3 vs Arrow C++ 24.0.0, measured 2026-10-25. Windows (Haswell, 4 vCPU virtual machine, MSVC 19.44): Carquet 0.7.3 vs Arrow C++ 24.0.0, measured 2026-11-02. x86 Linux (Xeon D-1531): Carquet 0.4.4 vs Arrow C++ 23.0.1; that run predates the writer parallelism of 0.7.1 and has not been re-measured since.
 
 <div align="center">
 
-| | x86 (Xeon D-1531) | | ARM (Apple M3) | |
-|---|---|---|---|---|
-| **Codec** | **Write** | **Read** | **Write** | **Read** |
-| snappy | **1.55x** | **1.25x** | **4.78x** | **1.78x** |
-| zstd | **1.31x** | **1.04x** | **5.76x** | **1.41x** |
-| lz4 | **1.02x** | 0.83x | **4.64x** | **1.97x** |
-| none | **1.13x** | **40.6x**\* | **2.46x** | **49.4x**\* |
+| | x86 Linux (Xeon D-1531) | | x86 Windows (Haswell, MSVC) | | ARM (Apple M3) | |
+|---|---|---|---|---|---|---|
+| **Codec** | **Write** | **Read** | **Write** | **Read** | **Write** | **Read** |
+| snappy | **1.55x** | **1.25x** | **3.39x** | **1.17x** | **4.78x** | **1.78x** |
+| zstd | **1.31x** | **1.04x** | **3.83x** | **1.13x** | **5.76x** | **1.41x** |
+| lz4 | **1.02x** | 0.83x | **2.96x** | **1.05x** | **4.64x** | **1.97x** |
+| none | **1.13x** | **40.6x**\* | **2.10x** | **62.0x**\* | **2.46x** | **49.4x**\* |
 
 </div>
 
 \* Uncompressed reads use mmap zero-copy, see the methodology note.
 
-Compressed reads involve full decompression and decoding of every value, no shortcuts, and both libraries use the same system lz4/zstd shared libraries, so the raw codec speed is identical. The most meaningful comparison is the **same-file cross-read** table (in the full results), where both libraries read the exact same Parquet file: Carquet reads compressed data **1.5–2.1x faster** than Arrow C++ on that apples-to-apples test (x86 run: 1.6–2.6x).
+Compressed reads involve full decompression and decoding of every value, no shortcuts, and on Linux and macOS both libraries use the same system lz4/zstd shared libraries, so the raw codec speed is identical. The most meaningful comparison is the **same-file cross-read** table (in the full results), where both libraries read the exact same Parquet file: Carquet reads compressed data **1.5–2.1x faster** than Arrow C++ on that apples-to-apples test (x86 Linux run: 1.6–2.6x; Windows run: 1.04–1.30x, where cold reads from the virtual machine's disk take most of the time).
 
 <details>
 <summary><b>Benchmark methodology</b></summary>
@@ -626,6 +646,8 @@ Compressed reads involve full decompression and decoding of every value, no shor
 <br/>
 
 All benchmarks use identical data (deterministic LCG PRNG), identical Parquet settings (no dictionary, BYTE_STREAM_SPLIT for floats, page checksums, mmap reads), trimmed median of 11–51 iterations, with the OS page cache purged between write and read phases and a cooldown between configurations. Schema: 3 columns (INT64, DOUBLE, INT32). Compared against the Arrow C++ low-level Parquet reader (bypassing Arrow Table materialization) and PyArrow.
+
+The page cache is purged per file: `posix_fadvise(DONTNEED)` on Linux; on macOS and Windows the file is copied without caching (`F_NOCACHE`, `FILE_FLAG_NO_BUFFERING`) and the copy replaces it (`benchmark/bench_purge_win32.h`). On Windows, carquet links the zstd / lz4 it builds itself and Arrow C++ the conda-forge ones, so codec speed can differ slightly between the two.
 
 The **same-file cross-read** benchmark is the fairest comparison: both libraries read the exact same Parquet file (written by one, read by both). This eliminates differences in page sizes, encoding choices, and row group layout.
 
@@ -844,6 +866,79 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 </details>
 
 <details>
+<summary><b>Full Windows results</b> (Intel Haswell VM, MSVC)</summary>
+
+<br/>
+
+*Carquet 0.7.3 built with MSVC 19.44 (x64 Release, OpenMP), OpenStack VM with 4 vCPU (Intel Haswell, 3.1 GHz), 14.6GB RAM, virtual SAS disk, Windows Server 2025, Arrow C++ 24.0.0 (conda-forge), ZSTD level 1, measured on 2026-11-02. Cold reads go to the virtual disk, which narrows the read ratios; writes and the zero-copy path are CPU-bound.*
+
+#### 10M rows vs Arrow C++
+
+<div align="center">
+
+| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio | Size |
+|-------|--------------|-----------------|---------|-------------|----------------|---------|------|
+| none | **182ms** | 382ms | **2.10x** | **2.04ms** | 126.5ms | **62.0x**\* | 190.7MB |
+| snappy | **175ms** | 594ms | **3.39x** | **115.6ms** | 134.9ms | **1.17x** | 125.1MB |
+| zstd | **242ms** | 927ms | **3.83x** | **140.7ms** | 159.2ms | **1.13x** | 95.3MB |
+| lz4 | **178ms** | 527ms | **2.96x** | **95.5ms** | 99.9ms | **1.05x** | 122.9MB |
+
+</div>
+
+<br/>
+
+#### 1M rows vs Arrow C++
+
+<div align="center">
+
+| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio |
+|-------|--------------|-----------------|---------|-------------|----------------|---------|
+| none | **15.6ms** | 37.6ms | **2.41x** | **0.44ms** | 13.72ms | **31.2x**\* |
+| snappy | **25.4ms** | 61.2ms | **2.41x** | **14.01ms** | 16.31ms | **1.16x** |
+| zstd | **30.4ms** | 94.3ms | **3.10x** | **17.09ms** | 18.38ms | **1.08x** |
+| lz4 | **26.4ms** | 53.8ms | **2.04x** | 13.07ms | **12.89ms** | 0.99x |
+
+</div>
+
+<br/>
+
+#### 100K rows vs Arrow C++
+
+<div align="center">
+
+| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio |
+|-------|--------------|-----------------|---------|-------------|----------------|---------|
+| none | **3.53ms** | 3.95ms | **1.12x** | **0.16ms** | 2.13ms | **13.3x**\* |
+| snappy | **5.60ms** | 6.23ms | **1.11x** | **2.79ms** | 3.92ms | **1.41x** |
+| zstd | **7.11ms** | 9.79ms | **1.38x** | **2.86ms** | 4.36ms | **1.52x** |
+| lz4 | **5.75ms** | 5.82ms | **1.01x** | 2.22ms | **2.15ms** | 0.97x |
+
+</div>
+
+<br/>
+
+#### Same-file cross-read (10M rows)
+
+<div align="center">
+
+| Codec | Writer | Carquet Read | Arrow C++ Read | Ratio |
+|-------|--------|-------------|----------------|-------|
+| none | Carquet | **2.65ms** | 116.9ms | **44.1x**\* |
+| none | Arrow | **5.29ms** | 126.6ms | **23.9x**\* |
+| snappy | Carquet | **115.2ms** | 135.0ms | **1.17x** |
+| snappy | Arrow | **112.7ms** | 146.2ms | **1.30x** |
+| zstd | Carquet | **137.7ms** | 150.5ms | **1.09x** |
+| zstd | Arrow | **134.9ms** | 155.3ms | **1.15x** |
+| lz4 | Carquet | **92.1ms** | 95.6ms | **1.04x** |
+| lz4 | Arrow | **89.7ms** | 98.1ms | **1.09x** |
+
+</div>
+
+\* Zero-copy mmap path
+
+</details>
+
+<details>
 <summary><b>Running the benchmarks yourself</b></summary>
 
 <br/>
@@ -876,6 +971,18 @@ cmake --build build -j$(nproc)
 # Or point at a custom Arrow install
 cmake -B build ... -DCARQUET_ARROW_CPP_ROOT=/path/to/arrow-prefix
 ```
+
+On Windows (Developer PowerShell for VS), Arrow C++ can come from conda-forge (`micromamba create -p C:\arrow -c conda-forge libarrow libparquet`); its DLLs must be on `PATH` when the benchmark runs:
+
+```powershell
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCARQUET_BUILD_BENCHMARKS=ON `
+  -DCARQUET_BUILD_ARROW_CPP_BENCHMARK=ON -DCARQUET_ARROW_CPP_ROOT=C:/arrow/Library
+cmake --build build
+$env:PATH = "C:\arrow\Library\bin;$env:PATH"
+python benchmark\run_benchmark.py --build-dir build --skip-xlarge --no-pyarrow
+```
+
+Keep the build and `--temp-dir` folders out of real-time antivirus scanning: Windows Defender scans every file the benchmark writes, and its machine-learning heuristic has flagged some of carquet's test executables as false positives (`Trojan:Win64/CobaltStrike.RDH!MTB`).
 
 The Arrow C++ benchmark uses the low-level `parquet::ParquetFileReader` API (bypassing Arrow Table materialization overhead) with parallel row group readers. The **same-file cross-read** mode has both libraries read the exact same Parquet file, eliminating differences in page sizes, encoding, and row group layout. Both benchmarks use identical data, row group sizing, no dictionary, page checksums, mmap reads, BYTE_STREAM_SPLIT for floats.
 

@@ -501,6 +501,7 @@ if has_config("cli") then
             "src/cli/codegen.c",
             "src/cli/codegen_read.c",
             "src/cli/codegen_write.c")
+        if is_plat("windows", "mingw") then add_syslinks("shell32") end  -- CommandLineToArgvW
         if GCC_LIKE then add_cflags("-Wno-unused-result") end
     target_end()
 end

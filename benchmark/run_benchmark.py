@@ -59,6 +59,16 @@ def get_cpu_name():
                 return out
         except Exception:
             pass
+    if platform.system() == "Windows":
+        try:
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                 r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
+            name = winreg.QueryValueEx(key, "ProcessorNameString")[0].strip()
+            if name:
+                return name
+        except Exception:
+            pass
     try:
         with open("/proc/cpuinfo") as f:
             for line in f:
@@ -549,8 +559,9 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     build_dir = (os.path.abspath(args.build_dir) if args.build_dir
                  else os.path.join(script_dir, "..", "build"))
-    carquet_bin = os.path.join(build_dir, "benchmark_carquet")
-    arrow_cpp_bin = os.path.join(build_dir, "benchmark_arrow_cpp")
+    exe = ".exe" if os.name == "nt" else ""
+    carquet_bin = os.path.join(build_dir, "benchmark_carquet" + exe)
+    arrow_cpp_bin = os.path.join(build_dir, "benchmark_arrow_cpp" + exe)
 
     if not args.no_carquet and not os.path.isfile(carquet_bin):
         print(f"{RED}Error:{RST} {carquet_bin} not found. Build the benchmark first:")
