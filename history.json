@@ -99,12 +99,16 @@
   "2026-10-31": {
    "count": 565,
    "uniques": 72
+  },
+  "2026-11-01": {
+   "count": 350,
+   "uniques": 17
   }
  },
  "since": "2026-10-07",
- "total_clones": 16788,
- "total_unique_cloners_daily_sum": 1017,
- "updated": "2026-11-01T10:28:21Z",
+ "total_clones": 17138,
+ "total_unique_cloners_daily_sum": 1034,
+ "updated": "2026-11-02T11:09:03Z",
  "views": {
   "2026-10-07": {
    "count": 41,
@@ -205,6 +209,10 @@
   "2026-10-31": {
    "count": 19,
    "uniques": 10
+  },
+  "2026-11-01": {
+   "count": 15,
+   "uniques": 5
   }
  }
 }
