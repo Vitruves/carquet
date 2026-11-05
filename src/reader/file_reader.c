@@ -557,6 +557,7 @@ carquet_reader_t* carquet_reader_open(
     }
 
     reader->prebuffer.row_group = -1;
+    reader->prebuffer.file_offset = -1;
 
     carquet_status_t status;
 
@@ -640,6 +641,7 @@ carquet_reader_t* carquet_reader_open_file(
     }
 
     reader->prebuffer.row_group = -1;
+    reader->prebuffer.file_offset = -1;
     reader->file = file;
     reader->owns_file = false;  /* Caller retains ownership of the FILE handle */
 
@@ -918,32 +920,38 @@ carquet_status_t carquet_reader_prebuffer(
 
     size_t total_size = (size_t)(max_end - min_offset);
 
-    /* Release previous prebuffer if any */
-    carquet_reader_release_prebuffer(reader);
-
-    /* Allocate and read the coalesced range */
-    uint8_t* buf = carquet_mem_malloc(total_size);
-    if (!buf) {
-        CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY,
-            /* %llu, not %zu: the MinGW/msvcrt printf has no z length modifier. */
-            "Failed to allocate prebuffer (%llu bytes)",
-            (unsigned long long)total_size);
-        return CARQUET_ERROR_OUT_OF_MEMORY;
+    /* Reuse the previous buffer when the new range fits: a row-group-by-row-
+     * group scan then allocates (and page-faults in) the buffer once instead
+     * of once per row group. The old range is invalidated first so a failed
+     * read below never leaves a stale cache behind. */
+    reader->prebuffer.file_offset = -1;
+    reader->prebuffer.size = 0;
+    reader->prebuffer.row_group = -1;
+    if (total_size > reader->prebuffer.capacity) {
+        /* free + malloc, not realloc: the old contents are not needed. */
+        carquet_mem_free(reader->prebuffer.data);
+        reader->prebuffer.capacity = 0;
+        reader->prebuffer.data = carquet_mem_malloc(total_size);
+        if (!reader->prebuffer.data) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY,
+                /* %llu, not %zu: the MinGW/msvcrt printf has no z length modifier. */
+                "Failed to allocate prebuffer (%llu bytes)",
+                (unsigned long long)total_size);
+            return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
+        reader->prebuffer.capacity = total_size;
     }
 
     if (carquet_fseek64(reader->file, (int64_t)min_offset, SEEK_SET) != 0) {
-        carquet_mem_free(buf);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_SEEK, "Failed to seek for prebuffer");
         return CARQUET_ERROR_FILE_SEEK;
     }
 
-    if (fread(buf, 1, total_size, reader->file) != total_size) {
-        carquet_mem_free(buf);
+    if (fread(reader->prebuffer.data, 1, total_size, reader->file) != total_size) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_READ, "Failed to read prebuffer data");
         return CARQUET_ERROR_FILE_READ;
     }
 
-    reader->prebuffer.data = buf;
     reader->prebuffer.file_offset = min_offset;
     reader->prebuffer.size = total_size;
     reader->prebuffer.row_group = row_group_index;
@@ -952,13 +960,12 @@ carquet_status_t carquet_reader_prebuffer(
 }
 
 void carquet_reader_release_prebuffer(carquet_reader_t* reader) {
-    if (reader->prebuffer.data) {
-        carquet_mem_free(reader->prebuffer.data);
-        reader->prebuffer.data = NULL;
-        reader->prebuffer.file_offset = 0;
-        reader->prebuffer.size = 0;
-        reader->prebuffer.row_group = -1;
-    }
+    carquet_mem_free(reader->prebuffer.data);
+    reader->prebuffer.data = NULL;
+    reader->prebuffer.capacity = 0;
+    reader->prebuffer.file_offset = -1;
+    reader->prebuffer.size = 0;
+    reader->prebuffer.row_group = -1;
 }
 
 /* ============================================================================
@@ -1073,6 +1080,140 @@ void carquet_column_reader_free(carquet_column_reader_t* reader) {
     carquet_mem_free(reader->decompress_buffer);
     carquet_mem_free(reader->scratch_def_levels);
     carquet_mem_free(reader);
+}
+
+/* ============================================================================
+ * Column Reader Reset (reuse across row groups)
+ * ============================================================================
+ */
+
+void carquet_column_reader_rebind(
+    carquet_column_reader_t* col_reader,
+    carquet_reader_t* file_reader,
+    int32_t row_group_index,
+    int32_t column_index,
+    bool preserve_dictionaries) {
+
+    const parquet_row_group_t* rg = &file_reader->metadata.row_groups[row_group_index];
+
+    col_reader->row_group_index = row_group_index;
+    col_reader->column_index = column_index;
+    col_reader->preserve_dictionary = false;
+
+    if (!rg->columns || column_index >= rg->num_columns) {
+        col_reader->chunk = NULL;
+        col_reader->col_meta = NULL;
+        col_reader->values_remaining = 0;
+        return;
+    }
+
+    col_reader->chunk = &rg->columns[column_index];
+    if (!col_reader->chunk->has_metadata) {
+        col_reader->col_meta = NULL;
+        col_reader->values_remaining = 0;
+        return;
+    }
+    col_reader->col_meta = &col_reader->chunk->metadata;
+
+    /* Decide dictionary preservation up front, before any page is loaded.
+     * Pages are pre-loaded (and decoded/sized) ahead of the read phase, so the
+     * decode width (physical value vs. 4-byte index) must be fixed now; keying
+     * off has_dictionary instead would only flip after the first load and
+     * desync the buffer width from the copy width.
+     *
+     * Never preserve for repeated (nested) columns: the nested reconstruction
+     * path (read_nested_list_column) and the list/dictionary public APIs only
+     * understand materialized physical values, not the 4-byte preserved index
+     * stream. Leaving it on would make that path read 16-byte carquet_byte_array_t
+     * structs out of a buffer holding uint32_t indices — wild pointers and an
+     * out-of-bounds read on export. */
+    col_reader->preserve_dictionary =
+        preserve_dictionaries && col_reader->col_meta->has_dictionary_page_offset &&
+        col_reader->max_rep_level == 0;
+
+    /* Reset reading state */
+    col_reader->values_remaining = col_reader->col_meta->num_values;
+    col_reader->data_start_offset = col_reader->col_meta->data_page_offset;
+    col_reader->current_page = 0;
+    col_reader->page_loaded = false;
+    col_reader->page_num_values = 0;
+    col_reader->page_values_read = 0;
+    col_reader->page_header_size = 0;
+    col_reader->page_compressed_size = 0;
+
+    /* Dictionary may differ between row groups - must reload */
+    if (col_reader->has_dictionary) {
+        if (col_reader->dictionary_ownership == CARQUET_DATA_OWNED) {
+            carquet_mem_free(col_reader->dictionary_data);
+        }
+        carquet_mem_free(col_reader->dictionary_offsets);
+        col_reader->dictionary_data = NULL;
+        col_reader->dictionary_offsets = NULL;
+        col_reader->dictionary_size = 0;
+        col_reader->dictionary_count = 0;
+        col_reader->dictionary_ownership = CARQUET_DATA_OWNED;
+        col_reader->has_dictionary = false;
+    }
+
+    /* If decoded_values is a VIEW (mmap pointer), don't free - just clear */
+    if (col_reader->decoded_ownership == CARQUET_DATA_VIEW) {
+        col_reader->decoded_values = NULL;
+        col_reader->decoded_capacity = 0;
+    }
+    col_reader->decoded_ownership = CARQUET_DATA_OWNED;
+
+    /* Free BYTE_ARRAY page data retention list */
+    carquet_column_clear_retained_pages(col_reader);
+
+    col_reader->dense_cursor_pos = 0;
+    col_reader->dense_cursor_val = 0;
+
+    /* Keep reusable buffers: page_buffer, decoded_values, decoded_def_levels,
+     * decoded_rep_levels, indices_buffer, decompress_buffer, scratch levels.
+     * These will be reused on the next page load. */
+}
+
+
+carquet_status_t carquet_column_reader_reset(
+    carquet_column_reader_t* reader,
+    int32_t row_group_index,
+    carquet_error_t* error) {
+
+    carquet_reader_t* file_reader = reader->file_reader;
+    if (!carquet_reader_row_group_index_valid(file_reader, row_group_index)) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_ROW_GROUP_NOT_FOUND,
+            "Row group %d not found", row_group_index);
+        return CARQUET_ERROR_ROW_GROUP_NOT_FOUND;
+    }
+
+    const parquet_row_group_t* rg = &file_reader->metadata.row_groups[row_group_index];
+    int32_t column_index = reader->column_index;
+    if (!rg->columns || column_index >= rg->num_columns) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_COLUMN_NOT_FOUND,
+            "Column %d not in row group", column_index);
+        return CARQUET_ERROR_COLUMN_NOT_FOUND;
+    }
+    const parquet_column_chunk_t* chunk = &rg->columns[column_index];
+    if (!chunk->has_metadata) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_NOT_IMPLEMENTED,
+            "External column metadata not supported");
+        return CARQUET_ERROR_NOT_IMPLEMENTED;
+    }
+    /* Same guard as carquet_reader_get_column(): the decode width comes from
+     * reader->type, fixed at creation, so a row group whose chunk claims a
+     * different physical type must be rejected rather than misdecoded. */
+    if (chunk->metadata.type != reader->type) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_METADATA,
+            "Column %d physical type in row group %d (%d) does not match "
+            "schema type (%d)", column_index, row_group_index,
+            (int)chunk->metadata.type, (int)reader->type);
+        return CARQUET_ERROR_INVALID_METADATA;
+    }
+
+    /* Public column readers always materialize values (preserve = false). */
+    carquet_column_reader_rebind(reader, file_reader, row_group_index,
+                                 column_index, false);
+    return CARQUET_OK;
 }
 
 bool carquet_column_has_next(const carquet_column_reader_t* reader) {

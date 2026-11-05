@@ -202,16 +202,6 @@ static bool scalar_checked_gather_double(const double* dict, int32_t dict_count,
                                      count, (int64_t*)output);
 }
 
-static bool validate_gather_indices(const uint32_t* indices, int64_t count, int32_t dict_count) {
-    uint32_t limit = (uint32_t)dict_count;
-    for (int64_t i = 0; i < count; i++) {
-        if (indices[i] >= limit) {
-            return false;
-        }
-    }
-    return true;
-}
-
 static void scalar_byte_split_encode_float(const float* values, int64_t count,
                                             uint8_t* output) {
     const uint8_t* src = (const uint8_t*)values;
@@ -1283,17 +1273,8 @@ bool carquet_dispatch_checked_gather_i32(const int32_t* dict, int32_t dict_count
     if (dict_count <= 0) {
         return count == 0;
     }
-#if defined(CARQUET_ARCH_ARM)
-    if (g_dispatch.checked_gather_i32 &&
-        g_dispatch.checked_gather_i32 != scalar_checked_gather_i32) {
-        return g_dispatch.checked_gather_i32(dict, dict_count, indices, count, output);
-    }
-#endif
-    if (!validate_gather_indices(indices, count, dict_count)) {
-        return false;
-    }
-    g_dispatch.gather_i32(dict, indices, count, output);
-    return true;
+    /* Bounds check fused into the gather loop on every arch (one pass). */
+    return g_dispatch.checked_gather_i32(dict, dict_count, indices, count, output);
 }
 
 bool carquet_dispatch_checked_gather_i64(const int64_t* dict, int32_t dict_count,
@@ -1303,17 +1284,8 @@ bool carquet_dispatch_checked_gather_i64(const int64_t* dict, int32_t dict_count
     if (dict_count <= 0) {  /* see carquet_dispatch_checked_gather_i32 */
         return count == 0;
     }
-#if defined(CARQUET_ARCH_ARM)
-    if (g_dispatch.checked_gather_i64 &&
-        g_dispatch.checked_gather_i64 != scalar_checked_gather_i64) {
-        return g_dispatch.checked_gather_i64(dict, dict_count, indices, count, output);
-    }
-#endif
-    if (!validate_gather_indices(indices, count, dict_count)) {
-        return false;
-    }
-    g_dispatch.gather_i64(dict, indices, count, output);
-    return true;
+    /* Bounds check fused into the gather loop on every arch (one pass). */
+    return g_dispatch.checked_gather_i64(dict, dict_count, indices, count, output);
 }
 
 bool carquet_dispatch_checked_gather_float(const float* dict, int32_t dict_count,
@@ -1323,17 +1295,8 @@ bool carquet_dispatch_checked_gather_float(const float* dict, int32_t dict_count
     if (dict_count <= 0) {  /* see carquet_dispatch_checked_gather_i32 */
         return count == 0;
     }
-#if defined(CARQUET_ARCH_ARM)
-    if (g_dispatch.checked_gather_float &&
-        g_dispatch.checked_gather_float != scalar_checked_gather_float) {
-        return g_dispatch.checked_gather_float(dict, dict_count, indices, count, output);
-    }
-#endif
-    if (!validate_gather_indices(indices, count, dict_count)) {
-        return false;
-    }
-    g_dispatch.gather_float(dict, indices, count, output);
-    return true;
+    /* Bounds check fused into the gather loop on every arch (one pass). */
+    return g_dispatch.checked_gather_float(dict, dict_count, indices, count, output);
 }
 
 bool carquet_dispatch_checked_gather_double(const double* dict, int32_t dict_count,
@@ -1343,17 +1306,8 @@ bool carquet_dispatch_checked_gather_double(const double* dict, int32_t dict_cou
     if (dict_count <= 0) {  /* see carquet_dispatch_checked_gather_i32 */
         return count == 0;
     }
-#if defined(CARQUET_ARCH_ARM)
-    if (g_dispatch.checked_gather_double &&
-        g_dispatch.checked_gather_double != scalar_checked_gather_double) {
-        return g_dispatch.checked_gather_double(dict, dict_count, indices, count, output);
-    }
-#endif
-    if (!validate_gather_indices(indices, count, dict_count)) {
-        return false;
-    }
-    g_dispatch.gather_double(dict, indices, count, output);
-    return true;
+    /* Bounds check fused into the gather loop on every arch (one pass). */
+    return g_dispatch.checked_gather_double(dict, dict_count, indices, count, output);
 }
 
 void carquet_dispatch_byte_split_encode_float(const float* values, int64_t count,

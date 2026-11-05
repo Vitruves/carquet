@@ -1546,6 +1546,10 @@ carquet_status_t carquet_reader_row_group_metadata(
  *
  * For mmap readers, this is a no-op (the OS handles page coalescing).
  *
+ * Each call replaces the previously cached range. The buffer itself is kept
+ * and reused while the new range fits (it only grows), so it holds the largest
+ * range pre-buffered so far until carquet_reader_release_prebuffer() or close.
+ *
  * This is most beneficial for:
  * - Network/cloud storage (S3, GCS) where each I/O has high latency
  * - Reading many columns from the same row group
@@ -1580,8 +1584,8 @@ carquet_status_t carquet_reader_prebuffer(
 /**
  * @brief Release pre-buffered data.
  *
- * Frees the memory used by carquet_reader_prebuffer(). Called automatically
- * when the reader is closed.
+ * Drops the cached range and frees the buffer used by
+ * carquet_reader_prebuffer(). Called automatically when the reader is closed.
  *
  * @param[in] reader File reader
  */
@@ -1769,6 +1773,41 @@ int64_t carquet_column_remaining(const carquet_column_reader_t* reader);
  */
 CARQUET_API
 void carquet_column_reader_free(carquet_column_reader_t* reader);
+
+/**
+ * @brief Move a column reader to another row group, keeping its buffers.
+ *
+ * Equivalent to freeing the reader and calling carquet_reader_get_column()
+ * for the same column in @p row_group_index, except that the page, decode
+ * and scratch buffers are kept and reused. Scanning a file row group by row
+ * group with one reader per column then allocates its large decode buffers
+ * once instead of once per row group.
+ *
+ * Reading restarts at the beginning of the column chunk. Byte-array values
+ * returned by earlier reads are invalidated, as with
+ * carquet_column_reader_free().
+ *
+ * @param[in] reader Column reader
+ * @param[in] row_group_index Row group to read next
+ * @param[out] error Error information (may be NULL)
+ * @return CARQUET_OK on success. On error the reader is left unchanged.
+ *
+ * @code{.c}
+ * carquet_column_reader_t* col = carquet_reader_get_column(reader, 0, c, &err);
+ * for (int32_t rg = 0; col && rg < num_row_groups; rg++) {
+ *     if (rg > 0 && carquet_column_reader_reset(col, rg, &err) != CARQUET_OK) break;
+ *     while ((n = carquet_column_read_batch(col, values, 1024, NULL, NULL)) > 0) { ... }
+ * }
+ * carquet_column_reader_free(col);
+ * @endcode
+ *
+ * @note Thread-safe: Yes (for different reader instances)
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1)
+carquet_status_t carquet_column_reader_reset(
+    carquet_column_reader_t* reader,
+    int32_t row_group_index,
+    carquet_error_t* error);
 
 /* ============================================================================
  * Batch Reader API

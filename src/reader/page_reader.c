@@ -612,8 +612,11 @@ static carquet_status_t ensure_decoded_page_buffers(
         reader->decoded_values = NULL;
         release_decoded_level_buffers(reader);
 
+        /* malloc, not calloc: the page decoder writes every value it reports
+         * and reads only ever copy decoded values out, so zeroing is a wasted
+         * pass over the buffer (and forces every page of it to be touched). */
         if (values_buffer_size > 0) {
-            reader->decoded_values = carquet_mem_calloc(1, values_buffer_size);
+            reader->decoded_values = carquet_mem_malloc(values_buffer_size);
         }
         if (need_def_levels && num_values > 0) {
             reader->decoded_def_levels = carquet_mem_malloc(sizeof(int16_t) * (size_t)num_values);
@@ -644,6 +647,62 @@ static carquet_status_t ensure_decoded_page_buffers(
     }
 
     return CARQUET_OK;
+}
+
+/* Gather INT32/INT64/FLOAT/DOUBLE values of an RLE_DICTIONARY index stream.
+ * Returns false when an index is past the dictionary.
+ *
+ * The RLE/bit-packed decoder masks every index to bit_width bits, so when the
+ * dictionary has at least 2^bit_width entries no index can be out of bounds
+ * and the separate validation pass over the indices is skipped. */
+static bool gather_numeric_dictionary_values(
+    const carquet_column_reader_t* reader,
+    int bit_width,
+    const uint32_t* indices,
+    int32_t count,
+    void* values) {
+
+    const uint8_t* dict = reader->dictionary_data;
+    int32_t dict_count = reader->dictionary_count;
+    bool in_bounds = bit_width >= 0 && bit_width < 31 &&
+                     ((int32_t)1 << bit_width) <= dict_count;
+
+    switch (reader->type) {
+        case CARQUET_PHYSICAL_INT32:
+            if (in_bounds) {
+                carquet_dispatch_gather_i32((const int32_t*)dict, indices, count,
+                                            (int32_t*)values);
+                return true;
+            }
+            return carquet_dispatch_checked_gather_i32((const int32_t*)dict,
+                dict_count, indices, count, (int32_t*)values);
+        case CARQUET_PHYSICAL_INT64:
+            if (in_bounds) {
+                carquet_dispatch_gather_i64((const int64_t*)dict, indices, count,
+                                            (int64_t*)values);
+                return true;
+            }
+            return carquet_dispatch_checked_gather_i64((const int64_t*)dict,
+                dict_count, indices, count, (int64_t*)values);
+        case CARQUET_PHYSICAL_FLOAT:
+            if (in_bounds) {
+                carquet_dispatch_gather_float((const float*)dict, indices, count,
+                                              (float*)values);
+                return true;
+            }
+            return carquet_dispatch_checked_gather_float((const float*)dict,
+                dict_count, indices, count, (float*)values);
+        case CARQUET_PHYSICAL_DOUBLE:
+            if (in_bounds) {
+                carquet_dispatch_gather_double((const double*)dict, indices, count,
+                                               (double*)values);
+                return true;
+            }
+            return carquet_dispatch_checked_gather_double((const double*)dict,
+                dict_count, indices, count, (double*)values);
+        default:
+            return false;
+    }
 }
 
 /* ============================================================================
@@ -1315,40 +1374,12 @@ carquet_status_t carquet_read_data_page_v1(
                     /* Use SIMD-optimized gather for common types */
                     switch (reader->type) {
                         case CARQUET_PHYSICAL_INT32:
-                            if (!carquet_dispatch_checked_gather_i32(
-                                    (const int32_t*)reader->dictionary_data,
-                                    reader->dictionary_count,
-                                    indices, encoded_count, (int32_t*)values)) {
-                                CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
-                                                  "Dictionary index out of bounds");
-                                return CARQUET_ERROR_DECODE;
-                            }
-                            break;
                         case CARQUET_PHYSICAL_INT64:
-                            if (!carquet_dispatch_checked_gather_i64(
-                                    (const int64_t*)reader->dictionary_data,
-                                    reader->dictionary_count,
-                                    indices, encoded_count, (int64_t*)values)) {
-                                CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
-                                                  "Dictionary index out of bounds");
-                                return CARQUET_ERROR_DECODE;
-                            }
-                            break;
                         case CARQUET_PHYSICAL_FLOAT:
-                            if (!carquet_dispatch_checked_gather_float(
-                                    (const float*)reader->dictionary_data,
-                                    reader->dictionary_count,
-                                    indices, encoded_count, (float*)values)) {
-                                CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
-                                                  "Dictionary index out of bounds");
-                                return CARQUET_ERROR_DECODE;
-                            }
-                            break;
                         case CARQUET_PHYSICAL_DOUBLE:
-                            if (!carquet_dispatch_checked_gather_double(
-                                    (const double*)reader->dictionary_data,
-                                    reader->dictionary_count,
-                                    indices, encoded_count, (double*)values)) {
+                            if (!gather_numeric_dictionary_values(
+                                    reader, bit_width, indices,
+                                    encoded_count, values)) {
                                 CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
                                                   "Dictionary index out of bounds");
                                 return CARQUET_ERROR_DECODE;
@@ -1696,40 +1727,12 @@ carquet_status_t carquet_read_data_page_v2(
                 } else {
                     switch (reader->type) {
                         case CARQUET_PHYSICAL_INT32:
-                            if (!carquet_dispatch_checked_gather_i32(
-                                    (const int32_t*)reader->dictionary_data,
-                                    reader->dictionary_count,
-                                    indices, encoded_count, (int32_t*)values)) {
-                                CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
-                                                  "Dictionary index out of bounds");
-                                return CARQUET_ERROR_DECODE;
-                            }
-                            break;
                         case CARQUET_PHYSICAL_INT64:
-                            if (!carquet_dispatch_checked_gather_i64(
-                                    (const int64_t*)reader->dictionary_data,
-                                    reader->dictionary_count,
-                                    indices, encoded_count, (int64_t*)values)) {
-                                CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
-                                                  "Dictionary index out of bounds");
-                                return CARQUET_ERROR_DECODE;
-                            }
-                            break;
                         case CARQUET_PHYSICAL_FLOAT:
-                            if (!carquet_dispatch_checked_gather_float(
-                                    (const float*)reader->dictionary_data,
-                                    reader->dictionary_count,
-                                    indices, encoded_count, (float*)values)) {
-                                CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
-                                                  "Dictionary index out of bounds");
-                                return CARQUET_ERROR_DECODE;
-                            }
-                            break;
                         case CARQUET_PHYSICAL_DOUBLE:
-                            if (!carquet_dispatch_checked_gather_double(
-                                    (const double*)reader->dictionary_data,
-                                    reader->dictionary_count,
-                                    indices, encoded_count, (double*)values)) {
+                            if (!gather_numeric_dictionary_values(
+                                    reader, bit_width, indices,
+                                    encoded_count, values)) {
                                 CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
                                                   "Dictionary index out of bounds");
                                 return CARQUET_ERROR_DECODE;

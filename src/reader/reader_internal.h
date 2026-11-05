@@ -78,9 +78,10 @@ struct carquet_schema {
  * Pre-buffered I/O cache for coalesced reads.
  */
 typedef struct carquet_prebuffer {
-    uint8_t* data;          /* Coalesced read buffer */
-    int64_t file_offset;    /* Start offset in file */
-    size_t size;            /* Size of buffer */
+    uint8_t* data;          /* Coalesced read buffer (kept across calls) */
+    size_t capacity;        /* Allocated bytes behind data */
+    int64_t file_offset;    /* Start offset in file (-1 = no cached range) */
+    size_t size;            /* Valid bytes cached from file_offset */
     int32_t row_group;      /* Row group this cache is for (-1 = none) */
 } carquet_prebuffer_t;
 
@@ -223,6 +224,20 @@ carquet_schema_t* build_schema(
 bool carquet_reader_row_group_index_valid(
     const carquet_reader_t* reader,
     int32_t row_group_index);
+
+/**
+ * Re-point a column reader at another row group of the same file, keeping its
+ * page/decode/scratch buffers. Drops the dictionary, retained pages and all
+ * per-chunk reading state. No validation: callers pass a valid row group and
+ * the column index the reader was created for (see carquet_column_reader_reset
+ * for the checked public variant).
+ */
+void carquet_column_reader_rebind(
+    carquet_column_reader_t* col_reader,
+    carquet_reader_t* file_reader,
+    int32_t row_group_index,
+    int32_t column_index,
+    bool preserve_dictionaries);
 
 /**
  * Open file with memory mapping.

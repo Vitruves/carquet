@@ -1012,94 +1012,6 @@ static void read_nested_list_column(
 }
 
 /* ============================================================================
- * Column Reader Reset (reuse across row groups)
- * ============================================================================
- */
-
-static void reset_column_reader_for_row_group(
-    carquet_column_reader_t* col_reader,
-    carquet_reader_t* file_reader,
-    int32_t row_group_index,
-    int32_t column_index,
-    bool preserve_dictionaries) {
-
-    const parquet_row_group_t* rg = &file_reader->metadata.row_groups[row_group_index];
-
-    col_reader->row_group_index = row_group_index;
-    col_reader->column_index = column_index;
-    col_reader->preserve_dictionary = false;
-
-    if (!rg->columns || column_index >= rg->num_columns) {
-        col_reader->chunk = NULL;
-        col_reader->col_meta = NULL;
-        col_reader->values_remaining = 0;
-        return;
-    }
-
-    col_reader->chunk = &rg->columns[column_index];
-    if (!col_reader->chunk->has_metadata) {
-        col_reader->col_meta = NULL;
-        col_reader->values_remaining = 0;
-        return;
-    }
-    col_reader->col_meta = &col_reader->chunk->metadata;
-
-    /* Decide dictionary preservation up front, before any page is loaded.
-     * Pages are pre-loaded (and decoded/sized) ahead of the read phase, so the
-     * decode width (physical value vs. 4-byte index) must be fixed now; keying
-     * off has_dictionary instead would only flip after the first load and
-     * desync the buffer width from the copy width.
-     *
-     * Never preserve for repeated (nested) columns: the nested reconstruction
-     * path (read_nested_list_column) and the list/dictionary public APIs only
-     * understand materialized physical values, not the 4-byte preserved index
-     * stream. Leaving it on would make that path read 16-byte carquet_byte_array_t
-     * structs out of a buffer holding uint32_t indices — wild pointers and an
-     * out-of-bounds read on export. */
-    col_reader->preserve_dictionary =
-        preserve_dictionaries && col_reader->col_meta->has_dictionary_page_offset &&
-        col_reader->max_rep_level == 0;
-
-    /* Reset reading state */
-    col_reader->values_remaining = col_reader->col_meta->num_values;
-    col_reader->data_start_offset = col_reader->col_meta->data_page_offset;
-    col_reader->current_page = 0;
-    col_reader->page_loaded = false;
-    col_reader->page_num_values = 0;
-    col_reader->page_values_read = 0;
-    col_reader->page_header_size = 0;
-    col_reader->page_compressed_size = 0;
-
-    /* Dictionary may differ between row groups - must reload */
-    if (col_reader->has_dictionary) {
-        if (col_reader->dictionary_ownership == CARQUET_DATA_OWNED) {
-            carquet_mem_free(col_reader->dictionary_data);
-        }
-        carquet_mem_free(col_reader->dictionary_offsets);
-        col_reader->dictionary_data = NULL;
-        col_reader->dictionary_offsets = NULL;
-        col_reader->dictionary_size = 0;
-        col_reader->dictionary_count = 0;
-        col_reader->dictionary_ownership = CARQUET_DATA_OWNED;
-        col_reader->has_dictionary = false;
-    }
-
-    /* If decoded_values is a VIEW (mmap pointer), don't free - just clear */
-    if (col_reader->decoded_ownership == CARQUET_DATA_VIEW) {
-        col_reader->decoded_values = NULL;
-        col_reader->decoded_capacity = 0;
-    }
-    col_reader->decoded_ownership = CARQUET_DATA_OWNED;
-
-    /* Free BYTE_ARRAY page data retention list */
-    carquet_column_clear_retained_pages(col_reader);
-
-    /* Keep reusable buffers: decoded_values, decoded_def_levels,
-     * decoded_rep_levels, indices_buffer, decompress_buffer.
-     * These will be reused on the next page load. */
-}
-
-/* ============================================================================
  * Batch Reader Implementation
  * ============================================================================
  */
@@ -1531,7 +1443,7 @@ static carquet_status_t open_row_group_readers(
 
         if (batch_reader->col_readers[i]) {
             /* Reuse: reset state but keep allocated buffers */
-            reset_column_reader_for_row_group(
+            carquet_column_reader_rebind(
                 batch_reader->col_readers[i],
                 batch_reader->reader,
                 row_group_index, file_col_idx,
@@ -2242,7 +2154,7 @@ static void pipeline_fill(carquet_batch_reader_t* br) {
         for (int32_t i = 0; i < br->num_projected; i++) {
             int32_t file_col_idx = br->projected_columns[i];
             if (slot->col_readers[i]) {
-                reset_column_reader_for_row_group(
+                carquet_column_reader_rebind(
                     slot->col_readers[i], br->reader,
                     target_rg, file_col_idx,
                     br->config.preserve_dictionaries);
@@ -2573,7 +2485,7 @@ static carquet_status_t position_projected_column(
     /* No offset index for this column: reset to chunk start and read-and-
      * discard up to target_row. Forward-only — backward seeks are handled
      * by the reset. */
-    reset_column_reader_for_row_group(cr, br->reader,
+    carquet_column_reader_rebind(cr, br->reader,
         br->current_row_group, file_col,
         br->config.preserve_dictionaries);
     if (target_row > 0) {

@@ -138,6 +138,20 @@ if (n < 0) {
 
 The error out-parameter is cleared on entry, so `err.code == CARQUET_OK` reliably means "no failure", independent of the count. Passing `NULL` for the error makes it behave exactly like `carquet_column_read_batch()`.
 
+To scan a column across several row groups, create the column reader once and move it with `carquet_column_reader_reset()` instead of freeing and re-creating it per row group: the reader keeps its page and decode buffers, so large decode buffers are allocated (and page-faulted in) once per scan rather than once per row group. `carquet_reader_prebuffer()` likewise reuses its buffer while the next row group's range fits.
+
+```c
+int32_t cols[] = {2};
+carquet_column_reader_t* col = NULL;
+for (int32_t rg = 0; rg < carquet_reader_num_row_groups(reader); rg++) {
+    carquet_reader_prebuffer(reader, rg, cols, 1, &err);   /* optional, fread readers */
+    if (!col) col = carquet_reader_get_column(reader, rg, 2, &err);
+    else if (carquet_column_reader_reset(col, rg, &err) != CARQUET_OK) break;
+    while ((n = carquet_column_read_batch(col, values, 1024, def_levels, NULL)) > 0) { /* ... */ }
+}
+carquet_column_reader_free(col);
+```
+
 Also available:
 
 - `carquet_column_skip()`
