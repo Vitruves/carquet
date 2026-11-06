@@ -29,7 +29,6 @@ def test_typed_roundtrip_exact(tmp_path, typed_table):
     out = carquet.read_table(path)
     for name in typed_table.column_names:
         assert out.schema.field(name).type == typed_table.schema.field(name).type, name
-        assert out.column(name).to_pylist() == typed_table.column(name).to_pylist(), name
     assert_tables_equal(out, typed_table)
     assert_tables_equal(pq.read_table(path), typed_table)
 

@@ -39,7 +39,7 @@ jobs:
       matrix:
         # Native runners only: the C library picks its SIMD sources from the
         # host architecture and the tests need to run on the built wheel.
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14, macos-15-intel, windows-2022]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-2022]
     steps:
       - uses: actions/checkout@v7
 
