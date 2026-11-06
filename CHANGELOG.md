@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Bug Fixes
+
+- `CARQUET_ERROR_INIT` used designated initializers, which C++ only accepts from C++20: C++17 consumers failed to build on MSVC, and Clang / GCC warned under `-Wpedantic`. It is now a positional initializer with the same values, valid C and C++ (checked from C++11 to C++20 with `-Wpedantic -Werror`).
+
 ## v0.7.3
 
 **In short:** a memory-safety pass (14 fixes, 3 high severity: a heap overwrite from a crafted footer, an out-of-bounds write in multi-threaded mmap reads, a double free after a background write error), files from older writers that carquet could not read (parquet-mr without `dictionary_page_offset`, multi-member gzip, raw LZ4 under the Hadoop codec id, mistyped footer fields), a batch-reader hang on fuzzed input, fuzzers that now actually instrument the library, and faster compressed I/O (Apple M3, 1M rows: writes −11 to −19 %, Snappy / LZ4 reads −17 / −23 %; 10M rows: uncompressed writes −14 %, compressed I/O mostly within noise). Output bytes unchanged. PyArrow and DuckDB read every file (`interop/run_interop.py`: 25/25 PyArrow, 23/23 DuckDB write; 26/26 read, 57/75 parquet-testing files verified value for value, 0 failures). The Python package is rewritten around the batch reader (column projection, filters with statistics / page-index pushdown, streaming, metadata / statistics / page index / bloom filter access, every writer option) and reads 2-3x faster than 0.7.2 (more than 10x for column subsets). First pass on a real Windows machine: 32-bit MSVC builds silently wrote corrupt wide INT64 DELTA_BINARY_PACKED pages (compiler miscompile), non-ASCII file paths failed (also from the Python wheel), clang-cl and MinGW-w64 did not build or run, and buffers handed to the caller could not be freed safely across a DLL boundary (new `carquet_free()`); MSVC x64 / x86, clang-cl and MinGW-w64, static and DLL, now pass the full suite. AVX2 bit-unpacking covers widths above 8 bits (6–21x faster kernels; end-to-end reads within noise). First Windows benchmark against Arrow C++ 24.0.0 (MSVC, 10M rows): writes 2.1–3.8x faster, compressed reads 1.05–1.17x.
