@@ -189,6 +189,8 @@ target("carquet")
     -- Public API headers propagate to every dependent; src/ stays private.
     add_includedirs("include", {public = true})
     add_includedirs("src")
+    -- `xmake install` copies these to <prefix>/include/carquet/ (CMake: install(DIRECTORY include/carquet)).
+    add_headerfiles("include/(carquet/*.h)")
 
     add_packages("zstd", "zlib", "lz4", {public = true})
     if has_config("brotli") then

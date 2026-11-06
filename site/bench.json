@@ -1,0 +1,631 @@
+{
+  "carquet_version": "0.7.3",
+  "timestamp": "2026-11-06",
+  "system": {
+    "cpu": "Apple M3",
+    "ram_gb": 16,
+    "os": "macOS-26.5-arm64-arm-64bit-Mach-O",
+    "arch": "arm64",
+    "python": "3.13.5"
+  },
+  "config": {
+    "warmup_iterations": 3,
+    "bench_iterations": {
+      "small": 51,
+      "medium": 21,
+      "large": 11,
+      "xlarge": 11
+    },
+    "statistic": "trimmed_median",
+    "cache_purge": true,
+    "cooldown_seconds": 3,
+    "subprocess_timeout_seconds": 300
+  },
+  "results": [
+    {
+      "library": "arrow_cpp",
+      "dataset": "large",
+      "compression": "lz4",
+      "rows": 10000000,
+      "write_ms": 241.22,
+      "read_ms": 18.19,
+      "file_bytes": 129405099
+    },
+    {
+      "library": "arrow_cpp",
+      "dataset": "large",
+      "compression": "none",
+      "rows": 10000000,
+      "write_ms": 112.09,
+      "read_ms": 13.9,
+      "file_bytes": 200095003
+    },
+    {
+      "library": "arrow_cpp",
+      "dataset": "large",
+      "compression": "snappy",
+      "rows": 10000000,
+      "write_ms": 271.36,
+      "read_ms": 23.78,
+      "file_bytes": 131524302
+    },
+    {
+      "library": "arrow_cpp",
+      "dataset": "large",
+      "compression": "zstd",
+      "rows": 10000000,
+      "write_ms": 352.83,
+      "read_ms": 35.05,
+      "file_bytes": 101606090
+    },
+    {
+      "library": "arrow_cpp",
+      "dataset": "medium",
+      "compression": "lz4",
+      "rows": 1000000,
+      "write_ms": 25.16,
+      "read_ms": 1.96,
+      "file_bytes": 12943537
+    },
+    {
+      "library": "arrow_cpp",
+      "dataset": "medium",
+      "compression": "none",
+      "rows": 1000000,
+      "write_ms": 13.19,
+      "read_ms": 1.72,
+      "file_bytes": 20012832
+    },
+    {
+      "library": "arrow_cpp",
+      "dataset": "medium",
+      "compression": "snappy",
+      "rows": 1000000,
+      "write_ms": 23.99,
+      "read_ms": 2.49,
+      "file_bytes": 13156551
+    },
+    {
+      "library": "arrow_cpp",
+      "dataset": "medium",
+      "compression": "zstd",
+      "rows": 1000000,
+      "write_ms": 33.6,
+      "read_ms": 3.03,
+      "file_bytes": 10164352
+    },
+    {
+      "library": "arrow_cpp",
+      "dataset": "small",
+      "compression": "lz4",
+      "rows": 100000,
+      "write_ms": 2.57,
+      "read_ms": 0.61,
+      "file_bytes": 1294329
+    },
+    {
+      "library": "arrow_cpp",
+      "dataset": "small",
+      "compression": "none",
+      "rows": 100000,
+      "write_ms": 1.75,
+      "read_ms": 0.24,
+      "file_bytes": 2001375
+    },
+    {
+      "library": "arrow_cpp",
+      "dataset": "small",
+      "compression": "snappy",
+      "rows": 100000,
+      "write_ms": 2.52,
+      "read_ms": 0.9,
+      "file_bytes": 1315651
+    },
+    {
+      "library": "arrow_cpp",
+      "dataset": "small",
+      "compression": "zstd",
+      "rows": 100000,
+      "write_ms": 3.6,
+      "read_ms": 1.3,
+      "file_bytes": 1016334
+    },
+    {
+      "library": "carquet",
+      "dataset": "large",
+      "compression": "lz4",
+      "rows": 10000000,
+      "write_ms": 52.38,
+      "read_ms": 9.6,
+      "file_bytes": 128682195
+    },
+    {
+      "library": "carquet",
+      "dataset": "large",
+      "compression": "none",
+      "rows": 10000000,
+      "write_ms": 48.79,
+      "read_ms": 0.3,
+      "file_bytes": 200013459
+    },
+    {
+      "library": "carquet",
+      "dataset": "large",
+      "compression": "snappy",
+      "rows": 10000000,
+      "write_ms": 57.19,
+      "read_ms": 12.59,
+      "file_bytes": 131163987
+    },
+    {
+      "library": "carquet",
+      "dataset": "large",
+      "compression": "zstd",
+      "rows": 10000000,
+      "write_ms": 59.66,
+      "read_ms": 19.75,
+      "file_bytes": 99907282
+    },
+    {
+      "library": "carquet",
+      "dataset": "medium",
+      "compression": "lz4",
+      "rows": 1000000,
+      "write_ms": 6.54,
+      "read_ms": 0.97,
+      "file_bytes": 12877807
+    },
+    {
+      "library": "carquet",
+      "dataset": "medium",
+      "compression": "none",
+      "rows": 1000000,
+      "write_ms": 6.75,
+      "read_ms": 0.07,
+      "file_bytes": 20004278
+    },
+    {
+      "library": "carquet",
+      "dataset": "medium",
+      "compression": "snappy",
+      "rows": 1000000,
+      "write_ms": 7.02,
+      "read_ms": 1.58,
+      "file_bytes": 13135400
+    },
+    {
+      "library": "carquet",
+      "dataset": "medium",
+      "compression": "zstd",
+      "rows": 1000000,
+      "write_ms": 7.97,
+      "read_ms": 2.16,
+      "file_bytes": 10069690
+    },
+    {
+      "library": "carquet",
+      "dataset": "small",
+      "compression": "lz4",
+      "rows": 100000,
+      "write_ms": 1.67,
+      "read_ms": 0.29,
+      "file_bytes": 1287900
+    },
+    {
+      "library": "carquet",
+      "dataset": "small",
+      "compression": "none",
+      "rows": 100000,
+      "write_ms": 1.08,
+      "read_ms": 0.02,
+      "file_bytes": 2000499
+    },
+    {
+      "library": "carquet",
+      "dataset": "small",
+      "compression": "snappy",
+      "rows": 100000,
+      "write_ms": 1.8,
+      "read_ms": 0.36,
+      "file_bytes": 1313216
+    },
+    {
+      "library": "carquet",
+      "dataset": "small",
+      "compression": "zstd",
+      "rows": 100000,
+      "write_ms": 1.81,
+      "read_ms": 0.63,
+      "file_bytes": 1006793
+    },
+    {
+      "library": "fastparquet",
+      "dataset": "large",
+      "compression": "lz4",
+      "rows": 10000000,
+      "write_ms": 225.32,
+      "read_ms": 55.27,
+      "file_bytes": 138612356
+    },
+    {
+      "library": "fastparquet",
+      "dataset": "large",
+      "compression": "none",
+      "rows": 10000000,
+      "write_ms": 65.4,
+      "read_ms": 49.04,
+      "file_bytes": 200004094
+    },
+    {
+      "library": "fastparquet",
+      "dataset": "large",
+      "compression": "snappy",
+      "rows": 10000000,
+      "write_ms": 204.12,
+      "read_ms": 110.5,
+      "file_bytes": 140576700
+    },
+    {
+      "library": "fastparquet",
+      "dataset": "large",
+      "compression": "zstd",
+      "rows": 10000000,
+      "write_ms": 331.08,
+      "read_ms": 185.36,
+      "file_bytes": 107512731
+    },
+    {
+      "library": "fastparquet",
+      "dataset": "medium",
+      "compression": "lz4",
+      "rows": 1000000,
+      "write_ms": 21.59,
+      "read_ms": 5.06,
+      "file_bytes": 13876160
+    },
+    {
+      "library": "fastparquet",
+      "dataset": "medium",
+      "compression": "none",
+      "rows": 1000000,
+      "write_ms": 7.45,
+      "read_ms": 3.0,
+      "file_bytes": 20003951
+    },
+    {
+      "library": "fastparquet",
+      "dataset": "medium",
+      "compression": "snappy",
+      "rows": 1000000,
+      "write_ms": 22.15,
+      "read_ms": 10.09,
+      "file_bytes": 14064235
+    },
+    {
+      "library": "fastparquet",
+      "dataset": "medium",
+      "compression": "zstd",
+      "rows": 1000000,
+      "write_ms": 32.61,
+      "read_ms": 18.44,
+      "file_bytes": 10754026
+    },
+    {
+      "library": "fastparquet",
+      "dataset": "small",
+      "compression": "lz4",
+      "rows": 100000,
+      "write_ms": 2.25,
+      "read_ms": 0.73,
+      "file_bytes": 1388551
+    },
+    {
+      "library": "fastparquet",
+      "dataset": "small",
+      "compression": "none",
+      "rows": 100000,
+      "write_ms": 1.04,
+      "read_ms": 0.52,
+      "file_bytes": 2001053
+    },
+    {
+      "library": "fastparquet",
+      "dataset": "small",
+      "compression": "snappy",
+      "rows": 100000,
+      "write_ms": 2.31,
+      "read_ms": 1.2,
+      "file_bytes": 1406830
+    },
+    {
+      "library": "fastparquet",
+      "dataset": "small",
+      "compression": "zstd",
+      "rows": 100000,
+      "write_ms": 3.45,
+      "read_ms": 2.05,
+      "file_bytes": 1075763
+    },
+    {
+      "library": "pyarrow",
+      "dataset": "large",
+      "compression": "lz4",
+      "rows": 10000000,
+      "write_ms": 283.2,
+      "read_ms": 30.2,
+      "file_bytes": 129632610
+    },
+    {
+      "library": "pyarrow",
+      "dataset": "large",
+      "compression": "none",
+      "rows": 10000000,
+      "write_ms": 170.45,
+      "read_ms": 26.77,
+      "file_bytes": 200119734
+    },
+    {
+      "library": "pyarrow",
+      "dataset": "large",
+      "compression": "snappy",
+      "rows": 10000000,
+      "write_ms": 293.86,
+      "read_ms": 38.42,
+      "file_bytes": 131427090
+    },
+    {
+      "library": "pyarrow",
+      "dataset": "large",
+      "compression": "zstd",
+      "rows": 10000000,
+      "write_ms": 423.24,
+      "read_ms": 42.54,
+      "file_bytes": 101643796
+    },
+    {
+      "library": "pyarrow",
+      "dataset": "medium",
+      "compression": "lz4",
+      "rows": 1000000,
+      "write_ms": 29.2,
+      "read_ms": 2.98,
+      "file_bytes": 12966161
+    },
+    {
+      "library": "pyarrow",
+      "dataset": "medium",
+      "compression": "none",
+      "rows": 1000000,
+      "write_ms": 16.98,
+      "read_ms": 2.73,
+      "file_bytes": 20014899
+    },
+    {
+      "library": "pyarrow",
+      "dataset": "medium",
+      "compression": "snappy",
+      "rows": 1000000,
+      "write_ms": 27.89,
+      "read_ms": 3.66,
+      "file_bytes": 13146090
+    },
+    {
+      "library": "pyarrow",
+      "dataset": "medium",
+      "compression": "zstd",
+      "rows": 1000000,
+      "write_ms": 38.83,
+      "read_ms": 3.96,
+      "file_bytes": 10167660
+    },
+    {
+      "library": "pyarrow",
+      "dataset": "small",
+      "compression": "lz4",
+      "rows": 100000,
+      "write_ms": 2.93,
+      "read_ms": 0.43,
+      "file_bytes": 1296659
+    },
+    {
+      "library": "pyarrow",
+      "dataset": "small",
+      "compression": "none",
+      "rows": 100000,
+      "write_ms": 1.99,
+      "read_ms": 0.24,
+      "file_bytes": 2001590
+    },
+    {
+      "library": "pyarrow",
+      "dataset": "small",
+      "compression": "snappy",
+      "rows": 100000,
+      "write_ms": 2.82,
+      "read_ms": 0.66,
+      "file_bytes": 1314643
+    },
+    {
+      "library": "pyarrow",
+      "dataset": "small",
+      "compression": "zstd",
+      "rows": 100000,
+      "write_ms": 4.17,
+      "read_ms": 0.72,
+      "file_bytes": 1016697
+    }
+  ],
+  "arrow_cpp_version": "26.0.1",
+  "pyarrow_version": "26.0.1",
+  "fastparquet_version": "2026.9.0",
+  "crossread_results": [
+    {
+      "writer": "arrow_file",
+      "dataset": "large",
+      "compression": "lz4",
+      "carquet_read_ms": 8.97,
+      "arrow_read_ms": 18.77
+    },
+    {
+      "writer": "arrow_file",
+      "dataset": "large",
+      "compression": "none",
+      "carquet_read_ms": 0.9,
+      "arrow_read_ms": 14.84
+    },
+    {
+      "writer": "arrow_file",
+      "dataset": "large",
+      "compression": "snappy",
+      "carquet_read_ms": 11.38,
+      "arrow_read_ms": 22.86
+    },
+    {
+      "writer": "arrow_file",
+      "dataset": "large",
+      "compression": "zstd",
+      "carquet_read_ms": 18.67,
+      "arrow_read_ms": 28.7
+    },
+    {
+      "writer": "arrow_file",
+      "dataset": "medium",
+      "compression": "lz4",
+      "carquet_read_ms": 1.13,
+      "arrow_read_ms": 1.88
+    },
+    {
+      "writer": "arrow_file",
+      "dataset": "medium",
+      "compression": "none",
+      "carquet_read_ms": 0.14,
+      "arrow_read_ms": 1.57
+    },
+    {
+      "writer": "arrow_file",
+      "dataset": "medium",
+      "compression": "snappy",
+      "carquet_read_ms": 1.45,
+      "arrow_read_ms": 2.5
+    },
+    {
+      "writer": "arrow_file",
+      "dataset": "medium",
+      "compression": "zstd",
+      "carquet_read_ms": 2.19,
+      "arrow_read_ms": 3.07
+    },
+    {
+      "writer": "arrow_file",
+      "dataset": "small",
+      "compression": "lz4",
+      "carquet_read_ms": 0.5,
+      "arrow_read_ms": 0.66
+    },
+    {
+      "writer": "arrow_file",
+      "dataset": "small",
+      "compression": "none",
+      "carquet_read_ms": 0.05,
+      "arrow_read_ms": 0.29
+    },
+    {
+      "writer": "arrow_file",
+      "dataset": "small",
+      "compression": "snappy",
+      "carquet_read_ms": 0.38,
+      "arrow_read_ms": 0.94
+    },
+    {
+      "writer": "arrow_file",
+      "dataset": "small",
+      "compression": "zstd",
+      "carquet_read_ms": 0.9,
+      "arrow_read_ms": 1.3
+    },
+    {
+      "writer": "carquet_file",
+      "dataset": "large",
+      "compression": "lz4",
+      "carquet_read_ms": 9.39,
+      "arrow_read_ms": 19.14
+    },
+    {
+      "writer": "carquet_file",
+      "dataset": "large",
+      "compression": "none",
+      "carquet_read_ms": 0.43,
+      "arrow_read_ms": 16.85
+    },
+    {
+      "writer": "carquet_file",
+      "dataset": "large",
+      "compression": "snappy",
+      "carquet_read_ms": 13.6,
+      "arrow_read_ms": 24.52
+    },
+    {
+      "writer": "carquet_file",
+      "dataset": "large",
+      "compression": "zstd",
+      "carquet_read_ms": 19.36,
+      "arrow_read_ms": 28.62
+    },
+    {
+      "writer": "carquet_file",
+      "dataset": "medium",
+      "compression": "lz4",
+      "carquet_read_ms": 0.97,
+      "arrow_read_ms": 2.02
+    },
+    {
+      "writer": "carquet_file",
+      "dataset": "medium",
+      "compression": "none",
+      "carquet_read_ms": 0.05,
+      "arrow_read_ms": 1.49
+    },
+    {
+      "writer": "carquet_file",
+      "dataset": "medium",
+      "compression": "snappy",
+      "carquet_read_ms": 1.25,
+      "arrow_read_ms": 2.48
+    },
+    {
+      "writer": "carquet_file",
+      "dataset": "medium",
+      "compression": "zstd",
+      "carquet_read_ms": 2.34,
+      "arrow_read_ms": 3.89
+    },
+    {
+      "writer": "carquet_file",
+      "dataset": "small",
+      "compression": "lz4",
+      "carquet_read_ms": 0.3,
+      "arrow_read_ms": 0.72
+    },
+    {
+      "writer": "carquet_file",
+      "dataset": "small",
+      "compression": "none",
+      "carquet_read_ms": 0.02,
+      "arrow_read_ms": 0.34
+    },
+    {
+      "writer": "carquet_file",
+      "dataset": "small",
+      "compression": "snappy",
+      "carquet_read_ms": 0.36,
+      "arrow_read_ms": 1.12
+    },
+    {
+      "writer": "carquet_file",
+      "dataset": "small",
+      "compression": "zstd",
+      "carquet_read_ms": 0.64,
+      "arrow_read_ms": 1.42
+    }
+  ]
+}

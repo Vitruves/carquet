@@ -16,7 +16,7 @@ repository-code: "https://github.com/Vitruves/carquet"
 url: "https://github.com/Vitruves/carquet"
 license: MIT
 version: 0.7.3
-date-released: "2026-10-20"
+date-released: "2026-11-06"
 keywords:
   - parquet
   - apache-parquet
