@@ -48,32 +48,31 @@
 </p>
 
 <br/>
+<br/>
 
----
+<img src="res/img/divider.svg" width="100%" alt="" />
 
-<!-- ────────────────────────────  HIGHLIGHTS  ──────────────────────────── -->
-
-## Highlights
+### Highlights
 
 <div align="center">
 
 | | |
 |---|---|
-| ⚡ **Fast** | Writes **2.3–5.9x faster** than Arrow C++ and reads compressed data **1.5–2.1x faster** from the very same file (Apple M3, 10M rows). Uncompressed reads are served straight from the mmap in **0.30 ms**. SIMD for SSE4.2 / AVX2 / AVX-512 / NEON / SVE with runtime dispatch. |
-| 🪶 **Small** | Pure C11, a **~500 KB** library (Arrow C++: 50 MB+). Four compression dependencies (zstd, zlib, lz4, brotli), fetched automatically when missing. Builds in under a minute with a single `make` or `xmake`. |
-| 📦 **Complete** | All physical types and encodings, Snappy / GZIP / LZ4 / ZSTD / Brotli, V1 + V2 pages, nested schemas at any depth, bloom filters, page indexes, statistics-based pruning, append. [Full matrix ↓](#parquet-feature-support) |
-| 🔗 **Interoperable** | Files read by PyArrow, DuckDB and Spark out of the box. Zero-dependency [Arrow C Data Interface](docs/reading.md#export-to-arrow-c-data-interface) bridge (struct / list / map at any depth) and a full [Python API](#python-api) on top of PyArrow. |
-| 🛠 **Tooling** | `carquet` CLI to inspect, filter, export and validate files, plus `codegen` to emit a ready-to-compile C reader. A ready-made [agent skill](#ai-coding-agents) for Claude Code and Codex. |
+| <img src="res/img/icons/fast.svg" width="22" height="22" align="absmiddle" alt="" />&nbsp; **Fast** | Writes **2.3–5.9x faster** than Arrow C++ and reads compressed data **1.5–2.1x faster** from the very same file (Apple M3, 10M rows). Uncompressed reads are served straight from the mmap in **0.30 ms**. |
+| <img src="res/img/icons/simd.svg" width="22" height="22" align="absmiddle" alt="" />&nbsp; **SIMD** | 30+ hand-written vector kernels for **SSE4.2, AVX, AVX2, AVX-512, NEON and SVE**: bit-unpacking and RLE levels, dictionary gathers, byte-stream split, min/max statistics, null bitmaps, Snappy / LZ4 match copies. One portable binary picks the widest kernel at runtime, with a scalar fallback. |
+| <img src="res/img/icons/small.svg" width="22" height="22" align="absmiddle" alt="" />&nbsp; **Small** | Pure C11, a **~500 KB** library (Arrow C++: 50 MB+). Four compression dependencies (zstd, zlib, lz4, brotli), fetched automatically when missing. Builds in under a minute with a single `make` or `xmake`. |
+| <img src="res/img/icons/complete.svg" width="22" height="22" align="absmiddle" alt="" />&nbsp; **Complete** | All physical types and encodings, Snappy / GZIP / LZ4 / ZSTD / Brotli, V1 + V2 pages, nested schemas at any depth, bloom filters, page indexes, statistics-based pruning, append. [Full matrix ↓](#parquet-feature-support) |
+| <img src="res/img/icons/interop.svg" width="22" height="22" align="absmiddle" alt="" />&nbsp; **Interoperable** | Files read by PyArrow, DuckDB and Spark out of the box. Zero-dependency [Arrow C Data Interface](docs/reading.md#export-to-arrow-c-data-interface) bridge (struct / list / map at any depth) and a full [Python API](#python-api) on top of PyArrow. |
+| <img src="res/img/icons/tooling.svg" width="22" height="22" align="absmiddle" alt="" />&nbsp; **Tooling** | `carquet` CLI to inspect, filter, export and validate files, plus `codegen` to emit a ready-to-compile C reader. A ready-made [agent skill](#ai-coding-agents) for Claude Code and Codex. |
 
 </div>
 
 <br/>
+<br/>
 
----
+<img src="res/img/divider.svg" width="100%" alt="" />
 
-<!-- ────────────────────────────  BENCHMARKS  ──────────────────────────── -->
-
-## Benchmarks
+### Benchmarks
 
 <p align="center">
   <picture>
@@ -125,7 +124,7 @@ The **same-file cross-read** benchmark is the fairest comparison: both libraries
 
 *12 threads @ 2.2GHz, 32GB RAM, Ubuntu 24.04, ZSTD level 1*
 
-#### 10M rows vs Arrow C++
+##### 10M rows vs Arrow C++
 
 <div align="center">
 
@@ -140,7 +139,7 @@ The **same-file cross-read** benchmark is the fairest comparison: both libraries
 
 <br/>
 
-#### 1M rows vs Arrow C++
+##### 1M rows vs Arrow C++
 
 <div align="center">
 
@@ -155,7 +154,7 @@ The **same-file cross-read** benchmark is the fairest comparison: both libraries
 
 <br/>
 
-#### 100K rows vs Arrow C++
+##### 100K rows vs Arrow C++
 
 <div align="center">
 
@@ -170,7 +169,7 @@ The **same-file cross-read** benchmark is the fairest comparison: both libraries
 
 <br/>
 
-#### Same-file cross-read (10M rows)
+##### Same-file cross-read (10M rows)
 
 Both libraries read the **same** Parquet file, the fairest apples-to-apples comparison.
 
@@ -191,7 +190,7 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 
 <br/>
 
-#### 10M rows vs PyArrow
+##### 10M rows vs PyArrow
 
 <div align="center">
 
@@ -215,7 +214,7 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 
 *Carquet 0.7.3, MacBook Air M3, 16GB RAM, macOS 26.5, Arrow C++ 26.0.1, PyArrow 26.0.1, fastparquet 2026.9.0, ZSTD level 1, measured on 2026-11-06. Raw report: [`benchmark/bench_0.7.3_darwin_arm64_20261106.json`](benchmark/bench_0.7.3_darwin_arm64_20261106.json).*
 
-#### 10M rows vs Arrow C++
+##### 10M rows vs Arrow C++
 
 <div align="center">
 
@@ -230,7 +229,7 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 
 <br/>
 
-#### 1M rows vs Arrow C++
+##### 1M rows vs Arrow C++
 
 <div align="center">
 
@@ -245,7 +244,7 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 
 <br/>
 
-#### 100K rows vs Arrow C++
+##### 100K rows vs Arrow C++
 
 <div align="center">
 
@@ -260,7 +259,7 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 
 <br/>
 
-#### 10M rows vs PyArrow
+##### 10M rows vs PyArrow
 
 <div align="center">
 
@@ -275,7 +274,7 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 
 <br/>
 
-#### 1M rows vs PyArrow
+##### 1M rows vs PyArrow
 
 <div align="center">
 
@@ -290,7 +289,7 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 
 <br/>
 
-#### 100K rows vs PyArrow
+##### 100K rows vs PyArrow
 
 <div align="center">
 
@@ -305,7 +304,7 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 
 <br/>
 
-#### 10M rows vs fastparquet
+##### 10M rows vs fastparquet
 
 <div align="center">
 
@@ -320,7 +319,7 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 
 <br/>
 
-#### 1M rows vs fastparquet
+##### 1M rows vs fastparquet
 
 <div align="center">
 
@@ -335,7 +334,7 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 
 <br/>
 
-#### 100K rows vs fastparquet
+##### 100K rows vs fastparquet
 
 <div align="center">
 
@@ -350,7 +349,7 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 
 <br/>
 
-#### Same-file cross-read (10M rows)
+##### Same-file cross-read (10M rows)
 
 Both libraries read the **same** Parquet file, the fairest apples-to-apples comparison.
 
@@ -380,7 +379,7 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 
 *Carquet 0.7.3 built with MSVC 19.44 (x64 Release, OpenMP), OpenStack VM with 4 vCPU (Intel Haswell, 3.1 GHz), 14.6GB RAM, virtual SAS disk, Windows Server 2025, Arrow C++ 24.0.0 (conda-forge), ZSTD level 1, measured on 2026-11-02. Cold reads go to the virtual disk, which narrows the read ratios; writes and the zero-copy path are CPU-bound.*
 
-#### 10M rows vs Arrow C++
+##### 10M rows vs Arrow C++
 
 <div align="center">
 
@@ -395,7 +394,7 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 
 <br/>
 
-#### 1M rows vs Arrow C++
+##### 1M rows vs Arrow C++
 
 <div align="center">
 
@@ -410,7 +409,7 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 
 <br/>
 
-#### 100K rows vs Arrow C++
+##### 100K rows vs Arrow C++
 
 <div align="center">
 
@@ -425,7 +424,7 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 
 <br/>
 
-#### Same-file cross-read (10M rows)
+##### Same-file cross-read (10M rows)
 
 <div align="center">
 
@@ -507,12 +506,11 @@ python3 benchmark/plot_readme_chart.py benchmark/bench_<version>_<os>_<arch>_<da
 </details>
 
 <br/>
+<br/>
 
----
+<img src="res/img/divider.svg" width="100%" alt="" />
 
-<!-- ────────────────────────────  QUICK LOOK  ──────────────────────────── -->
-
-## Thirty seconds of carquet
+### Thirty seconds of carquet
 
 ```c
 #include <carquet/carquet.h>
@@ -535,20 +533,17 @@ carquet_schema_free(schema);
 > **Where carquet fits.** Arrow stays the right choice when you need its ecosystem (compute kernels, datasets, Flight, encryption). carquet is for C and C++ programs, embedded systems and language runtimes that only need to read and write Parquet quickly and correctly.
 
 <br/>
+<br/>
 
----
+<img src="res/img/divider.svg" width="100%" alt="" />
 
-<!-- ────────────────────────────  INSTALLATION  ──────────────────────────── -->
-
-## Installation
-
-This section installs the **C library, its headers and the `carquet` CLI**. Python users want the separate [Python API](#python-api) (`pip install carquet`).
+### Installation
 
 **Requirements:** a C11 compiler (GCC 4.9+, Clang 3.4+, MSVC 2015+) and CMake 3.16+ (or [xmake](#from-source-with-xmake)). zstd, zlib, lz4 and brotli are used from the system when present and fetched otherwise. OpenMP is optional (parallel reads and writes).
 
 <br/>
 
-### From source, with `make`
+#### From source, with `make`
 
 The simplest route. `make` is a thin wrapper that calls CMake with the right flags, there is nothing else to configure:
 
@@ -560,9 +555,23 @@ sudo make install     # library, headers, CLI, pkg-config and CMake package file
 
 Then link with `-lcarquet`, `pkg-config --cflags --libs carquet`, or `find_package(carquet)` in CMake.
 
+<div align="center">
+
+| Command | What it does |
+|---|---|
+| `make` | Release static library + CLI (default) |
+| `make native` | Same, tuned for this CPU (`-march=native`) |
+| `make shared` | Shared library instead of static |
+| `make debug` / `make test` | Debug build / build and run the test suite |
+| `make install PREFIX=$HOME/.local` | Install to another prefix (default `/usr/local`) |
+
+</div>
+
+All targets and variables: [docs/building.md](docs/building.md#make-targets).
+
 <br/>
 
-### From source, with `xmake`
+#### From source, with `xmake`
 
 [xmake](https://xmake.io) needs nothing else installed: it downloads pinned zstd 1.5.6, zlib 1.3.1, lz4 1.10.0 and brotli 1.1.0 and links them statically, so the `carquet` CLI has no runtime dependency.
 
@@ -574,9 +583,23 @@ xmake install -o /usr/local   # headers, library and CLI (sudo if the prefix nee
 
 A static install contains only `libcarquet.a`, so link the codecs yourself (`-lcarquet -lzstd -lz -llz4`, plus `-lbrotlienc -lbrotlidec -lbrotlicommon` unless built with `--brotli=n`). Configure with `xmake f --shared=y` instead for a self-contained shared library with the codecs built in.
 
+<div align="center">
+
+| `xmake f …` then `xmake` | What it does |
+|---|---|
+| `--shared=y` | Shared library with the codecs built in |
+| `--native_arch=y` | Tune for this CPU (`-march=native`) |
+| `--brotli=n` | Drop the BROTLI codec and its dependency |
+| `--openmp=n` | Build without OpenMP |
+| `-m debug --tests=y` | Debug build with tests (`xmake test`) |
+
+</div>
+
+All options: [docs/building.md](docs/building.md#xmake).
+
 <br/>
 
-### In your CMake project
+#### In your CMake project
 
 ```cmake
 include(FetchContent)
@@ -587,197 +610,41 @@ target_link_libraries(myapp PRIVATE carquet)
 
 Or, after `make install`: `find_package(carquet REQUIRED)` and link `carquet::carquet`.
 
-<br/>
-
----
-
-<!-- ────────────────────────────  BUILD CONFIGURATIONS  ──────────────────────────── -->
-
-## Build configurations
-
-### `make` targets
-
-Every target configures `build/` and builds it in parallel. `make help` prints this list. Each one has an [xmake equivalent](#xmake).
+Set options before `FetchContent_MakeAvailable` (`set(CARQUET_BUILD_CLI OFF CACHE BOOL "" FORCE)`), or pass them as `-D` flags when building carquet on its own:
 
 <div align="center">
 
-| Command | Build type | What you get |
-|---|---|---|
-| `make` / `make release` | Release | Static library + `carquet` CLI (the default) |
-| `make native` | Release | Same, tuned for this CPU with `-march=native` (binary does not run on older CPUs) |
-| `make shared` | Release | Shared library (`.so` / `.dylib` / `.dll`) instead of static |
-| `make benchmark` | Release | Benchmark programs (`benchmark_carquet`, profiling targets) |
-| `make debug` | Debug | Library + CLI with assertions, no optimization |
-| `make test` | Debug | Test suite, then runs it with `ctest` |
-| `make dev` | Debug | Everything: tests, examples, benchmarks, interop programs |
-| `make fuzz` | Debug | libFuzzer targets (use a Clang toolchain) |
-| `make install` | Release | Builds `release`, then installs to `PREFIX` |
-| `make clean` | | Deletes the build directory |
-
-</div>
-
-<div align="center">
-
-| Variable | Default | Example |
-|---|---|---|
-| `PREFIX` | CMake default (`/usr/local` on Unix) | `make install PREFIX=$HOME/.local` |
-| `BUILD` | `build` | `make test BUILD=build-debug` (keep several configurations side by side) |
-| `JOBS` | number of cores | `make JOBS=4` |
-| `CMAKE` | `cmake` | `make CMAKE=/opt/cmake/bin/cmake` |
-
-</div>
-
-All targets share `build/` by default, so `make test` after `make benchmark` reconfigures it as Debug. Use `BUILD=` to keep a Release and a Debug tree apart.
-
-<br/>
-
-### CMake options
-
-For anything the `make` targets don't cover, call CMake directly and pass options with `-DOPTION=ON|OFF`:
-
-```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DCARQUET_BUILD_SHARED=ON -DCARQUET_ENABLE_BROTLI=OFF
-cmake --build build -j
-sudo cmake --install build --prefix /usr/local
-```
-
-<div align="center">
-
-| What to build | Default | |
+| Option | Default | |
 |---|:---:|---|
-| `CARQUET_BUILD_CLI` | ON | `carquet` command-line tool |
 | `CARQUET_BUILD_SHARED` | OFF | Shared instead of static library |
-| `CARQUET_BUILD_DEV` | OFF | Turns on tests, examples, benchmarks and interop at once |
-| `CARQUET_BUILD_TESTS` | = DEV | Test suite (`ctest`) |
-| `CARQUET_BUILD_EXAMPLES` | = DEV | Programs in [`examples/`](examples/) |
-| `CARQUET_BUILD_BENCHMARKS` | = DEV | Benchmark and profiling programs |
-| `CARQUET_BUILD_ARROW_CPP_BENCHMARK` | OFF | Arrow C++ comparison benchmark (needs Arrow C++) |
-| `CARQUET_BUILD_INTEROP` | = DEV | C / Python round-trip programs |
-| `CARQUET_BUILD_FUZZ` | OFF | Fuzz targets |
-| `CARQUET_BUILD_DOCS` | OFF | `docs` target, Doxygen HTML into `build/docs/html/` |
-
-| Dependencies | Default | |
-|---|:---:|---|
-| `CARQUET_ENABLE_BROTLI` | ON | BROTLI codec; OFF drops the libbrotli dependency |
-| `CARQUET_BUNDLE_DEPS` | OFF | Always fetch and statically bundle zstd / zlib / lz4 / brotli (portable artifacts, Python wheel) |
-| `CARQUET_ZSTD_TARGET`, `_ZLIB_`, `_LZ4_`, `_BROTLI_TARGET` | empty | Link an existing CMake target instead of searching or fetching (see below) |
-| `CARQUET_ARROW_CPP_ROOT` | empty | Arrow C++ install prefix for the comparison benchmark |
-| `CMAKE_DISABLE_FIND_PACKAGE_OpenMP` | OFF | ON builds without OpenMP (no `libgomp` / `vcomp140.dll` at runtime) |
-
-| CPU | Default | |
-|---|:---:|---|
-| `CARQUET_NATIVE_ARCH` | OFF | `-march=native`; fastest, host-only binary |
-| `CARQUET_ENABLE_SSE`, `_AVX`, `_AVX2`, `_AVX512` | ON | x86 SIMD kernels, chosen at runtime from what the CPU supports |
-| `CARQUET_ENABLE_NEON` | ON | ARM NEON kernels |
-| `CARQUET_ENABLE_SVE` | OFF | ARM SVE kernels (experimental) |
-| `CARQUET_MSVC_HARDENING` | ON | MSVC: `/guard:cf` and `/CETCOMPAT` |
+| `CARQUET_BUILD_CLI` | ON | `carquet` CLI (turn OFF when embedding) |
+| `CARQUET_NATIVE_ARCH` | OFF | `-march=native`, host-only binary |
+| `CARQUET_ENABLE_BROTLI` | ON | OFF drops the libbrotli dependency |
+| `CARQUET_BUNDLE_DEPS` | OFF | Always fetch and statically bundle the codecs |
+| `CARQUET_ZSTD_TARGET` (and `_ZLIB_`, `_LZ4_`, `_BROTLI_`) | empty | Link your project's existing codec target |
 
 </div>
 
-SIMD kernels are compiled in and selected at runtime with scalar fallbacks, so a default build runs on any CPU of its architecture. Only `CARQUET_NATIVE_ARCH` ties the binary to the build machine.
+All options: [docs/building.md](docs/building.md#cmake-options).
 
 <br/>
 
-### xmake
-
-`xmake.lua` is a full alternative to CMake with the same options and defaults. Configure once with `xmake f`, then `xmake` builds; the configuration is remembered until the next `xmake f`.
-
-<div align="center">
-
-| `make` target | xmake equivalent |
-|---|---|
-| `make` | `xmake` |
-| `make native` | `xmake f --native_arch=y && xmake` |
-| `make shared` | `xmake f --shared=y && xmake` |
-| `make benchmark` | `xmake f --benchmarks=y && xmake` |
-| `make debug` | `xmake f -m debug && xmake` |
-| `make test` | `xmake f -m debug --tests=y && xmake && xmake test` |
-| `make dev` | `xmake f -m debug --dev=y && xmake` |
-| `make fuzz` | `xmake f -m debug --fuzz=y --toolchain=clang && xmake` |
-| `make clean` | `xmake clean` (or `xmake f -c` to also reset the configuration) |
-| `cmake --build build --target docs` | `xmake docs` (no configure flag needed) |
-
-</div>
-
-Options mirror the CMake ones without the `CARQUET_` prefix, in lower case, as `--option=y|n`. Combine them freely: `xmake f -m release --shared=y --brotli=n --avx512=n`.
-
-<div align="center">
-
-| xmake option | Default | Description |
-|--------------|---------|-------------|
-| `--dev` | n | Build tests, examples, benchmarks and interop |
-| `--tests` / `--examples` / `--benchmarks` / `--interop` | n | Build one group individually |
-| `--arrow_cpp_benchmark` | n | Arrow C++ comparison benchmark (uses Arrow from the xmake repo if available) |
-| `--cli` | y | Build the `carquet` CLI tool |
-| `--shared` | n | Build a shared library instead of static |
-| `--openmp` | y | OpenMP parallel column reading (auto-disabled if unavailable) |
-| `--native_arch` | n | `-march=native` for maximum performance (host-only binary) |
-| `--sse` / `--avx` / `--avx2` / `--avx512` / `--neon` | y | SIMD instruction sets (auto-detected) |
-| `--sve` | n | ARM SVE (experimental) |
-| `--brotli` | y | BROTLI codec (libbrotli from the xmake repo) |
-| `--fuzz` | n | Build fuzz targets (use `--toolchain=clang`); then `--fuzz_engine=libFuzzer\|AFL`, `--fuzz_sanitizers=y\|n` |
-
-</div>
-
-<details>
-<summary><b>Windows</b> (MSVC, clang-cl, MinGW-w64)</summary>
-
-<br/>
-
-MSVC (x64 and Win32), clang-cl and MinGW-w64 GCC are all supported, static or shared. `CMakePresets.json` has `msvc`, `msvc-shared`, `clang-cl` and `mingw` presets:
-
-```powershell
-# from a Developer PowerShell for VS (or with MinGW-w64 gcc + ninja on PATH for "mingw")
-cmake --preset msvc
-cmake --build --preset msvc
-ctest --preset msvc
-```
-
-- When configuring by hand, set the C++ compiler as well as the C one (for example `CC=clang-cl CXX=clang-cl`): the fetched zstd project enables C++, and CMake otherwise picks a mismatched driver.
-- With `-DCARQUET_BUILD_SHARED=ON` you get `carquet.dll` plus the `carquet.lib` import library (`libcarquet.dll` / `libcarquet.dll.a` with MinGW). Consumers must define `CARQUET_BUILD_SHARED`; `find_package(carquet)` and `carquet.pc` add it for you. Put the DLL next to your executable or on `PATH`.
-- Release memory that carquet hands you, such as `carquet_writer_get_buffer()` output, with `carquet_free()` and not `free()`. The DLL and your program may use different C runtime heaps (Debug vs Release CRT, `/MT`, MinGW vs MSVC).
-- File paths may be UTF-8 (non-ASCII names work). The `carquet` CLI accepts Unicode arguments and prints UTF-8 to the console.
-- MinGW builds with OpenMP need `libgomp-1.dll` and `libwinpthread-1.dll` at runtime. MSVC builds need `vcomp140.dll` (from the Visual C++ Redistributable). Pass `-DCMAKE_DISABLE_FIND_PACKAGE_OpenMP=ON` for a build without that dependency.
-- Windows Defender's machine-learning heuristic may quarantine `test_encoding_roundtrip.exe` and `test_fuzz_regressions.exe` as `Trojan:Win64/CobaltStrike.RDH!MTB` (a false positive on their embedded binary test data; ctest then reports them as "Not Run"). Exclude the build directory from scanning to run the full suite.
-
-</details>
-
-<details>
-<summary><b>Using your own zstd / zlib / lz4 / brotli</b> (embedding carquet in a larger CMake project)</summary>
-
-<br/>
-
-When carquet is pulled in with `add_subdirectory()` or `FetchContent`, it resolves each compression library in this order:
-
-1. The target named by `CARQUET_ZSTD_TARGET`, `CARQUET_ZLIB_TARGET`, `CARQUET_LZ4_TARGET` or `CARQUET_BROTLI_TARGET`, if set.
-2. A system copy (skipped when `CARQUET_BUNDLE_DEPS` is ON).
-3. A copy it fetches and builds itself. If your project already builds the library under its usual target name (`libzstd_static`, `zlibstatic`, `lz4_static`), carquet reuses that target instead of fetching a second copy.
-
-A project that vendors these libraries and has no system copy therefore needs no configuration. To choose explicitly, name the target:
-
-```cmake
-set(CARQUET_ZLIB_TARGET zlibstatic)
-add_subdirectory(carquet)
-```
-
-A named target is linked as is, with no search and no fetch, and a name that is not a target is a configure error rather than a silent fallback. The target can be imported or built in-tree, static or shared, and must carry its include directories as a usage requirement.
-
-</details>
-
-<details>
-<summary><b>Tests, sanitizers and API docs</b></summary>
-
-<br/>
+#### Python
 
 ```bash
-make test                                    # Debug build + ctest
-make dev && ctest --test-dir build           # everything, including examples and interop programs
-cmake -B build -DCARQUET_BUILD_DOCS=ON && cmake --build build --target docs   # Doxygen → build/docs/html/
+pip install carquet
 ```
 
-[CONTRIBUTING.md](CONTRIBUTING.md) describes the per-pull-request gate (tests, sanitizers, fuzzing, interop, benchmarks).
+Prebuilt wheels bundle the library for Linux, macOS and Windows; see the [Python API](#python-api).
 
-</details>
+<br/>
+<br/>
+
+<img src="res/img/divider.svg" width="100%" alt="" />
+
+### Build configurations
+
+All `make` targets and variables, every CMake and xmake option, Windows toolchains (MSVC, clang-cl, MinGW-w64), linking your own zstd / zlib / lz4 / brotli, tests, sanitizers and the Doxygen reference are documented in **[docs/building.md](docs/building.md)**.
 
 <a id="ai-coding-agents"></a>
 
@@ -799,18 +666,17 @@ The same files also work as a personal skill (`~/.claude/skills/`, `~/.codex/ski
 </details>
 
 <br/>
+<br/>
 
----
+<img src="res/img/divider.svg" width="100%" alt="" />
 
-<!-- ────────────────────────────  C API  ──────────────────────────── -->
-
-## C API
+### C API
 
 A Write and a Read example below; the [manual in `docs/`](docs/README.md) covers everything else.
 
 <br/>
 
-### Write a Parquet File
+#### Write a Parquet File
 
 ```c
 #include <carquet/carquet.h>
@@ -844,7 +710,7 @@ int main(void) {
 
 <br/>
 
-### Read a Parquet File
+#### Read a Parquet File
 
 ```c
 #include <carquet/carquet.h>
@@ -892,7 +758,7 @@ int main(void) {
 
 <br/>
 
-### More Recipes
+#### More Recipes
 
 Everything beyond flat read/write lives in the manual; each page links to a runnable example:
 
@@ -913,7 +779,7 @@ Everything beyond flat read/write lives in the manual; each page links to a runn
 
 <br/>
 
-### API Reference
+#### API Reference
 
 The full API is in [`include/carquet/carquet.h`](include/carquet/carquet.h). Key types:
 
@@ -929,7 +795,7 @@ The full API is in [`include/carquet/carquet.h`](include/carquet/carquet.h). Key
 
 </div>
 
-The [manual](docs/README.md) explains which surface to use when; the source layout and architecture are documented in [CONTRIBUTING.md](CONTRIBUTING.md). A browsable HTML reference can be generated from the headers with Doxygen, see *Tests, sanitizers and API docs* under [Build configurations](#build-configurations).
+The [manual](docs/README.md) explains which surface to use when; the source layout and architecture are documented in [CONTRIBUTING.md](CONTRIBUTING.md). A browsable HTML reference can be generated from the headers with Doxygen, see [docs/building.md](docs/building.md#tests-sanitizers-and-api-docs).
 
 <details>
 <summary><b>Example application: MetricStore</b> (<code>mocklib/</code>)</summary>
@@ -948,12 +814,11 @@ It links carquet the way any downstream project would (`find_package(carquet)` /
 </details>
 
 <br/>
+<br/>
 
----
+<img src="res/img/divider.svg" width="100%" alt="" />
 
-<!-- ────────────────────────────  PYTHON API  ──────────────────────────── -->
-
-## Python API
+### Python API
 
 `carquet` on PyPI is not a wrapper around the C calls above: it is a **Pythonic, `pyarrow.parquet`-style API** (`read_table`, `ParquetFile`, `ParquetWriter`, DNF `filters`) built on the same engine. The wheel bundles the C library with every codec compiled in; data crosses into Python through the Arrow C Data Interface, so decoding, decompression and I/O run in C without the GIL and PyArrow receives the buffers directly.
 
@@ -990,12 +855,11 @@ with cq.ParquetFile("data.parquet") as pf:
 Types round-trip exactly with `pyarrow.parquet` (time zones, categoricals, decimals, large types, nested data). The full reference is in [`python/README.md`](python/README.md).
 
 <br/>
+<br/>
 
----
+<img src="res/img/divider.svg" width="100%" alt="" />
 
-<!-- ────────────────────────────  CLI TOOL  ──────────────────────────── -->
-
-## CLI Tool
+### CLI Tool
 
 Carquet ships with a command-line tool for inspecting Parquet files and generating C reader code. It is built and installed by default alongside the library.
 
@@ -1026,7 +890,7 @@ carquet validate data.parquet
 
 <br/>
 
-### Row Filtering
+#### Row Filtering
 
 `cat`, `count`, `head`, `tail`, `sample`, and `export` accept `-p / --filter EXPR` to push a row predicate down to the page level: only pages whose column-index min/max can match the predicate are decompressed.
 
@@ -1042,7 +906,7 @@ The grammar is `column OP value [AND column OP value]...` with `OP` ∈ {`=`, `=
 
 <br/>
 
-### Code Generation
+#### Code Generation
 
 Generate a complete, compilable C reader from any Parquet file's schema:
 
@@ -1076,18 +940,17 @@ carquet codegen -f data.parquet -o reader.c
 </details>
 
 <br/>
+<br/>
 
----
+<img src="res/img/divider.svg" width="100%" alt="" />
 
-<!-- ────────────────────────────  FEATURE SUPPORT  ──────────────────────────── -->
-
-## Parquet Feature Support
+### Parquet Feature Support
 
 What the library implements today, by area.
 
 <br/>
 
-### Format
+#### Format
 
 <div align="center">
 
@@ -1152,12 +1015,11 @@ What the library implements today, by area.
 </details>
 
 <br/>
+<br/>
 
----
+<img src="res/img/divider.svg" width="100%" alt="" />
 
-<!-- ────────────────────────────  INTEROPERABILITY  ──────────────────────────── -->
-
-## Interoperability
+### Interoperability
 
 Carquet files are fully compatible with PyArrow, DuckDB, Spark, and any Parquet reader.
 
@@ -1192,12 +1054,11 @@ CARQUET_BIN=build/carquet python3 interop/snappy_multi_rowgroup.py --rows 150000
 </details>
 
 <br/>
+<br/>
 
----
+<img src="res/img/divider.svg" width="100%" alt="" />
 
-<!-- ────────────────────────────  CONTRIBUTING & LICENSE  ──────────────────────────── -->
-
-## Contributing, Citing, License
+### Contributing, Citing, License
 
 - **Contributing**: [CONTRIBUTING.md](CONTRIBUTING.md) covers setup, code style and the per-pull-request gate (tests, sanitizers, fuzzing, interop, benchmarks). Release notes are in [CHANGELOG.md](CHANGELOG.md).
 - **Citing**: a [`CITATION.cff`](CITATION.cff) is included; GitHub's "Cite this repository" button formats it as BibTeX or APA.

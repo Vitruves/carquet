@@ -67,6 +67,12 @@
   }
   document.querySelectorAll("code[class^=lang-]").forEach((c) => highlight(c, c.className.slice(5)));
 
+  // ── SIMD lanes: same work, fewer steps (scalar 16 ticks, 8-wide 2 ticks, 16-wide 1 tick)
+  const tick = 3.2 / 16;
+  [[".lane.scalar", 1], [".lane.vec", 8], [".lane.wide", 16]].forEach(([sel, w]) => {
+    document.querySelectorAll(sel + " i").forEach((c, i) => (c.style.animationDelay = (Math.floor(i / w) * tick).toFixed(2) + "s"));
+  });
+
   // ── copy buttons ───────────────────────────────────────────────────────
   function copy(text, done) {
     if (navigator.clipboard) navigator.clipboard.writeText(text).then(done, () => {});

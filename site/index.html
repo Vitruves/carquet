@@ -23,6 +23,7 @@
     <nav class="links">
       <a href="#bench">Benchmarks</a>
       <a href="#metal">Why C</a>
+      <a href="#simd">SIMD</a>
       <a href="#install">Install</a>
       <a href="#api">API</a>
       <a href="#cli">CLI</a>
@@ -104,10 +105,57 @@
           <p>C has no layer between your data and the silicon. Carquet uses that directly: columns are decoded with vector instructions picked at runtime, uncompressed pages are served straight from the memory map, and memory comes from arenas instead of millions of small allocations.</p>
         </div>
         <ul class="metal-grid">
-          <li><span class="k">SIMD</span><b>SSE4.2 · AVX2 · AVX-512 · NEON · SVE</b><span>Runtime CPU detection, hand-written kernels, scalar fallback everywhere.</span></li>
+          <li><span class="k">arena</span><b>No per-value malloc</b><span>Metadata and scratch space come from arena allocators. No garbage collector, no pauses.</span></li>
           <li><span class="k">mmap</span><b>Zero-copy reads</b><span>Uncompressed columns are handed out in place: 10M rows in well under a millisecond.</span></li>
           <li><span class="k">OpenMP</span><b>Parallel encode &amp; async I/O</b><span>Page-granular parallel compression with a background writer, byte-identical to the serial path.</span></li>
           <li><span class="k">500K</span><b>~500 KB library</b><span>Four dependencies (zstd, zlib, lz4, brotli), fetched for you. Arrow C++ is 50 MB+.</span></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- SIMD -->
+  <section id="simd" class="section simd-sec">
+    <div class="wrap">
+      <p class="eyebrow">SIMD inside</p>
+      <h2>Augmented with SIMD.<br><span class="hot">Eight values per instruction.</span></h2>
+      <p class="sub">The hot loops of Parquet decoding are written as vector kernels for every major instruction set. One portable binary detects the CPU at startup and dispatches to the widest kernel it supports, with a scalar fallback for everything else.</p>
+
+      <div class="simd">
+        <div class="lanes" aria-hidden="true">
+          <div class="lane-row">
+            <span class="lane-l">scalar<small>1 value / op</small></span>
+            <div class="lane scalar"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+          </div>
+          <div class="lane-row">
+            <span class="lane-l">AVX2 · NEON<small>8 × 32-bit / op</small></span>
+            <div class="lane vec"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+          </div>
+          <div class="lane-row">
+            <span class="lane-l">AVX-512<small>16 × 32-bit / op</small></span>
+            <div class="lane wide"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+          </div>
+        </div>
+
+        <div class="isa">
+          <div><b>x86-64</b><span>SSE4.2</span><span>AVX</span><span>AVX2</span><span>AVX-512</span></div>
+          <div><b>ARM64</b><span>NEON</span><span>SVE</span></div>
+        </div>
+
+        <div class="simd-stats">
+          <div><b>30+</b><span>dispatched kernels</span></div>
+          <div><b>6</b><span>instruction sets</span></div>
+          <div><b>up to 21×</b><span>faster AVX2 bit-unpacking</span></div>
+          <div><b>1</b><span>binary, runtime dispatch</span></div>
+        </div>
+
+        <ul class="simd-list">
+          <li><b>Bit-unpacking &amp; RLE</b><span>Definition levels and dictionary indices of any bit width, unpacked a register at a time.</span></li>
+          <li><b>Dictionary gathers</b><span>Index-to-value gathers with the bounds check fused into the vector loop.</span></li>
+          <li><b>Byte-stream split</b><span>FLOAT / DOUBLE transposes for BYTE_STREAM_SPLIT, both directions.</span></li>
+          <li><b>Statistics</b><span>Min / max for every numeric type, NaN-aware, computed while copying.</span></li>
+          <li><b>Nulls &amp; booleans</b><span>Validity bitmaps, non-null counts and boolean packing.</span></li>
+          <li><b>Codecs &amp; DELTA</b><span>Snappy / LZ4 match copies and the prefix sums behind DELTA_BINARY_PACKED.</span></li>
         </ul>
       </div>
     </div>
@@ -420,7 +468,7 @@ message schema {
       <h2>Make Parquet the fast part.</h2>
       <div class="cta center">
         <a class="btn" href="#install">Get started →</a>
-        <a class="btn ghost" href="https://github.com/Vitruves/carquet">Star on GitHub ★</a>
+        <a class="btn ghost" href="https://github.com/Vitruves/carquet">Star on GitHub</a>
       </div>
     </div>
   </section>

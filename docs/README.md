@@ -37,6 +37,7 @@ For runnable code, start with:
 
 ## Manual Pages
 
+- [`building.md`](./building.md): `make` targets, CMake and xmake options, Windows toolchains, linking your own codecs, tests and API docs
 - [`reading.md`](./reading.md): opening files, batch reads, low-level column reads, statistics, metadata inspection
 - [`writing.md`](./writing.md): schema creation, required and nullable writes, row groups, metadata, buffer-backed output
 - [`nested-data.md`](./nested-data.md): lists, maps, groups, definition levels, repetition levels, schema introspection
