@@ -958,7 +958,12 @@ python3 ../benchmark/run_benchmark.py --skip-xlarge
 
 # Override ZSTD level (default: 1)
 CARQUET_BENCH_ZSTD_LEVEL=3 python3 ../benchmark/run_benchmark.py
+
+# Also compare fastparquet (opt-in; needs `pip install fastparquet pandas`)
+python3 ../benchmark/run_benchmark.py --fastparquet
 ```
+
+fastparquet uses the same data, row group size, no dictionary and zstd level, and LZ4_RAW for `lz4`. It cannot write BYTE_STREAM_SPLIT or page checksums, and it reads through pandas, so its numbers are less directly comparable than Arrow's.
 
 To include the Arrow C++ comparison, enable its target at configure time:
 

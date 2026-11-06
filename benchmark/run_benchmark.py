@@ -14,6 +14,7 @@ Usage:
     python3 benchmark/run_benchmark.py --cooldown 5    # 5s cooldown between configs
     python3 benchmark/run_benchmark.py --no-pyarrow    # skip PyArrow
     python3 benchmark/run_benchmark.py --no-arrow-cpp  # skip Arrow C++
+    python3 benchmark/run_benchmark.py --fastparquet   # also compare fastparquet (opt-in)
 """
 
 import argparse
@@ -236,6 +237,17 @@ sys.path.insert(0, os.path.dirname({script!r}))
 from benchmark_pyarrow import run_benchmark
 comp_map = {{"none": None, "snappy": "snappy", "zstd": "zstd", "lz4": "lz4"}}
 run_benchmark({dataset!r}, {rows}, comp_map[{compression!r}], {compression!r})
+"""
+    return run_benchmark_process([python, "-c", code], timeout_seconds)
+
+
+def run_fastparquet_single(python, script, dataset, compression, rows, timeout_seconds):
+    """Run fastparquet benchmark for a single config by invoking a helper snippet."""
+    code = f"""
+import sys, os
+sys.path.insert(0, os.path.dirname({script!r}))
+from benchmark_fastparquet import run_benchmark
+run_benchmark({dataset!r}, {rows}, {compression!r})
 """
     return run_benchmark_process([python, "-c", code], timeout_seconds)
 
@@ -483,24 +495,27 @@ def print_crossread_table(crossread_results):
     print(f"  {DIM}ratio = Arrow read time / Carquet read time (higher = Carquet faster){RST}")
 
 
+COMPETITORS = [
+    ("arrow_cpp", "Arrow C++"),
+    ("pyarrow", "PyArrow"),
+    ("fastparquet", "fastparquet"),
+]
+
+
 def print_final_tables(results, crossread_results=None):
     """Print final summary tables for the libraries that ran."""
     has_carquet = have_results(results, "carquet")
-    has_arrow_cpp = have_results(results, "arrow_cpp")
-    has_pyarrow = have_results(results, "pyarrow")
+    competitors = [(lib, label) for lib, label in COMPETITORS
+                   if have_results(results, lib)]
 
     if has_carquet:
-        if has_arrow_cpp:
-            print_comparison_table(results, "arrow_cpp", "Arrow C++")
-        if has_pyarrow:
-            print_comparison_table(results, "pyarrow", "PyArrow")
-        if not has_arrow_cpp and not has_pyarrow:
+        for lib, label in competitors:
+            print_comparison_table(results, lib, label)
+        if not competitors:
             print_library_table(results, "carquet", "Carquet")
     else:
-        if has_arrow_cpp:
-            print_library_table(results, "arrow_cpp", "Arrow C++")
-        if has_pyarrow:
-            print_library_table(results, "pyarrow", "PyArrow")
+        for lib, label in competitors:
+            print_library_table(results, lib, label)
 
     if crossread_results:
         print_crossread_table(crossread_results)
@@ -510,7 +525,7 @@ def print_final_tables(results, crossread_results=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Carquet benchmark runner with optional Arrow C++ and PyArrow comparisons"
+        description="Carquet benchmark runner with optional Arrow C++, PyArrow and fastparquet comparisons"
     )
     parser.add_argument("--quick", action="store_true",
                         help="Run only large configs (10M rows, all codecs)")
@@ -532,6 +547,8 @@ def main():
                         help="Skip Arrow C++ benchmarks")
     parser.add_argument("--no-pyarrow", action="store_true",
                         help="Skip PyArrow benchmarks")
+    parser.add_argument("--fastparquet", action="store_true",
+                        help="Also benchmark fastparquet (needs fastparquet + pandas)")
     parser.add_argument("--no-carquet", action="store_true",
                         help="Skip Carquet benchmarks")
     parser.add_argument("--iterations", type=int, default=0,
@@ -600,6 +617,20 @@ def main():
             print(f"{YLW}Warning:{RST} PyArrow not available, skipping")
             has_pyarrow = False
 
+    has_fastparquet = args.fastparquet
+    fastparquet_script = os.path.join(script_dir, "benchmark_fastparquet.py")
+    fastparquet_version = None
+
+    if has_fastparquet:
+        try:
+            fastparquet_version = subprocess.check_output(
+                [python, "-c", "import fastparquet, pandas; print(fastparquet.__version__)"],
+                stderr=subprocess.DEVNULL, text=True
+            ).strip()
+        except Exception:
+            print(f"{YLW}Warning:{RST} fastparquet (or pandas) not available, skipping")
+            has_fastparquet = False
+
     benchmark_runners = []
     if not args.no_carquet:
         benchmark_runners.append((
@@ -621,6 +652,13 @@ def main():
             "PyArrow",
             lambda dataset, compression, rows: run_pyarrow_single(
                 python, pyarrow_script, dataset, compression, rows, args.timeout)
+        ))
+    if has_fastparquet:
+        benchmark_runners.append((
+            "fastparquet",
+            "fastparquet",
+            lambda dataset, compression, rows: run_fastparquet_single(
+                python, fastparquet_script, dataset, compression, rows, args.timeout)
         ))
 
     if not benchmark_runners:
@@ -653,6 +691,8 @@ def main():
         print(f"  {DIM}vs:{RST}   Arrow C++ {arrow_cpp_version}")
     if has_pyarrow:
         print(f"  {DIM}vs:{RST}   PyArrow {pyarrow_version}")
+    if has_fastparquet:
+        print(f"  {DIM}vs:{RST}   fastparquet {fastparquet_version}")
     zstd_level = get_benchmark_zstd_level()
     iter_desc = f"{args.iterations} iters (override)" if args.iterations > 0 else "11-51 iters by size"
     print(f"  {DIM}cfg:{RST}  {len(configs)} configs, {args.cooldown}s cooldown, "
@@ -698,11 +738,11 @@ def main():
                 config_results[lib_key] = result
                 mr = (rows / result["read_ms"]) * 1000 / 1e6
                 sz = fmt_size(result["file_bytes"])
-                print(f"       {lib_label:<9} W {fmt_ms(result['write_ms'])}  "
+                print(f"       {lib_label:<11} W {fmt_ms(result['write_ms'])}  "
                       f"R {fmt_ms(result['read_ms'])} "
                       f"{DIM}({mr:.0f}M r/s, {sz}, {elapsed:.0f}s){RST}")
             else:
-                print(f"       {lib_label:<9} {RED}failed{RST}")
+                print(f"       {lib_label:<11} {RED}failed{RST}")
                 if error_detail:
                     print(f"       {DIM}{error_detail}{RST}")
 
@@ -711,15 +751,12 @@ def main():
 
         carquet_r = config_results.get("carquet")
         arrow_cpp_r = config_results.get("arrow_cpp")
-        pyarrow_r = config_results.get("pyarrow")
-        if carquet_r and arrow_cpp_r:
-            ws = fmt_speedup(carquet_r["write_ms"], arrow_cpp_r["write_ms"])
-            rs = fmt_speedup(carquet_r["read_ms"], arrow_cpp_r["read_ms"])
-            print(f"       {DIM}vs Arrow C++  W {ws}  R {rs}{RST}")
-        if carquet_r and pyarrow_r:
-            ws = fmt_speedup(carquet_r["write_ms"], pyarrow_r["write_ms"])
-            rs = fmt_speedup(carquet_r["read_ms"], pyarrow_r["read_ms"])
-            print(f"       {DIM}vs PyArrow    W {ws}  R {rs}{RST}")
+        for lib, label in COMPETITORS:
+            other_r = config_results.get(lib)
+            if carquet_r and other_r:
+                ws = fmt_speedup(carquet_r["write_ms"], other_r["write_ms"])
+                rs = fmt_speedup(carquet_r["read_ms"], other_r["read_ms"])
+                print(f"       {DIM}vs {label:<11} W {ws}  R {rs}{RST}")
 
         # ── Cross-read: each library reads the other's file ──
         carquet_file = os.path.join(
@@ -813,6 +850,8 @@ def main():
         report["arrow_cpp_version"] = arrow_cpp_version
     if pyarrow_version:
         report["pyarrow_version"] = pyarrow_version
+    if fastparquet_version:
+        report["fastparquet_version"] = fastparquet_version
 
     for (lib, (ds, comp)), r in sorted(results.items()):
         report["results"].append({
