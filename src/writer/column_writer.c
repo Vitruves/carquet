@@ -77,6 +77,7 @@ extern carquet_page_writer_t* carquet_page_writer_create(
 
 extern void carquet_page_writer_destroy(carquet_page_writer_t* writer);
 extern void carquet_page_writer_reset(carquet_page_writer_t* writer);
+extern void carquet_page_writer_reset_geo_stats(carquet_page_writer_t* writer);
 
 extern carquet_status_t carquet_page_writer_add_values(
     carquet_page_writer_t* writer,
@@ -430,6 +431,7 @@ void carquet_column_writer_reset(carquet_column_writer_internal_t* writer) {
     if (!writer) return;
 
     carquet_page_writer_reset(writer->page_writer);
+    carquet_page_writer_reset_geo_stats(writer->page_writer);
     carquet_buffer_clear(&writer->column_buffer);
 
     writer->total_values = 0;

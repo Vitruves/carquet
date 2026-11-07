@@ -315,6 +315,15 @@ void carquet_page_writer_destroy(carquet_page_writer_t* writer) {
     }
 }
 
+/* GeospatialStatistics describe a column chunk, not a page, so they survive
+ * carquet_page_writer_reset() (which runs after every page) and are cleared
+ * here, once per chunk. */
+void carquet_page_writer_reset_geo_stats(carquet_page_writer_t* writer) {
+    if (writer && writer->geo_enabled) {
+        carquet_geo_stats_init(&writer->geo_stats);
+    }
+}
+
 void carquet_page_writer_reset(carquet_page_writer_t* writer) {
     carquet_buffer_clear(&writer->values_buffer);
     writer->deferred_applied = false;
