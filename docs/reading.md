@@ -227,7 +227,7 @@ Use footer-only helpers when you do not need to build a full reader:
 
 `carquet_reader_column_statistics()` returns aggregated stats for a single (row group, column). The `min_value` / `max_value` fields are raw bytes — interpret them according to the column's physical type. For `FLOAT16` columns the two bytes are the little-endian IEEE half representation of the numeric min/max (not a lexicographic bound). `INT96` and `GEOMETRY`/`GEOGRAPHY` columns report no min/max (`has_min_max == false`). Legacy files whose V1 pages use the deprecated `BIT_PACKED` level encoding are decoded transparently.
 
-For `GEOMETRY`/`GEOGRAPHY` columns, call `carquet_reader_geospatial_statistics()` to get the coordinate bounding box (`xmin/xmax/ymin/ymax`, plus `z`/`m` when present) and the set of ISO-WKB geometry type codes. It returns `CARQUET_ERROR_INVALID_METADATA` for columns that carry no geospatial statistics (not an error). The `carquet stat` CLI prints this automatically.
+For `GEOMETRY`/`GEOGRAPHY` columns, call `carquet_reader_geospatial_statistics()` to get the coordinate bounding box (`xmin/xmax/ymin/ymax`, plus `z`/`m` when present) and the set of ISO-WKB geometry type codes. It returns `CARQUET_ERROR_INVALID_METADATA` for columns that carry no geospatial statistics (not an error). The `carquet stat` CLI prints this automatically. Read a GEOMETRY / GEOGRAPHY column's CRS with `carquet_schema_node_geospatial_crs()`: the logical type's `crs` array holds at most 127 bytes, and a file's CRS (inline PROJJSON especially) is often longer.
 
 ```c
 carquet_column_statistics_t s;

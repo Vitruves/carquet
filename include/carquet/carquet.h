@@ -1192,6 +1192,24 @@ const carquet_logical_type_t* carquet_schema_node_logical_type(
     const carquet_schema_node_t* node);
 
 /**
+ * @brief Get the whole CRS of a GEOMETRY or GEOGRAPHY node.
+ *
+ * The logical type's @c crs array holds at most
+ * @c CARQUET_GEOSPATIAL_CRS_MAX - 1 bytes, and a CRS read from a file may be
+ * longer: inline PROJJSON nearly always is. This returns the CRS whole.
+ *
+ * @param[in] node Schema node to query
+ * @return The CRS, "" when the type gives none (OGC:CRS84), or NULL when the
+ *         node is not GEOMETRY or GEOGRAPHY. Owned by the schema; valid while
+ *         it is.
+ *
+ * @note Thread-safe: Yes (read-only)
+ */
+CARQUET_API CARQUET_PURE CARQUET_NONNULL(1)
+const char* carquet_schema_node_geospatial_crs(
+    const carquet_schema_node_t* node);
+
+/**
  * @brief Get the repetition level of a node.
  *
  * @param[in] node Schema node to query
