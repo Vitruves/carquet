@@ -29,7 +29,7 @@ Read-side layout differs by API: `carquet_row_batch_column()` is row-aligned (on
 | `CARQUET_LOGICAL_UUID` | FLBA(16) | none | 16 raw bytes |
 | `CARQUET_LOGICAL_FLOAT16` | FLBA(2) | none | IEEE half, little-endian; statistics ordered numerically |
 | `CARQUET_LOGICAL_INTERVAL` | FLBA(12) | none | months, days, millis (3 × uint32 LE) |
-| `CARQUET_LOGICAL_GEOMETRY` / `GEOGRAPHY` | BYTE_ARRAY | `.geometry.crs` / `.geography.crs`, `.algorithm`, `.has_algorithm` | ISO WKB; writer computes bounding-box statistics |
+| `CARQUET_LOGICAL_GEOMETRY` / `GEOGRAPHY` | BYTE_ARRAY | `.geometry.crs` / `.geography.crs` (at most 127 bytes; a file's whole CRS from `carquet_schema_node_geospatial_crs()`), `.algorithm`, `.has_algorithm` | ISO WKB; writer computes bounding-box statistics |
 | `CARQUET_LOGICAL_VARIANT` | group | via `carquet_schema_add_variant()` | unshredded `{metadata, value}` group |
 | `CARQUET_LOGICAL_LIST` / `MAP` | group | via `carquet_schema_add_list()` / `add_map()` (3-level standard layout) | |
 | `CARQUET_LOGICAL_NULL` | any | none | all-null column |

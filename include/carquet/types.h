@@ -151,7 +151,10 @@ typedef struct carquet_logical_type {
 
         /* For GEOMETRY */
         struct {
-            char crs[CARQUET_GEOSPATIAL_CRS_MAX];  /* Optional, empty => OGC:CRS84 */
+            /* Optional, empty => OGC:CRS84. Holds at most
+             * CARQUET_GEOSPATIAL_CRS_MAX - 1 bytes; read a file's CRS with
+             * carquet_schema_node_geospatial_crs(), which is never cut. */
+            char crs[CARQUET_GEOSPATIAL_CRS_MAX];
         } geometry;
 
         /* For GEOGRAPHY */

@@ -2,8 +2,13 @@
 
 ## Unreleased
 
+### API
+
+- `carquet_schema_node_geospatial_crs()` returns a GEOMETRY or GEOGRAPHY node's CRS whole (`""` when the type gives none, `NULL` for other nodes). The logical type's fixed `crs` array still holds at most 127 bytes. The Python binding uses it when present. ABI-compatible: no public struct changes.
+
 ### Bug Fixes
 
+- A GEOMETRY or GEOGRAPHY CRS longer than 127 bytes was cut to its first 127 when a file was read, with no sign it had been cut: inline PROJJSON, which DuckDB writes and parquet-testing's `geospatial/crs-arbitrary-value.parquet` carries (2,316 bytes), came back as a different, unparseable CRS. The footer parser now also keeps the whole CRS in the schema element, `carquet_schema_node_geospatial_crs()` returns it, and the writer writes it back when given a schema read from a file (deep-copied, so the reader may close first). Test: `long_geospatial_crs` in `tests/test_fuzz_regressions.c`. Output bytes unchanged except that such a CRS is no longer truncated on rewrite.
 - `CARQUET_ERROR_INIT` used designated initializers, which C++ only accepts from C++20: C++17 consumers failed to build on MSVC, and Clang / GCC warned under `-Wpedantic`. It is now a positional initializer with the same values, valid C and C++ (checked from C++11 to C++20 with `-Wpedantic -Werror`).
 
 ## v0.7.3

@@ -321,6 +321,129 @@ static int run_dict_quirk(const char* name, footer_mutator_t mut) {
     return 0;
 }
 
+/* apache/parquet-testing geospatial/crs-arbitrary-value.parquet carries a
+ * 2,316-byte inline PROJJSON CRS, and DuckDB writes PROJJSON inline too. The
+ * fixed crs array kept only its first 127 bytes, so the CRS read back as a
+ * different, unparseable one. */
+static char long_crs[300];
+
+static void set_long_crs(parquet_file_metadata_t* md) {
+    md->schema[2].geospatial_crs = long_crs;
+}
+
+static int write_geometry_file(const carquet_schema_t* s, uint8_t** out, size_t* out_size) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_writer_options_t o;
+    carquet_writer_options_init(&o);
+    carquet_writer_t* w = carquet_writer_create_buffer(s, &o, &err);
+    if (!w) return 1;
+    uint8_t point[21] = { 1, 1, 0, 0, 0 };
+    double xy[2] = { 1.0, 2.0 };
+    memcpy(point + 5, xy, sizeof(xy));
+    carquet_byte_array_t g = { point, 21 };
+    int32_t id = 1;
+    void* buf = NULL;
+    size_t sz = 0;
+    int rc = carquet_writer_write_batch(w, 0, &id, 1, NULL, NULL) != CARQUET_OK ||
+             carquet_writer_write_batch(w, 1, &g, 1, NULL, NULL) != CARQUET_OK ||
+             carquet_writer_close(w) != CARQUET_OK ||
+             carquet_writer_get_buffer(w, &buf, &sz) != CARQUET_OK;
+    if (rc) { free(buf); return 1; }
+    *out = buf;
+    *out_size = sz;
+    return 0;
+}
+
+static const char* geometry_crs(const carquet_reader_t* r) {
+    const carquet_schema_t* s = carquet_reader_schema(r);
+    return carquet_schema_node_geospatial_crs(carquet_schema_get_element(s, 2));
+}
+
+static int test_long_geospatial_crs(void) {
+    const char* name = "long_geospatial_crs";
+    memset(long_crs, 'x', sizeof(long_crs) - 1);
+    long_crs[0] = '{';
+    long_crs[sizeof(long_crs) - 2] = '}';
+    long_crs[sizeof(long_crs) - 1] = '\0';
+
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t* s = carquet_schema_create(&err);
+    carquet_logical_type_t geo = { .id = CARQUET_LOGICAL_GEOMETRY };
+    memcpy(geo.params.geometry.crs, "OGC:CRS84", 10);
+    if (!s ||
+        carquet_schema_add_column(s, "id", CARQUET_PHYSICAL_INT32, NULL,
+                                  CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK ||
+        carquet_schema_add_column(s, "g", CARQUET_PHYSICAL_BYTE_ARRAY, &geo,
+                                  CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK) {
+        carquet_schema_free(s);
+        TEST_FAIL(name, "schema");
+    }
+    uint8_t* orig = NULL;
+    size_t orig_size = 0;
+    int rc = write_geometry_file(s, &orig, &orig_size);
+    carquet_schema_free(s);
+    if (rc) TEST_FAIL(name, "write");
+    size_t sz = 0;
+    uint8_t* f = rewrite_footer(orig, orig_size, set_long_crs, &sz);
+    free(orig);
+    if (!f) TEST_FAIL(name, "footer rewrite");
+
+    const char* why = NULL;
+    carquet_reader_t* r = carquet_reader_open_buffer(f, sz, NULL, &err);
+    if (!r) {
+        why = "open_buffer";
+    } else if (!geometry_crs(r) || strcmp(geometry_crs(r), long_crs) != 0) {
+        why = "CRS not returned whole";
+    } else {
+        const carquet_schema_t* rs = carquet_reader_schema(r);
+        const carquet_logical_type_t* lt =
+            carquet_schema_node_logical_type(carquet_schema_get_element(rs, 2));
+        if (strlen(lt->params.geometry.crs) != CARQUET_GEOSPATIAL_CRS_MAX - 1 ||
+            strncmp(lt->params.geometry.crs, long_crs, CARQUET_GEOSPATIAL_CRS_MAX - 1) != 0) {
+            why = "fixed array is not the CRS's prefix";
+        } else if (carquet_schema_node_geospatial_crs(carquet_schema_get_element(rs, 1)) != NULL) {
+            why = "non-geospatial column has a CRS";
+        }
+    }
+
+    /* A writer given a schema read from a file keeps the whole CRS, even when
+     * the reader closes before the writer does. */
+    uint8_t* again = NULL;
+    size_t again_size = 0;
+    if (!why) {
+        carquet_error_t werr = CARQUET_ERROR_INIT;
+        carquet_writer_options_t o;
+        carquet_writer_options_init(&o);
+        carquet_writer_t* w = carquet_writer_create_buffer(carquet_reader_schema(r), &o, &werr);
+        carquet_reader_close(r);
+        r = NULL;
+        uint8_t point[21] = { 1, 1, 0, 0, 0 };
+        carquet_byte_array_t g = { point, 21 };
+        int32_t id = 1;
+        void* buf = NULL;
+        if (!w || carquet_writer_write_batch(w, 0, &id, 1, NULL, NULL) != CARQUET_OK ||
+            carquet_writer_write_batch(w, 1, &g, 1, NULL, NULL) != CARQUET_OK ||
+            carquet_writer_close(w) != CARQUET_OK ||
+            carquet_writer_get_buffer(w, &buf, &again_size) != CARQUET_OK) {
+            why = "rewrite";
+            free(buf);
+        } else {
+            again = buf;
+            carquet_reader_t* r2 = carquet_reader_open_buffer(again, again_size, NULL, &werr);
+            if (!r2 || !geometry_crs(r2) || strcmp(geometry_crs(r2), long_crs) != 0) {
+                why = "CRS lost when written back";
+            }
+            carquet_reader_close(r2);
+        }
+    }
+    carquet_reader_close(r);
+    free(again);
+    free(f);
+    if (why) TEST_FAIL(name, why);
+    TEST_PASS(name);
+    return 0;
+}
+
 /* parquet-testing alltypes_tiny_pages / hadoop_lz4_compressed: "Expected data
  * page" — the leading dictionary page was only loaded via
  * dictionary_page_offset. */
@@ -515,6 +638,7 @@ int main(void) {
     failures += test_gzip_concatenated_members();
     failures += test_lz4_codec5_raw_block();
     failures += test_column_name_never_null();
+    failures += test_long_geospatial_crs();
     printf("\n%d failure(s)\n", failures);
     return failures ? 1 : 0;
 }

@@ -546,6 +546,22 @@ const carquet_logical_type_t* carquet_schema_node_logical_type(const carquet_sch
     return elem->has_logical_type ? &elem->logical_type : NULL;
 }
 
+const char* carquet_schema_node_geospatial_crs(const carquet_schema_node_t* node) {
+    /* node is nonnull per API contract */
+    const parquet_schema_element_t* elem = (const parquet_schema_element_t*)node;
+    if (!elem->has_logical_type) return NULL;
+    switch (elem->logical_type.id) {
+        case CARQUET_LOGICAL_GEOMETRY:
+            return elem->geospatial_crs ? elem->geospatial_crs
+                                        : elem->logical_type.params.geometry.crs;
+        case CARQUET_LOGICAL_GEOGRAPHY:
+            return elem->geospatial_crs ? elem->geospatial_crs
+                                        : elem->logical_type.params.geography.crs;
+        default:
+            return NULL;
+    }
+}
+
 carquet_field_repetition_t carquet_schema_node_repetition(const carquet_schema_node_t* node) {
     /* node is nonnull per API contract */
     const parquet_schema_element_t* elem = (const parquet_schema_element_t*)node;
