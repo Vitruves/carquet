@@ -4,6 +4,7 @@
 
 ### Bug Fixes
 
+- A `GEOMETRY` or `GEOGRAPHY` column chunk's GeospatialStatistics accumulated from the start of the file rather than of the chunk: every row group after the first reported the bounding box and geometry types of all earlier row groups too. Harmless for a single row group; wrong for a reader that skips row groups by box, which is what the statistics are for. `carquet_page_writer_reset()` runs after every page and so rightly keeps the accumulator; nothing cleared it per chunk. `carquet_column_writer_reset()` now does (`page_writer.c`, `column_writer.c`). Test: `geospatial_stats_per_row_group` in `tests/test_writer_extensions.c`. ABI-compatible; output bytes change only in the statistics of the second and later row groups of geospatial columns.
 - `CARQUET_ERROR_INIT` used designated initializers, which C++ only accepts from C++20: C++17 consumers failed to build on MSVC, and Clang / GCC warned under `-Wpedantic`. It is now a positional initializer with the same values, valid C and C++ (checked from C++11 to C++20 with `-Wpedantic -Werror`).
 
 ## v0.7.3

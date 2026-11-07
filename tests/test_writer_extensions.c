@@ -622,6 +622,51 @@ static int test_geospatial_stats(void) {
     return 0;
 }
 
+/* Each row group's GeospatialStatistics cover that row group only. */
+static int test_geospatial_stats_per_row_group(void) {
+    char path[512]; carquet_test_temp_path(path, sizeof(path), "ext_geo_rg");
+    carquet_error_t err = CARQUET_ERROR_INIT;
+
+    static uint8_t p0[21], p1[21], p2[21];
+    put_wkb_point(p0, 1.0, 2.0);
+    put_wkb_point(p1, 5.0, 6.0);
+    put_wkb_point(p2, 30.0, 40.0);
+    carquet_byte_array_t first[2] = { { p0, 21 }, { p1, 21 } };
+    carquet_byte_array_t second[1] = { { p2, 21 } };
+
+    carquet_schema_t* s = carquet_schema_create(&err);
+    carquet_logical_type_t geo = { .id = CARQUET_LOGICAL_GEOMETRY };
+    if (!s || carquet_schema_add_column(s, "g", CARQUET_PHYSICAL_BYTE_ARRAY,
+            &geo, CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK)
+        { if (s) carquet_schema_free(s); TEST_FAIL("geospatial_stats_per_row_group", "schema"); }
+    carquet_writer_options_t wo; carquet_writer_options_init(&wo);
+    carquet_writer_t* w = carquet_writer_create(path, s, &wo, &err);
+    if (!w || carquet_writer_write_batch(w, 0, first, 2, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_new_row_group(w) != CARQUET_OK ||
+        carquet_writer_write_batch(w, 0, second, 1, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_close(w) != CARQUET_OK)
+        { if (w) carquet_writer_close(w); carquet_schema_free(s);
+          TEST_FAIL("geospatial_stats_per_row_group", "write"); }
+    carquet_schema_free(s);
+
+    carquet_reader_t* r = carquet_reader_open(path, NULL, &err);
+    carquet_geospatial_statistics_t g0, g1;
+    int ok = r && carquet_reader_num_row_groups(r) == 2 &&
+             carquet_reader_geospatial_statistics(r, 0, 0, &g0) == CARQUET_OK &&
+             carquet_reader_geospatial_statistics(r, 1, 0, &g1) == CARQUET_OK &&
+             g0.has_bbox && g0.xmin == 1.0 && g0.xmax == 5.0 &&
+             g0.ymin == 2.0 && g0.ymax == 6.0 &&
+             /* Not 1..30 x 2..40: the first row group's points are not here. */
+             g1.has_bbox && g1.xmin == 30.0 && g1.xmax == 30.0 &&
+             g1.ymin == 40.0 && g1.ymax == 40.0 &&
+             g1.num_geometry_types == 1 && g1.geometry_types[0] == 1;
+    if (r) carquet_reader_close(r);
+    carquet_test_cleanup(path);
+    if (!ok) TEST_FAIL("geospatial_stats_per_row_group", "second row group includes the first");
+    TEST_PASS("geospatial_stats_per_row_group");
+    return 0;
+}
+
 /* ---- TIMESTAMP coercion ---- */
 static int test_timestamp_coercion(void) {
     char path[512]; carquet_test_temp_path(path, sizeof(path), "ext_tscoerce");
@@ -1799,6 +1844,7 @@ int main(void) {
     failures += test_float16_stats();
     failures += test_bitpacked_levels();
     failures += test_geospatial_stats();
+    failures += test_geospatial_stats_per_row_group();
     failures += test_timestamp_coercion();
     failures += test_write_batch_size();
     failures += test_file_format_version();
