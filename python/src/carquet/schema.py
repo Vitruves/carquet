@@ -59,7 +59,7 @@ class LogicalType:
         return n
 
     @classmethod
-    def _from_c(cls, lt) -> Optional["LogicalType"]:
+    def _from_c(cls, lt, crs: Optional[str] = None) -> Optional["LogicalType"]:
         name = LOGICAL_TYPES.get(int(lt.id), f"UNKNOWN_{int(lt.id)}")
         p = lt.params
         if name == "UNKNOWN":
@@ -72,11 +72,11 @@ class LogicalType:
             t = p.time if name == "TIME" else p.timestamp
             return cls(name, unit=TIME_UNITS.get(int(t.unit), "MICROS"), is_adjusted_to_utc=bool(t.is_adjusted_to_utc))
         if name == "GEOMETRY":
-            return cls(name, crs=_ffi.decode(p.geometry.crs) or None)
+            return cls(name, crs=(crs if crs is not None else _ffi.decode(p.geometry.crs)) or None)
         if name == "GEOGRAPHY":
             g = p.geography
             algo = EDGE_ALGORITHMS.get(int(g.algorithm)) if g.has_algorithm else None
-            return cls(name, crs=_ffi.decode(g.crs) or None, algorithm=algo)
+            return cls(name, crs=(crs if crs is not None else _ffi.decode(g.crs)) or None, algorithm=algo)
         if name == "VARIANT":
             return cls(name, specification_version=int(p.variant.specification_version) or 1)
         return cls(name)
@@ -194,7 +194,7 @@ class ParquetSchema:
                 continue
             is_leaf = bool(lib.carquet_schema_node_is_leaf(node))
             lt_ptr = lib.carquet_schema_node_logical_type(node)
-            lt = LogicalType._from_c(lt_ptr.contents) if lt_ptr else None
+            lt = LogicalType._from_c(lt_ptr.contents, _geospatial_crs(lib, node)) if lt_ptr else None
             phys = tl = None
             if is_leaf:
                 phys = PHYSICAL_TYPES.get(int(lib.carquet_schema_node_physical_type(node)), "UNKNOWN")
@@ -330,3 +330,15 @@ class ParquetSchema:
                 lines.append(f"{pad}{e.name}: {e.repetition} group{lt}")
         return "\n".join(lines)
 
+
+def _geospatial_crs(lib, node) -> Optional[str]:
+    """The whole GEOMETRY / GEOGRAPHY CRS of a schema node, or None when the
+    node has none or the library predates carquet_schema_node_geospatial_crs()
+    (the logical type's fixed array, which holds at most 127 bytes, is used
+    then)."""
+    try:
+        fn = lib.carquet_schema_node_geospatial_crs
+    except AttributeError:
+        return None
+    raw = fn(node)
+    return _ffi.decode(raw) if raw is not None else None

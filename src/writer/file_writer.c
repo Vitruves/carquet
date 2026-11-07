@@ -728,11 +728,22 @@ static carquet_status_t store_schema_elements(
 
     for (int32_t i = 0; i < schema->num_elements; i++) {
         writer->schema_elements[i] = schema->elements[i];
+        /* Owned copy, set below; cleared first so teardown after a failure
+         * never frees the caller's string. */
+        writer->schema_elements[i].geospatial_crs = NULL;
         if (schema->elements[i].name) {
             writer->schema_elements[i].name = carquet_heap_strdup(schema->elements[i].name);
             if (!writer->schema_elements[i].name) {
                 return CARQUET_ERROR_OUT_OF_MEMORY;
             }
+        }
+
+        /* A long GEOMETRY / GEOGRAPHY CRS from a schema read from a file:
+         * deep-copied like the name, since the reader may close first. */
+        if (schema->elements[i].geospatial_crs) {
+            char* crs = carquet_heap_strdup(schema->elements[i].geospatial_crs);
+            if (!crs) return CARQUET_ERROR_OUT_OF_MEMORY;
+            writer->schema_elements[i].geospatial_crs = crs;
         }
 
         /* Deep-copy per-field metadata (Arrow custom_metadata) into heap the
@@ -2353,6 +2364,10 @@ static carquet_status_t build_file_metadata(
             metadata->schema[i].name = carquet_arena_strdup(
                 &writer->arena, writer->schema_elements[i].name);
         }
+        if (writer->schema_elements[i].geospatial_crs) {
+            metadata->schema[i].geospatial_crs = carquet_arena_strdup(
+                &writer->arena, writer->schema_elements[i].geospatial_crs);
+        }
     }
 
     /* Row groups */
@@ -3709,6 +3724,7 @@ cleanup:
         free_schema_field_metadata(writer->schema_elements, writer->num_schema_elements);
         for (int32_t i = 0; i < writer->num_schema_elements; i++) {
             carquet_mem_free(writer->schema_elements[i].name);
+            carquet_mem_free((void*)writer->schema_elements[i].geospatial_crs);
         }
         carquet_mem_free(writer->schema_elements);
         writer->schema_elements = NULL;
@@ -3791,6 +3807,7 @@ void carquet_writer_abort(carquet_writer_t* writer) {
         free_schema_field_metadata(writer->schema_elements, writer->num_schema_elements);
         for (int32_t i = 0; i < writer->num_schema_elements; i++) {
             carquet_mem_free(writer->schema_elements[i].name);
+            carquet_mem_free((void*)writer->schema_elements[i].geospatial_crs);
         }
         carquet_mem_free(writer->schema_elements);
     }
