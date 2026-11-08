@@ -398,7 +398,7 @@ if want("tests") then
         "test_production", "test_maturity", "test_large_schema",
         "test_edge_encodings", "test_edge_compression", "test_edge_malformed",
         "test_edge_boundaries", "test_edge_io", "test_nested",
-        "test_bloom_page_index", "test_mmap", "test_advanced_api",
+        "test_bloom_page_index", "test_mmap", "test_advanced_api", "test_dictionary_fallback",
         "test_encoding_roundtrip", "test_writer_extensions", "test_bitunpack_wide",
         "test_page_filter", "test_append", "test_row_range", "test_dict_decode",
         "test_decimal_stats", "test_arrow_dictionary", "test_snappy_diag", "test_parallel_write",

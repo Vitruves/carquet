@@ -498,7 +498,12 @@ static bool page_values_can_be_viewed_directly(
     (void)encoding;
     return false;
 #else
+    /* A reader preserving dictionaries hands out 4-byte indices, not physical
+     * values: a PLAIN page (a writer's fallback after the dictionary filled)
+     * must take the decode path, which rejects it, rather than be viewed as
+     * indices. */
     if (encoding != CARQUET_ENCODING_PLAIN ||
+        reader->preserve_dictionary ||
         reader->max_def_level > 0 ||
         reader->max_rep_level > 0) {
         return false;

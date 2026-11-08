@@ -895,6 +895,7 @@ if(CARQUET_BUILD_TESTS)
 
     # Advanced API tests (bloom filter, page index, kv metadata, etc.)
     add_carquet_test(test_advanced_api tests/test_advanced_api.c)
+    add_carquet_test(test_dictionary_fallback tests/test_dictionary_fallback.c)
 
     # carquet-reads-carquet roundtrip for every opt-in encoding
     add_carquet_test(test_encoding_roundtrip tests/test_encoding_roundtrip.c)
