@@ -694,6 +694,21 @@ carquet_status_t carquet_get_file_info(
     return CARQUET_OK;
 }
 
+/* Read exactly `size` bytes at `offset` from the reader's file. A reader
+ * with positional I/O must never go through fseek + fread once it is open:
+ * column readers load pages with positional reads from other threads, and on
+ * Windows those move the handle's file pointer (ReadFile with an offset on a
+ * synchronous handle) behind the C stream's back, so a later fread would
+ * return bytes from the wrong place. */
+static bool reader_file_read_at(carquet_reader_t* reader, void* buf, size_t size,
+                                int64_t offset) {
+    if (reader->positional_io) {
+        return carquet_file_pread(reader->file, buf, size, offset) == size;
+    }
+    return carquet_fseek64(reader->file, offset, SEEK_SET) == 0 &&
+           fread(buf, 1, size, reader->file) == size;
+}
+
 carquet_status_t carquet_validate_file(
     const char* path,
     carquet_error_t* error) {
@@ -728,8 +743,7 @@ carquet_status_t carquet_validate_file(
             memcpy(head, reader->mmap_data, PARQUET_MAGIC_LEN);  /* size >= 12 */
             have_head = true;
         } else if (reader->file) {
-            have_head = carquet_fseek64(reader->file, 0, SEEK_SET) == 0 &&
-                fread(head, 1, PARQUET_MAGIC_LEN, reader->file) == PARQUET_MAGIC_LEN;
+            have_head = reader_file_read_at(reader, head, PARQUET_MAGIC_LEN, 0);
         }
         if (!have_head || memcmp(head, PARQUET_MAGIC, PARQUET_MAGIC_LEN) != 0) {
             CARQUET_SET_ERROR(&local, CARQUET_ERROR_INVALID_MAGIC, "Invalid header magic");
@@ -943,12 +957,7 @@ carquet_status_t carquet_reader_prebuffer(
         reader->prebuffer.capacity = total_size;
     }
 
-    if (carquet_fseek64(reader->file, (int64_t)min_offset, SEEK_SET) != 0) {
-        CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_SEEK, "Failed to seek for prebuffer");
-        return CARQUET_ERROR_FILE_SEEK;
-    }
-
-    if (fread(reader->prebuffer.data, 1, total_size, reader->file) != total_size) {
+    if (!reader_file_read_at(reader, reader->prebuffer.data, total_size, (int64_t)min_offset)) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_READ, "Failed to read prebuffer data");
         return CARQUET_ERROR_FILE_READ;
     }
@@ -1372,14 +1381,7 @@ static carquet_status_t reader_read_bytes(
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
 
-    if (carquet_fseek64(reader->file, (int64_t)offset, SEEK_SET) != 0) {
-        carquet_mem_free(buf);
-        CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_SEEK,
-            "Failed to seek to offset %lld", (long long)offset);
-        return CARQUET_ERROR_FILE_SEEK;
-    }
-
-    if (fread(buf, 1, (size_t)size, reader->file) != (size_t)size) {
+    if (!reader_file_read_at(reader, buf, (size_t)size, (int64_t)offset)) {
         carquet_mem_free(buf);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_READ,
             "Failed to read %d bytes at offset %lld", size, (long long)offset);

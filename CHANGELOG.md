@@ -57,6 +57,9 @@ Arrow stream and `ARROW:schema` restore (new in this release; one test per fix i
 - `carquet_predicate_t`: RANGE on a FIXED_LEN_BYTE_ARRAY column requires `lo_size` / `hi_size` equal to the type length at compile time (it was refused later, only on files with a page index); a clause's unused members are no longer read.
 - The stream's schema leaked one node per dictionary-restored field (`release_schema` in `arrow_c_read.c` ignored `dictionary`).
 
+Windows:
+- **Reads without mmap could return bytes from the wrong place**: a positional read on Windows moves the handle's file pointer, and the reader still loaded the page-index / bloom data, the prebuffer and the header magic with `fseek` + `fread` on the same stream, so a filtered read (page index + pages read in parallel) could decode the wrong bytes (`test_batch_pipeline`: `strings_required_filtered_pread` returned a wrong row count on every Windows build). A reader with positional I/O now does every read positionally (`file_reader.c`). New in this release with the non-mmap pipeline; POSIX `pread` never moved the position.
+
 Python (tests in `python/tests/test_core.py`):
 - `carquet.table({...})` / `write_table({...})` with Arrow arrays as columns: a list, struct or dictionary array kept the producer's field name (usually empty) instead of the dict key, and an array whose schema carries metadata failed with a ctypes `ArgumentError`. The column's schema node is now rebuilt under the dict key, children and dictionary moved (`_build.py`).
 - `to_pylist()` / `to_pandas()` looked up the dictionary index (and read the string view) of null slots, whose content Arrow leaves unspecified: an out-of-range index under a null raised `IndexError` / `KeyError` on data from other producers. Null slots are skipped (`_decode.py`).
