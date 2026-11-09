@@ -58,11 +58,11 @@
 
 | | |
 |---|---|
-| <img src="res/img/icons/fast.svg" width="22" height="22" align="absmiddle" alt="" />&nbsp; **Fast** | Writes **2.3–5.9x faster** than Arrow C++ and reads compressed data **1.5–2.1x faster** from the very same file (Apple M3, 10M rows). Uncompressed reads are served straight from the mmap in **0.30 ms**. |
+| <img src="res/img/icons/fast.svg" width="22" height="22" align="absmiddle" alt="" />&nbsp; **Fast** | Writes **2.0–5.6x faster** than Arrow C++ and reads compressed data **1.5–2.1x faster** from the very same file (Apple M3, 10M rows). Uncompressed reads are served straight from the mmap in **0.28 ms**. |
 | <img src="res/img/icons/simd.svg" width="22" height="22" align="absmiddle" alt="" />&nbsp; **SIMD** | 30+ hand-written vector kernels for **SSE4.2, AVX, AVX2, AVX-512, NEON and SVE**: bit-unpacking and RLE levels, dictionary gathers, byte-stream split, min/max statistics, null bitmaps, Snappy / LZ4 match copies. One portable binary picks the widest kernel at runtime, with a scalar fallback. |
 | <img src="res/img/icons/small.svg" width="22" height="22" align="absmiddle" alt="" />&nbsp; **Small** | Pure C11, a **~500 KB** library (Arrow C++: 50 MB+). Four compression dependencies (zstd, zlib, lz4, brotli), fetched automatically when missing. Builds in under a minute with a single `make` or `xmake`. |
 | <img src="res/img/icons/complete.svg" width="22" height="22" align="absmiddle" alt="" />&nbsp; **Complete** | All physical types and encodings, Snappy / GZIP / LZ4 / ZSTD / Brotli, V1 + V2 pages, nested schemas at any depth, bloom filters, page indexes, statistics-based pruning, append. [Full matrix ↓](#parquet-feature-support) |
-| <img src="res/img/icons/interop.svg" width="22" height="22" align="absmiddle" alt="" />&nbsp; **Interoperable** | Files read by PyArrow, DuckDB and Spark out of the box. Zero-dependency [Arrow C Data Interface](docs/reading.md#export-to-arrow-c-data-interface) bridge (struct / list / map at any depth) and a full [Python API](#python-api) on top of PyArrow. |
+| <img src="res/img/icons/interop.svg" width="22" height="22" align="absmiddle" alt="" />&nbsp; **Interoperable** | Files read by PyArrow, DuckDB and Spark out of the box. Zero-dependency [Arrow C Data Interface](docs/reading.md#export-to-arrow-c-data-interface) bridge (struct / list / map at any depth) and a full [Python API](#python-api) with no dependencies. |
 | <img src="res/img/icons/tooling.svg" width="22" height="22" align="absmiddle" alt="" />&nbsp; **Tooling** | `carquet` CLI to inspect, filter, export and validate files, plus `codegen` to emit a ready-to-compile C reader. A ready-made [agent skill](#ai-coding-agents) for Claude Code and Codex. |
 
 </div>
@@ -91,23 +91,23 @@ Speed-up of carquet over Arrow C++ at 10M rows (higher = carquet faster):
 | | ARM · Apple M3 | | x86 · Windows (Haswell, MSVC) | | x86 · Linux (Xeon D-1531) | |
 |---|---:|---:|---:|---:|---:|---:|
 | **Codec** | **Write** | **Read** | **Write** | **Read** | **Write** | **Read** |
-| snappy | **4.74x** | **1.89x** | **3.39x** | **1.17x** | **1.55x** | **1.25x** |
-| zstd | **5.91x** | **1.77x** | **3.83x** | **1.13x** | **1.31x** | **1.04x** |
-| lz4 | **4.61x** | **1.89x** | **2.96x** | **1.05x** | **1.02x** | 0.83x |
-| none | **2.30x** | **46.3x**\* | **2.10x** | **62.0x**\* | **1.13x** | **40.6x**\* |
+| snappy | **4.77x** | **1.63x** | **3.39x** | **1.17x** | **1.55x** | **1.25x** |
+| zstd | **5.56x** | **1.40x** | **3.83x** | **1.13x** | **1.31x** | **1.04x** |
+| lz4 | **4.62x** | **1.85x** | **2.96x** | **1.05x** | **1.02x** | 0.83x |
+| none | **2.04x** | **52.0x**\* | **2.10x** | **62.0x**\* | **1.13x** | **40.6x**\* |
 
 </div>
 
-<sub>\* mmap zero-copy path. Apple M3: carquet 0.7.3 vs Arrow C++ 26.0.1 (2026-11-06). Windows: carquet 0.7.3 vs Arrow C++ 24.0.0 (2026-11-02). Linux: carquet 0.4.4 vs Arrow C++ 23.0.1, before the 0.7.1 writer parallelism, not re-measured since.</sub>
+<sub>\* mmap zero-copy path. Apple M3: carquet 0.8.0 vs Arrow C++ 26.0.1 (2026-11-09). Windows: carquet 0.7.3 vs Arrow C++ 24.0.0 (2026-11-02). Linux: carquet 0.4.4 vs Arrow C++ 23.0.1, before the 0.7.1 writer parallelism, not re-measured since.</sub>
 
-Compressed reads decode every value, and on Linux and macOS both libraries link the same system lz4 / zstd, so codec speed is identical. The fairest comparison is the **same-file cross-read** (both libraries read the exact same file): carquet is **1.5–2.1x faster** on M3, 1.6–2.6x on Linux and 1.04–1.30x on the Windows VM, whose cold reads are bound by the virtual disk.
+Compressed reads decode every value, and on Linux and macOS both libraries link the same system lz4 / zstd, so codec speed is identical. The fairest comparison is the **same-file cross-read** (both libraries read the exact same file): carquet is **1.5–2.1x faster** than Arrow C++ on M3 (2.0–4.1x faster than polars), 1.6–2.6x on Linux and 1.04–1.30x on the Windows VM, whose cold reads are bound by the virtual disk.
 
 <details>
 <summary><b>Benchmark methodology</b></summary>
 
 <br/>
 
-All benchmarks use identical data (deterministic LCG PRNG), identical Parquet settings (no dictionary, BYTE_STREAM_SPLIT for floats, page checksums, mmap reads), trimmed median of 11–51 iterations, with the OS page cache purged between write and read phases and a cooldown between configurations. Schema: 3 columns (INT64, DOUBLE, INT32). Compared against the Arrow C++ low-level Parquet reader (bypassing Arrow Table materialization) and PyArrow.
+All benchmarks use identical data (deterministic LCG PRNG), identical Parquet settings (no dictionary, BYTE_STREAM_SPLIT for floats, page checksums, mmap reads), trimmed median of 11–51 iterations, with the OS page cache purged between write and read phases and a cooldown between configurations. Schema: 3 columns (INT64, DOUBLE, INT32). Compared against the Arrow C++ low-level Parquet reader (bypassing Arrow Table materialization), PyArrow, fastparquet and polars' native (Rust) reader and writer.
 
 The page cache is purged per file: `posix_fadvise(DONTNEED)` on Linux; on macOS and Windows the file is copied without caching (`F_NOCACHE`, `FILE_FLAG_NO_BUFFERING`) and the copy replaces it (`benchmark/bench_purge_win32.h`). On Windows, carquet links the zstd / lz4 it builds itself and Arrow C++ the conda-forge ones, so codec speed can differ slightly between the two.
 
@@ -212,7 +212,7 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 
 <br/>
 
-*Carquet 0.7.3, MacBook Air M3, 16GB RAM, macOS 26.5, Arrow C++ 26.0.1, PyArrow 26.0.1, fastparquet 2026.9.0, ZSTD level 1, measured on 2026-11-06. Raw report: [`benchmark/bench_0.7.3_darwin_arm64_20261106.json`](benchmark/bench_0.7.3_darwin_arm64_20261106.json).*
+*Carquet 0.8.0, MacBook Air M3, 16GB RAM, macOS 26.5, Arrow C++ 26.0.1, PyArrow 26.0.1, fastparquet 2026.9.0, polars 2.1.0, ZSTD level 1, measured on 2026-11-09 (10M-row configs from a second run the same day: the first run's first config was disturbed). Raw report: [`benchmark/bench_0.8.0_darwin_arm64_20261109.json`](benchmark/bench_0.8.0_darwin_arm64_20261109.json).*
 
 ##### 10M rows vs Arrow C++
 
@@ -220,10 +220,10 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 
 | Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio | Size |
 |-------|--------------|---------|---------|-------------|---------|---------|------|
-| none | **48.8ms** | 112ms | **2.30x** | **0.30ms** | 13.9ms | **46.3x**\* | 200.0MB |
-| snappy | **57.2ms** | 271ms | **4.74x** | **12.6ms** | 23.8ms | **1.89x** | 131.2MB |
-| zstd | **59.7ms** | 353ms | **5.91x** | **19.8ms** | 35.0ms | **1.77x** | 99.9MB |
-| lz4 | **52.4ms** | 241ms | **4.61x** | **9.60ms** | 18.2ms | **1.89x** | 128.7MB |
+| none | **57.7ms** | 117ms | **2.04x** | **0.28ms** | 14.6ms | **52.0x**\* | 190.7MB |
+| snappy | **49.3ms** | 235ms | **4.77x** | **14.0ms** | 22.7ms | **1.63x** | 125.1MB |
+| zstd | **61.0ms** | 339ms | **5.56x** | **20.6ms** | 28.8ms | **1.40x** | 95.3MB |
+| lz4 | **52.9ms** | 244ms | **4.62x** | **9.83ms** | 18.2ms | **1.85x** | 122.7MB |
 
 </div>
 
@@ -235,10 +235,10 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 
 | Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio |
 |-------|--------------|---------|---------|-------------|---------|---------|
-| none | **6.75ms** | 13.2ms | **1.95x** | **0.07ms** | 1.72ms | **24.6x**\* |
-| snappy | **7.02ms** | 24.0ms | **3.42x** | **1.58ms** | 2.49ms | **1.58x** |
-| zstd | **7.97ms** | 33.6ms | **4.22x** | **2.16ms** | 3.03ms | **1.40x** |
-| lz4 | **6.54ms** | 25.2ms | **3.85x** | **0.97ms** | 1.96ms | **2.02x** |
+| none | **5.87ms** | 12.3ms | **2.10x** | **0.06ms** | 1.59ms | **26.5x**\* |
+| snappy | **7.40ms** | 25.9ms | **3.49x** | **1.30ms** | 2.53ms | **1.95x** |
+| zstd | **8.32ms** | 34.1ms | **4.10x** | **2.36ms** | 3.17ms | **1.34x** |
+| lz4 | **7.70ms** | 25.7ms | **3.34x** | **1.06ms** | 2.15ms | **2.03x** |
 
 </div>
 
@@ -250,10 +250,10 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 
 | Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio |
 |-------|--------------|---------|---------|-------------|---------|---------|
-| none | **1.08ms** | 1.75ms | **1.62x** | **0.02ms** | 0.24ms | **12.0x**\* |
-| snappy | **1.80ms** | 2.52ms | **1.40x** | **0.36ms** | 0.90ms | **2.50x** |
-| zstd | **1.81ms** | 3.60ms | **1.99x** | **0.63ms** | 1.30ms | **2.06x** |
-| lz4 | **1.67ms** | 2.57ms | **1.54x** | **0.29ms** | 0.61ms | **2.10x** |
+| none | **0.87ms** | 1.65ms | **1.90x** | **0.02ms** | 0.23ms | **11.5x**\* |
+| snappy | **1.52ms** | 2.62ms | **1.72x** | **0.38ms** | 0.91ms | **2.39x** |
+| zstd | **1.90ms** | 3.69ms | **1.94x** | **0.64ms** | 1.32ms | **2.06x** |
+| lz4 | **1.66ms** | 2.63ms | **1.58x** | **0.30ms** | 0.63ms | **2.10x** |
 
 </div>
 
@@ -265,10 +265,10 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 
 | Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
 |-------|--------------|---------|---------|-------------|---------|---------|
-| none | **48.8ms** | 170ms | **3.49x** | **0.30ms** | 26.8ms | **89.2x**\* |
-| snappy | **57.2ms** | 294ms | **5.14x** | **12.6ms** | 38.4ms | **3.05x** |
-| zstd | **59.7ms** | 423ms | **7.09x** | **19.8ms** | 42.5ms | **2.15x** |
-| lz4 | **52.4ms** | 283ms | **5.41x** | **9.60ms** | 30.2ms | **3.15x** |
+| none | **57.7ms** | 165ms | **2.87x** | **0.28ms** | 26.1ms | **93.1x**\* |
+| snappy | **49.3ms** | 276ms | **5.60x** | **14.0ms** | 39.3ms | **2.82x** |
+| zstd | **61.0ms** | 387ms | **6.34x** | **20.6ms** | 41.3ms | **2.00x** |
+| lz4 | **52.9ms** | 287ms | **5.43x** | **9.83ms** | 29.0ms | **2.95x** |
 
 </div>
 
@@ -280,10 +280,10 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 
 | Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
 |-------|--------------|---------|---------|-------------|---------|---------|
-| none | **6.75ms** | 17.0ms | **2.52x** | **0.07ms** | 2.73ms | **39.0x**\* |
-| snappy | **7.02ms** | 27.9ms | **3.97x** | **1.58ms** | 3.66ms | **2.32x** |
-| zstd | **7.97ms** | 38.8ms | **4.87x** | **2.16ms** | 3.96ms | **1.83x** |
-| lz4 | **6.54ms** | 29.2ms | **4.46x** | **0.97ms** | 2.98ms | **3.07x** |
+| none | **5.87ms** | 17.5ms | **2.98x** | **0.06ms** | 2.79ms | **46.5x**\* |
+| snappy | **7.40ms** | 28.9ms | **3.90x** | **1.30ms** | 3.61ms | **2.78x** |
+| zstd | **8.32ms** | 39.4ms | **4.74x** | **2.36ms** | 4.00ms | **1.69x** |
+| lz4 | **7.70ms** | 30.5ms | **3.97x** | **1.06ms** | 3.22ms | **3.04x** |
 
 </div>
 
@@ -295,10 +295,10 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 
 | Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
 |-------|--------------|---------|---------|-------------|---------|---------|
-| none | **1.08ms** | 1.99ms | **1.84x** | **0.02ms** | 0.24ms | **12.0x**\* |
-| snappy | **1.80ms** | 2.82ms | **1.57x** | **0.36ms** | 0.66ms | **1.83x** |
-| zstd | **1.81ms** | 4.17ms | **2.30x** | **0.63ms** | 0.72ms | **1.14x** |
-| lz4 | **1.67ms** | 2.93ms | **1.75x** | **0.29ms** | 0.43ms | **1.48x** |
+| none | **0.87ms** | 2.10ms | **2.41x** | **0.02ms** | 0.26ms | **13.0x**\* |
+| snappy | **1.52ms** | 3.00ms | **1.97x** | **0.38ms** | 0.67ms | **1.76x** |
+| zstd | **1.90ms** | 4.13ms | **2.17x** | **0.64ms** | 0.73ms | **1.14x** |
+| lz4 | **1.66ms** | 3.04ms | **1.83x** | **0.30ms** | 0.44ms | **1.47x** |
 
 </div>
 
@@ -310,10 +310,10 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 
 | Codec | Carquet Write | fastparquet Write | W ratio | Carquet Read | fastparquet Read | R ratio |
 |-------|--------------|---------|---------|-------------|---------|---------|
-| none | **48.8ms** | 65.4ms | **1.34x** | **0.30ms** | 49.0ms | **163.5x**\* |
-| snappy | **57.2ms** | 204ms | **3.57x** | **12.6ms** | 110ms | **8.78x** |
-| zstd | **59.7ms** | 331ms | **5.55x** | **19.8ms** | 185ms | **9.39x** |
-| lz4 | **52.4ms** | 225ms | **4.30x** | **9.60ms** | 55.3ms | **5.76x** |
+| none | **57.7ms** | 64.6ms | **1.12x** | **0.28ms** | 55.7ms | **198.8x**\* |
+| snappy | **49.3ms** | 208ms | **4.22x** | **14.0ms** | 103ms | **7.40x** |
+| zstd | **61.0ms** | 325ms | **5.33x** | **20.6ms** | 185ms | **8.95x** |
+| lz4 | **52.9ms** | 244ms | **4.61x** | **9.83ms** | 55.4ms | **5.64x** |
 
 </div>
 
@@ -325,10 +325,10 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 
 | Codec | Carquet Write | fastparquet Write | W ratio | Carquet Read | fastparquet Read | R ratio |
 |-------|--------------|---------|---------|-------------|---------|---------|
-| none | **6.75ms** | 7.45ms | **1.10x** | **0.07ms** | 3.00ms | **42.9x**\* |
-| snappy | **7.02ms** | 22.1ms | **3.16x** | **1.58ms** | 10.1ms | **6.39x** |
-| zstd | **7.97ms** | 32.6ms | **4.09x** | **2.16ms** | 18.4ms | **8.54x** |
-| lz4 | **6.54ms** | 21.6ms | **3.30x** | **0.97ms** | 5.06ms | **5.22x** |
+| none | **5.87ms** | 8.01ms | **1.36x** | **0.06ms** | 3.08ms | **51.3x**\* |
+| snappy | **7.40ms** | 22.8ms | **3.08x** | **1.30ms** | 10.2ms | **7.85x** |
+| zstd | **8.32ms** | 33.5ms | **4.03x** | **2.36ms** | 18.0ms | **7.61x** |
+| lz4 | **7.70ms** | 22.4ms | **2.92x** | **1.06ms** | 5.37ms | **5.07x** |
 
 </div>
 
@@ -340,10 +340,55 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 
 | Codec | Carquet Write | fastparquet Write | W ratio | Carquet Read | fastparquet Read | R ratio |
 |-------|--------------|---------|---------|-------------|---------|---------|
-| none | 1.08ms | **1.04ms** | 0.96x | **0.02ms** | 0.52ms | **26.0x**\* |
-| snappy | **1.80ms** | 2.31ms | **1.28x** | **0.36ms** | 1.20ms | **3.33x** |
-| zstd | **1.81ms** | 3.45ms | **1.91x** | **0.63ms** | 2.05ms | **3.25x** |
-| lz4 | **1.67ms** | 2.25ms | **1.35x** | **0.29ms** | 0.73ms | **2.52x** |
+| none | **0.87ms** | 1.08ms | **1.24x** | **0.02ms** | 0.58ms | **29.0x**\* |
+| snappy | **1.52ms** | 2.43ms | **1.60x** | **0.38ms** | 1.20ms | **3.16x** |
+| zstd | **1.90ms** | 3.47ms | **1.83x** | **0.64ms** | 2.06ms | **3.22x** |
+| lz4 | **1.66ms** | 2.31ms | **1.39x** | **0.30ms** | 0.73ms | **2.43x** |
+
+</div>
+
+<br/>
+
+##### 10M rows vs polars
+
+<div align="center">
+
+| Codec | Carquet Write | polars Write | W ratio | Carquet Read | polars Read | R ratio | Carquet Size | polars Size |
+|-------|--------------|---------|---------|-------------|---------|---------|------|------|
+| none | 57.7ms | **37.5ms** | 0.65x | **0.28ms** | 28.7ms | **102.4x**\* | 190.7MB | 105.1MB |
+| snappy | 49.3ms | **38.1ms** | 0.77x | **14.0ms** | 28.3ms | **2.03x** | 125.1MB | 103.8MB |
+| zstd | 61.0ms | **48.6ms** | 0.80x | **20.6ms** | 42.1ms | **2.04x** | 95.3MB | 98.1MB |
+| lz4 | 52.9ms | **40.0ms** | 0.76x | **9.83ms** | 29.4ms | **2.99x** | 122.7MB | 104.2MB |
+
+</div>
+
+<br/>
+
+##### 1M rows vs polars
+
+<div align="center">
+
+| Codec | Carquet Write | polars Write | W ratio | Carquet Read | polars Read | R ratio | Carquet Size | polars Size |
+|-------|--------------|---------|---------|-------------|---------|---------|------|------|
+| none | 5.87ms | **4.53ms** | 0.77x | **0.06ms** | 3.14ms | **52.3x**\* | 19.1MB | 12.6MB |
+| snappy | 7.40ms | **4.82ms** | 0.65x | **1.30ms** | 3.25ms | **2.50x** | 12.5MB | 11.5MB |
+| zstd | 8.32ms | **5.83ms** | 0.70x | **2.36ms** | 4.12ms | **1.75x** | 9.6MB | 10.1MB |
+| lz4 | 7.70ms | **4.77ms** | 0.62x | **1.06ms** | 3.26ms | **3.08x** | 12.3MB | 11.5MB |
+
+</div>
+
+<br/>
+
+##### 100K rows vs polars
+
+<div align="center">
+
+| Codec | Carquet Write | polars Write | W ratio | Carquet Read | polars Read | R ratio | Carquet Size | polars Size |
+|-------|--------------|---------|---------|-------------|---------|---------|------|------|
+| none | 0.87ms | **0.72ms** | 0.83x | **0.02ms** | 0.33ms | **16.5x**\* | 1.9MB | 1.3MB |
+| snappy | 1.52ms | **0.91ms** | 0.60x | **0.38ms** | 0.46ms | **1.21x** | 1.3MB | 1.1MB |
+| zstd | 1.90ms | **1.05ms** | 0.55x | **0.64ms** | 1.08ms | **1.69x** | 1.0MB | 1.0MB |
+| lz4 | 1.66ms | **0.96ms** | 0.58x | **0.30ms** | 0.44ms | **1.47x** | 1.2MB | 1.1MB |
 
 </div>
 
@@ -357,18 +402,41 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 
 | Codec | Writer | Carquet Read | Arrow C++ Read | Ratio |
 |-------|--------|-------------|----------------|-------|
-| none | Carquet | **0.43ms** | 16.9ms | **39.2x**\* |
-| none | Arrow | **0.90ms** | 14.8ms | **16.5x**\* |
-| snappy | Carquet | **13.6ms** | 24.5ms | **1.80x** |
-| snappy | Arrow | **11.4ms** | 22.9ms | **2.01x** |
-| zstd | Carquet | **19.4ms** | 28.6ms | **1.48x** |
-| zstd | Arrow | **18.7ms** | 28.7ms | **1.54x** |
-| lz4 | Carquet | **9.39ms** | 19.1ms | **2.04x** |
-| lz4 | Arrow | **8.97ms** | 18.8ms | **2.09x** |
+| none | Carquet | **0.30ms** | 17.1ms | **56.8x**\* |
+| none | Arrow | **0.94ms** | 17.4ms | **18.5x**\* |
+| snappy | Carquet | **12.7ms** | 23.3ms | **1.83x** |
+| snappy | Arrow | **11.5ms** | 24.4ms | **2.13x** |
+| zstd | Carquet | **20.2ms** | 30.3ms | **1.50x** |
+| zstd | Arrow | **19.8ms** | 30.7ms | **1.55x** |
+| lz4 | Carquet | **9.96ms** | 19.2ms | **1.93x** |
+| lz4 | Arrow | **8.90ms** | 17.8ms | **2.00x** |
+
+</div>
+
+<br/>
+
+##### Same-file cross-read vs polars (10M rows)
+
+Each library reads the file carquet's benchmark writes and the file polars writes with its own settings (dictionary encoding on `id` and `category`).
+
+<div align="center">
+
+| Codec | Writer | Carquet Read | polars Read | Ratio | File |
+|-------|--------|-------------|-------------|-------|------|
+| none | Carquet | **0.28ms** | 36.4ms | **130.0x**\* | 190.7MB |
+| none | polars | **10.3ms** | 27.8ms | **2.71x** | 105.1MB |
+| snappy | Carquet | **13.2ms** | 53.9ms | **4.09x** | 125.1MB |
+| snappy | polars | **12.4ms** | 30.5ms | **2.45x** | 103.8MB |
+| zstd | Carquet | **21.7ms** | 51.8ms | **2.39x** | 95.3MB |
+| zstd | polars | **17.4ms** | 34.7ms | **1.99x** | 98.1MB |
+| lz4 | Carquet | **10.7ms** | 37.7ms | **3.52x** | 122.7MB |
+| lz4 | polars | **11.5ms** | 26.7ms | **2.31x** | 104.2MB |
 
 </div>
 
 \* Zero-copy mmap path. fastparquet reads through pandas and cannot write BYTE_STREAM_SPLIT or page checksums, so its rows are less directly comparable.
+
+polars uses its own Rust Parquet reader and writer (`use_pyarrow=False`, its default), with the same data, row group size, zstd level, statistics and LZ4_RAW for `lz4`. It cannot write BYTE_STREAM_SPLIT or page checksums and has no switch for dictionary encoding: it dictionary-encodes `id` and `category` on its own, so on this data its files are 45% smaller than carquet's dictionary-free ones uncompressed and 15–17% smaller with snappy / lz4 (about the same size with zstd), and its writes put fewer bytes through the codec and the disk. With dictionary encoding on the same two columns, carquet writes the 10M rows in 45 ms (none), 51 ms (snappy), 51 ms (zstd) and 48 ms (lz4), against polars' 38, 38, 49 and 40 ms. Reads are compared fairly by the same-file table: carquet reads either library's file 2.0–4.1x faster with a codec.
 
 </details>
 
@@ -463,6 +531,7 @@ python3 benchmark/run_benchmark.py --skip-xlarge  # full comparison with PyArrow
 | `--quick` | Only the 10M-row configs (what the chart shows) |
 | `--skip-xlarge` | Skip the 100M-row configs (~2 GB per codec, 30+ minutes) |
 | `--fastparquet` | Also compare fastparquet (`pip install fastparquet pandas`) |
+| `--polars` | Also compare polars' own Rust Parquet reader / writer (`pip install polars`) |
 | `--no-pyarrow` / `--no-arrow-cpp` | Skip PyArrow / Arrow C++ |
 | `--iterations N` | Fixed iteration count (default: auto, 11–51) |
 | `--build-dir DIR` / `--temp-dir DIR` | Where the binaries live / where test files are written |
@@ -473,6 +542,8 @@ python3 benchmark/run_benchmark.py --skip-xlarge  # full comparison with PyArrow
 Always benchmark a **Release** build: `make benchmark` reconfigures `build/` as Release; a leftover Debug `build/` makes carquet look several times slower. `make native` + `-DCARQUET_BUILD_BENCHMARKS=ON` gives the host-tuned numbers.
 
 fastparquet uses the same data, row group size, no dictionary and zstd level, and LZ4_RAW for `lz4`. It cannot write BYTE_STREAM_SPLIT or page checksums, and it reads through pandas, so its numbers are less directly comparable than Arrow's.
+
+polars runs with its native reader and writer (not through PyArrow), the same data, row group size, zstd level and LZ4_RAW for `lz4`. It cannot write BYTE_STREAM_SPLIT or page checksums, and it picks dictionary encoding itself (no switch), which makes its files smaller on this data.
 
 The Arrow C++ comparison needs its own target (Arrow C++ found on the system, or pointed at with `CARQUET_ARROW_CPP_ROOT`):
 
@@ -573,7 +644,7 @@ All targets and variables: [docs/building.md](docs/building.md#make-targets).
 
 #### From source, with `xmake`
 
-[xmake](https://xmake.io) needs nothing else installed: it downloads pinned zstd 1.5.6, zlib 1.3.1, lz4 1.10.0 and brotli 1.1.0 and links them statically, so the `carquet` CLI has no runtime dependency.
+[xmake](https://xmake.io) needs nothing else installed: it downloads pinned zstd 1.5.6, zlib 1.4, lz4 1.10.0 and brotli 1.1.0 and links them statically, so the `carquet` CLI has no runtime dependency.
 
 ```bash
 git clone https://github.com/Vitruves/carquet.git && cd carquet
@@ -820,11 +891,11 @@ It links carquet the way any downstream project would (`find_package(carquet)` /
 
 ### Python API
 
-`carquet` on PyPI is not a wrapper around the C calls above: it is a **Pythonic, `pyarrow.parquet`-style API** (`read_table`, `ParquetFile`, `ParquetWriter`, DNF `filters`) built on the same engine. The wheel bundles the C library with every codec compiled in; data crosses into Python through the Arrow C Data Interface, so decoding, decompression and I/O run in C without the GIL and PyArrow receives the buffers directly.
+`carquet` on PyPI is not a wrapper around the C calls above: it is a **Pythonic, `pyarrow.parquet`-style API** (`read_table`, `ParquetFile`, `ParquetWriter`, DNF `filters`) built on the same engine. The wheel bundles the C library with every codec compiled in; data crosses into Python through the Arrow C Data Interface, so decoding, decompression and I/O run in C without the GIL. **It has no dependencies**: reads return a `carquet.Table` that converts to Python values, NumPy and pandas on its own, and that polars, DuckDB and PyArrow take without a copy.
 
 ```bash
-pip install "carquet[arrow]"   # with PyArrow: tables, DataFrames, streaming
-pip install carquet            # metadata, schema, statistics and validation only
+pip install carquet              # no dependencies: no PyArrow, no NumPy needed
+pip install "carquet[pandas]"    # with pandas + NumPy, for read_pandas() / to_pandas()
 ```
 
 ```python
@@ -846,9 +917,10 @@ with cq.ParquetFile("data.parquet") as pf:
 |---|---|
 | Read a file, a directory, bytes or a file object | `cq.read_table`, `cq.read_pandas` |
 | Stream large files | `ParquetFile.iter_batches`, `cq.iter_batches` |
-| Prune with statistics, page indexes, bloom filters | `filters=` (DNF or `pyarrow.compute` expression), `ParquetFile.bloom_filter` |
+| Prune with statistics, page indexes, bloom filters | `filters=` (DNF, exact results), `ParquetFile.bloom_filter` |
 | Write tables, DataFrames, polars, DuckDB results | `cq.write_table`, `cq.ParquetWriter` (incremental, `append=True`) |
-| Inspect without PyArrow | `cq.read_metadata`, `cq.read_parquet_schema`, `cq.info`, `cq.validate` |
+| Hand the data to pandas, NumPy, polars, DuckDB, PyArrow | `t.to_pandas()`, `t.column("x").to_numpy()`, `polars.DataFrame(t)`, `pyarrow.table(t)` |
+| Inspect a file without reading its data | `cq.read_metadata`, `cq.read_parquet_schema`, `cq.info`, `cq.validate` |
 
 </div>
 

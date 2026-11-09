@@ -64,6 +64,7 @@ TARGETS = [
     ("arrow_read",   "Nested Arrow reassembler (carquet_reader_read_arrow) over file bytes"),
     ("reader_file",  "Path/FILE*/mmap reader: fread page path, validate_file, stats/predicates"),
     ("arrow_write",  "Arrow write->read differential: write_arrow + read_arrow value compare"),
+    ("arrow_stream", "ArrowArrayStream scan: restore, predicate, row selection, ref views"),
 ]
 TARGET_NAMES = [t[0] for t in TARGETS]
 

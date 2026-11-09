@@ -600,6 +600,7 @@ carquet_reader_t* carquet_reader_open(
 
     reader->file = file;
     reader->owns_file = true;
+    reader->positional_io = carquet_file_supports_pread(file);
 
     /* Read and parse footer */
     status = read_footer(reader, error);
@@ -1075,6 +1076,7 @@ void carquet_column_reader_free(carquet_column_reader_t* reader) {
 
     /* Levels are always owned (decoded from RLE) */
     carquet_mem_free(reader->decoded_def_levels);
+    carquet_mem_free(reader->decoded_def_bits);
     carquet_mem_free(reader->decoded_rep_levels);
     carquet_mem_free(reader->indices_buffer);
     carquet_mem_free(reader->decompress_buffer);
@@ -1165,7 +1167,7 @@ void carquet_column_reader_rebind(
     /* Free BYTE_ARRAY page data retention list */
     carquet_column_clear_retained_pages(col_reader);
 
-    col_reader->dense_cursor_pos = 0;
+    col_reader->dense_cursor_pos = -1;
     col_reader->dense_cursor_val = 0;
 
     /* Keep reusable buffers: page_buffer, decoded_values, decoded_def_levels,

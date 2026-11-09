@@ -1,35 +1,58 @@
-"""carquet -- fast Apache Parquet reading and writing, backed by the carquet C library.
+"""carquet -- read and write Apache Parquet files, fast, with no dependencies.
 
-Reading::
+The package wraps the carquet C library. It needs nothing else: no PyArrow,
+no NumPy (pandas, NumPy, polars and PyArrow are used only when you ask for
+their objects).
+
+Read a file::
 
     import carquet as cq
 
-    table = cq.read_table("data.parquet", columns=["id", "price"],
-                          filters=[("price", ">", 100)])
-    df = cq.read_pandas("data.parquet")
+    t = cq.read_table("data.parquet")                      # a carquet.Table
+    t = cq.read_table("data.parquet", columns=["id", "price"],
+                      filters=[("price", ">", 100)])       # only what you need
+    t.num_rows, t.column_names, t.schema
+
+Use the data::
+
+    t.to_pydict()                    # {"id": [...], "price": [...]}
+    t.to_pylist()                    # [{"id": 1, "price": 120.0}, ...]
+    t.column("price").to_numpy()     # NumPy array
+    t.to_pandas()                    # pandas DataFrame (or cq.read_pandas(path))
+    polars.DataFrame(t), pyarrow.table(t), duckdb.sql("SELECT * FROM t")
+
+Write a file::
+
+    cq.write_table({"id": [1, 2, 3], "name": ["a", None, "c"]}, "out.parquet")
+    cq.write_table(df, "out.parquet", compression="snappy")   # pandas, polars, PyArrow...
+
+Large files, a batch at a time::
 
     with cq.ParquetFile("data.parquet") as pf:
-        pf.schema, pf.parquet_schema, pf.metadata
-        for batch in pf.iter_batches(batch_size=50_000):
+        print(pf.num_rows, pf.schema)
+        for batch in pf.iter_batches(batch_size=50_000, columns=["id"]):
             ...
 
-Writing::
+    with cq.ParquetWriter("out.parquet", t.schema) as w:
+        for batch in batches:
+            w.write(batch)
 
-    cq.write_table(table, "out.parquet", compression="zstd", use_dictionary=["country"])
+Look inside a file without reading its data::
 
-    with cq.ParquetWriter("out.parquet", schema) as w:
-        w.write(batch)
+    cq.info("data.parquet")                  # rows, row groups, size
+    cq.read_schema("data.parquet")           # column names and types
+    cq.read_metadata("data.parquet")         # row groups, statistics, encodings
 
-Tables cross the C boundary through the Arrow C Data Interface, and every C
-call runs without the GIL. :func:`info`, :func:`validate`,
-:func:`read_metadata`, :func:`read_parquet_schema`, :func:`cpu_info` and the
-version helpers work without PyArrow.
+Where to look next: ``help(cq.read_table)``, ``help(cq.write_table)``,
+``help(cq.Table)``, ``help(cq.ParquetFile)``, ``help(cq.ParquetWriter)``.
+Errors from the C library are raised as :class:`CarquetError`.
 """
 
 from __future__ import annotations
 
 from . import _ffi
 from ._types import COMPRESSION_CODECS
+from .arrow import Array, ChunkedArray, DataType, Field, RecordBatch, Schema, Table, table
 from .errors import CarquetError, StatusCode
 from .metadata import (
     BloomFilter,
@@ -44,6 +67,7 @@ from .metadata import (
     Statistics,
 )
 from .reader import (
+    ArrowStream,
     FileInfo,
     ParquetFile,
     info,
@@ -60,6 +84,15 @@ from .writer import ParquetWriter, write_table
 
 __all__ = [
     "COMPRESSION_CODECS",
+    "Array",
+    "ArrowStream",
+    "ChunkedArray",
+    "DataType",
+    "Field",
+    "RecordBatch",
+    "Schema",
+    "Table",
+    "table",
     "BloomFilter",
     "CarquetError",
     "ColumnChunkMetaData",

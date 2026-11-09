@@ -1,7 +1,13 @@
 /**
  * @file file_io.c
- * @brief UTF-8 path support for Windows file APIs (see file_io.h).
+ * @brief UTF-8 path support for Windows file APIs and positional reads
+ *        (see file_io.h).
  */
+
+/* pread()/fileno() are POSIX; strict -std=c11 headers hide them otherwise. */
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
 
 #include "file_io.h"
 
@@ -9,6 +15,8 @@
 
 #include "allocator.h"
 #include <windows.h>
+#include <io.h>
+#include <string.h>
 
 wchar_t* carquet_path_to_wide(const char* path) {
     if (!path) return NULL;
@@ -56,9 +64,65 @@ int carquet_remove(const char* path) {
     return rc;
 }
 
+static HANDLE file_handle(FILE* file) {
+    int fd = file ? _fileno(file) : -1;
+    if (fd < 0) return INVALID_HANDLE_VALUE;
+    return (HANDLE)_get_osfhandle(fd);
+}
+
+bool carquet_file_supports_pread(FILE* file) {
+    HANDLE h = file_handle(file);
+    return h != INVALID_HANDLE_VALUE && GetFileType(h) == FILE_TYPE_DISK;
+}
+
+size_t carquet_file_pread(FILE* file, void* buf, size_t size, int64_t offset) {
+    HANDLE h = file_handle(file);
+    if (h == INVALID_HANDLE_VALUE || offset < 0) return 0;
+    size_t done = 0;
+    while (done < size) {
+        size_t want = size - done;
+        DWORD chunk = want > 0x40000000u ? 0x40000000u : (DWORD)want;
+        uint64_t pos = (uint64_t)offset + done;
+        OVERLAPPED ov;
+        memset(&ov, 0, sizeof(ov));
+        ov.Offset = (DWORD)(pos & 0xFFFFFFFFu);
+        ov.OffsetHigh = (DWORD)(pos >> 32);
+        DWORD got = 0;
+        if (!ReadFile(h, (char*)buf + done, chunk, &got, &ov) || got == 0) break;
+        done += got;
+    }
+    return done;
+}
+
 #else
 
-/* ISO C forbids an empty translation unit. */
-typedef int carquet_file_io_unused_t;
+#include <errno.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+bool carquet_file_supports_pread(FILE* file) {
+    int fd = file ? fileno(file) : -1;
+    struct stat st;
+    return fd >= 0 && fstat(fd, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+size_t carquet_file_pread(FILE* file, void* buf, size_t size, int64_t offset) {
+    int fd = file ? fileno(file) : -1;
+    if (fd < 0 || offset < 0) return 0;
+    size_t done = 0;
+    while (done < size) {
+        int64_t pos = offset + (int64_t)done;
+        if ((int64_t)(off_t)pos != pos) break;   /* 32-bit off_t */
+        ssize_t n = pread(fd, (char*)buf + done, size - done, (off_t)pos);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n == 0) break;
+        done += (size_t)n;
+    }
+    return done;
+}
 
 #endif

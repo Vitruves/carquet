@@ -15,6 +15,18 @@
 #define CARQUET_CORE_FILE_IO_H
 
 #include <stdio.h>
+#include <stdbool.h>
+#include <stdint.h>
+
+/* Positional reads on a FILE's descriptor: pread() on POSIX, ReadFile() with
+ * an explicit offset on Windows. They neither use nor move the stream
+ * position, so several threads may read one file concurrently, which
+ * fseek()+fread() on a shared FILE cannot do. carquet_file_supports_pread()
+ * is true only for a regular disk file with a descriptor (not a pipe,
+ * terminal or memory stream); carquet_file_pread() returns the bytes read,
+ * short only at end of file or on error. */
+bool carquet_file_supports_pread(FILE* file);
+size_t carquet_file_pread(FILE* file, void* buf, size_t size, int64_t offset);
 
 #ifdef _WIN32
 #include <wchar.h>

@@ -1,7 +1,8 @@
-"""Shared helpers for the Python Parquet benchmarks (PyArrow, fastparquet).
+"""Shared helpers for the Python Parquet benchmarks (PyArrow, fastparquet, polars).
 
 Mirrors benchmark_carquet.c: same LCG data, iteration counts, trimmed median,
-page-cache purge and temp directory.
+page-cache purge and temp directory, and the null pattern of the
+"<size>_nullable" datasets.
 """
 
 import os
@@ -17,6 +18,14 @@ LCG_C = np.uint64(12345)
 LCG_MASK = np.uint64(0xFFFFFFFF)
 LCG_CHUNK_ROWS = 1_000_000
 BOX_MULLER_PI = 3.14159265358979
+COLUMN_NAMES = ("id", "value", "category")
+
+# "<size>_nullable" datasets: same values, OPTIONAL columns with NULL_PERCENT %
+# nulls each, dictionary encoding on `category`. Must match benchmark_carquet.c
+# and benchmark_arrow_cpp.cpp.
+NULLABLE_SUFFIX = "_nullable"
+NULL_PERCENT = 7
+DICTIONARY_COLUMNS = ("category",)
 
 
 def get_benchmark_zstd_level():
@@ -131,8 +140,36 @@ def generate_columns(num_rows):
     return {"id": ids, "value": values, "category": categories}
 
 
+def is_nullable_dataset(name):
+    return name.endswith(NULLABLE_SUFFIX)
+
+
+def base_dataset(name):
+    """Size name of a dataset ("large_nullable" -> "large")."""
+    return name[:-len(NULLABLE_SUFFIX)] if is_nullable_dataset(name) else name
+
+
+def null_masks(num_rows):
+    """Per-column null masks (True = null) of the nullable datasets.
+
+    lowbias32 hash of (row ^ per-column seed), identical to bench_is_null() in
+    benchmark_carquet.c / benchmark_arrow_cpp.cpp.
+    """
+    rows = np.arange(num_rows, dtype=np.uint32)
+    masks = {}
+    for col, name in enumerate(COLUMN_NAMES):
+        x = rows ^ np.uint32((0x9E3779B9 * (col + 1)) & 0xFFFFFFFF)
+        x ^= x >> np.uint32(16)
+        x *= np.uint32(0x7FEB352D)
+        x ^= x >> np.uint32(15)
+        x *= np.uint32(0x846CA68B)
+        x ^= x >> np.uint32(16)
+        masks[name] = (x % np.uint32(100)) < np.uint32(NULL_PERCENT)
+    return masks
+
+
 def get_iterations(name):
     iter_override = os.environ.get("CARQUET_BENCH_ITERATIONS")
     if iter_override and int(iter_override) > 0:
         return min(int(iter_override), 201)
-    return BENCH_ITERATIONS.get(name, 21)
+    return BENCH_ITERATIONS.get(base_dataset(name), 21)

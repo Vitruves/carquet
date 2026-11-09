@@ -571,8 +571,10 @@ static int test_arrow_import_validation(void) {
     carquet_error_t err = CARQUET_ERROR_INIT;
     int32_t ints[4] = {1, 2, 3, 4};
 
-    /* (1) int32 leaf into an INT64 writer column: write_batch used to read
-     *     8 bytes per value from a 4-byte-per-value buffer. */
+    /* (1) a leaf into a column of another physical type: write_batch used to
+     *     read 8 bytes per value from a 4-byte-per-value buffer. An int32 leaf
+     *     into an INT64 column is now widened (0.8.0); a double leaf into an
+     *     INT64 column must still be refused. */
     {
         carquet_schema_t* cs = NULL;
         carquet_writer_t* w = make_buffer_writer(CARQUET_PHYSICAL_INT64,
@@ -580,7 +582,7 @@ static int test_arrow_import_validation(void) {
         if (!w) TEST_FAIL("arrow_import_validation", "writer (1)");
         struct ArrowSchema leaf_s, top_s;
         struct ArrowSchema* kids_s[1] = { &leaf_s };
-        init_schema(&leaf_s, "i", "x", 0, NULL);
+        init_schema(&leaf_s, "g", "x", 0, NULL);
         init_schema(&top_s, "+s", "", 1, kids_s);
         const void* leaf_bufs[2] = { NULL, ints };
         struct ArrowArray leaf_a, top_a;
@@ -591,7 +593,7 @@ static int test_arrow_import_validation(void) {
         carquet_status_t st = carquet_writer_write_arrow(w, &top_a, &top_s, &err);
         carquet_writer_abort(w);
         carquet_schema_free(cs);
-        if (st == CARQUET_OK) TEST_FAIL("arrow_import_validation", "int32 leaf into INT64 accepted");
+        if (st == CARQUET_OK) TEST_FAIL("arrow_import_validation", "double leaf into INT64 accepted");
     }
 
     /* (2) nested struct array with fewer children than its schema: the

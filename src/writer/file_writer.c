@@ -140,6 +140,8 @@ extern int32_t carquet_row_group_writer_begin_page_tasks(
     carquet_row_group_writer_t* writer);
 extern carquet_page_task_t* carquet_row_group_writer_page_task(
     carquet_row_group_writer_t* writer, int32_t k);
+extern void carquet_row_group_writer_run_whole_column(
+    carquet_row_group_writer_t* writer, int32_t k);
 extern carquet_status_t carquet_row_group_writer_complete_page_tasks(
     carquet_row_group_writer_t* writer, int64_t file_offset, int64_t num_rows,
     size_t* total_size);
@@ -322,7 +324,8 @@ struct pipeline_rg;
 typedef struct encode_task_ctx {
     struct carquet_writer* writer;
     struct pipeline_rg* rg;
-    carquet_page_task_t* task;
+    carquet_page_task_t* task;        /* NULL: work item `item` is a whole column */
+    int32_t item;
 } encode_task_ctx_t;
 
 /* A row group whose pages are being encoded on the encode pool, or have
@@ -506,8 +509,15 @@ static carquet_status_t write_magic(FILE* file) {
     return CARQUET_OK;
 }
 
+/* Byte counts only grow: adding nothing (a batch whose values are all null,
+ * or a type the estimate does not size) must leave the total alone. It used
+ * to saturate to INT64_MAX on rhs == 0, which made the row-group size check
+ * flush a row group at every aligned write from then on. */
 static int64_t saturating_add_i64(int64_t lhs, int64_t rhs) {
-    if (rhs <= 0 || lhs >= INT64_MAX - rhs) {
+    if (rhs <= 0) {
+        return lhs;
+    }
+    if (lhs > INT64_MAX - rhs) {
         return INT64_MAX;
     }
     return lhs + rhs;
@@ -541,6 +551,9 @@ static int64_t estimate_column_batch_bytes(
             break;
         case CARQUET_PHYSICAL_DOUBLE:
             total = num_values * (int64_t)sizeof(double);
+            break;
+        case CARQUET_PHYSICAL_INT96:
+            total = num_values * (int64_t)sizeof(carquet_int96_t);
             break;
         case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY:
             if (column->type_length > 0) {
@@ -1737,13 +1750,16 @@ static carquet_status_t record_row_group(carquet_writer_t* writer,
  * with a barrier: its wall time is the slowest page of the last wave, on a
  * loaded machine a page whose thread was descheduled, and the main thread
  * sits out the stash of the next row group and the I/O hand-off serially.
- * When every column is page-parallel, the row group is instead handed to a
- * persistent pool as soon as the user starts the next one: its pages encode
- * while the user fills the other row-group writer, and the stragglers of row
- * group n overlap the first pages of n+1. The row group is completed (pages
+ * Instead, the row group is handed to a persistent pool as soon as the user
+ * starts the next one: its pages encode while the user fills the other
+ * row-group writer, and the stragglers of row group n overlap the first pages
+ * of n+1. Columns that are not page-parallel (dictionary, BYTE_ARRAY, ...) go
+ * to the pool as one work item each, finalized whole by one thread exactly
+ * as the serial path would, so they overlap the rest too instead of sending
+ * the row group back to the fork/join. The row group is completed (pages
  * accounted, chunk infos filled, metadata recorded, I/O queued) one flush
  * later, or at close. Output is the same bytes in the same order; only
- * which thread encodes which page changes.
+ * which thread encodes which page or column changes.
  */
 
 #ifdef _OPENMP
@@ -1818,15 +1834,21 @@ static void pipeline_return_scratch(carquet_writer_t* writer,
 static void encode_task_fn(void* arg) {
     encode_task_ctx_t* ctx = (encode_task_ctx_t*)arg;
     carquet_writer_t* writer = ctx->writer;
-    carquet_page_writer_t* scratch = pipeline_take_scratch(writer);
-    double t0 = omp_get_wtime();
-    if (scratch) {
-        carquet_column_writer_run_page_task(ctx->task, scratch);
+    if (ctx->task) {
+        carquet_page_writer_t* scratch = pipeline_take_scratch(writer);
+        double t0 = omp_get_wtime();
+        if (scratch) {
+            carquet_column_writer_run_page_task(ctx->task, scratch);
+        } else {
+            ctx->task->status = CARQUET_ERROR_OUT_OF_MEMORY;
+        }
+        ctx->task->elapsed = omp_get_wtime() - t0;
+        pipeline_return_scratch(writer, scratch);
     } else {
-        ctx->task->status = CARQUET_ERROR_OUT_OF_MEMORY;
+        /* A column that is not page-parallel, finalized whole with its own
+         * page writer (no scratch needed). */
+        carquet_row_group_writer_run_whole_column(ctx->rg->rg, ctx->item);
     }
-    ctx->task->elapsed = omp_get_wtime() - t0;
-    pipeline_return_scratch(writer, scratch);
     PIPELINE_LOCK(writer);
     if (--ctx->rg->remaining == 0) {
         PIPELINE_BROADCAST(writer);
@@ -1893,9 +1915,10 @@ static bool pipeline_ready(carquet_writer_t* writer) {
     return true;
 }
 
-/* Start encoding the current row group on the pool, if every column allows
- * it. `*started` tells; when false nothing happened and the caller finalizes
- * the row group the ordinary way. */
+/* Start encoding the current row group on the pool, if it can be pipelined
+ * (see carquet_row_group_writer_begin_page_tasks). `*started` tells; when
+ * false nothing happened and the caller finalizes the row group the ordinary
+ * way. */
 static carquet_status_t pipeline_begin(carquet_writer_t* writer, bool* started,
                                        int* slot_index) {
     *started = false;
@@ -1916,12 +1939,12 @@ static carquet_status_t pipeline_begin(carquet_writer_t* writer, bool* started,
         slot->ctx_capacity = n;
     }
     for (int32_t k = 0; k < n; k++) {
-        carquet_page_task_t* task = carquet_row_group_writer_page_task(
-            writer->current_row_group, k);
-        if (!task) return CARQUET_ERROR_INTERNAL;
+        /* NULL: item k is a whole column (they come first). */
         slot->ctx[k].writer = writer;
         slot->ctx[k].rg = slot;
-        slot->ctx[k].task = task;
+        slot->ctx[k].task = carquet_row_group_writer_page_task(
+            writer->current_row_group, k);
+        slot->ctx[k].item = k;
     }
     slot->rg = writer->current_row_group;
     slot->rows = writer->current_row_group_rows;
@@ -2190,6 +2213,75 @@ static bool deprecated_stats_are_compatible(const writer_column_def_t* column) {
     return true;
 }
 
+/* Length of the longest prefix of s[0..n) of at most `limit` bytes that ends
+ * on a UTF-8 character boundary. */
+static size_t utf8_prefix_len(const uint8_t* s, size_t n, size_t limit) {
+    if (n <= limit) return n;
+    size_t k = limit;
+    while (k > 0 && (s[k] & 0xC0) == 0x80) k--;
+    return k;
+}
+
+static bool utf8_is_valid(const uint8_t* s, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        uint8_t b0 = s[i];
+        size_t len = b0 < 0x80 ? 1 : (b0 & 0xE0) == 0xC0 ? 2 : (b0 & 0xF0) == 0xE0 ? 3 :
+                     (b0 & 0xF8) == 0xF0 ? 4 : 0;
+        if (len == 0 || i + len > n) return false;
+        for (size_t k = 1; k < len; k++) {
+            if ((s[i + k] & 0xC0) != 0x80) return false;
+        }
+        i += len;
+    }
+    return true;
+}
+
+/* Turn the valid UTF-8 prefix s[0..len) into a string greater than every
+ * string it prefixes, still valid UTF-8 and at most `cap` bytes: replace the
+ * last code point that has a successor fitting in `cap` by that successor and
+ * drop what follows it (what parquet-java and arrow-rs do for truncated STRING
+ * statistics). Returns the new length, 0 when there is no such bound. */
+static size_t utf8_increment(uint8_t* s, size_t len, size_t cap) {
+    while (len > 0) {
+        size_t start = len - 1;
+        while (start > 0 && (s[start] & 0xC0) == 0x80) start--;
+        size_t clen = len - start;
+        uint8_t b0 = s[start];
+        uint32_t cp;
+        if (clen == 1) cp = b0;
+        else if (clen == 2) cp = ((uint32_t)(b0 & 0x1F) << 6) | (s[start + 1] & 0x3F);
+        else if (clen == 3) cp = ((uint32_t)(b0 & 0x0F) << 12) | ((uint32_t)(s[start + 1] & 0x3F) << 6) |
+                                 (s[start + 2] & 0x3F);
+        else cp = ((uint32_t)(b0 & 0x07) << 18) | ((uint32_t)(s[start + 1] & 0x3F) << 12) |
+                  ((uint32_t)(s[start + 2] & 0x3F) << 6) | (s[start + 3] & 0x3F);
+        cp++;
+        if (cp >= 0xD800 && cp <= 0xDFFF) cp = 0xE000;   /* skip the surrogates */
+        size_t nlen = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+        if (cp <= 0x10FFFF && start + nlen <= cap) {
+            uint8_t* o = s + start;
+            if (nlen == 1) {
+                o[0] = (uint8_t)cp;
+            } else if (nlen == 2) {
+                o[0] = (uint8_t)(0xC0 | (cp >> 6));
+                o[1] = (uint8_t)(0x80 | (cp & 0x3F));
+            } else if (nlen == 3) {
+                o[0] = (uint8_t)(0xE0 | (cp >> 12));
+                o[1] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+                o[2] = (uint8_t)(0x80 | (cp & 0x3F));
+            } else {
+                o[0] = (uint8_t)(0xF0 | (cp >> 18));
+                o[1] = (uint8_t)(0x80 | ((cp >> 12) & 0x3F));
+                o[2] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+                o[3] = (uint8_t)(0x80 | (cp & 0x3F));
+            }
+            return start + nlen;
+        }
+        len = start;   /* no successor here: carry into the previous code point */
+    }
+    return 0;
+}
+
 static carquet_status_t build_file_metadata(
     carquet_writer_t* writer,
     parquet_file_metadata_t* metadata) {
@@ -2393,6 +2485,14 @@ static carquet_status_t build_file_metadata(
                     const size_t TRUNC = (size_t)writer->max_statistics_size;
                     bool variable_len =
                         (src_col->type == CARQUET_PHYSICAL_BYTE_ARRAY);
+                    /* STRING / JSON / ENUM bounds stay valid UTF-8 when
+                     * truncated: readers decode them (pyarrow raises on a
+                     * bound cut inside a character). */
+                    carquet_logical_type_id_t lt_id = j < writer->num_columns
+                        ? writer->columns[j].logical_type.id : CARQUET_LOGICAL_UNKNOWN;
+                    bool utf8 = variable_len &&
+                        (lt_id == CARQUET_LOGICAL_STRING || lt_id == CARQUET_LOGICAL_JSON ||
+                         lt_id == CARQUET_LOGICAL_ENUM);
 
                     int32_t min_n = (int32_t)src_col->min_value_size;
                     int32_t max_n = (int32_t)src_col->max_value_size;
@@ -2409,7 +2509,7 @@ static carquet_status_t build_file_metadata(
 
                     if (variable_len && (size_t)min_n > TRUNC) {
                         /* Truncated prefix is lex <= original, valid as min. */
-                        min_n = (int32_t)TRUNC;
+                        min_n = (int32_t)(utf8 ? utf8_prefix_len(min_buf, (size_t)min_n, TRUNC) : TRUNC);
                         min_exact = false;
                     }
 
@@ -2424,11 +2524,17 @@ static carquet_status_t build_file_metadata(
                          * wraps and we cannot emit a valid upper bound — drop
                          * max in that case. */
                         max_exact = false;
-                        size_t new_len = TRUNC;
-                        max_buf[new_len - 1]++;
-                        while (new_len > 0 && max_buf[new_len - 1] == 0) {
-                            new_len--;
-                            if (new_len > 0) max_buf[new_len - 1]++;
+                        size_t new_len = 0;
+                        size_t cut = utf8 ? utf8_prefix_len(max_buf, (size_t)max_n, TRUNC) : 0;
+                        if (utf8 && utf8_is_valid(max_buf, cut)) {
+                            new_len = utf8_increment(max_buf, cut, TRUNC);
+                        } else {   /* binary, or a STRING column that is not UTF-8 */
+                            new_len = TRUNC;
+                            max_buf[new_len - 1]++;
+                            while (new_len > 0 && max_buf[new_len - 1] == 0) {
+                                new_len--;
+                                if (new_len > 0) max_buf[new_len - 1]++;
+                            }
                         }
                         if (new_len == 0) {
                             emit_max = false;
@@ -3525,6 +3631,18 @@ carquet_status_t carquet_writer_close(carquet_writer_t* writer) {
         goto cleanup;
     }
 
+    /* An append writes over the old footer without truncating the file. The
+     * new footer can be shorter (empty statistics, encoding stats and
+     * key-value metadata are not restored byte for byte), which would leave
+     * the old footer length and PAR1 at the end of the file. */
+    if (writer->is_append) {
+        int64_t end = carquet_ftell64(writer->file);
+        if (end < 0 || carquet_ftruncate64(writer->file, end) != 0) {
+            status = CARQUET_ERROR_FILE_WRITE;
+            goto cleanup;
+        }
+    }
+
     /* For buffer writers, read back the entire file into memory.
      * Use 64-bit seek/tell to handle files >2 GB on all platforms. */
     if (writer->is_buffer_writer && writer->file) {
@@ -3707,6 +3825,55 @@ void carquet_writer_abort(carquet_writer_t* writer) {
  * Key-Value Metadata API
  * ============================================================================
  */
+
+carquet_status_t carquet_writer_set_arrow_schema(carquet_writer_t* writer, const struct ArrowSchema* schema) {
+    if (!writer || !schema) return CARQUET_ERROR_INVALID_ARGUMENT;
+    char* b64 = carquet_build_arrow_schema_b64_from_arrow(schema);
+    if (!b64) return CARQUET_ERROR_NOT_IMPLEMENTED;
+    /* Replace an earlier ARROW:schema entry. */
+    carquet_status_t st = CARQUET_OK;
+    bool replaced = false;
+    for (int32_t i = 0; i < writer->num_kv_metadata; i++) {
+        if (writer->kv_metadata[i].key && strcmp(writer->kv_metadata[i].key, "ARROW:schema") == 0) {
+            char* v = carquet_heap_strdup(b64);
+            if (!v) { st = CARQUET_ERROR_OUT_OF_MEMORY; break; }
+            carquet_mem_free(writer->kv_metadata[i].value);
+            writer->kv_metadata[i].value = v;
+            replaced = true;
+            break;
+        }
+    }
+    if (st == CARQUET_OK && !replaced) st = carquet_writer_add_metadata(writer, "ARROW:schema", b64);
+    carquet_mem_free(b64);
+    /* The schema's own key/value metadata (pandas, ...) goes to the footer too. */
+    const char* md = schema->metadata;
+    if (st == CARQUET_OK && md) {
+        int32_t n;
+        memcpy(&n, md, 4);
+        size_t pos = 4;
+        for (int32_t i = 0; i < n && st == CARQUET_OK; i++) {
+            int32_t kl, vl;
+            memcpy(&kl, md + pos, 4);
+            char* k = (char*)carquet_mem_malloc((size_t)kl + 1);
+            if (!k) { st = CARQUET_ERROR_OUT_OF_MEMORY; break; }
+            memcpy(k, md + pos + 4, (size_t)kl); k[kl] = '\0';
+            pos += 4 + (size_t)kl;
+            memcpy(&vl, md + pos, 4);
+            char* v = (char*)carquet_mem_malloc((size_t)vl + 1);
+            if (!v) { carquet_mem_free(k); st = CARQUET_ERROR_OUT_OF_MEMORY; break; }
+            memcpy(v, md + pos + 4, (size_t)vl); v[vl] = '\0';
+            pos += 4 + (size_t)vl;
+            bool have = strcmp(k, "ARROW:schema") == 0;
+            for (int32_t j = 0; j < writer->num_kv_metadata && !have; j++) {
+                have = writer->kv_metadata[j].key && strcmp(writer->kv_metadata[j].key, k) == 0;
+            }
+            if (!have) st = carquet_writer_add_metadata(writer, k, v);
+            carquet_mem_free(k);
+            carquet_mem_free(v);
+        }
+    }
+    return st;
+}
 
 carquet_status_t carquet_writer_add_metadata(
     carquet_writer_t* writer,

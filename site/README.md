@@ -5,7 +5,7 @@ Static GitHub Pages site (no build step): `index.html`, `style.css`, `app.js`, `
 The benchmark charts and headline numbers are computed in the browser from `bench.json`, an unmodified `run_benchmark.py` report. To refresh them, rerun the benchmark and copy the new report over it:
 
 ```bash
-python3 benchmark/run_benchmark.py --skip-xlarge --fastparquet
+python3 benchmark/run_benchmark.py --skip-xlarge --fastparquet --polars
 cp benchmark/bench_<version>_<os>_<arch>_<date>.json site/bench.json
 ```
 

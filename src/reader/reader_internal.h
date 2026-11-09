@@ -88,6 +88,10 @@ typedef struct carquet_prebuffer {
 struct carquet_reader {
     FILE* file;
     bool owns_file;
+    /* `file` is a regular disk file this reader opened itself: page reads use
+     * positional I/O (carquet_file_pread) instead of fseek+fread, so column
+     * readers of one file can load pages from several threads at once. */
+    bool positional_io;
 
     /* Memory-mapped data */
     const uint8_t* mmap_data;
@@ -170,12 +174,22 @@ struct carquet_column_reader {
     bool page_loaded;           /* Is a page currently loaded? */
     int32_t page_num_values;    /* Total values in current page */
     int32_t page_values_read;   /* Values already read from current page */
-    int32_t dense_cursor_pos;   /* page_values_read at which dense_cursor_val is valid */
+    int32_t dense_cursor_pos;   /* page_values_read at which dense_cursor_val is valid; -1 after a page change */
     int32_t dense_cursor_val;   /* present values before dense_cursor_pos (OPTIONAL columns) */
     int32_t page_header_size;   /* Size of current page header */
     int32_t page_compressed_size; /* Size of current page compressed data */
     uint8_t* decoded_values;    /* Buffer for decoded values from current page */
-    int16_t* decoded_def_levels; /* Buffer for decoded definition levels */
+    int16_t* decoded_def_levels; /* Buffer for decoded definition levels
+                                  * (NULL for carquet_column_def_as_bits()
+                                  * columns, see decoded_def_bits) */
+    uint8_t* decoded_def_bits;   /* Flat max_def == 1 columns: the page's
+                                  * definition levels as a validity bitmap,
+                                  * bit i (LSB first) = level i == 1. The 1-bit
+                                  * level stream already is that bitmap, so it
+                                  * is decoded straight into it; int16 levels
+                                  * are only expanded for a caller asking for
+                                  * them (carquet_read_next_page). */
+    size_t def_bits_capacity;    /* Bytes behind decoded_def_bits */
     int16_t* decoded_rep_levels; /* Buffer for decoded repetition levels */
     size_t decoded_capacity;    /* Capacity of decoded buffers, in values */
     size_t decoded_value_size;  /* Per-value byte width the values buffer was
@@ -209,6 +223,51 @@ struct carquet_column_reader {
  * Internal Functions
  * ============================================================================
  */
+
+/**
+ * Whether the column reader decodes its pages' definition levels into a
+ * validity bitmap (decoded_def_bits) instead of int16 levels: flat columns
+ * whose only levels are 0/1 definition levels (max_def == 1, max_rep == 0),
+ * i.e. top-level nullable columns.
+ */
+static inline bool carquet_column_def_as_bits(const carquet_column_reader_t* reader) {
+    return reader->max_def_level == 1 && reader->max_rep_level == 0;
+}
+
+/**
+ * Bits [at, at + n) of an LSB-first bitmap as a word (bit 0 = bit `at`),
+ * 1 <= n <= 64. Reads only the bytes covering the range.
+ */
+static inline uint64_t carquet_bitmap_load_bits(const uint8_t* bm, int64_t at, int n) {
+    const uint8_t* p = bm + (at >> 3);
+    unsigned s = (unsigned)(at & 7);
+    int nbytes = (int)((s + (unsigned)n + 7) >> 3);   /* 1..9 */
+    uint64_t w = 0;
+    if (nbytes >= 8) {
+        for (int b = 0; b < 8; b++) w |= (uint64_t)p[b] << (8 * b);
+        w >>= s;
+        if (nbytes == 9) w |= (uint64_t)p[8] << (64 - s);   /* s >= 1 here */
+    } else {
+        for (int b = 0; b < nbytes; b++) w |= (uint64_t)p[b] << (8 * b);
+        w >>= s;
+    }
+    if (n < 64) w &= ((uint64_t)1 << n) - 1;
+    return w;
+}
+
+/** Set bits of bm[start, start + n). */
+int64_t carquet_bitmap_count_range(const uint8_t* bm, int64_t start, int64_t n);
+
+/**
+ * Copy bits src[src_at, src_at + n) to dst[dst_at, ...). The bits of dst
+ * from dst_at on must be zero; only the bytes covering the range are
+ * written and only the bytes covering the source range are read.
+ */
+void carquet_bitmap_copy_range(uint8_t* dst, int64_t dst_at,
+                               const uint8_t* src, int64_t src_at, int64_t n);
+
+/** out[i] = bit (start + i) of bm, as a 0/1 level, for i < n. */
+void carquet_bitmap_to_levels(const uint8_t* bm, int64_t start, int64_t n, int16_t* out);
 
 /**
  * Build schema structure from parsed metadata.
@@ -380,6 +439,50 @@ struct carquet_worker_pool* carquet_row_batch_pool(const carquet_row_batch_t* ba
  * children, every other child is released. Implemented in arrow_c_read.c. */
 carquet_status_t carquet_arrow_schema_select_children(
     struct ArrowSchema* schema, const int32_t* keep, int32_t n);
+
+/* Row predicates for the Arrow stream (arrow_filter.c). `top_elems[0..ntop)`
+ * are the schema element indices of the batch's top-level fields, in batch
+ * order; every clause column must sit under one of them, with no LIST / MAP
+ * ancestor. */
+typedef struct carquet_compiled_predicate carquet_compiled_predicate_t;
+carquet_status_t carquet_predicate_compile(
+    const carquet_reader_t* reader, const carquet_predicate_t* pred,
+    const int32_t* top_elems, int32_t ntop,
+    carquet_compiled_predicate_t** out, carquet_error_t* error);
+void carquet_predicate_free(carquet_compiled_predicate_t* p);
+/* Statistics say some row of `rg` may match (`pred` is the uncompiled form). */
+bool carquet_predicate_row_group_might_match(const carquet_compiled_predicate_t* p,
+                                             const carquet_predicate_t* pred,
+                                             const carquet_reader_t* r, int32_t rg);
+/* Page-filter clauses (owned by `p`): the single conjunction's prunable ones;
+ * *count is 0 for several conjunctions. */
+const carquet_filter_clause_t* carquet_predicate_page_clauses(const carquet_compiled_predicate_t* p,
+                                                              int32_t* count);
+/* Distinct leaf columns the predicate reads (leaves needs room for every clause). */
+void carquet_predicate_columns(const carquet_compiled_predicate_t* p, int32_t* leaves, int32_t* n);
+/* keep[i] = row i of `batch` (a top-level struct array) matches; *kept = count. */
+carquet_status_t carquet_predicate_select(const carquet_compiled_predicate_t* p,
+                                          const struct ArrowArray* batch,
+                                          uint8_t* keep, int64_t* kept);
+/* "ARROW:schema" restore (arrow_restore.c). carquet_restore_plan() sets the
+ * footer key/value metadata on `schema` (a top-level struct of exported
+ * fields) and, with `restore`, rewrites its types to the stored ones; *plan
+ * is NULL when the batches need no conversion. */
+typedef struct carquet_restore_plan carquet_restore_plan_t;
+carquet_status_t carquet_arrow_stored_schema(const char* b64, struct ArrowSchema* out);
+carquet_status_t carquet_restore_plan(const carquet_reader_t* reader, bool restore,
+                                      struct ArrowSchema* schema, carquet_restore_plan_t** plan);
+carquet_status_t carquet_restore_apply(const carquet_restore_plan_t* plan, struct ArrowArray* batch);
+void carquet_restore_free(carquet_restore_plan_t* plan);
+
+/* An owned array of `len` nulls of `schema`'s type (arrow_filter.c). */
+carquet_status_t carquet_arrow_null_array(const struct ArrowSchema* schema, int64_t len, struct ArrowArray* out);
+
+/* New owned array with rows `rows[0..n)` of `in` (logical indices, ascending
+ * not required). Formats: struct, list / large list, map, null, bool,
+ * fixed-width primitives, utf8 / binary (+ large). */
+carquet_status_t carquet_arrow_take(const struct ArrowArray* in, const struct ArrowSchema* schema,
+                                    const int64_t* rows, int64_t n, struct ArrowArray* out);
 
 #ifdef __cplusplus
 }

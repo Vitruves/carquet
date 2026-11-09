@@ -32,9 +32,12 @@ __all__ = [
 
 
 def _copy(ptr: Optional[int], size: int) -> Optional[bytes]:
+    # A zero-length value (an empty string minimum) may come with a NULL pointer.
+    if size == 0:
+        return b""
     if not ptr or size < 0:
         return None
-    return ctypes.string_at(ptr, size) if size else b""
+    return ctypes.string_at(ptr, size)
 
 
 # --------------------------------------------------------------------------
@@ -60,25 +63,31 @@ class Statistics:
 
     @property
     def min(self) -> Any:
+        """Smallest value of the chunk, decoded with the column's type (``str``, ``datetime``, ``Decimal``...); None when the file stores no min/max."""
         return decode_value(self.min_raw, self.column) if self.has_min_max else None
 
     @property
     def max(self) -> Any:
+        """Largest value of the chunk, decoded with the column's type; None when the file stores no min/max."""
         return decode_value(self.max_raw, self.column) if self.has_min_max else None
 
     @property
     def has_null_count(self) -> bool:
+        """True when the file stores the number of nulls (``null_count`` is then not None)."""
         return self.null_count is not None
 
     @property
     def has_distinct_count(self) -> bool:
+        """True when the file stores the number of distinct values (``distinct_count`` is then not None)."""
         return self.distinct_count is not None
 
     @property
     def physical_type(self) -> str:
+        """Parquet physical type of the column (``"INT64"``, ``"BYTE_ARRAY"``...)."""
         return self.column.physical_type
 
     def to_dict(self) -> dict:
+        """The statistics as a plain dict."""
         return {
             "has_min_max": self.has_min_max,
             "min": self.min,
@@ -136,6 +145,7 @@ class ColumnChunkMetaData:
 
     @property
     def path_in_schema(self) -> str:
+        """Dotted path of the column (``"address.city"``)."""
         return self.column.path
 
     @property
@@ -145,6 +155,7 @@ class ColumnChunkMetaData:
 
     @property
     def has_dictionary_page(self) -> bool:
+        """True when the chunk is dictionary-encoded (it starts with a dictionary page)."""
         return self.dictionary_page_offset is not None
 
     @property
@@ -155,6 +166,7 @@ class ColumnChunkMetaData:
         return self.total_uncompressed_size / self.total_compressed_size
 
     def to_dict(self) -> dict:
+        """The chunk metadata as a plain dict (statistics included)."""
         d = {
             "path_in_schema": self.path_in_schema,
             "physical_type": self.physical_type,
@@ -242,10 +254,12 @@ class RowGroupMetaData:
 
     @property
     def num_columns(self) -> int:
+        """Number of leaf columns."""
         return len(self._columns)
 
     @property
     def columns(self) -> list:
+        """One :class:`ColumnChunkMetaData` per leaf column, in schema order."""
         return list(self._columns)
 
     def column(self, key: Union[int, str]) -> ColumnChunkMetaData:
@@ -264,6 +278,7 @@ class RowGroupMetaData:
         return len(self._columns)
 
     def to_dict(self) -> dict:
+        """The row group metadata as a plain dict (its column chunks included)."""
         return {
             "num_rows": self.num_rows,
             "num_columns": self.num_columns,
@@ -309,17 +324,21 @@ class FileMetaData:
 
     @property
     def num_row_groups(self) -> int:
+        """Number of row groups in the file."""
         return len(self._row_groups)
 
     @property
     def num_columns(self) -> int:
+        """Number of leaf columns."""
         return len(self.schema)
 
     @property
     def row_groups(self) -> list:
+        """Every :class:`RowGroupMetaData`, in file order."""
         return list(self._row_groups)
 
     def row_group(self, i: int) -> RowGroupMetaData:
+        """The :class:`RowGroupMetaData` of row group ``i`` (negative indices count from the end). Raises ``IndexError`` when out of range."""
         if not -len(self._row_groups) <= i < len(self._row_groups):
             raise IndexError(f"row group {i} out of range (file has {len(self._row_groups)})")
         return self._row_groups[i]
@@ -330,6 +349,7 @@ class FileMetaData:
         return self.key_value_metadata
 
     def to_dict(self) -> dict:
+        """The whole footer as a plain dict (handy with ``json.dumps(..., default=str)``)."""
         return {
             "num_rows": self.num_rows,
             "num_row_groups": self.num_row_groups,
@@ -374,10 +394,12 @@ class PageStatistics:
 
     @property
     def min(self) -> Any:
+        """Smallest value of the page, decoded with the column's type; None for a page of nulls only."""
         return None if self.is_null_page else decode_value(self.min_raw, self.column)
 
     @property
     def max(self) -> Any:
+        """Largest value of the page, decoded with the column's type; None for a page of nulls only."""
         return None if self.is_null_page else decode_value(self.max_raw, self.column)
 
     def __repr__(self) -> str:
@@ -402,6 +424,7 @@ class ColumnIndex:
 
     @property
     def num_pages(self) -> int:
+        """Number of data pages described."""
         return len(self.pages)
 
     def __repr__(self) -> str:
@@ -460,6 +483,7 @@ class OffsetIndex:
 
     @property
     def num_pages(self) -> int:
+        """Number of data pages described."""
         return len(self.pages)
 
     def __repr__(self) -> str:
@@ -500,6 +524,7 @@ class BloomFilter:
         self.column = column
 
     def might_contain(self, value: Any) -> bool:
+        """False when ``value`` is certainly not in the column chunk, True when it may be (``value in bloom_filter`` does the same)."""
         if not self._handle:
             raise ValueError("bloom filter is closed")
         lib = _ffi.get_lib()
@@ -528,6 +553,7 @@ class BloomFilter:
         return int(_ffi.get_lib().carquet_bloom_filter_size(self._handle)) if self._handle else 0
 
     def close(self) -> None:
+        """Free the filter (also done when the object is garbage-collected)."""
         h, self._handle = self._handle, None
         if h:
             _ffi.get_lib().carquet_bloom_filter_destroy(h)

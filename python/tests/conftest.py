@@ -7,11 +7,20 @@ import decimal
 
 import pytest
 
-pa = pytest.importorskip("pyarrow")
+try:  # PyArrow is an optional oracle: the tests that compare against it skip without it
+    import pyarrow as pa
+except ImportError:  # pragma: no cover - the pyarrow-free run
+    pa = None
+
+
+def _need_pa():
+    if pa is None:
+        pytest.skip("pyarrow not installed")
 
 
 def make_table(n: int = 1000) -> "pa.Table":
     """A table covering the common flat and nested types."""
+    _need_pa()
     ids = pa.array(range(n), pa.int64())
     values = pa.array([i * 0.5 for i in range(n)], pa.float64())
     names = pa.array([None if i % 7 == 3 else f"name-{i}" for i in range(n)], pa.string())
@@ -33,6 +42,7 @@ def make_table(n: int = 1000) -> "pa.Table":
 
 def make_typed_table(n: int = 200) -> "pa.Table":
     """Logical types that need conversion or ARROW:schema restoration on read."""
+    _need_pa()
     utc = dt.timezone.utc
     return pa.table(
         {
@@ -79,13 +89,14 @@ def written(tmp_path, table):
     return path
 
 
-def assert_tables_equal(actual: "pa.Table", expected: "pa.Table") -> None:
+def assert_tables_equal(actual, expected) -> None:
     """Same schema and values; dictionary columns compare by value (their
-    per-chunk dictionaries may be ordered differently)."""
-    assert actual.schema.equals(expected.schema, check_metadata=False), (actual.schema, expected.schema)
-    assert actual.num_rows == expected.num_rows
-    for name in expected.column_names:
-        a, b = actual.column(name), expected.column(name)
-        if pa.types.is_dictionary(b.type):
-            a, b = a.cast(b.type.value_type), b.cast(b.type.value_type)
-        assert a.equals(b), name
+    per-chunk dictionaries may be ordered differently). Either side may be a
+    carquet or a PyArrow table."""
+    import carquet
+
+    a, b = carquet.table(actual), carquet.table(expected)
+    assert a.schema.equals(b.schema), (a.schema, b.schema)
+    assert a.num_rows == b.num_rows
+    for name in b.column_names:
+        assert a.column(name).equals(b.column(name)), name

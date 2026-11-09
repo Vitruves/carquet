@@ -14,6 +14,29 @@ pq = pytest.importorskip("pyarrow.parquet")
 pc = pytest.importorskip("pyarrow.compute")
 
 
+def to_expression(filters, top_level):
+    """The DNF filter as a pyarrow.compute expression: the oracle carquet's
+    C predicate is checked against."""
+    dnf = carquet.filters.normalize_filters(filters).dnf
+    tops = set(top_level)
+
+    def ref(name):
+        return pc.field(name) if name in tops or "." not in name else pc.field(*name.split("."))
+
+    disj = None
+    for conj in dnf:
+        e = None
+        for col, op, val in conj:
+            f = ref(col)
+            c = {"==": lambda: f == val, "!=": lambda: f != val, "<": lambda: f < val, "<=": lambda: f <= val,
+                 ">": lambda: f > val, ">=": lambda: f >= val, "in": lambda: f.isin(list(val)),
+                 "not in": lambda: ~f.isin(list(val)), "is null": lambda: f.is_null(),
+                 "is not null": lambda: f.is_valid()}[op]()
+            e = c if e is None else (e & c)
+        disj = e if disj is None else (disj | e)
+    return disj
+
+
 @pytest.fixture(scope="module")
 def sorted_file(tmp_path_factory, table):
     path = tmp_path_factory.mktemp("f") / "sorted.parquet"
@@ -44,8 +67,7 @@ FILTERS = [
 
 @pytest.mark.parametrize("filters", FILTERS, ids=[str(f) for f in FILTERS])
 def test_filters_match_pyarrow_compute(sorted_file, table, filters):
-    expr = carquet.filters.normalize_filters(filters).to_expression(table.column_names)
-    expected = table.filter(expr)
+    expected = table.filter(to_expression(filters, table.column_names))
     out = carquet.read_table(sorted_file, filters=filters)
     assert out.equals(expected)
     # projection that does not include the filter columns
@@ -53,9 +75,9 @@ def test_filters_match_pyarrow_compute(sorted_file, table, filters):
     assert out.column_names == ["value"]
     assert out.column("value").equals(expected.column("value"))
     # streaming
-    batches = list(carquet.iter_batches(sorted_file, 64, columns=["id"], filters=filters))
-    got = pa.Table.from_batches(batches, schema=pa.schema([table.schema.field("id")])) if batches else None
-    assert (got.column("id").to_pylist() if got else []) == expected.column("id").to_pylist()
+    ids = [i for b in carquet.iter_batches(sorted_file, 64, columns=["id"], filters=filters)
+           for i in b.column("id").to_pylist()]
+    assert ids == expected.column("id").to_pylist()
 
 
 def test_row_group_pruning(sorted_file):
@@ -88,16 +110,15 @@ def test_typed_filter_values(tmp_path):
         assert pf.filter_row_groups([("u", "==", 42)]) == [4]
         out = pf.read(filters=[("dec", "<", decimal.Decimal("0.3"))])
         assert out.column("dec").to_pylist() == [decimal.Decimal("0.0"), decimal.Decimal("0.1"), decimal.Decimal("0.2")]
-        # a value of the wrong type cannot be pushed down; the exact filter reports it
-        with pytest.raises(pa.ArrowException):
+        # a value of the wrong type is an error
+        with pytest.raises(TypeError):
             pf.read(filters=[("d", "==", "not a date")])
 
 
-def test_expression_filter(sorted_file, table):
-    expr = (pc.field("id") < 205) & (pc.field("value") > 100)
-    out = carquet.read_table(sorted_file, columns=["id"], filters=expr)
-    assert out.column_names == ["id"]
-    assert out.column("id").to_pylist() == [201, 202, 203, 204]
+def test_expression_filter_rejected(sorted_file):
+    """pyarrow.compute expressions need PyArrow: carquet takes the DNF form only."""
+    with pytest.raises(TypeError):
+        carquet.read_table(sorted_file, filters=pc.field("id") < 205)
 
 
 def test_invalid_filters(sorted_file):
@@ -127,7 +148,7 @@ def test_pyarrow_file_filters(tmp_path, table):
     pq.write_table(table, path, row_group_size=128, write_page_index=True, data_page_size=512)
     expected_table = pq.read_table(path)
     for f in FILTERS:
-        expr = carquet.filters.normalize_filters(f).to_expression(table.column_names)
+        expr = to_expression(f, table.column_names)
         assert carquet.read_table(path, filters=f).equals(expected_table.filter(expr)), f
 
 
@@ -135,8 +156,7 @@ def test_pyarrow_file_filters(tmp_path, table):
 def _check(tmp_path, table, filters, **write_opts):
     path = tmp_path / "p.parquet"
     carquet.write_table(table, path, write_page_index=True, max_rows_per_page=2, row_group_size=4, **write_opts)
-    expr = carquet.filters.normalize_filters(filters).to_expression(table.column_names)
-    expected = table.filter(expr)
+    expected = table.filter(to_expression(filters, table.column_names))
     got = carquet.read_table(path, filters=filters)
     assert repr(got.to_pylist()) == repr(expected.to_pylist()), filters  # repr: NaN-aware
 

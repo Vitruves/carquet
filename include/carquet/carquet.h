@@ -199,13 +199,13 @@ extern "C" {
 #define CARQUET_VERSION_MAJOR 0
 
 /** @brief Minor version number */
-#define CARQUET_VERSION_MINOR 7
+#define CARQUET_VERSION_MINOR 8
 
 /** @brief Patch version number */
-#define CARQUET_VERSION_PATCH 3
+#define CARQUET_VERSION_PATCH 0
 
 /** @brief Version string in "MAJOR.MINOR.PATCH" format */
-#define CARQUET_VERSION_STRING "0.7.3"
+#define CARQUET_VERSION_STRING "0.8.0"
 
 /** @brief Numeric version for compile-time comparisons: (MAJOR * 10000 + MINOR * 100 + PATCH) */
 #define CARQUET_VERSION_NUMBER (CARQUET_VERSION_MAJOR * 10000 + CARQUET_VERSION_MINOR * 100 + CARQUET_VERSION_PATCH)
@@ -662,6 +662,12 @@ void carquet_schema_free(carquet_schema_t* schema);
  * @param[in] parent_index Parent group index (0 for root level, or index from add_group)
  * @return CARQUET_OK on success, error code on failure
  *
+ * Elements are stored in Parquet's depth-first order, so a group must be
+ * filled before a sibling of it is added: once a group's subtree has been
+ * followed by another element outside it, adding to that group returns
+ * CARQUET_ERROR_INVALID_ARGUMENT (the same rule applies to every
+ * carquet_schema_add_* function).
+ *
  * @note Thread-safe: No (schema is mutable during construction)
  *
  * @par Physical Types
@@ -707,7 +713,8 @@ carquet_status_t carquet_schema_add_column(
  * @param[in] name Group name
  * @param[in] repetition Field repetition level
  * @param[in] parent_index Parent group index (0 for root level)
- * @return Index of new group (>= 0), or -1 on error
+ * @return Index of new group (>= 0), or -1 on error (including a parent
+ *         that is already closed, see carquet_schema_add_column())
  *
  * @note Thread-safe: No
  *
@@ -3210,6 +3217,7 @@ typedef enum carquet_filter_op {
     CARQUET_FILTER_IN,           /**< value membership; values + value_count */
     CARQUET_FILTER_IS_NULL,
     CARQUET_FILTER_IS_NOT_NULL,
+    CARQUET_FILTER_NOT_IN,       /**< not a member of values; predicates only (carquet_predicate_t), not page filters */
 } carquet_filter_op_t;
 
 /**
@@ -3816,6 +3824,13 @@ carquet_status_t carquet_writer_get_buffer(
  * carquet_arrow_export_batch() covers what a row batch can represent — flat
  * columns plus single-level LIST<T> and MAP<K,V>; STRUCT and deeper nesting
  * there return CARQUET_ERROR_NOT_IMPLEMENTED (use carquet_reader_read_arrow()).
+ * carquet_reader_export_arrow_stream() streams a file as an ArrowArrayStream,
+ * through whichever of the two paths its fields need.
+ *
+ * Types (v0.8.0) follow pyarrow.parquet: DECIMAL is exported as decimal128
+ * (precision <= 38) or decimal256 (<= 76) whatever its physical type, INT96 as
+ * timestamp[ns]. Other logical types Arrow has no lossless equivalent for
+ * (UUID, INTERVAL, GEOMETRY, ...) keep their physical storage type.
  *
  * Ownership:
  * - Export (carquet_arrow_export_*): Carquet allocates and owns every buffer,
@@ -3866,6 +3881,21 @@ struct ArrowArray {
 };
 
 #endif /* ARROW_C_DATA_INTERFACE */
+
+/* Arrow C Stream Interface ABI (verbatim from the specification), guarded the
+ * same way. */
+#ifndef ARROW_C_STREAM_INTERFACE
+#define ARROW_C_STREAM_INTERFACE
+
+struct ArrowArrayStream {
+    int (*get_schema)(struct ArrowArrayStream*, struct ArrowSchema* out);
+    int (*get_next)(struct ArrowArrayStream*, struct ArrowArray* out);
+    const char* (*get_last_error)(struct ArrowArrayStream*);
+    void (*release)(struct ArrowArrayStream*);
+    void* private_data;
+};
+
+#endif /* ARROW_C_STREAM_INTERFACE */
 
 /**
  * @brief Export a flat Carquet schema as an Arrow C Data Interface schema.
@@ -3992,6 +4022,21 @@ carquet_status_t carquet_writer_write_arrow(
     carquet_error_t* error);
 
 /**
+ * @brief Record @p schema (the Arrow schema of the data being written) as the
+ *        file's "ARROW:schema" footer entry, plus its key/value metadata.
+ *
+ * Readers that restore Arrow types (pyarrow.parquet, the Arrow stream with
+ * `restore_arrow_schema`) then get the original types back: time zones,
+ * large / view / dictionary types, durations, the null type, child names,
+ * field metadata. Replaces an earlier "ARROW:schema" entry; the schema is not
+ * consumed.
+ * @return CARQUET_OK, CARQUET_ERROR_NOT_IMPLEMENTED for a type with no Arrow
+ *         IPC form, CARQUET_ERROR_OUT_OF_MEMORY.
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT
+carquet_status_t carquet_writer_set_arrow_schema(carquet_writer_t* writer, const struct ArrowSchema* schema);
+
+/**
  * @brief Read one Parquet row group directly into a nested Arrow C Data array.
  *
  * Reassembles the row group as a top-level Arrow struct array whose children
@@ -4052,6 +4097,237 @@ carquet_status_t carquet_reader_read_arrow_fields(
     struct ArrowSchema* out_schema,
     struct ArrowArray* out_array,
     carquet_error_t* error);
+
+/**
+ * @brief A row predicate in disjunctive normal form: an OR of conjunctions,
+ *        each an AND of clauses.
+ *
+ * The first `conjunction_sizes[0]` entries of `clauses` form the first
+ * conjunction, the next `conjunction_sizes[1]` the second, and so on. Values
+ * are encoded as for page filters (carquet_filter_clause_t: the column's
+ * physical representation; a non-zero `value_size` / `lo_size` / `hi_size` for a
+ * fixed-width column must equal its width). A clause may name any leaf column that is not
+ * inside a LIST or MAP; the filter evaluates it on the value the column
+ * exports to Arrow, so a DECIMAL compares numerically, INT96 by instant,
+ * strings and binary bytewise, unsigned integers unsigned.
+ *
+ * Semantics (those of pyarrow / Arrow compute): a comparison, IN or NOT_IN on
+ * a null value is false; IS_NULL / IS_NOT_NULL test for a null; floating-point
+ * comparisons follow IEEE 754 (NaN equals nothing, NE is true for NaN), except
+ * that IN / NOT_IN treat NaN as a member of a set containing NaN.
+ */
+typedef struct carquet_predicate {
+    const carquet_filter_clause_t* clauses;
+    const int32_t* conjunction_sizes;
+    int32_t num_conjunctions;
+} carquet_predicate_t;
+
+/**
+ * @brief Options for carquet_reader_export_arrow_stream().
+ *
+ * Initialise with carquet_arrow_stream_options_init().
+ */
+typedef struct carquet_arrow_stream_options {
+    /** Top-level field ordinals to read, in output order, without duplicates;
+     *  NULL or num_fields <= 0 reads every field. */
+    const int32_t* field_indices;
+    int32_t num_fields;
+    /** Maximum rows per batch (default 65536). Applies when every selected
+     *  field is a non-repeated primitive; a selection with a LIST, MAP or
+     *  STRUCT field is read one row group per batch. */
+    int32_t batch_size;
+    /** Decoder threads, 0 for one per core (default 0). */
+    int32_t num_threads;
+    /** When true, releasing the stream also closes the reader (default false). */
+    bool close_reader;
+    /** Row groups to read, in this order, without duplicates; NULL or
+     *  num_row_groups <= 0 reads them all in file order. */
+    const int32_t* row_groups;
+    int32_t num_row_groups;
+    /** Window of file rows [row_offset, row_offset + row_limit) to return;
+     *  row_limit < 0 reads to the end (default 0 / -1: every row). Not
+     *  combined with `row_groups`. */
+    int64_t row_offset;
+    int64_t row_limit;
+    /** Rows to keep (NULL keeps every row); see carquet_predicate_t. Copied:
+     *  the caller's clauses need not outlive the call. */
+    const carquet_predicate_t* predicate;
+    /** Apply the Arrow types stored in the footer's "ARROW:schema" entry, as
+     *  pyarrow.parquet does (time zones, large / view / dictionary types,
+     *  durations, date64, second units, the null type, fixed-size lists,
+     *  decimal widths, child names, field metadata); types it cannot reach
+     *  from the exported one stay as exported (default false). The footer
+     *  key/value metadata is always the schema metadata. */
+    bool restore_arrow_schema;
+} carquet_arrow_stream_options_t;
+
+/** @brief Initialise @p options with the defaults. */
+CARQUET_API CARQUET_NONNULL(1)
+void carquet_arrow_stream_options_init(carquet_arrow_stream_options_t* options);
+
+/**
+ * @brief Stream a file as an Arrow C Stream Interface `ArrowArrayStream`.
+ *
+ * Each batch is a top-level struct array whose children are the selected
+ * fields, typed as by carquet_reader_read_arrow(); get_schema() describes it.
+ * Batches never span row groups. A selection of primitives and single-level
+ * LIST / MAP of primitives is read through the batch reader (parallel decode;
+ * up to `batch_size` rows per batch when no field is repeated, else one row
+ * group per batch); one with any other field (STRUCT, deeper nesting) is
+ * assembled one row group per batch.
+ *
+ * With a predicate, row groups whose statistics rule every conjunction out are
+ * skipped, pages are pruned through the page index when the predicate is a
+ * single conjunction on batch-readable columns (and the file has one), and
+ * every batch is then filtered exactly; batches with no rows left are not
+ * returned. Columns the predicate needs are read and dropped.
+ *
+ * Every exported array outlives the stream. The reader must stay open until
+ * the stream is released, unless `close_reader` hands it to the stream; it
+ * must not be used by another thread while the stream reads from it. The
+ * stream's callbacks return 0, or an errno value (EINVAL, ENOMEM, EIO) with the
+ * message available from get_last_error().
+ *
+ * @param[in] reader Open reader.
+ * @param[in] options Options (NULL for the defaults).
+ * @param[out] out Stream to populate; the caller must call `out->release(out)`.
+ * @param[out] error Error details (may be NULL).
+ * @return CARQUET_OK, CARQUET_ERROR_INVALID_ARGUMENT for an out-of-range or
+ *         duplicate field index or row group, `row_groups` with a row window,
+ *         or a malformed predicate (unknown column, column inside a LIST or
+ *         MAP, wrong value size), or an error creating the reader. On error
+ *         @p out is left released and, with `close_reader`, the reader is
+ *         still the caller's.
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT
+carquet_status_t carquet_reader_export_arrow_stream(
+    carquet_reader_t* reader,
+    const carquet_arrow_stream_options_t* options,
+    struct ArrowArrayStream* out,
+    carquet_error_t* error);
+
+/**
+ * @brief Row groups whose statistics do not rule @p predicate out.
+ *
+ * Writes up to @p max_matching row-group indices (ascending) to @p matching.
+ * @return the number of such row groups (possibly more than max_matching),
+ *         or a negated carquet_status_t for a malformed predicate.
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT
+int32_t carquet_reader_predicate_row_groups(const carquet_reader_t* reader, const carquet_predicate_t* predicate,
+                                            int32_t* matching, int32_t max_matching, carquet_error_t* error);
+
+/**
+ * @brief Shared ownership of an exported Arrow array.
+ *
+ * carquet_arrow_ref_create() takes over @p array (moved: its `release` is set
+ * to NULL). carquet_arrow_ref_export() then produces, as often as needed, an
+ * independent ArrowArray that views the same buffers (rows
+ * [offset, offset + length), length < 0 for all) and that the receiver
+ * releases on its own; the data is freed once the ref and every export are
+ * released, from any thread. For bindings that keep a table and hand it to
+ * several consumers.
+ */
+typedef struct carquet_arrow_ref carquet_arrow_ref_t;
+
+/** @return the ref, or NULL (out of memory, or @p array already released). */
+CARQUET_API
+carquet_arrow_ref_t* carquet_arrow_ref_create(struct ArrowArray* array);
+
+/** @brief The array the ref holds, for reading (do not release or modify it). */
+CARQUET_API
+const struct ArrowArray* carquet_arrow_ref_array(const carquet_arrow_ref_t* ref);
+
+/** @return CARQUET_OK, or CARQUET_ERROR_INVALID_ARGUMENT for an offset
+ *          outside the array, CARQUET_ERROR_OUT_OF_MEMORY. */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT
+carquet_status_t carquet_arrow_ref_export(carquet_arrow_ref_t* ref, int64_t offset,
+                                          int64_t length, struct ArrowArray* out);
+
+/** @brief As carquet_arrow_ref_export(), for child @p child of the held
+ *  (struct) array alone: rows [offset, offset + length) of the parent, the
+ *  parent's own offset applied. */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT
+carquet_status_t carquet_arrow_ref_export_child(carquet_arrow_ref_t* ref, int32_t child,
+                                                int64_t offset, int64_t length, struct ArrowArray* out);
+
+/** @brief As carquet_arrow_ref_export(), keeping only children
+ *  children[0..n) of the held (struct) array, in that order. */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT
+carquet_status_t carquet_arrow_ref_export_select(carquet_arrow_ref_t* ref, const int32_t* children,
+                                                 int32_t n, int64_t offset, int64_t length,
+                                                 struct ArrowArray* out);
+
+/** @brief Drop the caller's reference (NULL is accepted). */
+CARQUET_API
+void carquet_arrow_ref_release(carquet_arrow_ref_t* ref);
+
+/**
+ * @brief Keep children keep[0..n) of a top-level struct schema, in that order,
+ *        releasing the others. For schemas carquet produced or copied
+ *        (children allocated with malloc).
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT
+carquet_status_t carquet_arrow_schema_select(struct ArrowSchema* schema, const int32_t* keep, int32_t n);
+
+/** @brief Deep copy of child @p child of @p src. */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT
+carquet_status_t carquet_arrow_schema_copy_child(const struct ArrowSchema* src, int32_t child,
+                                                 struct ArrowSchema* out);
+
+/**
+ * @brief An ArrowArrayStream over arrays already in memory: @p schema and
+ *        arrays[0..n) are moved into the stream (their `release` set to NULL),
+ *        which returns them in order.
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT
+carquet_status_t carquet_arrow_stream_from_arrays(struct ArrowSchema* schema, struct ArrowArray* arrays,
+                                                  int64_t n, struct ArrowArrayStream* out);
+
+/**
+ * @brief Build an ArrowArray from caller memory (for bindings): each of the
+ *        @p n_buffers buffers (NULL for an absent one) is copied (sizes[i]
+ *        bytes); @p children and @p dictionary (may be NULL) are moved in.
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT
+carquet_status_t carquet_arrow_array_build(int64_t length, int64_t null_count, int32_t n_buffers,
+                                           const void* const* buffers, const int64_t* sizes,
+                                           int32_t n_children, struct ArrowArray* children,
+                                           struct ArrowArray* dictionary, struct ArrowArray* out);
+
+/**
+ * @brief Build an ArrowSchema node: @p format, @p name and @p metadata (an
+ *        Arrow metadata blob, may be NULL) are copied; @p children and
+ *        @p dictionary (may be NULL) are moved in.
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT
+carquet_status_t carquet_arrow_schema_build(const char* format, const char* name, int64_t flags,
+                                            const char* metadata, int32_t n_children,
+                                            struct ArrowSchema* children, struct ArrowSchema* dictionary,
+                                            struct ArrowSchema* out);
+
+/**
+ * @brief Arrow PyCapsule support for bindings.
+ *
+ * carquet_arrow_capsule_init() takes the interpreter's PyCapsule_GetPointer
+ * (as a void*). A capsule's struct is then allocated with
+ * carquet_arrow_struct_alloc() and the capsule created with the matching
+ * destructor below, which releases the struct (unless a consumer moved it)
+ * and frees it without running interpreter code.
+ */
+CARQUET_API void carquet_arrow_capsule_init(void* get_pointer);
+CARQUET_API void* carquet_arrow_struct_alloc(size_t size);
+CARQUET_API void carquet_arrow_schema_capsule_destructor(void* capsule);
+CARQUET_API void carquet_arrow_array_capsule_destructor(void* capsule);
+CARQUET_API void carquet_arrow_stream_capsule_destructor(void* capsule);
+
+/**
+ * @brief Deep copy of an Arrow schema; the copy is the caller's to release.
+ * @return CARQUET_OK, CARQUET_ERROR_INVALID_ARGUMENT for a released or
+ *         malformed schema, CARQUET_ERROR_OUT_OF_MEMORY.
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT
+carquet_status_t carquet_arrow_schema_copy(const struct ArrowSchema* src, struct ArrowSchema* out);
 
 /* ============================================================================
  * C++ Compatibility - End

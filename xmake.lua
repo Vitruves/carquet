@@ -11,7 +11,7 @@
 -- Enable optional pieces individually, e.g. `xmake f --tests=y --fuzz=y`.
 
 set_project("carquet")
-set_version("0.7.3")
+set_version("0.8.0")
 -- gnu11, not strict c11: matches CMake's `set(CMAKE_C_STANDARD 11)` (GNU
 -- extensions stay on by default). Under strict -std=c11 the POSIX feature-test
 -- macros are off, so functions like strdup/posix_memalign aren't declared and
@@ -168,7 +168,9 @@ end
 -- To link the host's system libraries instead (like CMake's find_package path),
 -- drop {system = false} — xmake then prefers an installed zstd/zlib/lz4.
 add_requires("zstd 1.5.6", {system = false, configs = {shared = false}})
-add_requires("zlib 1.3.1", {system = false, configs = {shared = false}})
+-- zlib 1.4 (security fixes, #40) is not in xmake-repo yet: "v1.4" resolves
+-- through the package's git URL to the upstream tag (static, same sources).
+add_requires("zlib v1.4", {system = false, configs = {shared = false}})
 add_requires("lz4 1.10.0", {system = false, configs = {shared = false}})
 if has_config("brotli") then
     add_requires("brotli 1.1.0", {system = false, configs = {shared = false}})
@@ -398,14 +400,14 @@ if want("tests") then
         "test_production", "test_maturity", "test_large_schema",
         "test_edge_encodings", "test_edge_compression", "test_edge_malformed",
         "test_edge_boundaries", "test_edge_io", "test_nested",
-        "test_bloom_page_index", "test_mmap", "test_advanced_api",
+        "test_bloom_page_index", "test_mmap", "test_advanced_api", "test_dictionary_fallback",
         "test_encoding_roundtrip", "test_writer_extensions", "test_bitunpack_wide",
-        "test_page_filter", "test_append", "test_row_range", "test_dict_decode",
+        "test_page_filter", "test_append", "test_row_range", "test_batch_pipeline", "test_dict_decode",
         "test_decimal_stats", "test_arrow_dictionary", "test_snappy_diag", "test_parallel_write",
         "test_float16", "test_geo_wkb", "test_worker_pool", "test_custom_codec",
-        "test_real_world", "test_arrow_c_data", "test_batch_nested",
+        "test_real_world", "test_arrow_c_data", "test_arrow_stream", "test_batch_nested",
         "test_nested_write", "test_arrow_nested", "test_p2_conformance",
-        "test_cli_format", "test_fixes_0_7_2", "test_security_hardening",
+        "test_cli_format", "test_fixes_0_7_2", "test_fixes_0_7_4", "test_fixes_0_8_0", "test_compat_0_8_0", "test_security_hardening",
         "test_fuzz_regressions",
     }
     -- Tests that link extra non-library sources (the CLI helpers live in the
@@ -537,6 +539,7 @@ if has_config("fuzz") then
         "fuzz_roundtrip", "fuzz_writer", "fuzz_page_filter", "fuzz_append",
         "fuzz_arrow_schema", "fuzz_arrow_c_data", "fuzz_nested_write",
         "fuzz_arrow_read", "fuzz_reader_file", "fuzz_arrow_write",
+        "fuzz_arrow_stream",
     }
     for _, f in ipairs(fuzzers) do
         target(f)

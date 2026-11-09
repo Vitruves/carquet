@@ -16,6 +16,7 @@
   --s-arrow: #3987e5;
   --s-pyarrow: #199e70;
   --s-fastparquet: #9085e9;
+  --s-polars: #c48a12;
   --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
   --sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
 }

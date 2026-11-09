@@ -96,6 +96,7 @@ class SchemaElement:
 
     @property
     def depth(self) -> int:
+        """Nesting depth: 1 for a top-level field."""
         return len(self.path)
 
 
@@ -120,6 +121,7 @@ class ColumnSchema:
 
     @property
     def path(self) -> str:
+        """Dotted path of the column (``"address.city"``)."""
         return ".".join(self.parts)
 
     @property
@@ -129,14 +131,17 @@ class ColumnSchema:
 
     @property
     def is_nested(self) -> bool:
+        """True when the column sits inside a struct, list or map."""
         return len(self.parts) > 1
 
     @property
     def precision(self) -> Optional[int]:
+        """Total digits of a DECIMAL column; None otherwise."""
         return self.logical_type.precision if self.logical_type is not None else None
 
     @property
     def scale(self) -> Optional[int]:
+        """Digits after the decimal point of a DECIMAL column; None otherwise."""
         return self.logical_type.scale if self.logical_type is not None else None
 
     def __str__(self) -> str:

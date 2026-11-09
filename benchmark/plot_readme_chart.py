@@ -4,7 +4,7 @@
 Usage: python3 benchmark/plot_readme_chart.py benchmark/bench_<ver>_<os>_<arch>_<date>.json [--version 0.7.3]
                                              [--name bench_10m_m3]
 
-Draws every library present in the JSON (carquet, Arrow C++, PyArrow, fastparquet).
+Draws every library present in the JSON (carquet, Arrow C++, PyArrow, fastparquet, polars).
 """
 import argparse
 import json
@@ -17,12 +17,13 @@ from matplotlib.patches import Patch
 from matplotlib.ticker import FixedLocator, FuncFormatter, MultipleLocator, NullLocator
 
 CODECS = ["none", "snappy", "zstd", "lz4"]
-LIBS = [("carquet", None), ("arrow_cpp", "Arrow C++"), ("pyarrow", "PyArrow"), ("fastparquet", "fastparquet")]
+LIBS = [("carquet", None), ("arrow_cpp", "Arrow C++"), ("pyarrow", "PyArrow"), ("fastparquet", "fastparquet"),
+        ("polars", "polars")]
 THEMES = {
     "light": dict(bg="#fcfcfb", grid="#e6e5df", text="#1a1a19", muted="#8a897f", tick="#5d5c55",
-                  bars=["#2a78d6", "#eb6834", "#1baf7a", "#8e5cd9"]),
+                  bars=["#2a78d6", "#eb6834", "#1baf7a", "#8e5cd9", "#c48a12"]),
     "dark": dict(bg="#1a1a19", grid="#33332f", text="#f0efec", muted="#8f8e85", tick="#c3c2b7",
-                 bars=["#3987e5", "#d95926", "#199e70", "#9d6fe6"]),
+                 bars=["#3987e5", "#d95926", "#199e70", "#9d6fe6", "#dba22e"]),
 }
 
 
@@ -36,11 +37,14 @@ def label(v):
 
 def render(data, version, theme, out):
     t = THEMES[theme]
-    rows = {(r["library"], r["compression"]): r for r in data["results"] if r["rows"] == 10_000_000}
+    # dataset == "large" keeps the opt-in large_nullable configs (also 10M rows) out of the chart
+    rows = {(r["library"], r["compression"]): r for r in data["results"]
+            if r["rows"] == 10_000_000 and r.get("dataset", "large") == "large"}
     libs = [(i, lib, f"carquet {version}" if name is None else f"{name} {data[lib + '_version']}")
             for i, (lib, name) in enumerate(LIBS) if (lib, CODECS[0]) in rows]
     colors = [t["bars"][i] for i, _, _ in libs]
-    step = 0.732 / len(libs)
+    step = (0.732 if len(libs) < 5 else 0.86) / len(libs)
+    value_fs = 7.5 if len(libs) < 5 else 6.2
     iters = data["config"]["bench_iterations"]["large"]
 
     plt.rcParams["font.family"] = "DejaVu Sans"
@@ -64,7 +68,7 @@ def render(data, version, theme, out):
             ax.bar(xs, vals, width=step * 0.9, color=colors[j], zorder=3)
             for x, v in zip(xs, vals):
                 ax.annotate(label(v), (x, v), xytext=(0, 3), textcoords="offset points", ha="center", va="bottom",
-                            fontsize=7.5, color=t["tick"])
+                            fontsize=value_fs, color=t["tick"])
         if log:
             ax.set_yscale("log")
             ax.set_ylim(0.1, max(top * 1.6, 120))

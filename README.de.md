@@ -59,10 +59,10 @@
 
 | | |
 |---|---|
-| ⚡ **Schnell** | Schreibt **2.3–5.9x schneller** als Arrow C++ und liest komprimierte Daten aus ein und derselben Datei **1.5–2.1x schneller** (Apple M3, 10 Mio. Zeilen). Unkomprimiertes Lesen wird in **0.30 ms** direkt aus dem mmap bedient. SIMD für SSE4.2 / AVX2 / AVX-512 / NEON / SVE mit Laufzeit-Dispatch. |
+| ⚡ **Schnell** | Schreibt **2.0–5.6x schneller** als Arrow C++ und liest komprimierte Daten aus ein und derselben Datei **1.5–2.1x schneller** (Apple M3, 10 Mio. Zeilen). Unkomprimiertes Lesen wird in **0.28 ms** direkt aus dem mmap bedient. SIMD für SSE4.2 / AVX2 / AVX-512 / NEON / SVE mit Laufzeit-Dispatch. |
 | 🪶 **Klein** | Reines C11, eine **~500 KB** große Bibliothek (Arrow C++: 50 MB+). Vier Kompressionsabhängigkeiten (zstd, zlib, lz4, brotli), die bei Bedarf automatisch nachgeladen werden. Baut in unter einer Minute mit einem einzigen `make` oder `xmake`. |
 | 📦 **Vollständig** | Alle physischen Typen und Encodings, Snappy / GZIP / LZ4 / ZSTD / Brotli, V1- + V2-Pages, verschachtelte Schemata in beliebiger Tiefe, Bloom-Filter, Page-Indexe, statistikbasiertes Pruning, Append. [Vollständige Matrix ↓](#unterstützte-parquet-funktionen) |
-| 🔗 **Interoperabel** | Dateien werden out of the box von PyArrow, DuckDB und Spark gelesen. Abhängigkeitsfreie [Arrow C Data Interface](docs/reading.md#export-to-arrow-c-data-interface)-Brücke (struct / list / map in beliebiger Tiefe) und eine vollständige [Python-API](#python-api) auf Basis von PyArrow. |
+| 🔗 **Interoperabel** | Dateien werden out of the box von PyArrow, DuckDB und Spark gelesen. Abhängigkeitsfreie [Arrow C Data Interface](docs/reading.md#export-to-arrow-c-data-interface)-Brücke (struct / list / map in beliebiger Tiefe) und eine vollständige [Python-API](#python-api) ohne Abhängigkeiten. |
 | 🛠 **Werkzeuge** | `carquet`-CLI zum Inspizieren, Filtern, Exportieren und Validieren von Dateien, dazu `codegen`, das einen kompilierfertigen C-Reader erzeugt. Ein fertiger [Agent Skill](#ai-coding-agents) für Claude Code und Codex. |
 
 </div>
@@ -92,23 +92,23 @@ Beschleunigung von carquet gegenüber Arrow C++ bei 10 Mio. Zeilen (höher = car
 | | ARM · Apple M3 | | x86 · Windows (Haswell, MSVC) | | x86 · Linux (Xeon D-1531) | |
 |---|---:|---:|---:|---:|---:|---:|
 | **Codec** | **Schreiben** | **Lesen** | **Schreiben** | **Lesen** | **Schreiben** | **Lesen** |
-| snappy | **4.74x** | **1.89x** | **3.39x** | **1.17x** | **1.55x** | **1.25x** |
-| zstd | **5.91x** | **1.77x** | **3.83x** | **1.13x** | **1.31x** | **1.04x** |
-| lz4 | **4.61x** | **1.89x** | **2.96x** | **1.05x** | **1.02x** | 0.83x |
-| none | **2.30x** | **46.3x**\* | **2.10x** | **62.0x**\* | **1.13x** | **40.6x**\* |
+| snappy | **4.77x** | **1.63x** | **3.39x** | **1.17x** | **1.55x** | **1.25x** |
+| zstd | **5.56x** | **1.40x** | **3.83x** | **1.13x** | **1.31x** | **1.04x** |
+| lz4 | **4.62x** | **1.85x** | **2.96x** | **1.05x** | **1.02x** | 0.83x |
+| none | **2.04x** | **52.0x**\* | **2.10x** | **62.0x**\* | **1.13x** | **40.6x**\* |
 
 </div>
 
-<sub>\* mmap-Zero-Copy-Pfad. Apple M3: carquet 0.7.3 vs. Arrow C++ 26.0.1 (2026-11-06). Windows: carquet 0.7.3 vs. Arrow C++ 24.0.0 (2026-11-02). Linux: carquet 0.4.4 vs. Arrow C++ 23.0.1, vor der Writer-Parallelisierung von 0.7.1, seither nicht neu gemessen.</sub>
+<sub>\* mmap-Zero-Copy-Pfad. Apple M3: carquet 0.8.0 vs. Arrow C++ 26.0.1 (2026-11-09). Windows: carquet 0.7.3 vs. Arrow C++ 24.0.0 (2026-11-02). Linux: carquet 0.4.4 vs. Arrow C++ 23.0.1, vor der Writer-Parallelisierung von 0.7.1, seither nicht neu gemessen.</sub>
 
-Komprimiertes Lesen dekodiert jeden einzelnen Wert, und unter Linux und macOS linken beide Bibliotheken dieselben lz4 / zstd des Systems, die Codec-Geschwindigkeit ist also identisch. Der fairste Vergleich ist der **Cross-Read derselben Datei** (beide Bibliotheken lesen exakt dieselbe Datei): carquet ist auf M3 **1.5–2.1x schneller**, unter Linux 1.6–2.6x und auf der Windows-VM 1.04–1.30x, deren kalte Lesezugriffe durch die virtuelle Festplatte begrenzt sind.
+Komprimiertes Lesen dekodiert jeden einzelnen Wert, und unter Linux und macOS linken beide Bibliotheken dieselben lz4 / zstd des Systems, die Codec-Geschwindigkeit ist also identisch. Der fairste Vergleich ist der **Cross-Read derselben Datei** (beide Bibliotheken lesen exakt dieselbe Datei): carquet ist auf M3 **1.5–2.1x schneller** als Arrow C++ (2.0–4.1x schneller als polars), unter Linux 1.6–2.6x und auf der Windows-VM 1.04–1.30x, deren kalte Lesezugriffe durch die virtuelle Festplatte begrenzt sind.
 
 <details>
 <summary><b>Benchmark-Methodik</b></summary>
 
 <br/>
 
-Alle Benchmarks verwenden identische Daten (deterministischer LCG-PRNG), identische Parquet-Einstellungen (kein Dictionary, BYTE_STREAM_SPLIT für Gleitkommazahlen, Page-Prüfsummen, mmap-Lesen) und den getrimmten Median aus 11–51 Iterationen, wobei der Page-Cache des Betriebssystems zwischen Schreib- und Lesephase geleert wird und zwischen den Konfigurationen eine Abkühlpause liegt. Schema: 3 Spalten (INT64, DOUBLE, INT32). Verglichen wird mit dem Low-Level-Parquet-Reader von Arrow C++ (unter Umgehung der Arrow-Table-Materialisierung) und mit PyArrow.
+Alle Benchmarks verwenden identische Daten (deterministischer LCG-PRNG), identische Parquet-Einstellungen (kein Dictionary, BYTE_STREAM_SPLIT für Gleitkommazahlen, Page-Prüfsummen, mmap-Lesen) und den getrimmten Median aus 11–51 Iterationen, wobei der Page-Cache des Betriebssystems zwischen Schreib- und Lesephase geleert wird und zwischen den Konfigurationen eine Abkühlpause liegt. Schema: 3 Spalten (INT64, DOUBLE, INT32). Verglichen wird mit dem Low-Level-Parquet-Reader von Arrow C++ (unter Umgehung der Arrow-Table-Materialisierung), mit PyArrow, mit fastparquet sowie mit dem nativen (Rust-)Reader und -Writer von polars.
 
 Der Page-Cache wird pro Datei geleert: unter Linux mit `posix_fadvise(DONTNEED)`; unter macOS und Windows wird die Datei ohne Caching kopiert (`F_NOCACHE`, `FILE_FLAG_NO_BUFFERING`) und durch die Kopie ersetzt (`benchmark/bench_purge_win32.h`). Unter Windows linkt carquet die selbst gebauten zstd / lz4 und Arrow C++ die von conda-forge, sodass sich die Codec-Geschwindigkeit zwischen beiden leicht unterscheiden kann.
 
@@ -213,7 +213,7 @@ Beide Bibliotheken lesen **dieselbe** Parquet-Datei, der fairste direkte Verglei
 
 <br/>
 
-*Carquet 0.7.3, MacBook Air M3, 16GB RAM, macOS 26.5, Arrow C++ 26.0.1, PyArrow 26.0.1, fastparquet 2026.9.0, ZSTD-Level 1, gemessen am 2026-11-06. Rohbericht: [`benchmark/bench_0.7.3_darwin_arm64_20261106.json`](benchmark/bench_0.7.3_darwin_arm64_20261106.json).*
+*Carquet 0.8.0, MacBook Air M3, 16GB RAM, macOS 26.5, Arrow C++ 26.0.1, PyArrow 26.0.1, fastparquet 2026.9.0, polars 2.1.0, ZSTD-Level 1, gemessen am 2026-11-09 (10M-Zeilen-Konfigurationen aus einem zweiten Lauf am selben Tag: die erste Konfiguration des ersten Laufs war gestört). Rohbericht: [`benchmark/bench_0.8.0_darwin_arm64_20261109.json`](benchmark/bench_0.8.0_darwin_arm64_20261109.json).*
 
 #### 10 Mio. Zeilen vs. Arrow C++
 
@@ -221,10 +221,10 @@ Beide Bibliotheken lesen **dieselbe** Parquet-Datei, der fairste direkte Verglei
 
 | Codec | Carquet Schreiben | Arrow C++ Schreiben | Verh. Schreiben | Carquet Lesen | Arrow C++ Lesen | Verh. Lesen | Größe |
 |-------|--------------|---------|---------|-------------|---------|---------|------|
-| none | **48.8ms** | 112ms | **2.30x** | **0.30ms** | 13.9ms | **46.3x**\* | 200.0MB |
-| snappy | **57.2ms** | 271ms | **4.74x** | **12.6ms** | 23.8ms | **1.89x** | 131.2MB |
-| zstd | **59.7ms** | 353ms | **5.91x** | **19.8ms** | 35.0ms | **1.77x** | 99.9MB |
-| lz4 | **52.4ms** | 241ms | **4.61x** | **9.60ms** | 18.2ms | **1.89x** | 128.7MB |
+| none | **57.7ms** | 117ms | **2.04x** | **0.28ms** | 14.6ms | **52.0x**\* | 190.7MB |
+| snappy | **49.3ms** | 235ms | **4.77x** | **14.0ms** | 22.7ms | **1.63x** | 125.1MB |
+| zstd | **61.0ms** | 339ms | **5.56x** | **20.6ms** | 28.8ms | **1.40x** | 95.3MB |
+| lz4 | **52.9ms** | 244ms | **4.62x** | **9.83ms** | 18.2ms | **1.85x** | 122.7MB |
 
 </div>
 
@@ -236,10 +236,10 @@ Beide Bibliotheken lesen **dieselbe** Parquet-Datei, der fairste direkte Verglei
 
 | Codec | Carquet Schreiben | Arrow C++ Schreiben | Verh. Schreiben | Carquet Lesen | Arrow C++ Lesen | Verh. Lesen |
 |-------|--------------|---------|---------|-------------|---------|---------|
-| none | **6.75ms** | 13.2ms | **1.95x** | **0.07ms** | 1.72ms | **24.6x**\* |
-| snappy | **7.02ms** | 24.0ms | **3.42x** | **1.58ms** | 2.49ms | **1.58x** |
-| zstd | **7.97ms** | 33.6ms | **4.22x** | **2.16ms** | 3.03ms | **1.40x** |
-| lz4 | **6.54ms** | 25.2ms | **3.85x** | **0.97ms** | 1.96ms | **2.02x** |
+| none | **5.87ms** | 12.3ms | **2.10x** | **0.06ms** | 1.59ms | **26.5x**\* |
+| snappy | **7.40ms** | 25.9ms | **3.49x** | **1.30ms** | 2.53ms | **1.95x** |
+| zstd | **8.32ms** | 34.1ms | **4.10x** | **2.36ms** | 3.17ms | **1.34x** |
+| lz4 | **7.70ms** | 25.7ms | **3.34x** | **1.06ms** | 2.15ms | **2.03x** |
 
 </div>
 
@@ -251,10 +251,10 @@ Beide Bibliotheken lesen **dieselbe** Parquet-Datei, der fairste direkte Verglei
 
 | Codec | Carquet Schreiben | Arrow C++ Schreiben | Verh. Schreiben | Carquet Lesen | Arrow C++ Lesen | Verh. Lesen |
 |-------|--------------|---------|---------|-------------|---------|---------|
-| none | **1.08ms** | 1.75ms | **1.62x** | **0.02ms** | 0.24ms | **12.0x**\* |
-| snappy | **1.80ms** | 2.52ms | **1.40x** | **0.36ms** | 0.90ms | **2.50x** |
-| zstd | **1.81ms** | 3.60ms | **1.99x** | **0.63ms** | 1.30ms | **2.06x** |
-| lz4 | **1.67ms** | 2.57ms | **1.54x** | **0.29ms** | 0.61ms | **2.10x** |
+| none | **0.87ms** | 1.65ms | **1.90x** | **0.02ms** | 0.23ms | **11.5x**\* |
+| snappy | **1.52ms** | 2.62ms | **1.72x** | **0.38ms** | 0.91ms | **2.39x** |
+| zstd | **1.90ms** | 3.69ms | **1.94x** | **0.64ms** | 1.32ms | **2.06x** |
+| lz4 | **1.66ms** | 2.63ms | **1.58x** | **0.30ms** | 0.63ms | **2.10x** |
 
 </div>
 
@@ -266,10 +266,10 @@ Beide Bibliotheken lesen **dieselbe** Parquet-Datei, der fairste direkte Verglei
 
 | Codec | Carquet Schreiben | PyArrow Schreiben | Verh. Schreiben | Carquet Lesen | PyArrow Lesen | Verh. Lesen |
 |-------|--------------|---------|---------|-------------|---------|---------|
-| none | **48.8ms** | 170ms | **3.49x** | **0.30ms** | 26.8ms | **89.2x**\* |
-| snappy | **57.2ms** | 294ms | **5.14x** | **12.6ms** | 38.4ms | **3.05x** |
-| zstd | **59.7ms** | 423ms | **7.09x** | **19.8ms** | 42.5ms | **2.15x** |
-| lz4 | **52.4ms** | 283ms | **5.41x** | **9.60ms** | 30.2ms | **3.15x** |
+| none | **57.7ms** | 165ms | **2.87x** | **0.28ms** | 26.1ms | **93.1x**\* |
+| snappy | **49.3ms** | 276ms | **5.60x** | **14.0ms** | 39.3ms | **2.82x** |
+| zstd | **61.0ms** | 387ms | **6.34x** | **20.6ms** | 41.3ms | **2.00x** |
+| lz4 | **52.9ms** | 287ms | **5.43x** | **9.83ms** | 29.0ms | **2.95x** |
 
 </div>
 
@@ -281,10 +281,10 @@ Beide Bibliotheken lesen **dieselbe** Parquet-Datei, der fairste direkte Verglei
 
 | Codec | Carquet Schreiben | PyArrow Schreiben | Verh. Schreiben | Carquet Lesen | PyArrow Lesen | Verh. Lesen |
 |-------|--------------|---------|---------|-------------|---------|---------|
-| none | **6.75ms** | 17.0ms | **2.52x** | **0.07ms** | 2.73ms | **39.0x**\* |
-| snappy | **7.02ms** | 27.9ms | **3.97x** | **1.58ms** | 3.66ms | **2.32x** |
-| zstd | **7.97ms** | 38.8ms | **4.87x** | **2.16ms** | 3.96ms | **1.83x** |
-| lz4 | **6.54ms** | 29.2ms | **4.46x** | **0.97ms** | 2.98ms | **3.07x** |
+| none | **5.87ms** | 17.5ms | **2.98x** | **0.06ms** | 2.79ms | **46.5x**\* |
+| snappy | **7.40ms** | 28.9ms | **3.90x** | **1.30ms** | 3.61ms | **2.78x** |
+| zstd | **8.32ms** | 39.4ms | **4.74x** | **2.36ms** | 4.00ms | **1.69x** |
+| lz4 | **7.70ms** | 30.5ms | **3.97x** | **1.06ms** | 3.22ms | **3.04x** |
 
 </div>
 
@@ -296,10 +296,10 @@ Beide Bibliotheken lesen **dieselbe** Parquet-Datei, der fairste direkte Verglei
 
 | Codec | Carquet Schreiben | PyArrow Schreiben | Verh. Schreiben | Carquet Lesen | PyArrow Lesen | Verh. Lesen |
 |-------|--------------|---------|---------|-------------|---------|---------|
-| none | **1.08ms** | 1.99ms | **1.84x** | **0.02ms** | 0.24ms | **12.0x**\* |
-| snappy | **1.80ms** | 2.82ms | **1.57x** | **0.36ms** | 0.66ms | **1.83x** |
-| zstd | **1.81ms** | 4.17ms | **2.30x** | **0.63ms** | 0.72ms | **1.14x** |
-| lz4 | **1.67ms** | 2.93ms | **1.75x** | **0.29ms** | 0.43ms | **1.48x** |
+| none | **0.87ms** | 2.10ms | **2.41x** | **0.02ms** | 0.26ms | **13.0x**\* |
+| snappy | **1.52ms** | 3.00ms | **1.97x** | **0.38ms** | 0.67ms | **1.76x** |
+| zstd | **1.90ms** | 4.13ms | **2.17x** | **0.64ms** | 0.73ms | **1.14x** |
+| lz4 | **1.66ms** | 3.04ms | **1.83x** | **0.30ms** | 0.44ms | **1.47x** |
 
 </div>
 
@@ -311,10 +311,10 @@ Beide Bibliotheken lesen **dieselbe** Parquet-Datei, der fairste direkte Verglei
 
 | Codec | Carquet Schreiben | fastparquet Schreiben | Verh. Schreiben | Carquet Lesen | fastparquet Lesen | Verh. Lesen |
 |-------|--------------|---------|---------|-------------|---------|---------|
-| none | **48.8ms** | 65.4ms | **1.34x** | **0.30ms** | 49.0ms | **163.5x**\* |
-| snappy | **57.2ms** | 204ms | **3.57x** | **12.6ms** | 110ms | **8.78x** |
-| zstd | **59.7ms** | 331ms | **5.55x** | **19.8ms** | 185ms | **9.39x** |
-| lz4 | **52.4ms** | 225ms | **4.30x** | **9.60ms** | 55.3ms | **5.76x** |
+| none | **57.7ms** | 64.6ms | **1.12x** | **0.28ms** | 55.7ms | **198.8x**\* |
+| snappy | **49.3ms** | 208ms | **4.22x** | **14.0ms** | 103ms | **7.40x** |
+| zstd | **61.0ms** | 325ms | **5.33x** | **20.6ms** | 185ms | **8.95x** |
+| lz4 | **52.9ms** | 244ms | **4.61x** | **9.83ms** | 55.4ms | **5.64x** |
 
 </div>
 
@@ -326,10 +326,10 @@ Beide Bibliotheken lesen **dieselbe** Parquet-Datei, der fairste direkte Verglei
 
 | Codec | Carquet Schreiben | fastparquet Schreiben | Verh. Schreiben | Carquet Lesen | fastparquet Lesen | Verh. Lesen |
 |-------|--------------|---------|---------|-------------|---------|---------|
-| none | **6.75ms** | 7.45ms | **1.10x** | **0.07ms** | 3.00ms | **42.9x**\* |
-| snappy | **7.02ms** | 22.1ms | **3.16x** | **1.58ms** | 10.1ms | **6.39x** |
-| zstd | **7.97ms** | 32.6ms | **4.09x** | **2.16ms** | 18.4ms | **8.54x** |
-| lz4 | **6.54ms** | 21.6ms | **3.30x** | **0.97ms** | 5.06ms | **5.22x** |
+| none | **5.87ms** | 8.01ms | **1.36x** | **0.06ms** | 3.08ms | **51.3x**\* |
+| snappy | **7.40ms** | 22.8ms | **3.08x** | **1.30ms** | 10.2ms | **7.85x** |
+| zstd | **8.32ms** | 33.5ms | **4.03x** | **2.36ms** | 18.0ms | **7.61x** |
+| lz4 | **7.70ms** | 22.4ms | **2.92x** | **1.06ms** | 5.37ms | **5.07x** |
 
 </div>
 
@@ -341,10 +341,55 @@ Beide Bibliotheken lesen **dieselbe** Parquet-Datei, der fairste direkte Verglei
 
 | Codec | Carquet Schreiben | fastparquet Schreiben | Verh. Schreiben | Carquet Lesen | fastparquet Lesen | Verh. Lesen |
 |-------|--------------|---------|---------|-------------|---------|---------|
-| none | 1.08ms | **1.04ms** | 0.96x | **0.02ms** | 0.52ms | **26.0x**\* |
-| snappy | **1.80ms** | 2.31ms | **1.28x** | **0.36ms** | 1.20ms | **3.33x** |
-| zstd | **1.81ms** | 3.45ms | **1.91x** | **0.63ms** | 2.05ms | **3.25x** |
-| lz4 | **1.67ms** | 2.25ms | **1.35x** | **0.29ms** | 0.73ms | **2.52x** |
+| none | **0.87ms** | 1.08ms | **1.24x** | **0.02ms** | 0.58ms | **29.0x**\* |
+| snappy | **1.52ms** | 2.43ms | **1.60x** | **0.38ms** | 1.20ms | **3.16x** |
+| zstd | **1.90ms** | 3.47ms | **1.83x** | **0.64ms** | 2.06ms | **3.22x** |
+| lz4 | **1.66ms** | 2.31ms | **1.39x** | **0.30ms** | 0.73ms | **2.43x** |
+
+</div>
+
+<br/>
+
+#### 10 Mio. Zeilen vs. polars
+
+<div align="center">
+
+| Codec | Carquet Schreiben | polars Schreiben | Verh. Schreiben | Carquet Lesen | polars Lesen | Verh. Lesen | Carquet Größe | polars Größe |
+|-------|--------------|---------|---------|-------------|---------|---------|------|------|
+| none | 57.7ms | **37.5ms** | 0.65x | **0.28ms** | 28.7ms | **102.4x**\* | 190.7MB | 105.1MB |
+| snappy | 49.3ms | **38.1ms** | 0.77x | **14.0ms** | 28.3ms | **2.03x** | 125.1MB | 103.8MB |
+| zstd | 61.0ms | **48.6ms** | 0.80x | **20.6ms** | 42.1ms | **2.04x** | 95.3MB | 98.1MB |
+| lz4 | 52.9ms | **40.0ms** | 0.76x | **9.83ms** | 29.4ms | **2.99x** | 122.7MB | 104.2MB |
+
+</div>
+
+<br/>
+
+#### 1 Mio. Zeilen vs. polars
+
+<div align="center">
+
+| Codec | Carquet Schreiben | polars Schreiben | Verh. Schreiben | Carquet Lesen | polars Lesen | Verh. Lesen | Carquet Größe | polars Größe |
+|-------|--------------|---------|---------|-------------|---------|---------|------|------|
+| none | 5.87ms | **4.53ms** | 0.77x | **0.06ms** | 3.14ms | **52.3x**\* | 19.1MB | 12.6MB |
+| snappy | 7.40ms | **4.82ms** | 0.65x | **1.30ms** | 3.25ms | **2.50x** | 12.5MB | 11.5MB |
+| zstd | 8.32ms | **5.83ms** | 0.70x | **2.36ms** | 4.12ms | **1.75x** | 9.6MB | 10.1MB |
+| lz4 | 7.70ms | **4.77ms** | 0.62x | **1.06ms** | 3.26ms | **3.08x** | 12.3MB | 11.5MB |
+
+</div>
+
+<br/>
+
+#### 100K Zeilen vs. polars
+
+<div align="center">
+
+| Codec | Carquet Schreiben | polars Schreiben | Verh. Schreiben | Carquet Lesen | polars Lesen | Verh. Lesen | Carquet Größe | polars Größe |
+|-------|--------------|---------|---------|-------------|---------|---------|------|------|
+| none | 0.87ms | **0.72ms** | 0.83x | **0.02ms** | 0.33ms | **16.5x**\* | 1.9MB | 1.3MB |
+| snappy | 1.52ms | **0.91ms** | 0.60x | **0.38ms** | 0.46ms | **1.21x** | 1.3MB | 1.1MB |
+| zstd | 1.90ms | **1.05ms** | 0.55x | **0.64ms** | 1.08ms | **1.69x** | 1.0MB | 1.0MB |
+| lz4 | 1.66ms | **0.96ms** | 0.58x | **0.30ms** | 0.44ms | **1.47x** | 1.2MB | 1.1MB |
 
 </div>
 
@@ -358,18 +403,41 @@ Beide Bibliotheken lesen **dieselbe** Parquet-Datei, der fairste direkte Verglei
 
 | Codec | Writer | Carquet Lesen | Arrow C++ Lesen | Verhältnis |
 |-------|--------|-------------|----------------|-------|
-| none | Carquet | **0.43ms** | 16.9ms | **39.2x**\* |
-| none | Arrow | **0.90ms** | 14.8ms | **16.5x**\* |
-| snappy | Carquet | **13.6ms** | 24.5ms | **1.80x** |
-| snappy | Arrow | **11.4ms** | 22.9ms | **2.01x** |
-| zstd | Carquet | **19.4ms** | 28.6ms | **1.48x** |
-| zstd | Arrow | **18.7ms** | 28.7ms | **1.54x** |
-| lz4 | Carquet | **9.39ms** | 19.1ms | **2.04x** |
-| lz4 | Arrow | **8.97ms** | 18.8ms | **2.09x** |
+| none | Carquet | **0.30ms** | 17.1ms | **56.8x**\* |
+| none | Arrow | **0.94ms** | 17.4ms | **18.5x**\* |
+| snappy | Carquet | **12.7ms** | 23.3ms | **1.83x** |
+| snappy | Arrow | **11.5ms** | 24.4ms | **2.13x** |
+| zstd | Carquet | **20.2ms** | 30.3ms | **1.50x** |
+| zstd | Arrow | **19.8ms** | 30.7ms | **1.55x** |
+| lz4 | Carquet | **9.96ms** | 19.2ms | **1.93x** |
+| lz4 | Arrow | **8.90ms** | 17.8ms | **2.00x** |
+
+</div>
+
+<br/>
+
+#### Cross-Read derselben Datei vs. polars (10 Mio. Zeilen)
+
+Jede Bibliothek liest die Datei, die der carquet-Benchmark schreibt, und die Datei, die polars mit seinen eigenen Einstellungen schreibt (Dictionary-Encoding auf `id` und `category`).
+
+<div align="center">
+
+| Codec | Writer | Carquet Lesen | polars Lesen | Verhältnis | Datei |
+|-------|--------|-------------|-------------|-------|------|
+| none | Carquet | **0.28ms** | 36.4ms | **130.0x**\* | 190.7MB |
+| none | polars | **10.3ms** | 27.8ms | **2.71x** | 105.1MB |
+| snappy | Carquet | **13.2ms** | 53.9ms | **4.09x** | 125.1MB |
+| snappy | polars | **12.4ms** | 30.5ms | **2.45x** | 103.8MB |
+| zstd | Carquet | **21.7ms** | 51.8ms | **2.39x** | 95.3MB |
+| zstd | polars | **17.4ms** | 34.7ms | **1.99x** | 98.1MB |
+| lz4 | Carquet | **10.7ms** | 37.7ms | **3.52x** | 122.7MB |
+| lz4 | polars | **11.5ms** | 26.7ms | **2.31x** | 104.2MB |
 
 </div>
 
 \* Zero-Copy-mmap-Pfad. fastparquet liest über pandas und kann weder BYTE_STREAM_SPLIT noch Page-Prüfsummen schreiben, daher sind seine Zeilen weniger direkt vergleichbar.
+
+polars verwendet seinen eigenen Rust-Parquet-Reader und -Writer (`use_pyarrow=False`, sein Standard), mit denselben Daten, derselben Row-Group-Größe, demselben zstd-Level, denselben Statistiken und LZ4_RAW für `lz4`. Es kann weder BYTE_STREAM_SPLIT noch Page-Prüfsummen schreiben und hat keinen Schalter für Dictionary-Encoding: Es kodiert `id` und `category` von sich aus per Dictionary, daher sind seine Dateien auf diesen Daten unkomprimiert 45% kleiner als die dictionary-freien von carquet und mit snappy / lz4 15–17% kleiner (mit zstd etwa gleich groß), und seine Schreibvorgänge schicken weniger Bytes durch Codec und Festplatte. Mit Dictionary-Encoding auf denselben beiden Spalten schreibt carquet die 10 Mio. Zeilen in 45 ms (none), 51 ms (snappy), 51 ms (zstd) und 48 ms (lz4), gegenüber 38, 38, 49 und 40 ms bei polars. Lesezugriffe vergleicht die Tabelle zum Cross-Read derselben Datei fair: carquet liest die Datei jeder der beiden Bibliotheken mit Codec 2.0–4.1x schneller.
 
 </details>
 
@@ -464,6 +532,7 @@ python3 benchmark/run_benchmark.py --skip-xlarge  # full comparison with PyArrow
 | `--quick` | Nur die 10M-Zeilen-Konfigurationen (das, was das Diagramm zeigt) |
 | `--skip-xlarge` | Die 100M-Zeilen-Konfigurationen überspringen (~2 GB pro Codec, 30+ Minuten) |
 | `--fastparquet` | Zusätzlich fastparquet vergleichen (`pip install fastparquet pandas`) |
+| `--polars` | Zusätzlich den eigenen Rust-Parquet-Reader / -Writer von polars vergleichen (`pip install polars`) |
 | `--no-pyarrow` / `--no-arrow-cpp` | PyArrow / Arrow C++ überspringen |
 | `--iterations N` | Feste Anzahl an Iterationen (Standard: automatisch, 11–51) |
 | `--build-dir DIR` / `--temp-dir DIR` | Wo die Binaries liegen / wohin die Testdateien geschrieben werden |
@@ -474,6 +543,8 @@ python3 benchmark/run_benchmark.py --skip-xlarge  # full comparison with PyArrow
 Benchmarken Sie immer einen **Release**-Build: `make benchmark` konfiguriert `build/` als Release neu; ein übrig gebliebenes Debug-`build/` lässt carquet um ein Mehrfaches langsamer erscheinen. `make native` + `-DCARQUET_BUILD_BENCHMARKS=ON` liefert die auf den Host abgestimmten Werte.
 
 fastparquet verwendet dieselben Daten, dieselbe Row-Group-Größe, kein Dictionary und dasselbe zstd-Level sowie LZ4_RAW für `lz4`. Es kann weder BYTE_STREAM_SPLIT noch Page-Prüfsummen schreiben und liest über pandas, daher sind seine Werte weniger direkt vergleichbar als die von Arrow.
+
+polars läuft mit seinem nativen Reader und Writer (nicht über PyArrow), denselben Daten, derselben Row-Group-Größe, demselben zstd-Level und LZ4_RAW für `lz4`. Es kann weder BYTE_STREAM_SPLIT noch Page-Prüfsummen schreiben und wählt das Dictionary-Encoding selbst (kein Schalter), wodurch seine Dateien auf diesen Daten kleiner werden.
 
 Der Arrow-C++-Vergleich benötigt ein eigenes Target (Arrow C++ wird auf dem System gefunden oder über `CARQUET_ARROW_CPP_ROOT` angegeben):
 
@@ -564,7 +635,7 @@ Danach linken Sie mit `-lcarquet`, `pkg-config --cflags --libs carquet` oder `fi
 
 ### Aus dem Quellcode, mit `xmake`
 
-[xmake](https://xmake.io) benötigt sonst nichts Installiertes: Es lädt fest versionierte zstd 1.5.6, zlib 1.3.1, lz4 1.10.0 und brotli 1.1.0 herunter und linkt sie statisch, sodass die `carquet`-CLI keine Laufzeitabhängigkeit hat.
+[xmake](https://xmake.io) benötigt sonst nichts Installiertes: Es lädt fest versionierte zstd 1.5.6, zlib 1.4, lz4 1.10.0 und brotli 1.1.0 herunter und linkt sie statisch, sodass die `carquet`-CLI keine Laufzeitabhängigkeit hat.
 
 ```bash
 git clone https://github.com/Vitruves/carquet.git && cd carquet
@@ -955,11 +1026,11 @@ Sie linkt carquet so, wie es jedes nachgelagerte Projekt täte (`find_package(ca
 
 ## Python-API
 
-`carquet` auf PyPI ist kein Wrapper um die obigen C-Aufrufe: Es ist eine **pythonische API im Stil von `pyarrow.parquet`** (`read_table`, `ParquetFile`, `ParquetWriter`, DNF-`filters`) auf Basis derselben Engine. Das Wheel bündelt die C-Bibliothek mit allen einkompilierten Codecs; die Daten gelangen über das Arrow C Data Interface nach Python, sodass Dekodierung, Dekompression und I/O in C ohne GIL laufen und PyArrow die Puffer direkt erhält.
+`carquet` auf PyPI ist kein Wrapper um die obigen C-Aufrufe: Es ist eine **pythonische API im Stil von `pyarrow.parquet`** (`read_table`, `ParquetFile`, `ParquetWriter`, DNF-`filters`) auf Basis derselben Engine. Das Wheel bündelt die C-Bibliothek mit allen einkompilierten Codecs; die Daten gelangen über das Arrow C Data Interface nach Python, sodass Dekodierung, Dekompression und I/O in C ohne GIL laufen. **Sie hat keine Abhängigkeiten**: Lesevorgänge liefern eine `carquet.Table`, die sich selbst in Python-Werte, NumPy und pandas umwandelt und die polars, DuckDB und PyArrow ohne Kopie übernehmen.
 
 ```bash
-pip install "carquet[arrow]"   # with PyArrow: tables, DataFrames, streaming
-pip install carquet            # metadata, schema, statistics and validation only
+pip install carquet              # no dependencies: no PyArrow, no NumPy needed
+pip install "carquet[pandas]"    # with pandas + NumPy, for read_pandas() / to_pandas()
 ```
 
 ```python
@@ -981,9 +1052,10 @@ with cq.ParquetFile("data.parquet") as pf:
 |---|---|
 | Eine Datei, ein Verzeichnis, Bytes oder ein Dateiobjekt lesen | `cq.read_table`, `cq.read_pandas` |
 | Große Dateien streamen | `ParquetFile.iter_batches`, `cq.iter_batches` |
-| Mit Statistiken, Page-Indexen, Bloom-Filtern prunen | `filters=` (DNF oder `pyarrow.compute`-Ausdruck), `ParquetFile.bloom_filter` |
+| Mit Statistiken, Page-Indexen, Bloom-Filtern prunen | `filters=` (DNF, exakte Ergebnisse), `ParquetFile.bloom_filter` |
 | Tabellen, DataFrames, polars, DuckDB-Ergebnisse schreiben | `cq.write_table`, `cq.ParquetWriter` (inkrementell, `append=True`) |
-| Ohne PyArrow inspizieren | `cq.read_metadata`, `cq.read_parquet_schema`, `cq.info`, `cq.validate` |
+| Daten an pandas, NumPy, polars, DuckDB, PyArrow übergeben | `t.to_pandas()`, `t.column("x").to_numpy()`, `polars.DataFrame(t)`, `pyarrow.table(t)` |
+| Eine Datei inspizieren, ohne ihre Daten zu lesen | `cq.read_metadata`, `cq.read_parquet_schema`, `cq.info`, `cq.validate` |
 
 </div>
 

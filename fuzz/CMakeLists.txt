@@ -29,6 +29,11 @@ endif()
 if(CARQUET_FUZZ_ENGINE STREQUAL "libFuzzer")
     target_compile_options(carquet PRIVATE -fsanitize=fuzzer-no-link)
 endif()
+# The sanitizers too: on the harness alone they only check the harness's own
+# loads and stores, and a use-after-free inside the library goes unnoticed.
+if(CARQUET_FUZZ_SANITIZERS)
+    target_compile_options(carquet PRIVATE ${FUZZ_SANITIZER_FLAGS})
+endif()
 
 # Function to add a fuzz target
 function(add_fuzz_target TARGET_NAME SOURCE_FILE)
@@ -116,3 +121,7 @@ file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/corpus_append)
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/corpus_arrow_c_data)
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/corpus_reader_file)
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/corpus_arrow_write)
+
+# Arrow stream fuzzer: streams arbitrary files with the stored Arrow types
+# restored and an exact predicate, then re-exports batches through refs.
+add_fuzz_target(fuzz_arrow_stream fuzz_arrow_stream.c)

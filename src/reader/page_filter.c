@@ -96,6 +96,7 @@ typedef struct {
     bool is_unsigned;
     bool is_float16;
     bool is_decimal;  /* DECIMAL backed by FLBA/BYTE_ARRAY: signed big-endian order */
+    bool is_repeated; /* leaf under a LIST/MAP: null_count counts level slots, not rows */
 } column_type_info_t;
 
 static carquet_status_t lookup_column_type(
@@ -121,6 +122,7 @@ static carquet_status_t lookup_column_type(
     out->is_unsigned = false;
     out->is_float16 = false;
     out->is_decimal = false;
+    out->is_repeated = carquet_schema_max_rep_level(schema, column_index) > 0;
 
     if (elem->has_logical_type) {
         if (elem->logical_type.id == CARQUET_LOGICAL_INTEGER &&
@@ -433,6 +435,11 @@ carquet_status_t carquet_page_filter_validate_clause(
         case CARQUET_FILTER_IS_NULL:
         case CARQUET_FILTER_IS_NOT_NULL:
             return CARQUET_OK;
+
+        case CARQUET_FILTER_NOT_IN:
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT,
+                "NOT_IN is a predicate op, not a page filter op");
+            return CARQUET_ERROR_INVALID_ARGUMENT;
     }
 
     CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT,
@@ -486,6 +493,12 @@ static bool page_matches_clause(const column_type_info_t* ti,
                                 int64_t page_first_row,
                                 int64_t page_num_rows) {
     (void)page_first_row;
+
+    /* The all-null shortcut (null_count >= rows) compares a count of null
+     * leaf slots with a count of rows. For a repeated leaf one row spans
+     * several slots, so the comparison proves nothing: [5, null, null, null]
+     * has 3 nulls in 1 row. */
+    if (ti->is_repeated) page_num_rows = 0;
 
     /* Null-presence ops: decide purely from the null count + null page
      * flag. */
@@ -646,6 +659,8 @@ static bool page_matches_clause(const column_type_info_t* ti,
         case CARQUET_FILTER_IS_NOT_NULL:
             /* Handled above. */
             return true;
+        case CARQUET_FILTER_NOT_IN:
+            return true;   /* rejected at set time; never prunes */
     }
     return true;
 }
@@ -708,16 +723,37 @@ static bool bloom_check_value(const carquet_bloom_filter_t* bf,
             int64_t x; memcpy(&x, v, sizeof(x));
             return carquet_bloom_filter_check_i64(bf, x);
         }
+        /* The bloom filter hashes the stored bits, while the min/max path
+         * compares numerically, where -0.0 == +0.0. A zero probe must look
+         * for both signs or a row holding the other one gets pruned. */
         case CARQUET_PHYSICAL_FLOAT: {
             float x; memcpy(&x, v, sizeof(x));
+            if (x == 0.0f) {
+                return carquet_bloom_filter_check_float(bf, 0.0f) ||
+                       carquet_bloom_filter_check_float(bf, -0.0f);
+            }
             return carquet_bloom_filter_check_float(bf, x);
         }
         case CARQUET_PHYSICAL_DOUBLE: {
             double x; memcpy(&x, v, sizeof(x));
+            if (x == 0.0) {
+                return carquet_bloom_filter_check_double(bf, 0.0) ||
+                       carquet_bloom_filter_check_double(bf, -0.0);
+            }
             return carquet_bloom_filter_check_double(bf, x);
         }
         case CARQUET_PHYSICAL_BYTE_ARRAY:
         case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY:
+            if (ti->is_float16 && vlen == 2) {
+                /* FLOAT16 zero: little-endian 0x0000 / 0x8000. */
+                const uint8_t* b = (const uint8_t*)v;
+                if (b[0] == 0 && (b[1] & 0x7F) == 0) {
+                    static const uint8_t pos0[2] = {0x00, 0x00};
+                    static const uint8_t neg0[2] = {0x00, 0x80};
+                    return carquet_bloom_filter_check_bytes(bf, pos0, 2) ||
+                           carquet_bloom_filter_check_bytes(bf, neg0, 2);
+                }
+            }
             return carquet_bloom_filter_check_bytes(bf, (const uint8_t*)v,
                                                     (size_t)vlen);
         default:
@@ -817,8 +853,11 @@ static carquet_status_t eval_clause_to_ranges(
     }
 
     int32_t n_ci_pages = carquet_column_index_num_pages(ci);
-    int32_t n_oi_pages = carquet_offset_index_num_pages(oi);
-    int32_t n_pages = n_ci_pages < n_oi_pages ? n_ci_pages : n_oi_pages;
+    int32_t n_pages = carquet_offset_index_num_pages(oi);
+    /* Both indexes must describe the same pages. When they disagree the
+     * ColumnIndex cannot be mapped onto rows: keep every page rather than
+     * dropping the rows of pages it does not cover. */
+    bool ci_usable = n_ci_pages == n_pages;
 
     carquet_row_range_list_clear(out);
 
@@ -831,9 +870,8 @@ static carquet_status_t eval_clause_to_ranges(
 
     for (int32_t i = 0; i < n_pages; i++) {
         carquet_page_stats_t stats;
-        if (carquet_column_index_get_page_stats(ci, i, &stats) != CARQUET_OK) {
-            continue;
-        }
+        bool have_stats = ci_usable &&
+            carquet_column_index_get_page_stats(ci, i, &stats) == CARQUET_OK;
         carquet_page_location_t loc;
         if (carquet_offset_index_get_page_location(oi, i, &loc) != CARQUET_OK) {
             continue;
@@ -857,7 +895,8 @@ static carquet_status_t eval_clause_to_ranges(
         prev_end = end_row;
         int64_t page_rows = end_row - first_row;
 
-        if (page_matches_clause(&ti, &stats, clause, first_row, page_rows)) {
+        if (!have_stats ||
+            page_matches_clause(&ti, &stats, clause, first_row, page_rows)) {
             st = carquet_row_range_list_append(out, first_row, page_rows);
             if (st != CARQUET_OK) {
                 carquet_column_index_free(ci);

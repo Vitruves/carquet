@@ -71,6 +71,7 @@ typedef int64_t (*count_non_nulls_fn)(const int16_t* def_levels, int64_t count, 
 typedef void (*build_null_bitmap_fn)(const int16_t* def_levels, int64_t count,
                                       int16_t max_def_level, uint8_t* null_bitmap);
 typedef void (*fill_def_levels_fn)(int16_t* def_levels, int64_t count, int16_t value);
+typedef bool (*levels_to_bits_fn)(const int16_t* levels, int64_t count, uint64_t* bits);
 typedef void (*minmax_i32_fn)(const int32_t* values, int64_t count, int32_t* min_value, int32_t* max_value);
 typedef void (*minmax_i64_fn)(const int64_t* values, int64_t count, int64_t* min_value, int64_t* max_value);
 typedef void (*minmax_float_fn)(const float* values, int64_t count, float* min_value, float* max_value);
@@ -341,6 +342,51 @@ static void scalar_fill_def_levels(int16_t* def_levels, int64_t count, int16_t v
     }
 }
 
+#include "core/endian.h"
+/* The SWAR path below reads four int16 lanes as one little-endian word. */
+#define CARQUET_SCALAR_LEVELS_SWAR CARQUET_LITTLE_ENDIAN
+
+/* Pack 0/1 levels into a bit array, level i at bit i % 64 of word i / 64.
+ * Writes (count + 63) / 64 words; the bits past count in the last word are
+ * zero. Returns false (the words are then unspecified) when a level is not 0
+ * or 1. Used by the 1-bit RLE level encoder. */
+static bool scalar_levels_to_bits(const int16_t* levels, int64_t count, uint64_t* bits) {
+    uint64_t bad = 0;
+    int64_t i = 0;
+    int64_t w = 0;
+#if CARQUET_SCALAR_LEVELS_SWAR
+    /* Four levels per 64-bit load. Valid lanes hold 0 or 1 at bits 0, 16,
+     * 32, 48; the multiply moves lane k to bit 45 + k with no carries (every
+     * partial product lands at a distinct position 15 * s + k). */
+    const uint64_t magic = 1ULL | (1ULL << 15) | (1ULL << 30) | (1ULL << 45);
+    for (; i + 64 <= count; i += 64, w++) {
+        uint64_t word = 0;
+        for (int b = 0; b < 64; b += 8) {
+            uint64_t a, c;
+            memcpy(&a, levels + i + b, sizeof(a));
+            memcpy(&c, levels + i + b + 4, sizeof(c));
+            bad |= (a | c) & ~0x0001000100010001ULL;
+            uint64_t lo = ((a * magic) >> 45) & 0xF;
+            uint64_t hi = ((c * magic) >> 45) & 0xF;
+            word |= (lo | (hi << 4)) << b;
+        }
+        bits[w] = word;
+    }
+#endif
+    while (i < count) {
+        uint64_t word = 0;
+        int64_t n = count - i < 64 ? count - i : 64;
+        for (int64_t j = 0; j < n; j++) {
+            uint16_t v = (uint16_t)levels[i + j];
+            bad |= v & ~1u;
+            word |= (uint64_t)(v & 1u) << j;
+        }
+        bits[w++] = word;
+        i += n;
+    }
+    return bad == 0;
+}
+
 static void scalar_minmax_i32(const int32_t* values, int64_t count,
                                int32_t* min_value, int32_t* max_value) {
     int32_t min_v = values[0];
@@ -471,6 +517,7 @@ extern int64_t carquet_sse_count_non_nulls(const int16_t* def_levels, int64_t co
 extern void carquet_sse_build_null_bitmap(const int16_t* def_levels, int64_t count,
                                            int16_t max_def_level, uint8_t* null_bitmap);
 extern void carquet_sse_fill_def_levels(int16_t* def_levels, int64_t count, int16_t value);
+extern bool carquet_sse_levels_to_bits(const int16_t* levels, int64_t count, uint64_t* bits);
 extern void carquet_sse_minmax_i32(const int32_t* values, int64_t count, int32_t* min_value, int32_t* max_value);
 extern void carquet_sse_minmax_i64(const int64_t* values, int64_t count, int64_t* min_value, int64_t* max_value);
 extern void carquet_sse_minmax_float(const float* values, int64_t count, float* min_value, float* max_value);
@@ -679,6 +726,7 @@ extern int64_t carquet_neon_count_non_nulls(const int16_t* def_levels, int64_t c
 extern void carquet_neon_build_null_bitmap(const int16_t* def_levels, int64_t count,
                                             int16_t max_def_level, uint8_t* null_bitmap);
 extern void carquet_neon_fill_def_levels(int16_t* def_levels, int64_t count, int16_t value);
+extern bool carquet_neon_levels_to_bits(const int16_t* levels, int64_t count, uint64_t* bits);
 extern void carquet_neon_minmax_i32(const int32_t* values, int64_t count, int32_t* min_value, int32_t* max_value);
 extern void carquet_neon_minmax_i64(const int64_t* values, int64_t count, int64_t* min_value, int64_t* max_value);
 extern void carquet_neon_minmax_float(const float* values, int64_t count, float* min_value, float* max_value);
@@ -798,6 +846,7 @@ typedef struct {
     count_non_nulls_fn count_non_nulls;
     build_null_bitmap_fn build_null_bitmap;
     fill_def_levels_fn fill_def_levels;
+    levels_to_bits_fn levels_to_bits;
     minmax_i32_fn minmax_i32;
     minmax_i64_fn minmax_i64;
     minmax_float_fn minmax_float;
@@ -903,6 +952,7 @@ void carquet_simd_dispatch_init(void) {
     g_dispatch.count_non_nulls = scalar_count_non_nulls;
     g_dispatch.build_null_bitmap = scalar_build_null_bitmap;
     g_dispatch.fill_def_levels = scalar_fill_def_levels;
+    g_dispatch.levels_to_bits = scalar_levels_to_bits;
     g_dispatch.minmax_i32 = scalar_minmax_i32;
     g_dispatch.minmax_i64 = scalar_minmax_i64;
     g_dispatch.minmax_float = scalar_minmax_float;
@@ -950,6 +1000,7 @@ void carquet_simd_dispatch_init(void) {
         g_dispatch.count_non_nulls = carquet_sse_count_non_nulls;
         g_dispatch.build_null_bitmap = carquet_sse_build_null_bitmap;
         g_dispatch.fill_def_levels = carquet_sse_fill_def_levels;
+        g_dispatch.levels_to_bits = carquet_sse_levels_to_bits;
         g_dispatch.minmax_i32 = carquet_sse_minmax_i32;
         g_dispatch.minmax_i64 = carquet_sse_minmax_i64;
         g_dispatch.minmax_float = carquet_sse_minmax_float;
@@ -1121,6 +1172,7 @@ void carquet_simd_dispatch_init(void) {
     g_dispatch.count_non_nulls = carquet_neon_count_non_nulls;
     g_dispatch.build_null_bitmap = carquet_neon_build_null_bitmap;
     g_dispatch.fill_def_levels = carquet_neon_fill_def_levels;
+    g_dispatch.levels_to_bits = carquet_neon_levels_to_bits;
     g_dispatch.minmax_i32 = carquet_neon_minmax_i32;
     /* i64 min/max is a short loop with scalar compares on NEON, and measured
      * slower than the compiler-generated scalar path on Apple Silicon. */
@@ -1397,6 +1449,11 @@ void carquet_dispatch_build_null_bitmap(const int16_t* def_levels, int64_t count
 void carquet_dispatch_fill_def_levels(int16_t* def_levels, int64_t count, int16_t value) {
     DISPATCH_ENSURE_INIT();
     g_dispatch.fill_def_levels(def_levels, count, value);
+}
+
+bool carquet_dispatch_levels_to_bits(const int16_t* levels, int64_t count, uint64_t* bits) {
+    DISPATCH_ENSURE_INIT();
+    return g_dispatch.levels_to_bits(levels, count, bits);
 }
 
 void carquet_dispatch_minmax_i32(const int32_t* values, int64_t count,

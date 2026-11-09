@@ -1,33 +1,29 @@
 """Reading Parquet files: :class:`ParquetFile` and the ``read_*`` functions.
 
-Two C read paths back the Arrow output:
-
-* the **batch reader** (``carquet_batch_reader_*``) for flat columns and
-  single-level ``list`` / ``map`` columns of primitives -- column projection,
-  row-group selection, page-index pruning, row ranges and the library's
-  parallel / pipelined decoding all happen in C; each batch is handed to
-  PyArrow through the Arrow C Data Interface;
-* the **nested assembler** (``carquet_reader_read_arrow_fields``) for structs
-  and deeper nesting, one row group at a time, reading only the projected
-  top-level fields.
-
-Every C call runs without the GIL.
+Every read is one C Arrow stream (``carquet_reader_export_arrow_stream``):
+column projection, row-group selection, row windows, filters (statistics,
+page index and the exact predicate), parallel decoding and the assembly of
+nested types all run in C, without the GIL. The batches it returns stay in
+the buffers C allocated; :class:`carquet.Table` reads them in place and hands
+them to any Arrow consumer through the Arrow PyCapsule interface. PyArrow is
+not needed.
 """
 
 from __future__ import annotations
 
+import ctypes
 import dataclasses
 import os
 import threading
 import weakref
-from ctypes import addressof, byref, c_int32, c_void_p
-from typing import TYPE_CHECKING, Any, Iterable, Iterator, Optional, Sequence, Union
+from ctypes import byref, c_int32
+from typing import Any, Iterable, Iterator, Optional, Sequence, Union
 
 from . import _ffi
-from ._arrow import ArrowArray, ArrowSchema, release_array, release_schema
-from ._convert import Converter
+from ._arrow import ArrowArray, ArrowArrayStream, ArrowSchema, release_schema, stream_capsule
+from .arrow import RecordBatch, Schema, Table, _stream_error
 from .errors import CarquetError, StatusCode
-from .filters import Filters, RowGroupPruner, build_page_filter, normalize_filters
+from .filters import _ALL, Filters, compile_filters, normalize_filters
 from .metadata import (
     BloomFilter,
     ColumnIndex,
@@ -38,10 +34,8 @@ from .metadata import (
 )
 from .schema import ColumnSchema, ParquetSchema
 
-if TYPE_CHECKING:  # pragma: no cover
-    import pyarrow as pa
-
 __all__ = [
+    "ArrowStream",
     "FileInfo",
     "ParquetFile",
     "info",
@@ -60,26 +54,6 @@ DEFAULT_BATCH_SIZE = 65536
 # Batch size used when the whole result is materialised (read / read_table):
 # large enough that a row group usually comes back as a single chunk.
 _READ_BATCH_SIZE = 1 << 20
-
-
-def _pa():
-    try:
-        import pyarrow as pa
-    except ImportError as exc:  # pragma: no cover - exercised only without pyarrow
-        raise ImportError(
-            "pyarrow is required for this carquet function; install it with "
-            "`pip install pyarrow` or `pip install 'carquet[arrow]'`"
-        ) from exc
-    return pa
-
-
-def _import_batch(pa, array: ArrowArray, schema) -> "pa.RecordBatch":
-    """Move a top-level struct ArrowArray into a RecordBatch of ``schema``."""
-    try:
-        return pa.RecordBatch._import_from_c(addressof(array), schema)
-    except BaseException:
-        release_array(array)
-        raise
 
 
 def _is_path(source: Any) -> bool:
@@ -132,43 +106,131 @@ def validate(path: PathLike) -> None:
 
 
 # --------------------------------------------------------------------------
-# Projection planning
+# Top-level fields
 # --------------------------------------------------------------------------
 class _Field:
-    """A top-level field: its leaf columns and which C path can read it."""
+    """A top-level field and its leaf columns."""
 
-    __slots__ = ("ordinal", "name", "leaves", "batchable")
+    __slots__ = ("ordinal", "name", "leaves")
 
-    def __init__(self, ordinal: int, name: str, leaves: list, batchable: bool) -> None:
+    def __init__(self, ordinal: int, name: str, leaves: list) -> None:
         self.ordinal = ordinal
         self.name = name
         self.leaves = leaves
-        self.batchable = batchable
 
 
 def _plan_fields(schema: ParquetSchema) -> list:
-    groups = {e.name: e for e in schema.elements if e.depth == 1 and not e.is_leaf}
     fields: list = []
     by_name: dict = {}
     for col in schema:
         top = col.parts[0]
         f = by_name.get(top)
         if f is None:
-            f = _Field(len(fields), top, [], False)
+            f = _Field(len(fields), top, [])
             by_name[top] = f
             fields.append(f)
         f.leaves.append(col)
-    for f in fields:
-        if len(f.leaves) == 1 and len(f.leaves[0].parts) == 1:
-            f.batchable = f.leaves[0].max_repetition_level == 0
-            continue
-        g = groups.get(f.name)
-        kind = g.logical_type.name if g is not None and g.logical_type is not None else None
-        single = all(len(c.parts) == 3 and c.max_repetition_level == 1 for c in f.leaves)
-        f.batchable = single and (
-            (kind == "LIST" and len(f.leaves) == 1) or (kind == "MAP" and len(f.leaves) == 2)
-        )
     return fields
+
+
+class _Scan:
+    """One C Arrow stream over a :class:`ParquetFile`, iterated as RecordBatches."""
+
+    def __init__(self, pf: "ParquetFile", ordinals: list, *, row_groups: Optional[list] = None,
+                 window: Optional[tuple] = None, predicate: Any = None, batch_size: int = _READ_BATCH_SIZE,
+                 use_threads: bool = True, split: bool = False) -> None:
+        self._pf = pf
+        self._stream: Optional[ArrowArrayStream] = None
+        self._interrupted = False
+        # The C stream returns a row group per batch for list / map / struct
+        # columns: with `split`, larger batches are cut into views of at most
+        # batch_size rows.
+        self._split = int(batch_size) if split else 0
+        self._pending: Optional[RecordBatch] = None
+        lib = _ffi.get_lib()
+        opts = _ffi.ArrowStreamOptions()
+        lib.carquet_arrow_stream_options_init(byref(opts))
+        keep: list = []
+        if ordinals:
+            idx = (c_int32 * len(ordinals))(*ordinals)
+            keep.append(idx)
+            opts.field_indices = idx
+            opts.num_fields = len(ordinals)
+        opts.batch_size = max(1, min(int(batch_size), 2**31 - 1))
+        opts.num_threads = pf._num_threads if use_threads else 1
+        if row_groups is not None:
+            rgs = (c_int32 * max(1, len(row_groups)))(*row_groups)
+            keep.append(rgs)
+            opts.row_groups = rgs
+            opts.num_row_groups = len(row_groups)
+        if window is not None:
+            opts.row_offset, opts.row_limit = window
+        if predicate is not None:
+            opts.predicate = ctypes.pointer(predicate.struct)
+        opts.restore_arrow_schema = pf._restore
+        stream = ArrowArrayStream()
+        err = _ffi.CarquetErrorStruct()
+        with pf._lock:
+            st = lib.carquet_reader_export_arrow_stream(pf._require_open(), byref(opts), byref(stream), byref(err))
+        _ffi.check(st, err, pf._name)
+        self._stream = stream
+        try:
+            c_schema = ArrowSchema()
+            if stream.get_schema(byref(stream), byref(c_schema)) != 0:
+                raise CarquetError(StatusCode.INTERNAL, f"{pf._name}: {_stream_error(stream)}")
+            self.schema = Schema(c_schema)
+        except BaseException:
+            self.close()
+            raise
+        pf._streams.add(self)
+
+    def __iter__(self) -> "_Scan":
+        return self
+
+    def __next__(self) -> RecordBatch:
+        if self._pending is not None:
+            b = self._pending
+            self._pending = None
+            return self._cut(b)
+        return self._cut(self._next_raw())
+
+    def _cut(self, b: RecordBatch) -> RecordBatch:
+        if self._split and b.num_rows > self._split:
+            self._pending = b.slice(self._split)
+            return b.slice(0, self._split)
+        return b
+
+    def _next_raw(self) -> RecordBatch:
+        pf = self._pf
+        with pf._lock:
+            if self._stream is None:
+                if self._interrupted:
+                    raise CarquetError(StatusCode.ALREADY_CLOSED,
+                                       f"{pf._name}: file closed while batches were being read")
+                raise StopIteration
+            arr = ArrowArray()
+            rc = self._stream.get_next(byref(self._stream), byref(arr))
+            if rc != 0:
+                msg = _stream_error(self._stream)
+                self.close()
+                raise CarquetError(StatusCode.FILE_READ if rc == 5 else StatusCode.INTERNAL, f"{pf._name}: {msg}")
+            if not arr.release:
+                self.close()
+                raise StopIteration
+        return RecordBatch._from_c(self.schema, arr)
+
+    def close(self, interrupted: bool = False) -> None:
+        if interrupted and self._stream is not None:
+            self._interrupted = True
+        s, self._stream = self._stream, None
+        if s is not None and s.release:
+            s.release(byref(s))
+
+    def __del__(self) -> None:  # pragma: no cover - best effort
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------
@@ -178,15 +240,15 @@ class ParquetFile:
     """An open Parquet file.
 
     ``source`` is a path, a bytes-like object (``bytes``, ``bytearray``,
-    ``memoryview``, ``pyarrow.Buffer``) or a binary file object; buffers are
-    read in place, without copying. Use it as a context manager or call
+    ``memoryview``, any buffer) or a binary file object; buffers are read in
+    place, without copying. Use it as a context manager or call
     :meth:`close`::
 
         with carquet.ParquetFile("data.parquet") as pf:
-            pf.schema                     # pyarrow.Schema
+            pf.schema                     # carquet.Schema (Arrow types)
             pf.parquet_schema             # carquet.ParquetSchema (physical/logical types)
             pf.metadata.row_group(0).column("id").statistics
-            pf.read(columns=["id", "name"], filters=[("id", ">", 100)])
+            t = pf.read(columns=["id", "name"], filters=[("id", ">", 100)])   # carquet.Table
             for batch in pf.iter_batches(batch_size=10_000):
                 ...
 
@@ -218,6 +280,7 @@ class ParquetFile:
         self._handle: Optional[int] = None
         self._keepalive: Any = None
         self._buffer_size: Optional[int] = None
+        self._buffer_addr: Optional[int] = None
         self._streams: "weakref.WeakSet" = weakref.WeakSet()
         self._lock = threading.RLock()
         self._num_threads = int(num_threads)
@@ -252,11 +315,13 @@ class ParquetFile:
                 ) from None
             self._keepalive = keep
             self._buffer_size = size
+            self._buffer_addr = addr
             opts.use_mmap = False
             handle = lib.carquet_reader_open_buffer(addr or None, size, byref(opts), byref(err))
         if not handle:
             _ffi.check(err.code or StatusCode.FILE_OPEN, err, self.path or "<buffer>")
         self._handle = handle
+        self._reader_opts = opts  # to open the independent readers of arrow_stream()
         self._memory_map = bool(lib.carquet_reader_is_mmap(handle))
         self._schema_handle = lib.carquet_reader_schema(handle)
 
@@ -266,14 +331,14 @@ class ParquetFile:
         self.num_columns: int = int(lib.carquet_reader_num_columns(handle))
         self._fields = _plan_fields(self.parquet_schema)
         self._field_by_name = {f.name: f for f in self._fields}
-        self._raw_arrow_schema: Any = None
+        self._schema: Optional[Schema] = None
         self._metadata: Optional[FileMetaData] = None
         self._kv: Optional[dict] = None
-        self._converters: dict = {}
 
     # -- lifecycle ---------------------------------------------------------
     @property
     def closed(self) -> bool:
+        """True once the file has been closed."""
         return not self._handle
 
     def _require_open(self) -> int:
@@ -316,29 +381,15 @@ class ParquetFile:
         )
 
     # -- schema & metadata ---------------------------------------------------
-    def _raw_schema(self):
-        if self._raw_arrow_schema is None:
-            handle = self._require_open()
-            pa = _pa()
-            lib = _ffi.get_lib()
-            c_schema = ArrowSchema()
-            err = _ffi.CarquetErrorStruct()
-            st = lib.carquet_arrow_export_schema(lib.carquet_reader_schema(handle), byref(c_schema), byref(err))
-            _ffi.check(st, err, self._name)
-            try:
-                self._raw_arrow_schema = pa.Schema._import_from_c(addressof(c_schema))
-            except BaseException:
-                release_schema(c_schema)
-                raise
-        return self._raw_arrow_schema
+    @property
+    def schema(self) -> Schema:
+        """The Arrow schema of what :meth:`read` returns (a :class:`carquet.Schema`)."""
+        if self._schema is None:
+            self._schema = _Scan(self, [f.ordinal for f in self._fields], window=(0, 0)).schema
+        return self._schema
 
     @property
-    def schema(self) -> "pa.Schema":
-        """The file schema as a :class:`pyarrow.Schema` (what :meth:`read` returns)."""
-        return self._converter([f.ordinal for f in self._fields]).schema
-
-    @property
-    def schema_arrow(self) -> "pa.Schema":
+    def schema_arrow(self) -> Schema:
         """Alias of :attr:`schema` (``pyarrow.parquet.ParquetFile`` spelling)."""
         return self.schema
 
@@ -427,33 +478,33 @@ class ParquetFile:
                 out.append(f.ordinal)
         return out
 
-    def _converter(self, ordinals: list) -> Converter:
-        key = tuple(ordinals)
-        conv = self._converters.get(key)
-        if conv is None:
-            pa = _pa()
-            raw = self._raw_schema()
-            raw_proj = pa.schema([raw.field(i) for i in ordinals])
-            conv = Converter(
-                pa,
-                raw_proj,
-                [self._fields[i].leaves for i in ordinals],
-                self.key_value_metadata,
-                restore_arrow_schema=self._restore,
-            )
-            conv.raw_schema = raw_proj
-            self._converters[key] = conv
-        return conv
-
-    def _row_groups(self, row_groups: Optional[Iterable[int]], filters: Optional[Filters]) -> list:
+    def _check_row_groups(self, row_groups: Optional[Iterable[int]]) -> Optional[list]:
         if row_groups is None:
-            rgs = list(range(self.num_row_groups))
-        else:
-            rgs = [self._check_rg(int(i)) for i in row_groups]
-        if filters is not None and filters.dnf:
-            pruner = RowGroupPruner(self._require_open(), self.parquet_schema, filters)
-            rgs = [rg for rg in rgs if pruner.might_match(rg)]
-        return rgs
+            return None
+        out = []
+        for i in row_groups:
+            rg = self._check_rg(int(i))
+            if rg in out:
+                raise ValueError(f"row group {rg} listed twice")
+            out.append(rg)
+        return out
+
+    def _predicate(self, flt: Optional[Filters]):
+        """``(predicate or None, no_rows)`` for a normalised filter."""
+        if flt is None:
+            return None, False
+        p = compile_filters(self.parquet_schema, flt)
+        if p is _ALL:
+            return None, False
+        return p, p is None
+
+    def _filter_fields(self, flt: Optional[Filters]) -> list:
+        out: list = []
+        for name in (flt.columns if flt is not None else []):
+            for o in self._resolve([name]):
+                if o not in out:
+                    out.append(o)
+        return out
 
     def filter_row_groups(self, filters: Any) -> list:
         """Indices of the row groups that may contain rows matching ``filters``.
@@ -461,58 +512,47 @@ class ParquetFile:
         Uses only column statistics (no data is read); a returned row group may
         still hold no matching row.
         """
-        return self._row_groups(None, normalize_filters(filters))
-
-    # -- raw streams ---------------------------------------------------------
-    def _stream(self, ordinals: list, rgs: list, batch_size: int, *, page_filter=None,
-                row_range=None, use_threads: bool = True) -> Iterator:
-        """Raw (unconverted) RecordBatches of the fields ``ordinals``."""
-        fields = [self._fields[i] for i in ordinals]
-        if not fields:
-            return self._row_count_stream(rgs, batch_size)
-        if all(f.batchable for f in fields):
-            return _BatchStream(self, fields, rgs, batch_size, page_filter, row_range, use_threads)
-        return self._nested_stream(ordinals, rgs, batch_size)
-
-    def _row_count_stream(self, rgs: list, batch_size: Optional[int]) -> Iterator:
-        """Zero-column batches carrying only row counts (``columns=[]``)."""
-        pa = _pa()
-        md = self.metadata
-        step = batch_size or _READ_BATCH_SIZE
-        for rg in rgs:
-            n = md.row_group(rg).num_rows
-            for start in range(0, n, step):
-                yield pa.record_batch([pa.nulls(min(step, n - start))], names=["_"]).select([])
-
-    def _nested_stream(self, ordinals: list, rgs: list, batch_size: Optional[int]) -> Iterator:
-        pa = _pa()
-        raw = self._converter(ordinals).raw_schema
-        for rg in rgs:
-            batch = self._read_arrow_fields(pa, rg, ordinals, raw)
-            if batch_size is None or batch.num_rows <= batch_size:
-                yield batch
-            else:
-                for start in range(0, batch.num_rows, batch_size):
-                    yield batch.slice(start, batch_size)
-
-    def _read_arrow_fields(self, pa, rg: int, ordinals: list, raw_schema) -> "pa.RecordBatch":
-        lib = _ffi.get_lib()
+        flt = normalize_filters(filters)
+        if flt is None:
+            return list(range(self.num_row_groups))
+        p = compile_filters(self.parquet_schema, flt, skip_repeated=True)
+        if p is _ALL:
+            return list(range(self.num_row_groups))
+        if p is None:
+            return []
+        out = (c_int32 * max(1, self.num_row_groups))()
+        err = _ffi.CarquetErrorStruct()
         with self._lock:
-            handle = self._require_open()
-            array = ArrowArray()
-            err = _ffi.CarquetErrorStruct()
-            if _ffi.has_symbol("carquet_reader_read_arrow_fields"):
-                idx = (c_int32 * len(ordinals))(*ordinals)
-                st = lib.carquet_reader_read_arrow_fields(handle, rg, idx, len(ordinals), None, byref(array), byref(err))
-                _ffi.check(st, err, self._name)
-                return _import_batch(pa, array, raw_schema)
-            # library without field projection: read everything, then select
-            st = lib.carquet_reader_read_arrow(handle, rg, None, byref(array), byref(err))
-            _ffi.check(st, err, self._name)
-            full = _import_batch(pa, array, self._raw_schema())
-            return pa.RecordBatch.from_arrays([full.column(i) for i in ordinals], schema=raw_schema)
+            n = _ffi.get_lib().carquet_reader_predicate_row_groups(self._require_open(), byref(p.struct), out,
+                                                                   self.num_row_groups, byref(err))
+        if n < 0:
+            _ffi.check(-n, err, self._name)
+        return list(out[:n])
 
     # -- reading -------------------------------------------------------------
+    def _empty(self, ordinals: list) -> Table:
+        return Table(_Scan(self, ordinals, window=(0, 0)).schema, [])
+
+    def _no_columns(self, rgs: Optional[list], flt: Optional[Filters], window: Optional[tuple] = None) -> Table:
+        """A table without columns: only the row count."""
+        pred, none = self._predicate(flt)
+        schema = self.schema._select([])
+        if none:
+            return Table(schema, [], 0)
+        if rgs == []:
+            return Table(schema, [], 0)
+        if pred is None:
+            md = self.metadata
+            if window is not None:
+                off, lim = window
+                n = max(0, min(self.num_rows - off, lim if lim >= 0 else self.num_rows))
+            else:
+                n = sum(md.row_group(rg).num_rows for rg in (rgs if rgs is not None else range(self.num_row_groups)))
+            return Table(schema, [], n)
+        fields = self._filter_fields(flt)
+        n = sum(b.num_rows for b in _Scan(self, fields, row_groups=rgs, window=window, predicate=pred))
+        return Table(schema, [], n)
+
     def read(
         self,
         columns: Optional[Sequence[str]] = None,
@@ -520,8 +560,8 @@ class ParquetFile:
         filters: Any = None,
         row_groups: Optional[Iterable[int]] = None,
         use_threads: bool = True,
-    ) -> "pa.Table":
-        """Read the file (or some row groups) into a :class:`pyarrow.Table`.
+    ) -> Table:
+        """Read the file (or some row groups) into a :class:`carquet.Table`.
 
         Args:
             columns: top-level fields to read, in the order wanted (a dotted
@@ -533,28 +573,27 @@ class ParquetFile:
             row_groups: only read these row groups (in this order).
             use_threads: allow multi-threaded decoding.
         """
-        pa = _pa()
         flt = normalize_filters(filters)
         ordinals = self._resolve(columns)
-        read_ordinals = self._with_filter_columns(ordinals, flt)
-        rgs = self._row_groups(row_groups, flt)
-        conv = self._converter(read_ordinals)
-        page_filter = self._page_filter(read_ordinals, rgs, flt)
-        batches = list(self._stream(read_ordinals, rgs, _READ_BATCH_SIZE, page_filter=page_filter,
-                                    use_threads=use_threads))
-        table = conv.table(pa.Table.from_batches(batches, schema=conv.raw_schema))
-        return self._finish(table, ordinals, read_ordinals, flt)
+        rgs = self._check_row_groups(row_groups)
+        if not ordinals and self._fields:
+            return self._no_columns(rgs, flt)
+        pred, none = self._predicate(flt)
+        if none or rgs == []:
+            return self._empty(ordinals)
+        scan = _Scan(self, ordinals, row_groups=rgs, predicate=pred, use_threads=use_threads)
+        return Table(scan.schema, list(scan))
 
-    def read_row_group(self, i: int, columns: Optional[Sequence[str]] = None, *, use_threads: bool = True) -> "pa.Table":
-        """Read row group ``i`` into a :class:`pyarrow.Table`."""
+    def read_row_group(self, i: int, columns: Optional[Sequence[str]] = None, *, use_threads: bool = True) -> Table:
+        """Read row group ``i``."""
         return self.read(columns, row_groups=[i], use_threads=use_threads)
 
     def read_row_groups(self, row_groups: Iterable[int], columns: Optional[Sequence[str]] = None, *,
-                        use_threads: bool = True) -> "pa.Table":
-        """Read the given row groups (in that order) into one :class:`pyarrow.Table`."""
+                        use_threads: bool = True) -> Table:
+        """Read the given row groups (in that order) into one table."""
         return self.read(columns, row_groups=list(row_groups), use_threads=use_threads)
 
-    def read_all(self, columns: Optional[Sequence[str]] = None, **kwargs) -> "pa.Table":
+    def read_all(self, columns: Optional[Sequence[str]] = None, **kwargs) -> Table:
         """Alias of :meth:`read`."""
         return self.read(columns, **kwargs)
 
@@ -566,79 +605,67 @@ class ParquetFile:
         filters: Any = None,
         row_groups: Optional[Iterable[int]] = None,
         use_threads: bool = True,
-    ) -> Iterator["pa.RecordBatch"]:
-        """Stream the file as :class:`pyarrow.RecordBatch` es of at most ``batch_size`` rows.
+    ) -> Iterator[RecordBatch]:
+        """Stream the file as :class:`carquet.RecordBatch` es of at most ``batch_size`` rows.
 
-        Batches never span row groups. With ``filters``, each batch is filtered
-        exactly (so batches may be shorter, and empty ones are skipped).
+        Batches never span row groups (a selection with list, map or struct
+        columns comes one row group per batch). With ``filters``, each batch
+        is filtered exactly (so batches may be shorter, and empty ones are
+        skipped).
         """
         if int(batch_size) <= 0:
             raise ValueError("batch_size must be a positive integer")
-        pa = _pa()
         flt = normalize_filters(filters)
         ordinals = self._resolve(columns)
-        read_ordinals = self._with_filter_columns(ordinals, flt)
-        rgs = self._row_groups(row_groups, flt)
-        conv = self._converter(read_ordinals)
-        page_filter = self._page_filter(read_ordinals, rgs, flt)
-        expr = flt.to_expression(self.parquet_schema.fields) if flt is not None else None
-        out_schema = None
-        for raw in self._stream(read_ordinals, rgs, int(batch_size), page_filter=page_filter, use_threads=use_threads):
-            batch = conv.batch(raw)
-            if expr is not None:
-                batch = batch.filter(expr)
-                if batch.num_rows == 0:
-                    continue
-            if read_ordinals != ordinals:
-                if out_schema is None:
-                    out_schema = pa.schema([batch.schema.field(i) for i in range(len(ordinals))],
-                                           metadata=batch.schema.metadata)
-                batch = pa.RecordBatch.from_arrays(batch.columns[: len(ordinals)], schema=out_schema)
-            yield batch
+        rgs = self._check_row_groups(row_groups)
+        pred, none = self._predicate(flt)
+        if none or rgs == []:
+            return iter(())
+        if not ordinals and self._fields:
+            return self._row_count_batches(rgs, flt, int(batch_size))
+        return _Scan(self, ordinals, row_groups=rgs, predicate=pred, batch_size=int(batch_size),
+                     use_threads=use_threads, split=True)
 
-    def iter_row_groups(self, columns: Optional[Sequence[str]] = None, **kwargs) -> Iterator["pa.Table"]:
-        """Yield one :class:`pyarrow.Table` per row group."""
+    def _row_count_batches(self, rgs: Optional[list], flt: Optional[Filters], batch_size: int) -> Iterator:
+        """Batches without columns, carrying only row counts (``columns=[]``)."""
+        schema = self.schema._select([])
+        pred, _none = self._predicate(flt)
+        if pred is None:
+            md = self.metadata
+            for rg in (rgs if rgs is not None else range(self.num_row_groups)):
+                n = md.row_group(rg).num_rows
+                for start in range(0, n, batch_size):
+                    yield RecordBatch(schema, None, 0, min(batch_size, n - start))
+            return
+        for b in _Scan(self, self._filter_fields(flt), row_groups=rgs, predicate=pred, batch_size=batch_size,
+                       split=True):
+            yield RecordBatch(schema, None, 0, b.num_rows)
+
+    def iter_row_groups(self, columns: Optional[Sequence[str]] = None, **kwargs) -> Iterator[Table]:
+        """Yield one table per row group."""
         for i in range(self.num_row_groups):
             yield self.read(columns, row_groups=[i], **kwargs)
 
     def slice(self, offset: int, length: Optional[int] = None, columns: Optional[Sequence[str]] = None, *,
-              use_threads: bool = True) -> "pa.Table":
+              use_threads: bool = True) -> Table:
         """Read rows ``[offset, offset + length)`` (to the end when ``length`` is None).
 
         Row groups outside the window are not read; for flat columns, pages
         before ``offset`` are skipped through the offset index when present.
         """
-        pa = _pa()
         offset = int(offset)
         if offset < 0:
             offset = max(0, self.num_rows + offset)
         if length is not None and int(length) < 0:
             raise ValueError("length must be >= 0")
-        end = self.num_rows if length is None else min(self.num_rows, offset + int(length))
+        limit = -1 if length is None else int(length)
         ordinals = self._resolve(columns)
-        conv = self._converter(ordinals)
-        if offset >= end:
-            return conv.schema.empty_table()
-        fields = [self._fields[i] for i in ordinals]
-        if fields and all(f.batchable and f.leaves[0].max_repetition_level == 0 for f in fields):
-            stream = _BatchStream(self, fields, list(range(self.num_row_groups)), _READ_BATCH_SIZE, None,
-                                  (offset, end - offset), use_threads)
-            table = pa.Table.from_batches(list(stream), schema=conv.raw_schema)
-        else:
-            rgs, first_row, row = [], None, 0
-            for rg in range(self.num_row_groups):
-                n = self.metadata.row_group(rg).num_rows
-                if row + n > offset and row < end:
-                    rgs.append(rg)
-                    if first_row is None:
-                        first_row = row
-                row += n
-            batches = list(self._stream(ordinals, rgs, _READ_BATCH_SIZE, use_threads=use_threads))
-            table = pa.Table.from_batches(batches, schema=conv.raw_schema)
-            table = table.slice(offset - (first_row or 0), end - offset)
-        return conv.table(table)
+        if not ordinals and self._fields:
+            return self._no_columns(None, None, (offset, limit))
+        scan = _Scan(self, ordinals, window=(offset, limit), use_threads=use_threads)
+        return Table(scan.schema, list(scan))
 
-    def head(self, n: int = 5, columns: Optional[Sequence[str]] = None) -> "pa.Table":
+    def head(self, n: int = 5, columns: Optional[Sequence[str]] = None) -> Table:
         """The first ``n`` rows."""
         return self.slice(0, n, columns)
 
@@ -647,167 +674,110 @@ class ParquetFile:
         flt = normalize_filters(filters)
         if flt is None:
             return self.num_rows
-        cols = flt.columns if flt.dnf else None
-        return sum(b.num_rows for b in self.iter_batches(_READ_BATCH_SIZE, columns=cols, filters=filters))
+        return self._no_columns(None, flt).num_rows
 
-    # -- helpers -------------------------------------------------------------
-    def _with_filter_columns(self, ordinals: list, flt: Optional[Filters]) -> list:
-        if flt is None or not flt.dnf:
-            if flt is not None and flt.expression is not None and len(ordinals) != len(self._fields):
-                # an Expression may reference any field: read them all, drop afterwards
-                return ordinals + [f.ordinal for f in self._fields if f.ordinal not in ordinals]
-            return ordinals
-        extra = []
-        for name in flt.columns:
-            for o in self._resolve([name]):
-                if o not in ordinals and o not in extra:
-                    extra.append(o)
-        return ordinals + extra
+    # -- Arrow streams -----------------------------------------------------
+    def arrow_stream(
+        self,
+        columns: Optional[Sequence[str]] = None,
+        *,
+        filters: Any = None,
+        row_groups: Optional[Iterable[int]] = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        use_threads: bool = True,
+    ) -> "ArrowStream":
+        """The file as an Arrow C stream, for any Arrow consumer.
 
-    def _page_filter(self, ordinals: list, rgs: list, flt: Optional[Filters]):
-        if flt is None or not flt.dnf or len(flt.dnf) != 1:
-            return None
-        if not all(self._fields[i].batchable for i in ordinals):
-            return None
-        pf = build_page_filter(self.parquet_schema, flt)
-        if pf is None:
-            return None
-        md = self.metadata
-        for rg in rgs:
-            for c in pf.columns:
-                if not md.row_group(rg).column(c).has_offset_index:
-                    return None
-        return pf
+        The result implements the Arrow PyCapsule interface
+        (``__arrow_c_stream__``): ``polars.DataFrame(stream)``,
+        ``duckdb.sql("SELECT * FROM stream")``, ``pyarrow.table(stream)``,
+        nanoarrow... Unlike :meth:`read`, nothing is materialised: the consumer
+        pulls the batches. Every ``__arrow_c_stream__`` call reads the file
+        again through its own handle, so the stream stays usable after this
+        file is closed.
+        """
+        self._require_open()
+        if int(batch_size) <= 0:
+            raise ValueError("batch_size must be a positive integer")
+        ordinals = self._resolve(columns)
+        if not ordinals and self._fields:
+            raise ValueError("arrow_stream needs at least one column")
+        flt = normalize_filters(filters)
+        pred, none = self._predicate(flt)
+        return ArrowStream(self.path, self._buffer_addr, self._buffer_size, self._keepalive, self._reader_opts,
+                           ordinals, self._check_row_groups(row_groups), pred, none,
+                           min(int(batch_size), 2**31 - 1), self._num_threads if use_threads else 1, self._name,
+                           self._restore)
 
-    def _finish(self, table, ordinals: list, read_ordinals: list, flt: Optional[Filters]):
-        if flt is not None:
-            table = table.filter(flt.to_expression(self.parquet_schema.fields))
-        if read_ordinals != ordinals:
-            table = table.select(list(range(len(ordinals))))
-        return table
+    def __arrow_c_stream__(self, requested_schema: Any = None) -> object:
+        """Arrow PyCapsule interface: every column, as :meth:`arrow_stream`."""
+        return self.arrow_stream().__arrow_c_stream__(requested_schema)
 
 
-class _BatchStream:
-    """Iterator over raw RecordBatches from a C batch reader."""
+class ArrowStream:
+    """An Arrow C stream over a Parquet file (see :meth:`ParquetFile.arrow_stream`).
 
-    def __init__(self, pf: ParquetFile, fields: list, rgs: list, batch_size: int, page_filter, row_range,
-                 use_threads: bool) -> None:
-        self._pf = pf
-        self._pa = _pa()
-        self._raw_schema = pf._converter([f.ordinal for f in fields]).raw_schema
-        self._leaves = [c.index for f in fields for c in f.leaves]
-        self._batch_size = max(1, min(int(batch_size), 2**31 - 1))
-        self._page_filter = page_filter
-        self._row_range = row_range
-        self._use_threads = use_threads
-        self._br: Optional[int] = None
-        self._keep: Any = None
-        self._done = False
-        self._interrupted = False
-        # One C reader over all selected row groups when they are in file order;
-        # otherwise one reader per row group, in the order asked.
-        rgs = list(rgs)
-        if not rgs:
-            self._runs = []
-        elif row_range is not None or rgs == list(range(pf.num_row_groups)):
-            self._runs = [None]  # every row group
-        elif rgs == sorted(set(rgs)):
-            self._runs = [rgs]
-        else:
-            self._runs = [[rg] for rg in rgs]
-        pf._streams.add(self)
+    It does not depend on the :class:`ParquetFile` it came from, and each
+    ``__arrow_c_stream__`` call opens a fresh read (DuckDB, for one, asks twice).
+    """
 
-    def __iter__(self) -> "_BatchStream":
-        return self
+    def __init__(self, path, buffer_addr, buffer_size, keepalive, reader_opts, ordinals: list,
+                 row_groups: Optional[list], predicate: Any, no_rows: bool, batch_size: int, num_threads: int,
+                 name: str, restore: bool = True) -> None:
+        self._path = path
+        self._buffer = (buffer_addr, buffer_size, keepalive)
+        self._opts = _ffi.ReaderOptions.from_buffer_copy(reader_opts)
+        self._ordinals = list(ordinals)
+        self._row_groups = row_groups
+        self._predicate = predicate
+        self._no_rows = no_rows
+        self._batch_size = batch_size
+        self._num_threads = num_threads
+        self._name = name
+        self._restore = restore
 
-    def _open(self, run: Optional[list]) -> None:
+    def __arrow_c_stream__(self, requested_schema: Any = None) -> object:
+        """Arrow PyCapsule interface. ``requested_schema`` is ignored (the
+        protocol lets a producer keep its own types)."""
         lib = _ffi.get_lib()
-        handle = self._pf._require_open()
-        cfg = _ffi.BatchReaderConfig()
-        lib.carquet_batch_reader_config_init(byref(cfg))
-        cfg.batch_size = self._batch_size
-        threads = self._pf._num_threads
-        cfg.num_threads = threads if self._use_threads else 1
-        cfg.use_mmap = self._pf._memory_map
-        idx = (c_int32 * len(self._leaves))(*self._leaves)
-        cfg.column_indices = idx
-        cfg.num_columns = len(self._leaves)
-        keep: list = [idx]
-        if run is not None:
-            wanted = frozenset(run)
-            cb = _ffi.RowGroupFilterFn(lambda _r, i, _u: i in wanted)
-            cfg.row_group_filter = cb
-            keep.append(cb)
         err = _ffi.CarquetErrorStruct()
-        br = lib.carquet_batch_reader_create(handle, byref(cfg), byref(err))
-        if not br:
-            _ffi.check(err.code or StatusCode.INTERNAL, err, self._pf._name)
-        try:
-            if self._page_filter is not None:
-                _ffi.check(lib.carquet_batch_reader_set_page_filter(br, self._page_filter.clauses,
-                                                                    self._page_filter.count), None, "page filter")
-            if self._row_range is not None:
-                off, lim = self._row_range
-                _ffi.check(lib.carquet_batch_reader_set_row_range(br, int(off), int(lim)), None, "row range")
-        except BaseException:
-            lib.carquet_batch_reader_free(br)
-            raise
-        self._br = br
-        self._keep = keep
+        if self._path is not None:
+            handle = lib.carquet_reader_open(_ffi.fsencode(self._path), byref(self._opts), byref(err))
+            keep = None
+        else:
+            addr, size, keep = self._buffer
+            handle = lib.carquet_reader_open_buffer(addr or None, size, byref(self._opts), byref(err))
+        if not handle:
+            _ffi.check(err.code or StatusCode.FILE_OPEN, err, self._name)
+        opts = _ffi.ArrowStreamOptions()
+        lib.carquet_arrow_stream_options_init(byref(opts))
+        idx = (c_int32 * max(1, len(self._ordinals)))(*self._ordinals)
+        opts.field_indices = idx
+        opts.num_fields = len(self._ordinals)
+        opts.batch_size = self._batch_size
+        opts.num_threads = self._num_threads
+        opts.close_reader = True
+        opts.restore_arrow_schema = self._restore
+        if self._row_groups is not None:
+            rgs = (c_int32 * max(1, len(self._row_groups)))(*self._row_groups)
+            opts.row_groups = rgs
+            opts.num_row_groups = len(self._row_groups)
+        if self._no_rows:
+            opts.row_offset, opts.row_limit, opts.row_groups, opts.num_row_groups = 0, 0, None, 0
+        elif self._predicate is not None:
+            opts.predicate = ctypes.pointer(self._predicate.struct)
+        stream = ArrowArrayStream()
+        st = lib.carquet_reader_export_arrow_stream(handle, byref(opts), byref(stream), byref(err))
+        if st != _ffi.OK:
+            lib.carquet_reader_close(handle)
+            _ffi.check(st, err, self._name)
+        return stream_capsule(stream, keep)
 
-    def __next__(self) -> "pa.RecordBatch":
-        lib = _ffi.get_lib()
-        pa = self._pa
-        with self._pf._lock:
-            while True:
-                if self._done:
-                    if self._interrupted:
-                        raise CarquetError(StatusCode.ALREADY_CLOSED,
-                                           f"{self._pf._name}: file closed while batches were being read")
-                    raise StopIteration
-                if self._br is None:
-                    if not self._runs:
-                        self._done = True
-                        self.close()
-                        raise StopIteration
-                    self._open(self._runs.pop(0))
-                batch = c_void_p()
-                st = lib.carquet_batch_reader_next(self._br, byref(batch))
-                if st == _ffi.END_OF_DATA or (st == _ffi.OK and not batch):
-                    self._free_reader()
-                    continue
-                if st != _ffi.OK:
-                    detail = lib.carquet_batch_reader_last_error(self._br)
-                    exc = _ffi.make_error(st, detail.contents if detail else None, self._pf._name)
-                    self.close()
-                    raise exc
-                array = ArrowArray()
-                err = _ffi.CarquetErrorStruct()
-                st = lib.carquet_arrow_export_batch(batch, self._pf._schema_handle, None, byref(array), byref(err))
-                lib.carquet_row_batch_free(batch)
-                if st != _ffi.OK:
-                    self.close()
-                    _ffi.check(st, err, self._pf._name)
-                return _import_batch(pa, array, self._raw_schema)
+    def read_all(self) -> Table:
+        """Read the stream into a :class:`carquet.Table`."""
+        from .arrow import table
 
-    def _free_reader(self) -> None:
-        br, self._br = self._br, None
-        if br:
-            _ffi.get_lib().carquet_batch_reader_free(br)
-        self._keep = None
-
-    def close(self, interrupted: bool = False) -> None:
-        if interrupted and not self._done:
-            self._interrupted = True
-        self._done = True
-        self._runs = []
-        self._free_reader()
-
-    def __del__(self) -> None:  # pragma: no cover - best effort
-        try:
-            self.close()
-        except Exception:
-            pass
+        return table(self)
 
 
 # --------------------------------------------------------------------------
@@ -828,6 +798,15 @@ def _sources(source: Any) -> Optional[list]:
     return None
 
 
+def _concat(tables: list) -> Table:
+    first = tables[0]
+    for t in tables[1:]:
+        if t.schema != first.schema:
+            raise ValueError("the files have different schemas and cannot be concatenated")
+    batches = [b for t in tables for b in t.to_batches()]
+    return Table(first.schema, batches, sum(t.num_rows for t in tables))
+
+
 def read_table(
     source: Source,
     *,
@@ -839,14 +818,41 @@ def read_table(
     verify_checksums: bool = True,
     restore_arrow_schema: bool = True,
     use_mmap: Optional[bool] = None,
-) -> "pa.Table":
-    """Read a Parquet file into a :class:`pyarrow.Table`.
+) -> Table:
+    """Read a Parquet file into a :class:`carquet.Table`.
 
-    ``source`` is a path, a bytes-like object, a binary file object, a
-    directory (every ``*.parquet`` file under it, in sorted order) or a list
-    of any of these; several files are concatenated (their schemas must
-    match). See :meth:`ParquetFile.read` for ``columns``, ``filters`` and
-    ``row_groups``.
+    ::
+
+        t = carquet.read_table("data.parquet")
+        t = carquet.read_table("data.parquet", columns=["id", "price"],
+                               filters=[("price", ">", 100)])
+        t.to_pandas()        # or t.to_pydict(), t.column("price").to_numpy(),
+                             # polars.DataFrame(t), pyarrow.table(t)
+
+    Args:
+        source: a path, a bytes-like object (read in place), a binary file
+            object, a directory (every ``*.parquet`` file under it, sorted)
+            or a list of any of these. Several files are concatenated; their
+            schemas must match.
+        columns: names of the columns to read, in the order wanted (default:
+            all). Only these columns are read from the file.
+        filters: keep only the rows that match, e.g. ``[("year", ">=", 2020),
+            ("country", "in", ["FR", "DE"])]``. A list of tuples is an AND, a
+            list of lists an OR of ANDs. Operators: ``==``, ``!=``, ``<``,
+            ``<=``, ``>``, ``>=``, ``in``, ``not in``, ``is null``,
+            ``is not null``. The result is exact, and data that statistics
+            rule out is not read at all.
+        row_groups: indices of the row groups to read (default: all).
+        use_threads: decode columns in parallel (default True).
+        memory_map: map the file in memory instead of buffered reads
+            (default True; ``use_mmap`` is the old name).
+        verify_checksums: check page checksums when the file has them.
+        restore_arrow_schema: give columns the exact types they were written
+            with (time zones, categoricals...) when the file recorded them
+            (default True).
+
+    Raises :class:`CarquetError` when the file cannot be read, ``KeyError``
+    for an unknown column.
     """
     many = _sources(source)
     opts = dict(memory_map=memory_map, verify_checksums=verify_checksums,
@@ -854,17 +860,21 @@ def read_table(
     if many is not None:
         if row_groups is not None:
             raise ValueError("row_groups cannot be combined with several source files")
-        pa = _pa()
         if not many:
             raise ValueError(f"no Parquet files found in {source!r}")
-        tables = [read_table(s, columns=columns, filters=filters, use_threads=use_threads, **opts) for s in many]
-        return pa.concat_tables(tables)
+        return _concat([read_table(s, columns=columns, filters=filters, use_threads=use_threads, **opts)
+                        for s in many])
     with ParquetFile(source, **opts) as pf:
         return pf.read(columns, filters=filters, row_groups=row_groups, use_threads=use_threads)
 
 
 def read_pandas(source: Source, **kwargs):
-    """:func:`read_table` followed by ``Table.to_pandas()`` (pandas metadata restores the index)."""
+    """Read a Parquet file into a pandas DataFrame (needs pandas).
+
+    Takes the arguments of :func:`read_table` (``columns``, ``filters``...).
+    A file written from a DataFrame gets its index, categoricals and nullable
+    dtypes back.
+    """
     return read_table(source, **kwargs).to_pandas()
 
 
@@ -878,7 +888,7 @@ def iter_batches(
     use_threads: bool = True,
     memory_map: bool = True,
     verify_checksums: bool = True,
-) -> Iterator["pa.RecordBatch"]:
+) -> Iterator[RecordBatch]:
     """Stream a Parquet file (or several) as RecordBatches; the file is closed at the end."""
     many = _sources(source)
     for s in many if many is not None else [source]:
@@ -887,7 +897,7 @@ def iter_batches(
                                        use_threads=use_threads)
 
 
-def read_schema(source: Source) -> "pa.Schema":
+def read_schema(source: Source) -> Schema:
     """The Arrow schema of a Parquet file, without reading any data."""
     with ParquetFile(source, memory_map=False) as pf:
         return pf.schema
@@ -900,6 +910,6 @@ def read_metadata(source: Source) -> FileMetaData:
 
 
 def read_parquet_schema(source: Source) -> ParquetSchema:
-    """The Parquet-level schema (:class:`ParquetSchema`) of a file; works without PyArrow."""
+    """The Parquet-level schema (:class:`ParquetSchema`) of a file."""
     with ParquetFile(source, memory_map=False) as pf:
         return pf.parquet_schema

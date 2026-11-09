@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "Johan H. G. Natter" }]
-keywords = ["parquet", "arrow", "columnar", "pyarrow", "zstd", "snappy"]
+keywords = ["parquet", "arrow", "columnar", "polars", "pandas", "zstd", "snappy"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -32,14 +32,15 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
     "Typing :: Typed",
 ]
-# pyarrow is only needed for Arrow data (read_table / write_table / ParquetFile.read...);
-# metadata, schema, statistics, info(), validate() and cpu_info() work without it.
-# numpy converts DECIMAL / INT96 storage to decimal128 / timestamp on read.
+# No dependencies: reads return carquet.Table (Arrow C Data arrays held by the C
+# library, exported to polars / DuckDB / PyArrow... through the Arrow PyCapsule
+# interface). NumPy and pandas are used, lazily, by the conversions to and from them.
 dependencies = []
 
 [project.optional-dependencies]
-arrow = ["pyarrow>=14", "numpy"]
-test = ["pytest", "pyarrow>=14", "numpy"]
+pandas = ["pandas", "numpy"]
+# PyArrow, DuckDB and polars are oracles in the tests (each skips when absent).
+test = ["pytest", "numpy", "pandas", "pyarrow>=14"]
 
 [project.urls]
 Homepage = "https://github.com/Vitruves/carquet"

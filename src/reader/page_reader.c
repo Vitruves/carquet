@@ -7,6 +7,7 @@
 
 #include "core/allocator.h"
 #include "core/compat.h"
+#include "core/file_io.h"
 #include <carquet/carquet.h>
 #include "reader_internal.h"
 #include "thrift/parquet_types.h"
@@ -160,6 +161,12 @@ static size_t prebuf_read_at(carquet_reader_t* file_reader,
             memcpy(buf, file_reader->prebuffer.data + (size_t)rel, size);
             return size;
         }
+    }
+
+    /* Positional read when possible: it leaves the stream position alone, so
+     * column readers on other threads can load their pages concurrently. */
+    if (file_reader->positional_io) {
+        return carquet_file_pread(file_reader->file, buf, size, offset);
     }
 
     /* Fall back to 64-bit aware seek + fread */
@@ -498,7 +505,12 @@ static bool page_values_can_be_viewed_directly(
     (void)encoding;
     return false;
 #else
+    /* A reader preserving dictionaries hands out 4-byte indices, not physical
+     * values: a PLAIN page (a writer's fallback after the dictionary filled)
+     * must take the decode path, which rejects it, rather than be viewed as
+     * indices. */
     if (encoding != CARQUET_ENCODING_PLAIN ||
+        reader->preserve_dictionary ||
         reader->max_def_level > 0 ||
         reader->max_rep_level > 0) {
         return false;
@@ -515,6 +527,39 @@ static bool page_values_can_be_viewed_directly(
             return reader->type_length > 0;
         case CARQUET_PHYSICAL_BOOLEAN:
         case CARQUET_PHYSICAL_BYTE_ARRAY:
+        default:
+            return false;
+    }
+#endif
+}
+
+/* A PLAIN page of a fixed-width def-as-bits column (top-level nullable
+ * INT32/INT64/INT96/FLOAT/DOUBLE/FLBA) whose dense values can be viewed in
+ * the page payload after its levels, as page_values_can_be_viewed_directly
+ * does for REQUIRED columns, instead of being copied into decoded_values. */
+static bool page_values_viewable_after_def_bits(
+    const carquet_column_reader_t* reader,
+    carquet_encoding_t encoding) {
+#if !CARQUET_LITTLE_ENDIAN
+    (void)reader;
+    (void)encoding;
+    return false;
+#else
+    /* A dictionary-preserving reader rejects a PLAIN page in
+     * carquet_read_data_page_v1/v2; leave it that path. */
+    if (encoding != CARQUET_ENCODING_PLAIN || !carquet_column_def_as_bits(reader) ||
+        reader->preserve_dictionary) {
+        return false;
+    }
+    switch (reader->type) {
+        case CARQUET_PHYSICAL_INT32:
+        case CARQUET_PHYSICAL_INT64:
+        case CARQUET_PHYSICAL_INT96:
+        case CARQUET_PHYSICAL_FLOAT:
+        case CARQUET_PHYSICAL_DOUBLE:
+            return true;
+        case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY:
+            return reader->type_length > 0;
         default:
             return false;
     }
@@ -555,13 +600,27 @@ static void release_decoded_level_buffers(carquet_column_reader_t* reader) {
     reader->decoded_rep_levels = NULL;
 }
 
+/* Size decoded_def_bits for a page of `num_values` levels; leaves it NULL on
+ * allocation failure (callers check). */
+static void ensure_def_bits_capacity(carquet_column_reader_t* reader, int32_t num_values) {
+    if (num_values <= 0) return;
+    /* +8: the slack carquet_rle_decode_to_bitmap writes short runs into. */
+    size_t bytes = ((size_t)num_values + 7) / 8 + 8;
+    if (bytes > reader->def_bits_capacity) {
+        carquet_mem_free(reader->decoded_def_bits);
+        reader->decoded_def_bits = carquet_mem_malloc(bytes);
+        reader->def_bits_capacity = reader->decoded_def_bits ? bytes : 0;
+    }
+}
+
 static carquet_status_t ensure_decoded_page_buffers(
     carquet_column_reader_t* reader,
     int32_t num_values,
     size_t value_size,
     carquet_error_t* error) {
 
-    bool need_def_levels = reader->max_def_level > 0;
+    bool need_def_bits = carquet_column_def_as_bits(reader);
+    bool need_def_levels = reader->max_def_level > 0 && !need_def_bits;
     bool need_rep_levels = reader->max_rep_level > 0;
     size_t values_buffer_size = 0;
 
@@ -635,7 +694,12 @@ static carquet_status_t ensure_decoded_page_buffers(
         }
     }
 
+    if (need_def_bits) {
+        ensure_def_bits_capacity(reader, num_values);
+    }
+
     if ((values_buffer_size > 0 && !reader->decoded_values) ||
+        (need_def_bits && num_values > 0 && !reader->decoded_def_bits) ||
         (need_def_levels && num_values > 0 && !reader->decoded_def_levels) ||
         (need_rep_levels && num_values > 0 && !reader->decoded_rep_levels)) {
         carquet_mem_free(reader->decoded_values);
@@ -709,6 +773,17 @@ static bool gather_numeric_dictionary_values(
  * Level Decoding
  * ============================================================================
  */
+
+/* Whether every dictionary index is below `count` (dictionary-preserving
+ * reads hand the raw indices to the caller). */
+static bool dictionary_indices_in_range(const uint32_t* idx, int64_t n, int32_t count) {
+    if (count <= 0) return n == 0;
+    uint32_t max_idx = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (idx[i] > max_idx) max_idx = idx[i];
+    }
+    return n == 0 || max_idx < (uint32_t)count;
+}
 
 static carquet_status_t decode_levels_rle(
     const uint8_t* data,
@@ -806,6 +881,173 @@ static carquet_status_t decode_v1_level_section(
     *ptr += sz;
     *remaining -= sz;
     return CARQUET_OK;
+}
+
+/* ----------------------------------------------------------------------------
+ * Definition levels as a validity bitmap (carquet_column_def_as_bits columns)
+ * ----------------------------------------------------------------------------
+ * With max_def == 1 and no repetition, levels are 1 bit wide: a bit-packed
+ * group of the RLE/bit-packing hybrid is one byte whose bits (LSB first) are
+ * the levels, and an RLE run is a bit range, so the stream decodes straight
+ * into the validity bitmap (carquet_rle_decode_to_bitmap). The non-null count
+ * is a popcount, and the batch reader spreads values and copies validity
+ * from those bits without ever materialising one int16 per row.
+ */
+
+/* Decode a page's definition levels (`num_values` 1-bit levels in
+ * data[0, size)) into reader->decoded_def_bits. Legacy BIT_PACKED is MSB
+ * first, so each byte is bit-reversed. */
+static carquet_status_t decode_def_bits(
+    carquet_column_reader_t* reader,
+    const uint8_t* data,
+    size_t size,
+    bool legacy_bit_packed,
+    int32_t num_values,
+    int32_t* non_null,
+    size_t* bytes_consumed) {
+
+    uint8_t* bits = reader->decoded_def_bits;
+    *non_null = 0;
+    *bytes_consumed = 0;
+    if (num_values <= 0) return CARQUET_OK;
+    if (!bits) return CARQUET_ERROR_DECODE;
+
+    if (legacy_bit_packed) {
+        size_t needed = ((size_t)num_values + 7) / 8;
+        if (needed > size) return CARQUET_ERROR_DECODE;
+        int64_t nn = 0;
+        for (size_t i = 0; i < needed; i++) {
+            unsigned b = data[i];
+            b = ((b & 0xF0u) >> 4) | ((b & 0x0Fu) << 4);
+            b = ((b & 0xCCu) >> 2) | ((b & 0x33u) << 2);
+            b = ((b & 0xAAu) >> 1) | ((b & 0x55u) << 1);
+            bits[i] = (uint8_t)b;
+        }
+        if (num_values & 7) bits[needed - 1] &= (uint8_t)((1u << (num_values & 7)) - 1);
+        for (size_t i = 0; i < needed; i++) nn += carquet_popcount32(bits[i]);
+        *non_null = (int32_t)nn;
+        *bytes_consumed = needed;
+        return CARQUET_OK;
+    }
+
+    int64_t nn = 0;
+    int64_t decoded = carquet_rle_decode_to_bitmap(data, size, bits, num_values, &nn);
+    if (decoded != num_values) return CARQUET_ERROR_DECODE;
+    *non_null = (int32_t)nn;
+    *bytes_consumed = size;
+    return CARQUET_OK;
+}
+
+/* decode_v1_level_section for the definition levels of a def-as-bits
+ * column: same section layout and errors, output into decoded_def_bits. */
+static carquet_status_t decode_v1_def_bits(
+    carquet_column_reader_t* reader,
+    const uint8_t** ptr,
+    size_t* remaining,
+    carquet_encoding_t level_encoding,
+    int32_t num_values,
+    int32_t* non_null,
+    carquet_error_t* error) {
+
+    size_t bytes_consumed = 0;
+    carquet_status_t status;
+    if (level_encoding == CARQUET_ENCODING_BIT_PACKED) {
+        status = decode_def_bits(reader, *ptr, *remaining, true, num_values,
+                                 non_null, &bytes_consumed);
+        if (status != CARQUET_OK) {
+            CARQUET_SET_ERROR(error, status, "Failed to decode BIT_PACKED levels");
+            return status;
+        }
+        *ptr += bytes_consumed;
+        *remaining -= bytes_consumed;
+        return CARQUET_OK;
+    }
+    if (*remaining < 4) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Truncated levels");
+        return CARQUET_ERROR_DECODE;
+    }
+    uint32_t sz = carquet_read_u32_le(*ptr);
+    *ptr += 4;
+    *remaining -= 4;
+    if (sz > *remaining) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Invalid level size");
+        return CARQUET_ERROR_DECODE;
+    }
+    status = decode_def_bits(reader, *ptr, sz, false, num_values, non_null,
+                             &bytes_consumed);
+    if (status != CARQUET_OK) {
+        CARQUET_SET_ERROR(error, status, "Failed to decode RLE levels");
+        return status;
+    }
+    *ptr += sz;
+    *remaining -= sz;
+    return CARQUET_OK;
+}
+
+int64_t carquet_bitmap_count_range(const uint8_t* bm, int64_t start, int64_t n) {
+    if (n <= 0) return 0;
+    int64_t c = 0;
+    if (start & 7) {
+        unsigned s = (unsigned)(start & 7);
+        int64_t take = 8 - (int64_t)s < n ? 8 - (int64_t)s : n;
+        c += carquet_popcount32((unsigned)(bm[start >> 3] >> s) & ((1u << take) - 1));
+        start += take;
+        n -= take;
+    }
+    const uint8_t* p = bm + (start >> 3);
+    for (; n >= 64; n -= 64, p += 8) c += carquet_popcount64(carquet_read_u64_le(p));
+    for (; n >= 8; n -= 8, p++) c += carquet_popcount32(*p);
+    if (n > 0) c += carquet_popcount32(*p & ((1u << n) - 1));
+    return c;
+}
+
+void carquet_bitmap_copy_range(uint8_t* dst, int64_t dst_at,
+                               const uint8_t* src, int64_t src_at, int64_t n) {
+    if (n <= 0) return;
+    uint8_t* d = dst + (dst_at >> 3);
+    unsigned sh = (unsigned)(dst_at & 7);
+    int64_t i = 0;
+    /* Whole words: d[0] keeps its low sh bits, the word's top sh bits land
+     * in d[8], which is inside the range since all 64 bits are. */
+    for (; n - i >= 64; i += 64, d += 8) {
+        uint64_t w = carquet_bitmap_load_bits(src, src_at + i, 64);
+        if (sh == 0) {
+            carquet_write_u64_le(d, w);
+        } else {
+            carquet_write_u64_le(d, carquet_read_u64_le(d) | (w << sh));
+            d[8] = (uint8_t)(w >> (64 - sh));
+        }
+    }
+    for (; i < n; d++) {
+        int take = n - i < 8 ? (int)(n - i) : 8;
+        unsigned v = (unsigned)carquet_bitmap_load_bits(src, src_at + i, take);
+        d[0] |= (uint8_t)(v << sh);
+        if (sh + (unsigned)take > 8) d[1] |= (uint8_t)(v >> (8 - sh));
+        i += take;
+    }
+}
+
+void carquet_bitmap_to_levels(const uint8_t* bm, int64_t start, int64_t n, int16_t* out) {
+    int64_t i = 0;
+    for (; i < n && ((start + i) & 7); i++) {
+        out[i] = (int16_t)((bm[(start + i) >> 3] >> ((start + i) & 7)) & 1);
+    }
+    const uint8_t* p = bm + ((start + i) >> 3);
+#if CARQUET_LITTLE_ENDIAN
+    /* One multiply spreads a nibble x over four int16 lanes: x * (1 + 2^15 +
+     * 2^30 + 2^45) holds copies of x at bits 0, 15, 30 and 45 (disjoint, so
+     * no carries), which puts bit k of x at bit 16k. */
+    const uint64_t spread = 0x0000200040008001ULL, lanes = 0x0001000100010001ULL;
+    for (; n - i >= 8; i += 8, p++) {
+        uint64_t lo = ((uint64_t)(*p & 0x0Fu) * spread) & lanes;
+        uint64_t hi = ((uint64_t)(*p >> 4) * spread) & lanes;
+        memcpy(out + i, &lo, sizeof(lo));
+        memcpy(out + i + 4, &hi, sizeof(hi));
+    }
+#endif
+    for (; i < n; i++) {
+        out[i] = (int16_t)((bm[(start + i) >> 3] >> ((start + i) & 7)) & 1);
+    }
 }
 
 /* ============================================================================
@@ -1191,8 +1433,18 @@ carquet_status_t carquet_read_data_page_v1(
         memset(rep_levels, 0, num_values * sizeof(int16_t));
     }
 
+    /* Count non-null values */
+    int32_t non_null_count = num_values;
+
     /* Decode definition levels if needed */
-    if (reader->max_def_level > 0 && def_levels) {
+    if (carquet_column_def_as_bits(reader) && reader->decoded_def_bits && !def_levels) {
+        carquet_status_t status = decode_v1_def_bits(
+            reader, &ptr, &remaining, header->definition_level_encoding,
+            num_values, &non_null_count, error);
+        if (status != CARQUET_OK) {
+            return status;
+        }
+    } else if (reader->max_def_level > 0 && def_levels) {
         int bit_width = bit_width_for_max(reader->max_def_level);
         carquet_status_t status = decode_v1_level_section(
             &ptr, &remaining, header->definition_level_encoding,
@@ -1200,16 +1452,11 @@ carquet_status_t carquet_read_data_page_v1(
         if (status != CARQUET_OK) {
             return status;
         }
+        non_null_count = (int32_t)carquet_dispatch_count_non_nulls(
+            def_levels, num_values, reader->max_def_level);
     } else if (def_levels) {
         /* Set all to max level (all values present) - use SIMD dispatch */
         carquet_dispatch_fill_def_levels(def_levels, num_values, reader->max_def_level);
-    }
-
-    /* Count non-null values */
-    int32_t non_null_count = num_values;
-    if (def_levels && reader->max_def_level > 0) {
-        non_null_count = (int32_t)carquet_dispatch_count_non_nulls(
-            def_levels, num_values, reader->max_def_level);
     }
 
     /* Decode values based on encoding */
@@ -1278,6 +1525,15 @@ carquet_status_t carquet_read_data_page_v1(
                         CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
                             "Dictionary indices truncated: decoded %lld of %lld",
                             (long long)decoded, (long long)encoded_count);
+                        return CARQUET_ERROR_DECODE;
+                    }
+                    /* The caller indexes its dictionary with these values:
+                     * reject what the materializing path would reject. */
+                    if (!dictionary_indices_in_range(out_indices, encoded_count,
+                                                     reader->dictionary_count)) {
+                        CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
+                            "Dictionary index out of range (dictionary has %d entries)",
+                            reader->dictionary_count);
                         return CARQUET_ERROR_DECODE;
                     }
                     break;
@@ -1525,8 +1781,32 @@ carquet_status_t carquet_read_data_page_v2(
         }
     }
 
+    /* Count non-null values */
+    int32_t non_null_count = num_values;
+
     /* V2: Definition levels come second, with known byte length (no length prefix) */
-    if (reader->max_def_level > 0 && def_levels) {
+    if (carquet_column_def_as_bits(reader) && reader->decoded_def_bits && !def_levels) {
+        int32_t def_bytes = header->definition_levels_byte_length;
+        if (def_bytes < 0 || (size_t)def_bytes > remaining) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Invalid V2 def level size");
+            return CARQUET_ERROR_DECODE;
+        }
+        if (def_bytes > 0) {
+            carquet_status_t status = decode_def_bits(
+                reader, ptr, (size_t)def_bytes, false, num_values,
+                &non_null_count, &bytes_consumed);
+            if (status != CARQUET_OK) {
+                CARQUET_SET_ERROR(error, status, "Failed to decode V2 def levels");
+                return status;
+            }
+        } else {
+            /* No level bytes: every level is 0, as the int16 path reads it. */
+            memset(reader->decoded_def_bits, 0, ((size_t)num_values + 7) / 8);
+            non_null_count = 0;
+        }
+        ptr += def_bytes;
+        remaining -= (size_t)def_bytes;
+    } else if (reader->max_def_level > 0 && def_levels) {
         int32_t def_bytes = header->definition_levels_byte_length;
         if (def_bytes < 0 || (size_t)def_bytes > remaining) {
             CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Invalid V2 def level size");
@@ -1567,8 +1847,6 @@ carquet_status_t carquet_read_data_page_v2(
      * must decompress only the data portion while leaving levels uncompressed.
      * By the time we get here, ptr points to uncompressed data. */
 
-    /* Count non-null values */
-    int32_t non_null_count = num_values;
     if (def_levels && reader->max_def_level > 0) {
         non_null_count = (int32_t)carquet_dispatch_count_non_nulls(
             def_levels, num_values, reader->max_def_level);
@@ -1639,6 +1917,15 @@ carquet_status_t carquet_read_data_page_v2(
                         CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
                             "Dictionary indices truncated: decoded %lld of %lld",
                             (long long)decoded, (long long)encoded_count);
+                        return CARQUET_ERROR_DECODE;
+                    }
+                    /* The caller indexes its dictionary with these values:
+                     * reject what the materializing path would reject. */
+                    if (!dictionary_indices_in_range(out_indices, encoded_count,
+                                                     reader->dictionary_count)) {
+                        CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
+                            "Dictionary index out of range (dictionary has %d entries)",
+                            reader->dictionary_count);
                         return CARQUET_ERROR_DECODE;
                     }
                     break;
@@ -1872,8 +2159,12 @@ static carquet_status_t prepare_data_page_payload(
         size_t levels_size = (size_t)v2h->repetition_levels_byte_length +
                              (size_t)v2h->definition_levels_byte_length;
         size_t compressed_data_size = (size_t)page_header->compressed_page_size - levels_size;
+        /* An all-null V2 page can carry a 0-byte data section even when
+         * is_compressed is set (parquet-java): there is nothing to inflate,
+         * and GZIP / BROTLI reject an empty input (Arrow GH-31992). */
         bool data_is_compressed = v2h->is_compressed &&
-                                  col_meta->codec != CARQUET_COMPRESSION_UNCOMPRESSED;
+                                  col_meta->codec != CARQUET_COMPRESSION_UNCOMPRESSED &&
+                                  compressed_data_size > 0;
 
         if (data_is_compressed) {
             size_t uncompressed_data_size =
@@ -2308,8 +2599,8 @@ static inline bool chunk_has_dictionary_offset(const parquet_column_metadata_t* 
  * alltypes_tiny_pages / hadoop_lz4_compressed) omit dictionary_page_offset:
  * the dictionary page then leads the data stream at data_page_offset, which
  * readers must detect by its page type (parquet-cpp does the same). Only
- * chunks that list a dictionary encoding are probed, so modern files pay
- * nothing. A chunk whose first page is not a dictionary page is left alone. */
+ * chunks that list a dictionary encoding (or no encoding at all) are probed,
+ * so modern files pay nothing. A chunk whose first page is not a dictionary page is left alone. */
 static carquet_status_t load_inferred_dictionary(
     carquet_column_reader_t* reader,
     carquet_error_t* error) {
@@ -2318,7 +2609,9 @@ static carquet_status_t load_inferred_dictionary(
     if (reader->has_dictionary || chunk_has_dictionary_offset(m)) {
         return CARQUET_OK;
     }
-    bool lists_dict = false;
+    /* An empty encodings list says nothing either way (parquet-testing's
+     * nation.dict-malformed.parquet): probe the first page then too. */
+    bool lists_dict = (m->num_encodings <= 0 || !m->encodings);
     for (int32_t i = 0; i < m->num_encodings && m->encodings; i++) {
         if (m->encodings[i] == CARQUET_ENCODING_PLAIN_DICTIONARY ||
             m->encodings[i] == CARQUET_ENCODING_RLE_DICTIONARY) {
@@ -2350,6 +2643,115 @@ static carquet_status_t load_inferred_dictionary(
  * Helper: Load and decode a new page (mmap path with zero-copy support)
  * ============================================================================
  */
+
+/* Present values among the `count` levels of the page just decoded, i.e.
+ * the dense values in decoded_values. */
+static int64_t decoded_page_dense_count(const carquet_column_reader_t* reader,
+                                        int64_t count) {
+    if (carquet_column_def_as_bits(reader) && reader->decoded_def_bits) {
+        return carquet_bitmap_count_range(reader->decoded_def_bits, 0, count);
+    }
+    if (reader->max_def_level > 0 && reader->decoded_def_levels) {
+        return carquet_dispatch_count_non_nulls(reader->decoded_def_levels, count,
+                                                reader->max_def_level);
+    }
+    return count;
+}
+
+/* Load a PLAIN page of a page_values_viewable_after_def_bits() column:
+ * levels into decoded_def_bits, decoded_values a view of the dense values in
+ * the payload (valid until the next page load, like the REQUIRED view). The
+ * checks and errors are those of carquet_read_data_page_v1/v2 for the page. */
+static carquet_status_t load_plain_page_view_def_bits(
+    carquet_column_reader_t* reader,
+    const parquet_page_header_t* page_header,
+    const uint8_t* page_data,
+    size_t page_size,
+    size_t value_size,
+    carquet_error_t* error) {
+
+    bool is_v2 = page_header->type == CARQUET_PAGE_DATA_V2;
+    int32_t num_values = is_v2 ? page_header->data_page_header_v2.num_values
+                               : page_header->data_page_header.num_values;
+    /* ensure_decoded_page_buffers' checks on the page's value count. */
+    if (num_values < 0) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Decode buffer size overflow");
+        return CARQUET_ERROR_OUT_OF_MEMORY;
+    }
+    if (reader->col_meta && reader->col_meta->num_values >= 0 &&
+        (int64_t)num_values > reader->col_meta->num_values) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE,
+            "Data page value count (%d) exceeds column chunk total (%lld)",
+            num_values, (long long)reader->col_meta->num_values);
+        return CARQUET_ERROR_INVALID_PAGE;
+    }
+    ensure_def_bits_capacity(reader, num_values);
+    if (num_values > 0 && !reader->decoded_def_bits) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate decode buffers");
+        return CARQUET_ERROR_OUT_OF_MEMORY;
+    }
+
+    const uint8_t* ptr = page_data;
+    size_t remaining = page_size;
+    int32_t non_null = 0;
+    size_t consumed = 0;
+    carquet_status_t status;
+    if (is_v2) {
+        const parquet_data_page_header_v2_t* h = &page_header->data_page_header_v2;
+        int32_t rep_bytes = h->repetition_levels_byte_length;
+        if (rep_bytes < 0 || (size_t)rep_bytes > remaining) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Invalid V2 rep level size");
+            return CARQUET_ERROR_DECODE;
+        }
+        ptr += rep_bytes;
+        remaining -= (size_t)rep_bytes;
+        int32_t def_bytes = h->definition_levels_byte_length;
+        if (def_bytes < 0 || (size_t)def_bytes > remaining) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Invalid V2 def level size");
+            return CARQUET_ERROR_DECODE;
+        }
+        if (def_bytes > 0) {
+            status = decode_def_bits(reader, ptr, (size_t)def_bytes, false, num_values,
+                                     &non_null, &consumed);
+            if (status != CARQUET_OK) {
+                CARQUET_SET_ERROR(error, status, "Failed to decode V2 def levels");
+                return status;
+            }
+        } else if (num_values > 0) {
+            memset(reader->decoded_def_bits, 0, ((size_t)num_values + 7) / 8);
+        }
+        ptr += def_bytes;
+        remaining -= (size_t)def_bytes;
+    } else {
+        status = decode_v1_def_bits(reader, &ptr, &remaining,
+                                    page_header->data_page_header.definition_level_encoding,
+                                    num_values, &non_null, error);
+        if (status != CARQUET_OK) {
+            return status;
+        }
+    }
+
+    size_t required_bytes = 0;
+    if (!checked_mul_size(value_size, (size_t)non_null, &required_bytes) ||
+        remaining < required_bytes) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Failed to decode values");
+        return CARQUET_ERROR_DECODE;
+    }
+
+    if (reader->decoded_ownership == CARQUET_DATA_OWNED) {
+        carquet_mem_free(reader->decoded_values);
+    }
+    reader->decoded_values = (uint8_t*)ptr;
+    reader->decoded_ownership = CARQUET_DATA_VIEW;
+    reader->decoded_capacity = 0;
+    release_decoded_level_buffers(reader);
+
+    reader->page_loaded = true;
+    reader->page_num_values = num_values;
+    reader->page_values_read = 0;
+    reader->dense_cursor_pos = -1; /* cursor belongs to the previous page */
+    return CARQUET_OK;
+}
 
 static carquet_status_t load_next_page_mmap(
     carquet_column_reader_t* reader,
@@ -2494,6 +2896,7 @@ static carquet_status_t load_next_page_mmap(
         reader->page_loaded = true;
         reader->page_num_values = num_values;
         reader->page_values_read = 0;
+        reader->dense_cursor_pos = -1; /* cursor belongs to the previous page */
         reader->page_header_size = (int32_t)header_size;
         reader->page_compressed_size = page_header.compressed_page_size;
 
@@ -2511,6 +2914,17 @@ static carquet_status_t load_next_page_mmap(
                                        error);
     if (status != CARQUET_OK) {
         return status;
+    }
+
+    if (page_values_viewable_after_def_bits(reader, page_encoding)) {
+        status = load_plain_page_view_def_bits(reader, &page_header, page_data, page_size,
+                                               value_size, error);
+        if (status != CARQUET_OK) {
+            return status;
+        }
+        reader->page_header_size = (int32_t)header_size;
+        reader->page_compressed_size = page_header.compressed_page_size;
+        return CARQUET_OK;
     }
 
     if (!is_v2 && page_values_can_be_viewed_directly(reader, page_encoding)) {
@@ -2535,6 +2949,7 @@ static carquet_status_t load_next_page_mmap(
         reader->page_loaded = true;
         reader->page_num_values = num_values;
         reader->page_values_read = 0;
+        reader->dense_cursor_pos = -1; /* cursor belongs to the previous page */
         reader->page_header_size = (int32_t)header_size;
         reader->page_compressed_size = page_header.compressed_page_size;
 
@@ -2582,11 +2997,13 @@ static carquet_status_t load_next_page_mmap(
             return CARQUET_ERROR_OUT_OF_MEMORY;
         }
         /* Fixup BYTE_ARRAY pointers to reference the retained copy */
-        ptrdiff_t offset = retained - page_data;
+        /* Only the dense (present) values were decoded: past them the
+         * buffer holds stale entries, which must not be rebased. */
         carquet_byte_array_t* ba = (carquet_byte_array_t*)reader->decoded_values;
-        for (int64_t i = 0; i < decoded_count; i++) {
+        int64_t dense = decoded_page_dense_count(reader, decoded_count);
+        for (int64_t i = 0; i < dense; i++) {
             if (ba[i].data) {
-                ba[i].data = ba[i].data + offset;
+                ba[i].data = retained + (ba[i].data - page_data);
             }
         }
     }
@@ -2594,6 +3011,7 @@ static carquet_status_t load_next_page_mmap(
     reader->page_loaded = true;
     reader->page_num_values = (int32_t)decoded_count;
     reader->page_values_read = 0;
+    reader->dense_cursor_pos = -1; /* cursor belongs to the previous page */
     reader->page_header_size = (int32_t)header_size;
     reader->page_compressed_size = page_header.compressed_page_size;
 
@@ -2716,6 +3134,17 @@ static carquet_status_t load_next_page_fread(
         return status;
     }
 
+    if (page_values_viewable_after_def_bits(reader, page_encoding)) {
+        status = load_plain_page_view_def_bits(reader, &page_header, page_data, page_size,
+                                               value_size, error);
+        if (status != CARQUET_OK) {
+            return status;
+        }
+        reader->page_header_size = (int32_t)header_size;
+        reader->page_compressed_size = page_header.compressed_page_size;
+        return CARQUET_OK;
+    }
+
     if (!is_v2 && page_values_can_be_viewed_directly(reader, page_encoding)) {
         size_t required_bytes = 0;
         if (!checked_mul_size(value_size, (size_t)num_values, &required_bytes)) {
@@ -2738,6 +3167,7 @@ static carquet_status_t load_next_page_fread(
         reader->page_loaded = true;
         reader->page_num_values = num_values;
         reader->page_values_read = 0;
+        reader->dense_cursor_pos = -1; /* cursor belongs to the previous page */
         reader->page_header_size = (int32_t)header_size;
         reader->page_compressed_size = page_header.compressed_page_size;
         return CARQUET_OK;
@@ -2785,11 +3215,13 @@ static carquet_status_t load_next_page_fread(
             return CARQUET_ERROR_OUT_OF_MEMORY;
         }
 
-        ptrdiff_t offset = retained - page_data;
+        /* Only the dense (present) values were decoded: past them the
+         * buffer holds stale entries, which must not be rebased. */
         carquet_byte_array_t* ba = (carquet_byte_array_t*)reader->decoded_values;
-        for (int64_t i = 0; i < decoded_count; i++) {
+        int64_t dense = decoded_page_dense_count(reader, decoded_count);
+        for (int64_t i = 0; i < dense; i++) {
             if (ba[i].data) {
-                ba[i].data = ba[i].data + offset;
+                ba[i].data = retained + (ba[i].data - page_data);
             }
         }
     }
@@ -2798,6 +3230,7 @@ static carquet_status_t load_next_page_fread(
     reader->page_loaded = true;
     reader->page_num_values = (int32_t)decoded_count;
     reader->page_values_read = 0;
+    reader->dense_cursor_pos = -1; /* cursor belongs to the previous page */
     reader->page_header_size = (int32_t)header_size;
     reader->page_compressed_size = page_header.compressed_page_size;
 
@@ -2986,6 +3419,7 @@ carquet_status_t carquet_column_reader_seek_to_data_page(
         reader->page_loaded = false;
         reader->page_num_values = 0;
         reader->page_values_read = 0;
+        reader->dense_cursor_pos = -1; /* cursor belongs to the previous page */
         reader->page_header_size = 0;
         reader->page_compressed_size = 0;
     }
@@ -3085,7 +3519,25 @@ carquet_status_t carquet_read_next_page(
     size_t offset = (size_t)reader->page_values_read * value_size;
     int32_t values_to_copy = to_copy;
 
-    if (reader->decoded_def_levels && reader->max_def_level > 0) {
+    bool def_bits = carquet_column_def_as_bits(reader) && reader->decoded_def_bits;
+    if (def_bits) {
+        /* Levels held as a validity bitmap: the counts are popcounts and int16
+         * levels are expanded only into a caller's def_levels (below). */
+        int32_t dense_start;
+        if (reader->page_values_read == 0) {
+            dense_start = 0;
+        } else if (reader->dense_cursor_pos == reader->page_values_read) {
+            dense_start = reader->dense_cursor_val;
+        } else {
+            dense_start = (int32_t)carquet_bitmap_count_range(
+                reader->decoded_def_bits, 0, reader->page_values_read);
+        }
+        values_to_copy = (int32_t)carquet_bitmap_count_range(
+            reader->decoded_def_bits, reader->page_values_read, to_copy);
+        offset = (size_t)dense_start * value_size;
+        reader->dense_cursor_pos = reader->page_values_read + to_copy;
+        reader->dense_cursor_val = dense_start + values_to_copy;
+    } else if (reader->decoded_def_levels && reader->max_def_level > 0) {
         /* Dense (present-value) offset of the first unread level. Recounting
          * [0, page_values_read) on every call made a page read in small
          * batches quadratic; keep a cursor and only recount when a skip
@@ -3114,7 +3566,10 @@ carquet_status_t carquet_read_next_page(
            (size_t)values_to_copy * value_size);
 
     if (def_levels) {
-        if (reader->decoded_def_levels) {
+        if (def_bits) {
+            carquet_bitmap_to_levels(reader->decoded_def_bits, reader->page_values_read,
+                                     to_copy, def_levels);
+        } else if (reader->decoded_def_levels) {
             memcpy(def_levels, reader->decoded_def_levels + reader->page_values_read,
                    (size_t)to_copy * sizeof(int16_t));
         } else {
@@ -3193,6 +3648,7 @@ int64_t carquet_column_skip(
             reader->page_loaded = false;
             reader->page_num_values = 0;
             reader->page_values_read = 0;
+            reader->dense_cursor_pos = -1; /* cursor belongs to the previous page */
             reader->page_header_size = 0;
             reader->page_compressed_size = 0;
             continue;

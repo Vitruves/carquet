@@ -66,7 +66,7 @@
   <section id="bench" class="section">
     <div class="wrap">
       <p class="eyebrow">Benchmarks</p>
-      <h2>Measured against Arrow C++, PyArrow and fastparquet.</h2>
+      <h2>Measured against Arrow C++, PyArrow, fastparquet and polars.</h2>
       <p class="sub" id="bench-sub"></p>
 
       <div class="controls">
@@ -196,7 +196,7 @@ $ cc app.c $(pkg-config --cflags --libs carquet)</code></pre>
         </div>
 
         <div class="panel" data-panel="pip" hidden>
-          <p>Prebuilt wheels bundle the library for Linux, macOS and Windows. Tables come back as <code>pyarrow.Table</code> through the Arrow C Data Interface.</p>
+          <p>Prebuilt wheels bundle the library for Linux, macOS and Windows. No dependencies: reads return a <code>carquet.Table</code> that pandas, NumPy, polars, DuckDB and PyArrow take through the Arrow C Data Interface.</p>
 <pre><code class="lang-sh">$ pip install carquet</code></pre>
         </div>
 
@@ -206,7 +206,7 @@ $ cc app.c $(pkg-config --cflags --libs carquet)</code></pre>
 set(CARQUET_BUILD_CLI OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(carquet
     GIT_REPOSITORY https://github.com/Vitruves/carquet.git
-    GIT_TAG        v0.7.3)
+    GIT_TAG        v0.8.0)
 FetchContent_MakeAvailable(carquet)
 target_link_libraries(app PRIVATE carquet)</code></pre>
         </div>
@@ -391,18 +391,19 @@ int main(void) {
 }</code></pre>
         </div>
         <div class="panel" data-panel="ex-py" hidden>
-          <p>The same engine from Python: pyarrow tables, pandas, streaming batches and filters, with the GIL released in every C call.</p>
+          <p>The same engine from Python, with no dependencies: tables that pandas, NumPy, polars, DuckDB and PyArrow take without a copy, streaming batches and exact filters, with the GIL released in every C call.</p>
 <pre><code class="lang-py">import carquet as cq
 
-# Projection and predicate pushdown, straight into a pyarrow.Table
+# Projection and predicate pushdown, into a carquet.Table
 table = cq.read_table("people.parquet", columns=["id", "score"],
                       filters=[("id", "&gt;=", 2)])
 
 df = cq.read_pandas("people.parquet")             # pandas.DataFrame
+table.to_pydict(); table.column("score").to_numpy()   # or polars.DataFrame(table)
 
 with cq.ParquetFile("people.parquet") as pf:      # streaming, GIL released
     for batch in pf.iter_batches(batch_size=65_536, columns=["name"]):
-        ...                                       # pyarrow.RecordBatch
+        ...                                       # carquet.RecordBatch
     print(pf.count_rows(filters=[("score", "is null")]))    # 1
 
 cq.write_table(table, "out.parquet", compression="zstd")</code></pre>

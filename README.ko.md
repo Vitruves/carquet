@@ -59,10 +59,10 @@
 
 | | |
 |---|---|
-| ⚡ **빠름** | Arrow C++보다 **2.3–5.9x 빠르게** 쓰고, 바로 그 동일한 파일에서 압축 데이터를 **1.5–2.1x 빠르게** 읽습니다(Apple M3, 1천만 행). 비압축 읽기는 mmap에서 곧바로 **0.30 ms**에 제공됩니다. 런타임 디스패치를 갖춘 SSE4.2 / AVX2 / AVX-512 / NEON / SVE SIMD. |
+| ⚡ **빠름** | Arrow C++보다 **2.0–5.6x 빠르게** 쓰고, 바로 그 동일한 파일에서 압축 데이터를 **1.5–2.1x 빠르게** 읽습니다(Apple M3, 1천만 행). 비압축 읽기는 mmap에서 곧바로 **0.28 ms**에 제공됩니다. 런타임 디스패치를 갖춘 SSE4.2 / AVX2 / AVX-512 / NEON / SVE SIMD. |
 | 🪶 **작음** | 순수 C11, **약 500 KB** 라이브러리(Arrow C++: 50 MB 이상). 압축 의존성은 네 가지(zstd, zlib, lz4, brotli)뿐이며 없으면 자동으로 가져옵니다. `make` 또는 `xmake` 한 번으로 1분 안에 빌드됩니다. |
 | 📦 **완전함** | 모든 물리 타입과 인코딩, Snappy / GZIP / LZ4 / ZSTD / Brotli, V1 + V2 페이지, 임의 깊이의 중첩 스키마, 블룸 필터, 페이지 인덱스, 통계 기반 프루닝, 추가(append). [전체 매트릭스 ↓](#parquet-기능-지원) |
-| 🔗 **상호 운용** | PyArrow, DuckDB, Spark가 별도 설정 없이 파일을 읽습니다. 의존성 없는 [Arrow C Data Interface](docs/reading.md#export-to-arrow-c-data-interface) 브리지(임의 깊이의 struct / list / map)와 PyArrow 기반의 완전한 [Python API](#python-api). |
+| 🔗 **상호 운용** | PyArrow, DuckDB, Spark가 별도 설정 없이 파일을 읽습니다. 의존성 없는 [Arrow C Data Interface](docs/reading.md#export-to-arrow-c-data-interface) 브리지(임의 깊이의 struct / list / map)와 의존성 없는 완전한 [Python API](#python-api). |
 | 🛠 **도구** | 파일을 검사, 필터링, 내보내기, 검증하는 `carquet` CLI와 바로 컴파일 가능한 C 리더를 생성하는 `codegen`. Claude Code와 Codex용으로 바로 쓸 수 있는 [에이전트 스킬](#ai-coding-agents). |
 
 </div>
@@ -92,23 +92,23 @@
 | | ARM · Apple M3 | | x86 · Windows (Haswell, MSVC) | | x86 · Linux (Xeon D-1531) | |
 |---|---:|---:|---:|---:|---:|---:|
 | **코덱** | **쓰기** | **읽기** | **쓰기** | **읽기** | **쓰기** | **읽기** |
-| snappy | **4.74x** | **1.89x** | **3.39x** | **1.17x** | **1.55x** | **1.25x** |
-| zstd | **5.91x** | **1.77x** | **3.83x** | **1.13x** | **1.31x** | **1.04x** |
-| lz4 | **4.61x** | **1.89x** | **2.96x** | **1.05x** | **1.02x** | 0.83x |
-| none | **2.30x** | **46.3x**\* | **2.10x** | **62.0x**\* | **1.13x** | **40.6x**\* |
+| snappy | **4.77x** | **1.63x** | **3.39x** | **1.17x** | **1.55x** | **1.25x** |
+| zstd | **5.56x** | **1.40x** | **3.83x** | **1.13x** | **1.31x** | **1.04x** |
+| lz4 | **4.62x** | **1.85x** | **2.96x** | **1.05x** | **1.02x** | 0.83x |
+| none | **2.04x** | **52.0x**\* | **2.10x** | **62.0x**\* | **1.13x** | **40.6x**\* |
 
 </div>
 
-<sub>\* mmap 제로 카피 경로. Apple M3: carquet 0.7.3 vs Arrow C++ 26.0.1(2026-11-06). Windows: carquet 0.7.3 vs Arrow C++ 24.0.0(2026-11-02). Linux: carquet 0.4.4 vs Arrow C++ 23.0.1, 0.7.1의 라이터 병렬화 이전 측정이며 이후 다시 측정되지 않았습니다.</sub>
+<sub>\* mmap 제로 카피 경로. Apple M3: carquet 0.8.0 vs Arrow C++ 26.0.1(2026-11-09). Windows: carquet 0.7.3 vs Arrow C++ 24.0.0(2026-11-02). Linux: carquet 0.4.4 vs Arrow C++ 23.0.1, 0.7.1의 라이터 병렬화 이전 측정이며 이후 다시 측정되지 않았습니다.</sub>
 
-압축 읽기는 모든 값을 디코딩하며, Linux와 macOS에서는 두 라이브러리가 동일한 시스템 lz4 / zstd를 링크하므로 코덱 속도는 동일합니다. 가장 공정한 비교는 **동일 파일 교차 읽기**(두 라이브러리가 정확히 같은 파일을 읽음)입니다. carquet은 M3에서 **1.5–2.1x**, Linux에서 1.6–2.6x, Windows VM에서 1.04–1.30x 빠르며, Windows VM의 콜드 읽기는 가상 디스크에 의해 제한됩니다.
+압축 읽기는 모든 값을 디코딩하며, Linux와 macOS에서는 두 라이브러리가 동일한 시스템 lz4 / zstd를 링크하므로 코덱 속도는 동일합니다. 가장 공정한 비교는 **동일 파일 교차 읽기**(두 라이브러리가 정확히 같은 파일을 읽음)입니다. carquet은 M3에서 Arrow C++보다 **1.5–2.1x**(polars보다 2.0–4.1x), Linux에서 1.6–2.6x, Windows VM에서 1.04–1.30x 빠르며, Windows VM의 콜드 읽기는 가상 디스크에 의해 제한됩니다.
 
 <details>
 <summary><b>벤치마크 방법론</b></summary>
 
 <br/>
 
-모든 벤치마크는 동일한 데이터(결정론적 LCG PRNG), 동일한 Parquet 설정(딕셔너리 없음, 부동소수점에 BYTE_STREAM_SPLIT, 페이지 체크섬, mmap 읽기)을 사용하며, 11–51회 반복의 절사 중앙값을 취하고, 쓰기와 읽기 단계 사이에 OS 페이지 캐시를 비우며 구성 간에 쿨다운을 둡니다. 스키마: 3개 컬럼(INT64, DOUBLE, INT32). Arrow C++ 저수준 Parquet 리더(Arrow Table 구체화를 우회) 및 PyArrow와 비교했습니다.
+모든 벤치마크는 동일한 데이터(결정론적 LCG PRNG), 동일한 Parquet 설정(딕셔너리 없음, 부동소수점에 BYTE_STREAM_SPLIT, 페이지 체크섬, mmap 읽기)을 사용하며, 11–51회 반복의 절사 중앙값을 취하고, 쓰기와 읽기 단계 사이에 OS 페이지 캐시를 비우며 구성 간에 쿨다운을 둡니다. 스키마: 3개 컬럼(INT64, DOUBLE, INT32). Arrow C++ 저수준 Parquet 리더(Arrow Table 구체화를 우회), PyArrow, fastparquet, polars의 네이티브(Rust) 리더 및 라이터와 비교했습니다.
 
 페이지 캐시는 파일별로 비웁니다. Linux에서는 `posix_fadvise(DONTNEED)`를 사용하고, macOS와 Windows에서는 캐시 없이(`F_NOCACHE`, `FILE_FLAG_NO_BUFFERING`) 파일을 복사한 뒤 그 사본으로 원본을 대체합니다(`benchmark/bench_purge_win32.h`). Windows에서는 carquet이 직접 빌드한 zstd / lz4를, Arrow C++는 conda-forge의 것을 링크하므로 두 라이브러리 간 코덱 속도가 약간 다를 수 있습니다.
 
@@ -213,7 +213,7 @@
 
 <br/>
 
-*Carquet 0.7.3, MacBook Air M3, 16GB RAM, macOS 26.5, Arrow C++ 26.0.1, PyArrow 26.0.1, fastparquet 2026.9.0, ZSTD 레벨 1, 2026-11-06 측정. 원본 보고서: [`benchmark/bench_0.7.3_darwin_arm64_20261106.json`](benchmark/bench_0.7.3_darwin_arm64_20261106.json).*
+*Carquet 0.8.0, MacBook Air M3, 16GB RAM, macOS 26.5, Arrow C++ 26.0.1, PyArrow 26.0.1, fastparquet 2026.9.0, polars 2.1.0, ZSTD 레벨 1, 2026-11-09 측정(1천만 행 구성은 같은 날 두 번째 실행에서 가져옴: 첫 번째 실행의 첫 구성이 교란됨). 원본 보고서: [`benchmark/bench_0.8.0_darwin_arm64_20261109.json`](benchmark/bench_0.8.0_darwin_arm64_20261109.json).*
 
 #### 1천만 행 vs Arrow C++
 
@@ -221,10 +221,10 @@
 
 | 코덱 | Carquet 쓰기 | Arrow C++ 쓰기 | 쓰기 비율 | Carquet 읽기 | Arrow C++ 읽기 | 읽기 비율 | 크기 |
 |-------|--------------|---------|---------|-------------|---------|---------|------|
-| none | **48.8ms** | 112ms | **2.30x** | **0.30ms** | 13.9ms | **46.3x**\* | 200.0MB |
-| snappy | **57.2ms** | 271ms | **4.74x** | **12.6ms** | 23.8ms | **1.89x** | 131.2MB |
-| zstd | **59.7ms** | 353ms | **5.91x** | **19.8ms** | 35.0ms | **1.77x** | 99.9MB |
-| lz4 | **52.4ms** | 241ms | **4.61x** | **9.60ms** | 18.2ms | **1.89x** | 128.7MB |
+| none | **57.7ms** | 117ms | **2.04x** | **0.28ms** | 14.6ms | **52.0x**\* | 190.7MB |
+| snappy | **49.3ms** | 235ms | **4.77x** | **14.0ms** | 22.7ms | **1.63x** | 125.1MB |
+| zstd | **61.0ms** | 339ms | **5.56x** | **20.6ms** | 28.8ms | **1.40x** | 95.3MB |
+| lz4 | **52.9ms** | 244ms | **4.62x** | **9.83ms** | 18.2ms | **1.85x** | 122.7MB |
 
 </div>
 
@@ -236,10 +236,10 @@
 
 | 코덱 | Carquet 쓰기 | Arrow C++ 쓰기 | 쓰기 비율 | Carquet 읽기 | Arrow C++ 읽기 | 읽기 비율 |
 |-------|--------------|---------|---------|-------------|---------|---------|
-| none | **6.75ms** | 13.2ms | **1.95x** | **0.07ms** | 1.72ms | **24.6x**\* |
-| snappy | **7.02ms** | 24.0ms | **3.42x** | **1.58ms** | 2.49ms | **1.58x** |
-| zstd | **7.97ms** | 33.6ms | **4.22x** | **2.16ms** | 3.03ms | **1.40x** |
-| lz4 | **6.54ms** | 25.2ms | **3.85x** | **0.97ms** | 1.96ms | **2.02x** |
+| none | **5.87ms** | 12.3ms | **2.10x** | **0.06ms** | 1.59ms | **26.5x**\* |
+| snappy | **7.40ms** | 25.9ms | **3.49x** | **1.30ms** | 2.53ms | **1.95x** |
+| zstd | **8.32ms** | 34.1ms | **4.10x** | **2.36ms** | 3.17ms | **1.34x** |
+| lz4 | **7.70ms** | 25.7ms | **3.34x** | **1.06ms** | 2.15ms | **2.03x** |
 
 </div>
 
@@ -251,10 +251,10 @@
 
 | 코덱 | Carquet 쓰기 | Arrow C++ 쓰기 | 쓰기 비율 | Carquet 읽기 | Arrow C++ 읽기 | 읽기 비율 |
 |-------|--------------|---------|---------|-------------|---------|---------|
-| none | **1.08ms** | 1.75ms | **1.62x** | **0.02ms** | 0.24ms | **12.0x**\* |
-| snappy | **1.80ms** | 2.52ms | **1.40x** | **0.36ms** | 0.90ms | **2.50x** |
-| zstd | **1.81ms** | 3.60ms | **1.99x** | **0.63ms** | 1.30ms | **2.06x** |
-| lz4 | **1.67ms** | 2.57ms | **1.54x** | **0.29ms** | 0.61ms | **2.10x** |
+| none | **0.87ms** | 1.65ms | **1.90x** | **0.02ms** | 0.23ms | **11.5x**\* |
+| snappy | **1.52ms** | 2.62ms | **1.72x** | **0.38ms** | 0.91ms | **2.39x** |
+| zstd | **1.90ms** | 3.69ms | **1.94x** | **0.64ms** | 1.32ms | **2.06x** |
+| lz4 | **1.66ms** | 2.63ms | **1.58x** | **0.30ms** | 0.63ms | **2.10x** |
 
 </div>
 
@@ -266,10 +266,10 @@
 
 | 코덱 | Carquet 쓰기 | PyArrow 쓰기 | 쓰기 비율 | Carquet 읽기 | PyArrow 읽기 | 읽기 비율 |
 |-------|--------------|---------|---------|-------------|---------|---------|
-| none | **48.8ms** | 170ms | **3.49x** | **0.30ms** | 26.8ms | **89.2x**\* |
-| snappy | **57.2ms** | 294ms | **5.14x** | **12.6ms** | 38.4ms | **3.05x** |
-| zstd | **59.7ms** | 423ms | **7.09x** | **19.8ms** | 42.5ms | **2.15x** |
-| lz4 | **52.4ms** | 283ms | **5.41x** | **9.60ms** | 30.2ms | **3.15x** |
+| none | **57.7ms** | 165ms | **2.87x** | **0.28ms** | 26.1ms | **93.1x**\* |
+| snappy | **49.3ms** | 276ms | **5.60x** | **14.0ms** | 39.3ms | **2.82x** |
+| zstd | **61.0ms** | 387ms | **6.34x** | **20.6ms** | 41.3ms | **2.00x** |
+| lz4 | **52.9ms** | 287ms | **5.43x** | **9.83ms** | 29.0ms | **2.95x** |
 
 </div>
 
@@ -281,10 +281,10 @@
 
 | 코덱 | Carquet 쓰기 | PyArrow 쓰기 | 쓰기 비율 | Carquet 읽기 | PyArrow 읽기 | 읽기 비율 |
 |-------|--------------|---------|---------|-------------|---------|---------|
-| none | **6.75ms** | 17.0ms | **2.52x** | **0.07ms** | 2.73ms | **39.0x**\* |
-| snappy | **7.02ms** | 27.9ms | **3.97x** | **1.58ms** | 3.66ms | **2.32x** |
-| zstd | **7.97ms** | 38.8ms | **4.87x** | **2.16ms** | 3.96ms | **1.83x** |
-| lz4 | **6.54ms** | 29.2ms | **4.46x** | **0.97ms** | 2.98ms | **3.07x** |
+| none | **5.87ms** | 17.5ms | **2.98x** | **0.06ms** | 2.79ms | **46.5x**\* |
+| snappy | **7.40ms** | 28.9ms | **3.90x** | **1.30ms** | 3.61ms | **2.78x** |
+| zstd | **8.32ms** | 39.4ms | **4.74x** | **2.36ms** | 4.00ms | **1.69x** |
+| lz4 | **7.70ms** | 30.5ms | **3.97x** | **1.06ms** | 3.22ms | **3.04x** |
 
 </div>
 
@@ -296,10 +296,10 @@
 
 | 코덱 | Carquet 쓰기 | PyArrow 쓰기 | 쓰기 비율 | Carquet 읽기 | PyArrow 읽기 | 읽기 비율 |
 |-------|--------------|---------|---------|-------------|---------|---------|
-| none | **1.08ms** | 1.99ms | **1.84x** | **0.02ms** | 0.24ms | **12.0x**\* |
-| snappy | **1.80ms** | 2.82ms | **1.57x** | **0.36ms** | 0.66ms | **1.83x** |
-| zstd | **1.81ms** | 4.17ms | **2.30x** | **0.63ms** | 0.72ms | **1.14x** |
-| lz4 | **1.67ms** | 2.93ms | **1.75x** | **0.29ms** | 0.43ms | **1.48x** |
+| none | **0.87ms** | 2.10ms | **2.41x** | **0.02ms** | 0.26ms | **13.0x**\* |
+| snappy | **1.52ms** | 3.00ms | **1.97x** | **0.38ms** | 0.67ms | **1.76x** |
+| zstd | **1.90ms** | 4.13ms | **2.17x** | **0.64ms** | 0.73ms | **1.14x** |
+| lz4 | **1.66ms** | 3.04ms | **1.83x** | **0.30ms** | 0.44ms | **1.47x** |
 
 </div>
 
@@ -311,10 +311,10 @@
 
 | 코덱 | Carquet 쓰기 | fastparquet 쓰기 | 쓰기 비율 | Carquet 읽기 | fastparquet 읽기 | 읽기 비율 |
 |-------|--------------|---------|---------|-------------|---------|---------|
-| none | **48.8ms** | 65.4ms | **1.34x** | **0.30ms** | 49.0ms | **163.5x**\* |
-| snappy | **57.2ms** | 204ms | **3.57x** | **12.6ms** | 110ms | **8.78x** |
-| zstd | **59.7ms** | 331ms | **5.55x** | **19.8ms** | 185ms | **9.39x** |
-| lz4 | **52.4ms** | 225ms | **4.30x** | **9.60ms** | 55.3ms | **5.76x** |
+| none | **57.7ms** | 64.6ms | **1.12x** | **0.28ms** | 55.7ms | **198.8x**\* |
+| snappy | **49.3ms** | 208ms | **4.22x** | **14.0ms** | 103ms | **7.40x** |
+| zstd | **61.0ms** | 325ms | **5.33x** | **20.6ms** | 185ms | **8.95x** |
+| lz4 | **52.9ms** | 244ms | **4.61x** | **9.83ms** | 55.4ms | **5.64x** |
 
 </div>
 
@@ -326,10 +326,10 @@
 
 | 코덱 | Carquet 쓰기 | fastparquet 쓰기 | 쓰기 비율 | Carquet 읽기 | fastparquet 읽기 | 읽기 비율 |
 |-------|--------------|---------|---------|-------------|---------|---------|
-| none | **6.75ms** | 7.45ms | **1.10x** | **0.07ms** | 3.00ms | **42.9x**\* |
-| snappy | **7.02ms** | 22.1ms | **3.16x** | **1.58ms** | 10.1ms | **6.39x** |
-| zstd | **7.97ms** | 32.6ms | **4.09x** | **2.16ms** | 18.4ms | **8.54x** |
-| lz4 | **6.54ms** | 21.6ms | **3.30x** | **0.97ms** | 5.06ms | **5.22x** |
+| none | **5.87ms** | 8.01ms | **1.36x** | **0.06ms** | 3.08ms | **51.3x**\* |
+| snappy | **7.40ms** | 22.8ms | **3.08x** | **1.30ms** | 10.2ms | **7.85x** |
+| zstd | **8.32ms** | 33.5ms | **4.03x** | **2.36ms** | 18.0ms | **7.61x** |
+| lz4 | **7.70ms** | 22.4ms | **2.92x** | **1.06ms** | 5.37ms | **5.07x** |
 
 </div>
 
@@ -341,10 +341,55 @@
 
 | 코덱 | Carquet 쓰기 | fastparquet 쓰기 | 쓰기 비율 | Carquet 읽기 | fastparquet 읽기 | 읽기 비율 |
 |-------|--------------|---------|---------|-------------|---------|---------|
-| none | 1.08ms | **1.04ms** | 0.96x | **0.02ms** | 0.52ms | **26.0x**\* |
-| snappy | **1.80ms** | 2.31ms | **1.28x** | **0.36ms** | 1.20ms | **3.33x** |
-| zstd | **1.81ms** | 3.45ms | **1.91x** | **0.63ms** | 2.05ms | **3.25x** |
-| lz4 | **1.67ms** | 2.25ms | **1.35x** | **0.29ms** | 0.73ms | **2.52x** |
+| none | **0.87ms** | 1.08ms | **1.24x** | **0.02ms** | 0.58ms | **29.0x**\* |
+| snappy | **1.52ms** | 2.43ms | **1.60x** | **0.38ms** | 1.20ms | **3.16x** |
+| zstd | **1.90ms** | 3.47ms | **1.83x** | **0.64ms** | 2.06ms | **3.22x** |
+| lz4 | **1.66ms** | 2.31ms | **1.39x** | **0.30ms** | 0.73ms | **2.43x** |
+
+</div>
+
+<br/>
+
+#### 1천만 행 vs polars
+
+<div align="center">
+
+| 코덱 | Carquet 쓰기 | polars 쓰기 | 쓰기 비율 | Carquet 읽기 | polars 읽기 | 읽기 비율 | Carquet 크기 | polars 크기 |
+|-------|--------------|---------|---------|-------------|---------|---------|------|------|
+| none | 57.7ms | **37.5ms** | 0.65x | **0.28ms** | 28.7ms | **102.4x**\* | 190.7MB | 105.1MB |
+| snappy | 49.3ms | **38.1ms** | 0.77x | **14.0ms** | 28.3ms | **2.03x** | 125.1MB | 103.8MB |
+| zstd | 61.0ms | **48.6ms** | 0.80x | **20.6ms** | 42.1ms | **2.04x** | 95.3MB | 98.1MB |
+| lz4 | 52.9ms | **40.0ms** | 0.76x | **9.83ms** | 29.4ms | **2.99x** | 122.7MB | 104.2MB |
+
+</div>
+
+<br/>
+
+#### 100만 행 vs polars
+
+<div align="center">
+
+| 코덱 | Carquet 쓰기 | polars 쓰기 | 쓰기 비율 | Carquet 읽기 | polars 읽기 | 읽기 비율 | Carquet 크기 | polars 크기 |
+|-------|--------------|---------|---------|-------------|---------|---------|------|------|
+| none | 5.87ms | **4.53ms** | 0.77x | **0.06ms** | 3.14ms | **52.3x**\* | 19.1MB | 12.6MB |
+| snappy | 7.40ms | **4.82ms** | 0.65x | **1.30ms** | 3.25ms | **2.50x** | 12.5MB | 11.5MB |
+| zstd | 8.32ms | **5.83ms** | 0.70x | **2.36ms** | 4.12ms | **1.75x** | 9.6MB | 10.1MB |
+| lz4 | 7.70ms | **4.77ms** | 0.62x | **1.06ms** | 3.26ms | **3.08x** | 12.3MB | 11.5MB |
+
+</div>
+
+<br/>
+
+#### 10만 행 vs polars
+
+<div align="center">
+
+| 코덱 | Carquet 쓰기 | polars 쓰기 | 쓰기 비율 | Carquet 읽기 | polars 읽기 | 읽기 비율 | Carquet 크기 | polars 크기 |
+|-------|--------------|---------|---------|-------------|---------|---------|------|------|
+| none | 0.87ms | **0.72ms** | 0.83x | **0.02ms** | 0.33ms | **16.5x**\* | 1.9MB | 1.3MB |
+| snappy | 1.52ms | **0.91ms** | 0.60x | **0.38ms** | 0.46ms | **1.21x** | 1.3MB | 1.1MB |
+| zstd | 1.90ms | **1.05ms** | 0.55x | **0.64ms** | 1.08ms | **1.69x** | 1.0MB | 1.0MB |
+| lz4 | 1.66ms | **0.96ms** | 0.58x | **0.30ms** | 0.44ms | **1.47x** | 1.2MB | 1.1MB |
 
 </div>
 
@@ -358,18 +403,41 @@
 
 | 코덱 | 라이터 | Carquet 읽기 | Arrow C++ 읽기 | 비율 |
 |-------|--------|-------------|----------------|-------|
-| none | Carquet | **0.43ms** | 16.9ms | **39.2x**\* |
-| none | Arrow | **0.90ms** | 14.8ms | **16.5x**\* |
-| snappy | Carquet | **13.6ms** | 24.5ms | **1.80x** |
-| snappy | Arrow | **11.4ms** | 22.9ms | **2.01x** |
-| zstd | Carquet | **19.4ms** | 28.6ms | **1.48x** |
-| zstd | Arrow | **18.7ms** | 28.7ms | **1.54x** |
-| lz4 | Carquet | **9.39ms** | 19.1ms | **2.04x** |
-| lz4 | Arrow | **8.97ms** | 18.8ms | **2.09x** |
+| none | Carquet | **0.30ms** | 17.1ms | **56.8x**\* |
+| none | Arrow | **0.94ms** | 17.4ms | **18.5x**\* |
+| snappy | Carquet | **12.7ms** | 23.3ms | **1.83x** |
+| snappy | Arrow | **11.5ms** | 24.4ms | **2.13x** |
+| zstd | Carquet | **20.2ms** | 30.3ms | **1.50x** |
+| zstd | Arrow | **19.8ms** | 30.7ms | **1.55x** |
+| lz4 | Carquet | **9.96ms** | 19.2ms | **1.93x** |
+| lz4 | Arrow | **8.90ms** | 17.8ms | **2.00x** |
+
+</div>
+
+<br/>
+
+#### 동일 파일 교차 읽기 vs polars (1천만 행)
+
+각 라이브러리는 carquet 벤치마크가 쓴 파일과 polars가 자체 설정(`id`와 `category`에 딕셔너리 인코딩)으로 쓴 파일을 읽습니다.
+
+<div align="center">
+
+| 코덱 | 라이터 | Carquet 읽기 | polars 읽기 | 비율 | 파일 |
+|-------|--------|-------------|-------------|-------|------|
+| none | Carquet | **0.28ms** | 36.4ms | **130.0x**\* | 190.7MB |
+| none | polars | **10.3ms** | 27.8ms | **2.71x** | 105.1MB |
+| snappy | Carquet | **13.2ms** | 53.9ms | **4.09x** | 125.1MB |
+| snappy | polars | **12.4ms** | 30.5ms | **2.45x** | 103.8MB |
+| zstd | Carquet | **21.7ms** | 51.8ms | **2.39x** | 95.3MB |
+| zstd | polars | **17.4ms** | 34.7ms | **1.99x** | 98.1MB |
+| lz4 | Carquet | **10.7ms** | 37.7ms | **3.52x** | 122.7MB |
+| lz4 | polars | **11.5ms** | 26.7ms | **2.31x** | 104.2MB |
 
 </div>
 
 \* 제로 카피 mmap 경로. fastparquet은 pandas를 통해 읽으며 BYTE_STREAM_SPLIT이나 페이지 체크섬을 쓸 수 없으므로, 해당 행들은 직접 비교하기에 덜 적합합니다.
+
+polars는 자체 Rust Parquet 리더와 라이터(`use_pyarrow=False`, 기본값)를 사용하며, 동일한 데이터, 행 그룹 크기, zstd 레벨, 통계를 사용하고 `lz4`에는 LZ4_RAW를 사용합니다. BYTE_STREAM_SPLIT이나 페이지 체크섬을 쓸 수 없고 딕셔너리 인코딩을 켜고 끄는 옵션도 없습니다. `id`와 `category`를 스스로 딕셔너리 인코딩하므로, 이 데이터에서 polars의 파일은 carquet의 딕셔너리 없는 파일보다 비압축 시 45%, snappy / lz4에서는 15–17% 작으며(zstd에서는 거의 같은 크기), 쓰기 시 코덱과 디스크를 거치는 바이트도 더 적습니다. 같은 두 컬럼에 딕셔너리 인코딩을 켜면 carquet은 1천만 행을 45 ms(none), 51 ms(snappy), 51 ms(zstd), 48 ms(lz4)에 쓰며, polars는 각각 38, 38, 49, 40 ms입니다. 읽기는 동일 파일 표로 공정하게 비교됩니다. 코덱을 사용할 때 carquet은 어느 라이브러리의 파일이든 2.0–4.1x 빠르게 읽습니다.
 
 </details>
 
@@ -464,6 +532,7 @@ python3 benchmark/run_benchmark.py --skip-xlarge  # full comparison with PyArrow
 | `--quick` | 1천만 행 구성만(차트에 표시되는 것) |
 | `--skip-xlarge` | 1억 행 구성 건너뛰기(코덱당 약 2 GB, 30분 이상) |
 | `--fastparquet` | fastparquet도 비교(`pip install fastparquet pandas`) |
+| `--polars` | polars 자체 Rust Parquet 리더 / 라이터도 비교(`pip install polars`) |
 | `--no-pyarrow` / `--no-arrow-cpp` | PyArrow / Arrow C++ 건너뛰기 |
 | `--iterations N` | 고정 반복 횟수(기본값: 자동, 11–51) |
 | `--build-dir DIR` / `--temp-dir DIR` | 바이너리가 있는 위치 / 테스트 파일을 쓰는 위치 |
@@ -474,6 +543,8 @@ python3 benchmark/run_benchmark.py --skip-xlarge  # full comparison with PyArrow
 항상 **Release** 빌드로 벤치마크하세요. `make benchmark`는 `build/`를 Release로 재구성합니다. 남아 있는 Debug `build/`는 carquet을 몇 배나 느려 보이게 만듭니다. `make native` + `-DCARQUET_BUILD_BENCHMARKS=ON`은 호스트에 맞춰 튜닝된 수치를 제공합니다.
 
 fastparquet은 동일한 데이터, 행 그룹 크기, 딕셔너리 없음, zstd 레벨을 사용하고 `lz4`에는 LZ4_RAW를 사용합니다. BYTE_STREAM_SPLIT이나 페이지 체크섬을 쓸 수 없고 pandas를 통해 읽기 때문에, 그 수치는 Arrow의 수치보다 직접 비교하기에 덜 적합합니다.
+
+polars는 네이티브 리더와 라이터(PyArrow를 거치지 않음)로 실행하며, 동일한 데이터, 행 그룹 크기, zstd 레벨을 사용하고 `lz4`에는 LZ4_RAW를 사용합니다. BYTE_STREAM_SPLIT이나 페이지 체크섬을 쓸 수 없고 딕셔너리 인코딩을 스스로 선택하므로(옵션 없음), 이 데이터에서는 파일이 더 작아집니다.
 
 Arrow C++ 비교에는 별도의 타깃이 필요합니다(시스템에서 찾은 Arrow C++, 또는 `CARQUET_ARROW_CPP_ROOT`로 지정한 경로):
 
@@ -564,7 +635,7 @@ sudo make install     # library, headers, CLI, pkg-config and CMake package file
 
 ### 소스에서 빌드, `xmake` 사용
 
-[xmake](https://xmake.io)는 다른 설치가 전혀 필요 없습니다. 버전이 고정된 zstd 1.5.6, zlib 1.3.1, lz4 1.10.0, brotli 1.1.0을 내려받아 정적으로 링크하므로 `carquet` CLI에는 런타임 의존성이 없습니다.
+[xmake](https://xmake.io)는 다른 설치가 전혀 필요 없습니다. 버전이 고정된 zstd 1.5.6, zlib 1.4, lz4 1.10.0, brotli 1.1.0을 내려받아 정적으로 링크하므로 `carquet` CLI에는 런타임 의존성이 없습니다.
 
 ```bash
 git clone https://github.com/Vitruves/carquet.git && cd carquet
@@ -955,11 +1026,11 @@ int main(void) {
 
 ## Python API
 
-PyPI의 `carquet`은 위 C 호출을 감싼 래퍼가 아닙니다. 같은 엔진 위에 구축된 **Python다운 `pyarrow.parquet` 스타일 API**(`read_table`, `ParquetFile`, `ParquetWriter`, DNF `filters`)입니다. 휠은 모든 코덱이 컴파일되어 포함된 C 라이브러리를 번들합니다. 데이터는 Arrow C Data Interface를 통해 Python으로 넘어가므로, 디코딩, 압축 해제, I/O는 GIL 없이 C에서 실행되고 PyArrow는 버퍼를 직접 받습니다.
+PyPI의 `carquet`은 위 C 호출을 감싼 래퍼가 아닙니다. 같은 엔진 위에 구축된 **Python다운 `pyarrow.parquet` 스타일 API**(`read_table`, `ParquetFile`, `ParquetWriter`, DNF `filters`)입니다. 휠은 모든 코덱이 컴파일되어 포함된 C 라이브러리를 번들합니다. 데이터는 Arrow C Data Interface를 통해 Python으로 넘어가므로, 디코딩, 압축 해제, I/O는 GIL 없이 C에서 실행됩니다. **의존성이 없습니다**. 읽기 결과는 `carquet.Table`이며, 자체적으로 Python 값, NumPy, pandas로 변환되고 polars, DuckDB, PyArrow는 복사 없이 받아 갑니다.
 
 ```bash
-pip install "carquet[arrow]"   # with PyArrow: tables, DataFrames, streaming
-pip install carquet            # metadata, schema, statistics and validation only
+pip install carquet              # no dependencies: no PyArrow, no NumPy needed
+pip install "carquet[pandas]"    # with pandas + NumPy, for read_pandas() / to_pandas()
 ```
 
 ```python
@@ -981,9 +1052,10 @@ with cq.ParquetFile("data.parquet") as pf:
 |---|---|
 | 파일, 디렉터리, 바이트 또는 파일 객체 읽기 | `cq.read_table`, `cq.read_pandas` |
 | 대용량 파일 스트리밍 | `ParquetFile.iter_batches`, `cq.iter_batches` |
-| 통계, 페이지 인덱스, 블룸 필터로 프루닝 | `filters=`(DNF 또는 `pyarrow.compute` 표현식), `ParquetFile.bloom_filter` |
+| 통계, 페이지 인덱스, 블룸 필터로 프루닝 | `filters=`(DNF, 정확한 결과), `ParquetFile.bloom_filter` |
 | 테이블, DataFrame, polars, DuckDB 결과 쓰기 | `cq.write_table`, `cq.ParquetWriter`(증분, `append=True`) |
-| PyArrow 없이 검사 | `cq.read_metadata`, `cq.read_parquet_schema`, `cq.info`, `cq.validate` |
+| pandas, NumPy, polars, DuckDB, PyArrow로 데이터 전달 | `t.to_pandas()`, `t.column("x").to_numpy()`, `polars.DataFrame(t)`, `pyarrow.table(t)` |
+| 데이터를 읽지 않고 파일 검사 | `cq.read_metadata`, `cq.read_parquet_schema`, `cq.info`, `cq.validate` |
 
 </div>
 

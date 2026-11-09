@@ -582,12 +582,9 @@ static int test_decimal_import(void) {
 
     struct ArrowSchema as; struct ArrowArray aa;
     if (carquet_reader_read_arrow(r, 0, &as, &aa, &err) != CARQUET_OK) TEST_FAIL("decimal_import", err.message);
-    assert(aa.length == 4 && strcmp(as.children[0]->format, "w:5") == 0);
-    const uint8_t* be = (const uint8_t*)aa.children[0]->buffers[1];
-    static const uint8_t exp[4][5] = {
-        {0x00, 0x00, 0x01, 0xE2, 0x40}, {0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
-        {0x00, 0x00, 0x00, 0x00, 0x00}, {0xFF, 0xFF, 0xFE, 0x1D, 0xC0} };
-    assert(memcmp(be, exp, sizeof(exp)) == 0);
+    /* Read back as decimal128, the 16-byte values written (round trip). */
+    assert(aa.length == 4 && strcmp(as.children[0]->format, "d:10,2") == 0);
+    assert(memcmp(aa.children[0]->buffers[1], le, sizeof(le)) == 0);
     as.release(&as); aa.release(&aa);
     carquet_reader_close(r);
     free(buf);

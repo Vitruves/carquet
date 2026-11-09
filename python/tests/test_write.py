@@ -154,7 +154,7 @@ def test_coerce_timestamps(tmp_path):
     carquet.write_table(t, path, coerce_timestamps="ms", allow_truncated_timestamps=True, store_schema=False)
     out = carquet.read_table(path)
     assert out.schema.field("ts").type == pa.timestamp("ms")
-    assert out.column("ts")[0].as_py() == dt.datetime(2024, 1, 1, 0, 0, 0, 1000)
+    assert out.column("ts")[0] == dt.datetime(2024, 1, 1, 0, 0, 0, 1000)
 
 
 def test_parquet_writer_packs_row_groups(tmp_path, table):
@@ -266,7 +266,8 @@ def test_polars_input(tmp_path):
     df = pl.DataFrame({"a": [1, 2, 3], "b": ["x", "y", None]})
     path = tmp_path / "pl.parquet"
     carquet.write_table(df, path)
-    assert pl.from_arrow(carquet.read_table(path)).equals(df)
+    assert pl.DataFrame(carquet.read_table(path)).equals(df)
+    assert carquet.read_table(path).to_polars().equals(df)
 
 
 def test_empty_and_wide(tmp_path):
@@ -314,6 +315,9 @@ def test_nullability_mismatch_is_conformed(tmp_path):
     assert carquet.read_table(path).column("x").to_pylist() == [1, 2, 3, 4]
     with carquet.ParquetWriter(tmp_path / "n2.parquet", pa.schema([("x", pa.int64())])) as w:
         w.write(pa.table({"x": pa.array([1])}, schema=schema))
+    # a null where the file's column is REQUIRED is refused, not written as garbage
+    with pytest.raises(CarquetError):
+        carquet.write_table(pa.table({"x": [None]}), path, append=True)
 
 
 def test_unclosed_writer_is_finished_on_gc(tmp_path, table):

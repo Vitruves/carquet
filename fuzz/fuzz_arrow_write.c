@@ -432,13 +432,6 @@ static void cmp_value(const struct ArrowSchema* ss, const struct ArrowArray* sa,
             else { int32_t t; memcpy(&t, d, 4); b = t; }
         } else if (rc == C_INT) {
             b = int_at(ra, rw, ru, ri);
-        } else if (rc == C_BYTES && rs->format[0] == 'w' && rw > 0 && rw <= 8) {
-            /* read_arrow exports FLBA-backed DECIMAL as its raw storage
-             * ("w:N", big-endian two's complement); see arrow_c_export.c. */
-            const uint8_t* d = (const uint8_t*)ra->buffers[1] + (size_t)(ra->offset + ri) * (size_t)rw;
-            uint64_t u = (d[0] & 0x80) ? ~(uint64_t)0 : 0;
-            for (int j = 0; j < rw; j++) u = (u << 8) | d[j];
-            b = (int64_t)u;
         } else MISMATCH("decimal category");
         if (a != b) MISMATCH("decimal value");
         return;

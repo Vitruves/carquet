@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime
 import decimal
+import math
 import struct
 import uuid
 from typing import Any, Optional
@@ -119,6 +120,12 @@ def _as_int(value: Any) -> int:
         return int(value.__index__())
     if isinstance(value, float) and value.is_integer():
         return int(value)
+    if isinstance(value, (float, decimal.Decimal)):
+        if isinstance(value, float) and math.isinf(value) or isinstance(value, decimal.Decimal) and value.is_infinite():
+            raise OverflowError(f"{value!r} is out of an integer column's range")
+        if isinstance(value, decimal.Decimal) and value == value.to_integral_value():
+            return int(value)
+        raise InexactValue(f"{value!r} is not an integer")
     raise TypeError(f"expected an integer, got {type(value).__name__}")
 
 
@@ -288,6 +295,10 @@ def _encode(value: Any, col: ColumnSchema, exact: bool) -> bytes:
                 raise ValueError(f"expected {n} bytes for {col.path}, got {len(b)}")
             return b
         raise TypeError(f"cannot compare a fixed-length binary column with {type(value).__name__}")
+    if pt == "INT96":
+        ns = _timestamp_units(value, "NANOS", exact)
+        day, nanos = divmod(ns, 86400 * 10**9)
+        return struct.pack("<qI", nanos, day + _JULIAN_EPOCH_DAY)
     raise TypeError(f"predicates on {pt} columns are not supported")
 
 

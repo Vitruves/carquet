@@ -145,22 +145,27 @@ static void parse_logical_type(thrift_decoder_t* dec, carquet_logical_type_t* lt
         switch (field_id) {
             case 1:  /* STRING */
                 lt->id = CARQUET_LOGICAL_STRING;
+                memset(&lt->params, 0, sizeof(lt->params));  /* a union: one arm only */
                 thrift_skip(dec, type);
                 break;
             case 2:  /* MAP */
                 lt->id = CARQUET_LOGICAL_MAP;
+                memset(&lt->params, 0, sizeof(lt->params));  /* a union: one arm only */
                 thrift_skip(dec, type);
                 break;
             case 3:  /* LIST */
                 lt->id = CARQUET_LOGICAL_LIST;
+                memset(&lt->params, 0, sizeof(lt->params));  /* a union: one arm only */
                 thrift_skip(dec, type);
                 break;
             case 4:  /* ENUM */
                 lt->id = CARQUET_LOGICAL_ENUM;
+                memset(&lt->params, 0, sizeof(lt->params));  /* a union: one arm only */
                 thrift_skip(dec, type);
                 break;
             case 5:  /* DECIMAL */
                 lt->id = CARQUET_LOGICAL_DECIMAL;
+                memset(&lt->params, 0, sizeof(lt->params));  /* a union: one arm only */
                 thrift_read_struct_begin(dec);
                 while (thrift_read_field_begin(dec, &type, &field_id)) {
                     if (field_id == 1) lt->params.decimal.scale = thrift_read_i32(dec);
@@ -171,10 +176,12 @@ static void parse_logical_type(thrift_decoder_t* dec, carquet_logical_type_t* lt
                 break;
             case 6:  /* DATE */
                 lt->id = CARQUET_LOGICAL_DATE;
+                memset(&lt->params, 0, sizeof(lt->params));  /* a union: one arm only */
                 thrift_skip(dec, type);
                 break;
             case 7:  /* TIME */
                 lt->id = CARQUET_LOGICAL_TIME;
+                memset(&lt->params, 0, sizeof(lt->params));  /* a union: one arm only */
                 thrift_read_struct_begin(dec);
                 while (thrift_read_field_begin(dec, &type, &field_id)) {
                     if (field_id == 1) lt->params.time.is_adjusted_to_utc = thrift_read_bool(dec);
@@ -197,6 +204,7 @@ static void parse_logical_type(thrift_decoder_t* dec, carquet_logical_type_t* lt
                 break;
             case 8:  /* TIMESTAMP */
                 lt->id = CARQUET_LOGICAL_TIMESTAMP;
+                memset(&lt->params, 0, sizeof(lt->params));  /* a union: one arm only */
                 thrift_read_struct_begin(dec);
                 while (thrift_read_field_begin(dec, &type, &field_id)) {
                     if (field_id == 1) lt->params.timestamp.is_adjusted_to_utc = thrift_read_bool(dec);
@@ -218,6 +226,7 @@ static void parse_logical_type(thrift_decoder_t* dec, carquet_logical_type_t* lt
                 break;
             case 10:  /* INTEGER */
                 lt->id = CARQUET_LOGICAL_INTEGER;
+                memset(&lt->params, 0, sizeof(lt->params));  /* a union: one arm only */
                 thrift_read_struct_begin(dec);
                 while (thrift_read_field_begin(dec, &type, &field_id)) {
                     if (field_id == 1) lt->params.integer.bit_width = (int8_t)thrift_read_byte(dec);
@@ -228,26 +237,32 @@ static void parse_logical_type(thrift_decoder_t* dec, carquet_logical_type_t* lt
                 break;
             case 11:  /* NULL */
                 lt->id = CARQUET_LOGICAL_NULL;
+                memset(&lt->params, 0, sizeof(lt->params));  /* a union: one arm only */
                 thrift_skip(dec, type);
                 break;
             case 12:  /* JSON */
                 lt->id = CARQUET_LOGICAL_JSON;
+                memset(&lt->params, 0, sizeof(lt->params));  /* a union: one arm only */
                 thrift_skip(dec, type);
                 break;
             case 13:  /* BSON */
                 lt->id = CARQUET_LOGICAL_BSON;
+                memset(&lt->params, 0, sizeof(lt->params));  /* a union: one arm only */
                 thrift_skip(dec, type);
                 break;
             case 14:  /* UUID */
                 lt->id = CARQUET_LOGICAL_UUID;
+                memset(&lt->params, 0, sizeof(lt->params));  /* a union: one arm only */
                 thrift_skip(dec, type);
                 break;
             case 15:  /* FLOAT16 */
                 lt->id = CARQUET_LOGICAL_FLOAT16;
+                memset(&lt->params, 0, sizeof(lt->params));  /* a union: one arm only */
                 thrift_skip(dec, type);
                 break;
             case 16:  /* VARIANT */
                 lt->id = CARQUET_LOGICAL_VARIANT;
+                memset(&lt->params, 0, sizeof(lt->params));  /* a union: one arm only */
                 lt->params.variant.specification_version = 1;
                 thrift_read_struct_begin(dec);
                 while (thrift_read_field_begin(dec, &type, &field_id)) {
@@ -261,6 +276,7 @@ static void parse_logical_type(thrift_decoder_t* dec, carquet_logical_type_t* lt
                 break;
             case 17: {  /* GEOMETRY */
                 lt->id = CARQUET_LOGICAL_GEOMETRY;
+                memset(&lt->params, 0, sizeof(lt->params));  /* a union: one arm only */
                 thrift_read_struct_begin(dec);
                 while (thrift_read_field_begin(dec, &type, &field_id)) {
                     if (field_id == 1) {
@@ -281,6 +297,7 @@ static void parse_logical_type(thrift_decoder_t* dec, carquet_logical_type_t* lt
             }
             case 18: {  /* GEOGRAPHY */
                 lt->id = CARQUET_LOGICAL_GEOGRAPHY;
+                memset(&lt->params, 0, sizeof(lt->params));  /* a union: one arm only */
                 thrift_read_struct_begin(dec);
                 while (thrift_read_field_begin(dec, &type, &field_id)) {
                     if (field_id == 1) {
@@ -992,6 +1009,21 @@ carquet_status_t parquet_parse_file_metadata(
         return dec.status;
     }
 
+    /* Row counts size buffers and become array lengths downstream: a
+     * negative one is a corrupt footer, whatever reads it next. */
+    if (metadata->num_rows < 0) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_METADATA,
+            "Negative row count in file metadata");
+        return CARQUET_ERROR_INVALID_METADATA;
+    }
+    for (int32_t r = 0; metadata->row_groups && r < metadata->num_row_groups; r++) {
+        if (metadata->row_groups[r].num_rows < 0) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_METADATA,
+                "Negative row count in row group %d", (int)r);
+            return CARQUET_ERROR_INVALID_METADATA;
+        }
+    }
+
     return CARQUET_OK;
 }
 
@@ -1550,8 +1582,10 @@ static void write_schema_element(thrift_encoder_t* enc, const parquet_schema_ele
         thrift_write_i32(enc, (int32_t)elem->converted_type);
     }
 
-    /* Field 7: scale */
-    if (elem->scale != 0) {
+    /* Field 7: scale. Written with precision even when 0: DuckDB, polars
+     * and fastparquet reject a DECIMAL element that has one without the
+     * other. */
+    if (elem->scale != 0 || elem->precision != 0) {
         thrift_write_field_header(enc, THRIFT_TYPE_I32, 7);
         thrift_write_i32(enc, elem->scale);
     }

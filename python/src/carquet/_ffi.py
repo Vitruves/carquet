@@ -38,7 +38,7 @@ from ctypes import (
 from pathlib import Path
 from typing import Optional
 
-from ._arrow import ArrowArray, ArrowSchema
+from ._arrow import ArrowArray, ArrowArrayStream, ArrowSchema
 from .errors import CarquetError
 
 ERROR_MESSAGE_MAX = 256  # CARQUET_ERROR_MESSAGE_MAX
@@ -336,6 +336,34 @@ class BatchReaderConfig(Structure):
     ]
 
 
+class PredicateStruct(Structure):
+    """carquet_predicate_t."""
+
+    _fields_ = [
+        ("clauses", POINTER(FilterClauseStruct)),
+        ("conjunction_sizes", POINTER(c_int32)),
+        ("num_conjunctions", c_int32),
+    ]
+
+
+class ArrowStreamOptions(Structure):
+    """carquet_arrow_stream_options_t."""
+
+    _fields_ = [
+        ("field_indices", POINTER(c_int32)),
+        ("num_fields", c_int32),
+        ("batch_size", c_int32),
+        ("num_threads", c_int32),
+        ("close_reader", c_bool),
+        ("row_groups", POINTER(c_int32)),
+        ("num_row_groups", c_int32),
+        ("row_offset", c_int64),
+        ("row_limit", c_int64),
+        ("predicate", POINTER(PredicateStruct)),
+        ("restore_arrow_schema", c_bool),
+    ]
+
+
 class AllocatorStruct(Structure):
     """carquet_allocator_t (only ``free`` is used, to release writer buffers)."""
 
@@ -365,6 +393,8 @@ EXPECTED_SIZES = {
     "RowGroupMetadataStruct": 24,
     "ByteArrayStruct": 16,
     "AllocatorStruct": 32,
+    "ArrowStreamOptions": 72,
+    "PredicateStruct": 24,
 }
 
 
@@ -563,6 +593,37 @@ def _declare(lib: ctypes.CDLL) -> None:
     proto("carquet_arrow_export_schema", c_int, vp, POINTER(ArrowSchema), _ErrP)
     proto("carquet_arrow_export_batch", c_int, vp, vp, POINTER(ArrowSchema), POINTER(ArrowArray), _ErrP)
     proto("carquet_arrow_import_schema", c_int, POINTER(ArrowSchema), POINTER(c_void_p), _ErrP)
+    proto("carquet_arrow_stream_options_init", None, POINTER(ArrowStreamOptions), optional=True)
+    proto("carquet_reader_predicate_row_groups", c_int32, vp, POINTER(PredicateStruct), POINTER(c_int32), c_int32,
+          _ErrP, optional=True)
+    proto("carquet_arrow_ref_create", vp, POINTER(ArrowArray), optional=True)
+    proto("carquet_arrow_ref_array", POINTER(ArrowArray), vp, optional=True)
+    proto("carquet_arrow_ref_export", c_int, vp, c_int64, c_int64, POINTER(ArrowArray), optional=True)
+    proto("carquet_arrow_ref_export_child", c_int, vp, c_int32, c_int64, c_int64, POINTER(ArrowArray), optional=True)
+    proto("carquet_arrow_ref_export_select", c_int, vp, POINTER(c_int32), c_int32, c_int64, c_int64,
+          POINTER(ArrowArray), optional=True)
+    proto("carquet_arrow_ref_release", None, vp, optional=True)
+    proto("carquet_arrow_schema_copy", c_int, POINTER(ArrowSchema), POINTER(ArrowSchema), optional=True)
+    proto("carquet_arrow_schema_copy_child", c_int, POINTER(ArrowSchema), c_int32, POINTER(ArrowSchema), optional=True)
+    proto("carquet_arrow_schema_select", c_int, POINTER(ArrowSchema), POINTER(c_int32), c_int32, optional=True)
+    proto("carquet_arrow_stream_from_arrays", c_int, POINTER(ArrowSchema), POINTER(ArrowArray), c_int64,
+          POINTER(ArrowArrayStream), optional=True)
+    proto("carquet_arrow_array_build", c_int, c_int64, c_int64, c_int32, POINTER(c_void_p), POINTER(c_int64),
+          c_int32, POINTER(ArrowArray), POINTER(ArrowArray), POINTER(ArrowArray), optional=True)
+    proto("carquet_arrow_schema_build", c_int, c_char_p, c_char_p, c_int64, c_char_p, c_int32,
+          POINTER(ArrowSchema), POINTER(ArrowSchema), POINTER(ArrowSchema), optional=True)
+    proto("carquet_writer_set_arrow_schema", c_int, vp, POINTER(ArrowSchema), optional=True)
+    proto("carquet_arrow_capsule_init", None, vp, optional=True)
+    proto("carquet_arrow_struct_alloc", vp, c_size_t, optional=True)
+    proto(
+        "carquet_reader_export_arrow_stream",
+        c_int,
+        vp,
+        POINTER(ArrowStreamOptions),
+        POINTER(ArrowArrayStream),
+        _ErrP,
+        optional=True,
+    )
 
     # writer
     proto("carquet_writer_options_init", None, POINTER(WriterOptions))

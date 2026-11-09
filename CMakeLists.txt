@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(carquet VERSION 0.7.3 LANGUAGES C)
+project(carquet VERSION 0.8.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -262,18 +262,24 @@ else()
     FetchContent_Declare(
         zlib
         GIT_REPOSITORY https://github.com/madler/zlib.git
-        GIT_TAG        v1.3.1
+        GIT_TAG        v1.4
         GIT_SHALLOW    TRUE
         GIT_PROGRESS   FALSE
     )
-    set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    # Only the static library is linked. zlib's tests would join carquet's
+    # ctest run (ZLIB_BUILD_TESTING is ON by default since 1.3.2).
+    set(ZLIB_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(ZLIB_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+    set(ZLIB_BUILD_STATIC ON CACHE BOOL "" FORCE)
     # Keep zlib's own install() rules out of carquet's install: they put a
     # shared zlib.dll + zlib.lib, zlib.h, zlib.pc and a man page in the
     # prefix. On Windows the default prefix (C:/Program Files (x86)/carquet)
     # is searched by find_package(), so the next carquet configure then took
     # that shared zlib as the "system" zlib and every test failed to start
     # (zlib.dll not found). A static carquet still installs zlibstatic via its
-    # own export set below. (Normal variable: scoped to this directory.)
+    # own export set below. zlib 1.4 reads ZLIB_INSTALL; SKIP_INSTALL_ALL
+    # covers an older zlib supplied through FETCHCONTENT_SOURCE_DIR_ZLIB.
+    set(ZLIB_INSTALL OFF CACHE BOOL "" FORCE)
     set(SKIP_INSTALL_ALL ON)
     FetchContent_MakeAvailable(zlib)
     set(ZLIB_LIBRARIES zlibstatic)
@@ -288,7 +294,9 @@ if(CARQUET_LZ4_TARGET)
     set(LZ4_INCLUDE_DIRS "")
     set(LZ4_FOUND TRUE)
 elseif(NOT CARQUET_BUNDLE_DEPS)
-    find_package(lz4 CONFIG QUIET)
+    # NAMES: lz4 installs lz4Config.cmake, some packagings LZ4Config.cmake, and
+    # the two differ on case-sensitive file systems (#29).
+    find_package(lz4 CONFIG QUIET NAMES lz4 LZ4)
 else()
     set(lz4_FOUND FALSE)  # see ZSTD_FOUND above
     set(LZ4_FOUND FALSE)
@@ -518,6 +526,11 @@ set(CARQUET_READER_SOURCES
     src/reader/arrow_schema_read.c
     src/reader/arrow_c_export.c
     src/reader/arrow_c_read.c
+    src/reader/arrow_leaf.c
+    src/reader/arrow_c_stream.c
+    src/reader/arrow_filter.c
+    src/reader/arrow_ref.c
+    src/reader/arrow_restore.c
     src/reader/row_group_reader.c
     src/reader/column_reader.c
     src/reader/page_reader.c
@@ -866,6 +879,9 @@ if(CARQUET_BUILD_TESTS)
 
     add_carquet_test(test_core tests/test_core.c)
     add_carquet_test(test_fixes_0_7_2 tests/test_fixes_0_7_2.c)
+    add_carquet_test(test_fixes_0_7_4 tests/test_fixes_0_7_4.c)
+    add_carquet_test(test_fixes_0_8_0 tests/test_fixes_0_8_0.c)
+    add_carquet_test(test_compat_0_8_0 tests/test_compat_0_8_0.c)
     add_carquet_test(test_thrift tests/test_thrift.c)
     add_carquet_test(test_encodings tests/test_encodings.c)
     add_carquet_test(test_reader tests/test_reader.c)
@@ -895,6 +911,7 @@ if(CARQUET_BUILD_TESTS)
 
     # Advanced API tests (bloom filter, page index, kv metadata, etc.)
     add_carquet_test(test_advanced_api tests/test_advanced_api.c)
+    add_carquet_test(test_dictionary_fallback tests/test_dictionary_fallback.c)
 
     # carquet-reads-carquet roundtrip for every opt-in encoding
     add_carquet_test(test_encoding_roundtrip tests/test_encoding_roundtrip.c)
@@ -904,6 +921,7 @@ if(CARQUET_BUILD_TESTS)
 
     # Arrow C Data Interface export/import bridge
     add_carquet_test(test_arrow_c_data tests/test_arrow_c_data.c)
+    add_carquet_test(test_arrow_stream tests/test_arrow_stream.c)
     add_carquet_test(test_arrow_nested tests/test_arrow_nested.c)
     add_carquet_test(test_p2_conformance tests/test_p2_conformance.c)
 
@@ -921,6 +939,7 @@ if(CARQUET_BUILD_TESTS)
 
     # Arbitrary [offset, limit) row-range read (predicate-independent slice)
     add_carquet_test(test_row_range tests/test_row_range.c)
+    add_carquet_test(test_batch_pipeline tests/test_batch_pipeline.c)
 
     # Module-level dictionary decode for BYTE_ARRAY / FIXED_LEN_BYTE_ARRAY
     add_carquet_test(test_dict_decode tests/test_dict_decode.c)
@@ -1218,6 +1237,11 @@ if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
                     set_target_properties(${_dep} PROPERTIES
                         INTERFACE_INCLUDE_DIRECTORIES "${_wrapped}")
                 endif()
+                # zlib >= 1.3.2 lists zlib.h / zconf.h as PUBLIC_HEADER; with
+                # no destination here they are not installed (they would
+                # shadow the system zlib headers in the prefix), and CMake
+                # warns. Drop the property: only the archive is needed.
+                set_target_properties(${_dep} PROPERTIES PUBLIC_HEADER "")
             endforeach()
             install(TARGETS ${_carquet_fetched_deps}
                 EXPORT carquetTargets

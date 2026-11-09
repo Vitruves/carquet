@@ -1,21 +1,26 @@
 """Writing Parquet files: :class:`ParquetWriter` and :func:`write_table`.
 
 Data reaches the C writer through the Arrow C Data Interface
-(``carquet_writer_write_arrow``), one RecordBatch at a time with no Python-side
-copy; encoding, compression and I/O run in C without the GIL (pages are
-encoded in parallel and row groups are written on a background thread).
+(``carquet_writer_write_arrow``), one batch at a time. Anything that speaks
+the Arrow PyCapsule interface (carquet, PyArrow, polars, DuckDB, nanoarrow...)
+is written without a Python-side copy; dicts, lists, NumPy arrays and pandas
+DataFrames are converted by :mod:`carquet._build`. Encoding, compression and
+I/O run in C without the GIL (pages are encoded in parallel and row groups are
+written on a background thread). PyArrow is not needed.
 """
 
 from __future__ import annotations
 
-import base64
 import ctypes
 import os
-from ctypes import addressof, byref
-from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, Optional, Sequence, Union
+from ctypes import byref
+from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence, Union
 
 from . import _ffi
-from ._arrow import ArrowSchema
+from ._arrow import ArrowArray, ArrowSchema, take_from_capsule, SCHEMA_CAPSULE
+from ._build import from_mapping, from_pandas, is_pandas, table_from_columns
+from .arrow import RecordBatch, Schema, StreamReader, Table
+from .arrow import table as _to_table
 from ._types import (
     ENCODING_NAMES,
     RLE_DICTIONARY,
@@ -26,50 +31,32 @@ from ._types import (
 from .errors import CarquetError, StatusCode
 from .schema import ParquetSchema
 
-if TYPE_CHECKING:  # pragma: no cover
-    import pyarrow as pa
-
 __all__ = ["ParquetWriter", "write_table"]
 
 DEFAULT_ROW_GROUP_SIZE = 1 << 20  # rows, like pyarrow.parquet.write_table
 
 
-def _pa():
-    from .reader import _pa as get
-
-    return get()
-
-
 # --------------------------------------------------------------------------
 # Input normalisation
 # --------------------------------------------------------------------------
-def _is_pandas(obj: Any) -> bool:
-    return type(obj).__module__.startswith("pandas.") and hasattr(obj, "columns") and hasattr(obj, "dtypes")
-
-
-def to_arrow(data: Any) -> tuple:
-    """``(schema, iterator of RecordBatch)`` for any supported tabular input."""
-    pa = _pa()
-    if isinstance(data, pa.Table):
+def to_batches(data: Any) -> tuple:
+    """``(Schema, iterator of RecordBatch)`` for any supported tabular input."""
+    if isinstance(data, Table):
         return data.schema, iter(data.to_batches())
-    if isinstance(data, pa.RecordBatch):
+    if isinstance(data, RecordBatch):
         return data.schema, iter([data])
-    if isinstance(data, pa.RecordBatchReader):
-        return data.schema, iter(data)
-    if _is_pandas(data):
-        t = pa.Table.from_pandas(data)
+    if is_pandas(data):
+        cols, md = from_pandas(data)
+        t = table_from_columns(cols, md)
         return t.schema, iter(t.to_batches())
-    if hasattr(data, "__arrow_c_stream__"):  # polars, duckdb, nanoarrow, ...
-        if hasattr(pa.RecordBatchReader, "from_stream"):
-            r = pa.RecordBatchReader.from_stream(data)
-            return r.schema, iter(r)
-        t = pa.table(data)
-        return t.schema, iter(t.to_batches())
+    if hasattr(data, "__arrow_c_stream__"):  # PyArrow, polars, DuckDB, nanoarrow, ArrowStream...
+        r = StreamReader(data)
+        return r.schema, r
     if hasattr(data, "__arrow_c_array__"):
-        b = pa.record_batch(data)
-        return b.schema, iter([b])
+        t = _to_table(data)
+        return t.schema, iter(t.to_batches())
     if isinstance(data, Mapping):
-        t = pa.table(data)
+        t = from_mapping(data)
         return t.schema, iter(t.to_batches())
     if isinstance(data, (list, tuple)) or hasattr(data, "__next__"):
         it = iter(data)
@@ -77,79 +64,45 @@ def to_arrow(data: Any) -> tuple:
             first = next(it)
         except StopIteration:
             raise ValueError("cannot infer a schema from an empty sequence of batches") from None
-        if isinstance(first, pa.Table):
-            first_batches = first.to_batches()
-            rest = (b for t in it for b in t.to_batches())
-            return first.schema, _chain(first_batches, rest)
-        if not isinstance(first, pa.RecordBatch):
-            raise TypeError(f"expected RecordBatch items, got {type(first).__name__}")
-        return first.schema, _chain([first], it)
+        schema, first_batches = to_batches(first)
+        rest = (b for item in it for b in to_batches(item)[1])
+        return schema, _chain(first_batches, rest)
     raise TypeError(
-        "expected a pyarrow Table / RecordBatch / RecordBatchReader, a pandas DataFrame, an object "
-        f"implementing the Arrow PyCapsule interface, a dict of columns or a list of batches; got {type(data).__name__}"
+        "expected a carquet Table / RecordBatch, an object implementing the Arrow PyCapsule interface "
+        "(PyArrow, polars, DuckDB...), a pandas DataFrame, a dict of columns or a list of batches; "
+        f"got {type(data).__name__}"
     )
 
 
-def _chain(first: list, rest: Iterable) -> Iterator:
+def _chain(first: Iterable, rest: Iterable) -> Iterator:
     yield from first
     yield from rest
 
 
-def _storage_type(pa, t):
-    """The type carquet writes for Arrow type ``t``.
-
-    Types without a Parquet mapping in the C bridge are written as their
-    storage (durations as int64, view types as their plain counterparts, the
-    null type as an all-null int32), like PyArrow does; the original type is
-    kept in ``ARROW:schema`` and restored on read.
-    """
-    types = pa.types
-    if types.is_duration(t):
-        return pa.int64()
-    if getattr(types, "is_string_view", None) and types.is_string_view(t):
-        return pa.string()
-    if getattr(types, "is_binary_view", None) and types.is_binary_view(t):
-        return pa.binary()
-    if types.is_null(t):
-        return pa.int32()
-    if types.is_struct(t):
-        fields = [t.field(i) for i in range(t.num_fields)]
-        new = [f.with_type(_storage_type(pa, f.type)) for f in fields]
-        return t if new == fields else pa.struct(new)
-    if types.is_map(t):
-        k, v = _storage_type(pa, t.key_type), _storage_type(pa, t.item_type)
-        if k == t.key_type and v == t.item_type:
-            return t
-        return pa.map_(t.key_field.with_type(k), t.item_field.with_type(v), keys_sorted=t.keys_sorted)
-    if types.is_list(t) or types.is_large_list(t) or types.is_fixed_size_list(t):
-        v = _storage_type(pa, t.value_type)
-        if v == t.value_type:
-            return t
-        f = t.value_field.with_type(v)
-        if types.is_fixed_size_list(t):
-            return pa.list_(f, t.list_size)
-        return pa.list_(f) if types.is_list(t) else pa.large_list(f)
-    return t
+def _schema_of(schema: Any) -> Schema:
+    if isinstance(schema, Schema):
+        return schema
+    if hasattr(schema, "__arrow_c_schema__"):
+        return Schema(take_from_capsule(schema.__arrow_c_schema__(), SCHEMA_CAPSULE, ArrowSchema))
+    raise TypeError(f"schema must be a carquet.Schema or implement __arrow_c_schema__, got {type(schema).__name__}")
 
 
-def _storage_schema(pa, schema):
-    fields = [f.with_type(_storage_type(pa, f.type)) for f in schema]
-    if all(a.type == f.type for a, f in zip(fields, schema)):
-        return None
-    return pa.schema(fields, metadata=schema.metadata)
+def _same_names(a: Schema, b: Schema) -> bool:
+    """The data's columns line up with the writer's (types are checked by the
+    C import, which also widens int32 -> int64 and float -> double)."""
+    return a.names == b.names
 
 
-def _types_equal(a, b) -> bool:
-    if len(a) != len(b):
-        return False
-    # nullability matters: the C writer rejects definition levels for a REQUIRED column
-    return all(fa.name == fb.name and fa.type.equals(fb.type) and fa.nullable == fb.nullable
-               for fa, fb in zip(a, b))
+def _conform_nullability(src: ArrowSchema, ref: ArrowSchema, depth: int = 0) -> None:
+    """Give the data's schema the writer's nullability flags: a nullable field
+    without nulls goes into a REQUIRED column (the C import refuses an actual
+    null there), a non-nullable one into an OPTIONAL column."""
+    src.flags = (src.flags & ~2) | (ref.flags & 2)
+    if depth < 64:
+        for i in range(min(src.n_children, ref.n_children)):
+            _conform_nullability(src.children[i].contents, ref.children[i].contents, depth + 1)
 
 
-# --------------------------------------------------------------------------
-# Option parsing
-# --------------------------------------------------------------------------
 def _format_version(version: Any) -> int:
     if version is None:
         return 2
@@ -247,16 +200,21 @@ def _sorting(spec: Any, columns: _Columns) -> list:
 # ParquetWriter
 # --------------------------------------------------------------------------
 class ParquetWriter:
-    """Incremental Parquet writer.
+    """Write a Parquet file piece by piece (:func:`write_table` writes one in a single call).
 
-    ``where`` is a path or a writable binary file object (the file is built in
-    memory and written to it on :meth:`close`). Write any number of tables /
-    batches; rows are packed into row groups of ``row_group_size`` rows
-    regardless of how they were chunked on input::
+    ::
 
-        with carquet.ParquetWriter("out.parquet", table.schema, compression="zstd") as w:
+        with carquet.ParquetWriter("out.parquet", schema, compression="zstd") as w:
             for batch in batches:
-                w.write(batch)
+                w.write(batch)          # Table, RecordBatch, DataFrame, dict...
+
+    ``where`` is a path or a writable binary file object (the file is then
+    built in memory and written to it on :meth:`close`). ``schema`` is a
+    :class:`carquet.Schema` (``table.schema``, ``carquet.read_schema(path)``)
+    or any Arrow schema, PyArrow's included. Every piece written must have the
+    schema's columns. Rows are packed into row groups of ``row_group_size``
+    rows however they arrive. Leaving the ``with`` block closes the file; if
+    the block raises, the file is discarded.
 
     With ``append=True`` the file at ``where`` must exist; new row groups are
     added after the existing ones (``schema`` defaults to the file's schema).
@@ -324,10 +282,8 @@ class ParquetWriter:
         metadata: Optional[Mapping[str, Any]] = None,
         page_size: Any = None,
     ) -> None:
-        pa = _pa()
         lib = _ffi.get_lib()
         self._writer: Optional[int] = None
-        self._pa = pa
         self._sink = None
         self.path: Optional[str] = None
         self._created_file = False
@@ -350,8 +306,7 @@ class ParquetWriter:
 
             with ParquetFile(self.path, memory_map=False) as pf:
                 schema = pf.schema
-        elif not isinstance(schema, pa.Schema):
-            schema = pa.schema(schema)
+        schema = _schema_of(schema)
         self.schema = schema
         self.row_group_size = int(row_group_size) if row_group_size else DEFAULT_ROW_GROUP_SIZE
         if self.row_group_size <= 0:
@@ -360,9 +315,7 @@ class ParquetWriter:
             store_schema = not append
 
         # Arrow schema -> carquet schema (the import consumes the ArrowSchema).
-        self._storage = _storage_schema(pa, schema)
-        c_schema = ArrowSchema()
-        _export_schema(pa, self._storage or schema, c_schema)
+        c_schema = schema._copy()
         cq_schema = ctypes.c_void_p()
         err = _ffi.CarquetErrorStruct()
         _ffi.check(lib.carquet_arrow_import_schema(byref(c_schema), byref(cq_schema), byref(err)), err, "schema")
@@ -388,9 +341,9 @@ class ParquetWriter:
             crc = write_page_checksum if write_page_checksum is not None else write_crc
             if crc is not None:
                 opts.write_crc = bool(crc)
-            # ARROW:schema is serialised by PyArrow itself below (exact Arrow
-            # types: time zones, dictionaries, large / extension types, nested
-            # field names), so the C writer's own copy is turned off.
+            # ARROW:schema is built from the Arrow schema itself below (exact
+            # types: time zones, dictionaries, large / view types, durations,
+            # child names, metadata), not from the Parquet schema.
             opts.write_arrow_schema = False
             if coerce_timestamps is not None:
                 opts.coerce_timestamps = True
@@ -426,13 +379,11 @@ class ParquetWriter:
                                     column_encoding, use_byte_stream_split, write_statistics,
                                     max_statistics_size, bloom_filters, sorting_columns)
             if store_schema:
-                blob = base64.b64encode(schema.serialize().to_pybytes())
-                self.add_metadata("ARROW:schema", blob)
-            if store_schema and schema.metadata:
-                for k, v in schema.metadata.items():
-                    key = k.decode("utf-8", "replace")
-                    if key != "ARROW:schema":
-                        self.add_metadata(key, v.decode("utf-8", "replace"))
+                st = lib.carquet_writer_set_arrow_schema(self._writer, byref(schema._c))
+                if st == StatusCode.NOT_IMPLEMENTED:  # a type with no IPC form: the Parquet types only
+                    pass
+                else:
+                    _ffi.check(st, None, "ARROW:schema")
             for k, v in (metadata or {}).items():
                 self.add_metadata(k, v)
         except BaseException:
@@ -516,6 +467,7 @@ class ParquetWriter:
     # -- writing -------------------------------------------------------------
     @property
     def closed(self) -> bool:
+        """True once the writer has been closed or aborted."""
         return not self._writer
 
     def _require_open(self) -> int:
@@ -536,43 +488,22 @@ class ParquetWriter:
         _ffi.check(_ffi.get_lib().carquet_writer_add_metadata(w, k, v), None, f"metadata {key!r}")
 
     def write(self, data: Any, row_group_size: Optional[int] = None) -> None:
-        """Write a table, record batch, batch reader, DataFrame or Arrow stream."""
+        """Write a table, record batch, Arrow stream (PyArrow, polars, DuckDB...),
+        DataFrame or dict of columns."""
         self._require_open()
-        schema, batches = to_arrow(data)
-        conform = None
-        if not _types_equal(schema, self.schema):
-            conform = self._conformer(schema)
+        schema, batches = to_batches(data)
+        if not _same_names(schema, self.schema):
+            raise ValueError(f"data columns {schema.names} do not match the writer schema {self.schema.names}")
         rg_size = int(row_group_size) if row_group_size else self.row_group_size
         for batch in batches:
-            if conform is not None:
-                batch = conform(batch)
             self._write_batch(batch, rg_size)
 
     write_table = write
     write_batch = write
 
-    def _conformer(self, schema):
-        pa = self._pa
-        if [f.name for f in schema] != [f.name for f in self.schema]:
-            raise ValueError(
-                f"data columns {schema.names} do not match the writer schema {self.schema.names}"
-            )
-
-        def conform(batch):
-            if batch.num_rows == 0:
-                return None
-            try:
-                return pa.Table.from_batches([batch]).cast(self.schema).to_batches()[0]
-            except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError) as exc:
-                raise ValueError(f"data schema does not match the writer schema: {exc}") from None
-
-        return conform
-
-    def _write_batch(self, batch, rg_size: int) -> None:
+    def _write_batch(self, batch: RecordBatch, rg_size: int) -> None:
         if batch is None or batch.num_rows == 0:
             return
-        if self._storage is not None:
-            batch = self._pa.Table.from_batches([batch]).cast(self._storage).to_batches()[0]
         start, n = 0, batch.num_rows
         while start < n:
             room = rg_size - self._rows_in_group
@@ -585,13 +516,11 @@ class ParquetWriter:
             if self._rows_in_group >= rg_size:
                 self.flush()
 
-    def _write_arrow(self, batch) -> None:
-        from ._arrow import ArrowArray
-
+    def _write_arrow(self, batch: RecordBatch) -> None:
         lib = _ffi.get_lib()
-        array = ArrowArray()
-        c_schema = ArrowSchema()
-        batch._export_to_c(addressof(array), addressof(c_schema))
+        array = batch._export()
+        c_schema = batch.schema._copy()
+        _conform_nullability(c_schema, self.schema._c)
         err = _ffi.CarquetErrorStruct()
         st = lib.carquet_writer_write_arrow(self._writer, byref(array), byref(c_schema), byref(err))
         _ffi.check(st, err, "write")
@@ -669,25 +598,43 @@ def _is_path_like(obj: Any) -> bool:
     return isinstance(obj, (str, os.PathLike))
 
 
-def _export_schema(pa, schema, c_schema) -> None:
-    schema._export_to_c(addressof(c_schema))
-
-
 def write_table(table: Any, where: Any, *, row_group_size: Optional[int] = None, **options) -> None:
-    """Write a table (or any input :meth:`ParquetWriter.write` accepts) to ``where``.
+    """Write data to a Parquet file.
 
-    ``where`` is a path or a writable binary file object (``io.BytesIO``, an
-    open file, ...). See :class:`ParquetWriter` for the options; with
-    ``append=True`` the rows are added to an existing file. If writing fails,
-    a file created by this call is removed.
+    ::
+
+        carquet.write_table({"id": [1, 2, 3], "name": ["a", None, "c"]}, "out.parquet")
+        carquet.write_table(df, "out.parquet", compression="snappy")     # pandas / polars
+        carquet.write_table(more_rows, "out.parquet", append=True)
+
+    Args:
+        table: what to write. A ``{column name: values}`` dict (Python lists,
+            NumPy arrays, pandas Series), a pandas DataFrame, a
+            :class:`carquet.Table`, or any Arrow table or stream (PyArrow,
+            polars, DuckDB...). In lists, None is a null; ``int``, ``float``,
+            ``str``, ``bytes``, ``bool``, ``datetime``, ``date``, ``time``,
+            ``timedelta``, ``Decimal``, ``list`` and ``dict`` values are
+            understood.
+        where: a path, or a writable binary file object (``io.BytesIO``...).
+        row_group_size: rows per row group (default 1 048 576).
+        **options: the most useful ones are ``compression`` (``"zstd"`` by
+            default, ``"snappy"``, ``"gzip"``, ``"brotli"``, ``"lz4"``,
+            ``"none"``), ``compression_level``, ``use_dictionary`` (True or a
+            list of columns with few distinct values), ``write_page_index``
+            and ``bloom_filters`` (faster filtered reads), ``metadata`` (a
+            ``{key: value}`` dict stored in the file) and ``append`` (add the
+            rows to an existing file). The full list is in
+            ``help(carquet.ParquetWriter)``.
+
+    If writing fails, a file created by this call is removed.
     """
-    schema, batches = to_arrow(table)
-    if options.get("append"):
-        schema = None  # the file's schema; the data is conformed to it
-    w = ParquetWriter(where, schema, row_group_size=row_group_size, **options)
+    schema, batches = to_batches(table)
+    w = ParquetWriter(where, None if options.get("append") else schema, row_group_size=row_group_size, **options)
     try:
+        if not _same_names(schema, w.schema):
+            raise ValueError(f"data columns {schema.names} do not match the file schema {w.schema.names}")
         for b in batches:
-            w._write_batch(b if _types_equal(b.schema, w.schema) else w._conformer(b.schema)(b), w.row_group_size)
+            w._write_batch(b, w.row_group_size)
         w.close()
     except BaseException:
         w._abort()

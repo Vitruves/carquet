@@ -119,9 +119,9 @@ def test_iter_batches(tmp_path, table):
     with carquet.ParquetFile(path) as pf:
         sizes = [b.num_rows for b in pf.iter_batches(batch_size=150)]
         assert sum(sizes) == table.num_rows and max(sizes) <= 150
-        flat = pa.Table.from_batches(list(pf.iter_batches(batch_size=150, columns=["id", "name"])))
+        flat = pa.Table.from_batches([pa.record_batch(b) for b in pf.iter_batches(batch_size=150, columns=["id", "name"])])
         assert flat.equals(table.select(["id", "name"]))
-        nested = pa.Table.from_batches(list(pf.iter_batches(batch_size=128, columns=["point"])))
+        nested = pa.Table.from_batches([pa.record_batch(b) for b in pf.iter_batches(batch_size=128, columns=["point"])])
         assert nested.equals(table.select(["point"]))
         with pytest.raises(ValueError):
             next(pf.iter_batches(batch_size=0))
@@ -300,7 +300,7 @@ def test_sliced_nested_conversions(tmp_path):
     path = tmp_path / "sn.parquet"
     carquet.write_table(t, path)
     with carquet.ParquetFile(path) as pf:
-        assert pa.Table.from_batches(list(pf.iter_batches(batch_size=7))).equals(t)
+        assert pa.Table.from_batches([pa.record_batch(b) for b in pf.iter_batches(batch_size=7)]).equals(t)
         assert pf.slice(5, 5).equals(t.slice(5, 5))
 
 
