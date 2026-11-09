@@ -13,6 +13,7 @@ import ctypes
 import datetime as dt
 import decimal
 import json
+import struct
 from typing import Any
 
 from .errors import CarquetError, StatusCode
@@ -58,6 +59,8 @@ def _fixed(node, start: int, n: int, code: str, width: int) -> list:
     if n <= 0:
         return []
     raw = ctypes.string_at(_buf(node, 1) + start * width, n * width)
+    if code == "e":  # memoryview.cast() only takes half floats from Python 3.12
+        return list(struct.unpack(f"={n}e", raw))
     return memoryview(raw).cast(code).tolist()
 
 
