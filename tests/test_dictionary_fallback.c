@@ -6,9 +6,11 @@
  * dictionary pages (as writers do once the dictionary is full). Read with
  * preserve_dictionaries, the batch reader returns the dictionary part's
  * indices, then fails at the PLAIN page: never the PLAIN values' bytes as
- * indices. carquet's writer falls back for whole chunks only, so the mixed
- * chunk is spliced from two files' chunks: a dictionary-encoded one, then a
- * PLAIN one's data pages, under the first's footer, grown to both.
+ * indices. A column reader reading indices (carquet_column_reader_reset_indices)
+ * stops there too, and carquet_column_reader_materialize() reads the PLAIN
+ * values from there. carquet's writer falls back for whole chunks only, so the
+ * mixed chunk is spliced from two files' chunks: a dictionary-encoded one, then
+ * a PLAIN one's data pages, under the first's footer, grown to both.
  */
 
 #include <carquet/carquet.h>
@@ -134,15 +136,154 @@ out:
     return rc;
 }
 
+#define STRING_ROWS 1000
+static const char* const strings[] = {"", "a", "bb", "a longer string value", "ccc"};
+
+/* one BYTE_ARRAY REQUIRED column s, dictionary-encoded: rows of strings[i % 5] */
+static int write_strings(const char* path) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t* schema = carquet_schema_create(&err);
+    if (!schema || carquet_schema_add_column(schema, "s", CARQUET_PHYSICAL_BYTE_ARRAY, NULL,
+                                             CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK) {
+        return 1;
+    }
+    carquet_writer_options_t opts;
+    carquet_writer_options_init(&opts);
+    carquet_writer_t* w = carquet_writer_create(path, schema, &opts, &err);
+    if (!w) {
+        carquet_schema_free(schema);
+        return 1;
+    }
+    static carquet_byte_array_t vs[STRING_ROWS];
+    for (int i = 0; i < STRING_ROWS; i++) {
+        vs[i].data = (uint8_t*)strings[i % 5];
+        vs[i].length = (int32_t)strlen(strings[i % 5]);
+    }
+    int rc = carquet_writer_set_column_encoding(w, 0, CARQUET_ENCODING_RLE_DICTIONARY) != CARQUET_OK ||
+             carquet_writer_write_batch(w, 0, vs, STRING_ROWS, NULL, NULL) != CARQUET_OK;
+    rc |= carquet_writer_close(w) != CARQUET_OK;
+    carquet_schema_free(schema);
+    return rc;
+}
+
+/* the next n reads of c, as indices, are the dictionary part's first n rows */
+static int check_indices(carquet_column_reader_t* c, int64_t n) {
+    static uint32_t indices[DICT_ROWS];
+    const uint8_t* dict = NULL;
+    const uint32_t* offsets = NULL;
+    int32_t count = 0;
+    if (carquet_column_read_batch(c, indices, n, NULL, NULL) != n ||
+        carquet_column_reader_dictionary(c, &dict, &count, &offsets) != CARQUET_OK ||
+        count != DICT_VALUES || offsets)
+        return 1;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t v;
+        if (indices[i] >= (uint32_t)count) return 1;
+        memcpy(&v, dict + (size_t)indices[i] * sizeof(int64_t), sizeof(v));
+        if (v != dict_value(i)) return 1;
+    }
+    return 0;
+}
+
+/* column readers reading indices: the mixed chunk to its PLAIN page, then values;
+ * resets between indices and values; a PLAIN chunk; a BYTE_ARRAY dictionary */
+static int column_reader_indices(carquet_reader_t* r, const char* plain_path, const char* strings_path) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    static int64_t values[DICT_ROWS + PLAIN_ROWS];
+    carquet_column_reader_t* c = carquet_reader_get_column(r, 0, 0, &err);
+    bool indices = false;
+    if (!c || carquet_column_reader_reset_indices(c, 0, &indices, &err) != CARQUET_OK || !indices)
+        TEST_FAIL("column_reader_indices", "reset_indices");
+    const uint8_t* dict = NULL;
+    int32_t count = 0;
+    if (carquet_column_reader_dictionary(c, &dict, &count, NULL) != CARQUET_ERROR_DICTIONARY_NOT_FOUND)
+        TEST_FAIL("column_reader_indices", "a dictionary before the first read");
+    if (check_indices(c, 10)) TEST_FAIL("column_reader_indices", "the first indices");
+    /* in the middle of a page: refused */
+    carquet_error_t e = CARQUET_ERROR_INIT;
+    if (carquet_column_reader_materialize(c, &e) != CARQUET_ERROR_INVALID_STATE)
+        TEST_FAIL("column_reader_indices", "materialize in the middle of a page");
+
+    /* on to the PLAIN page: a partial read of the indices before it, stopped there */
+    static uint32_t rest[DICT_ROWS];
+    int64_t got = 10;
+    for (;;) {
+        carquet_error_t re = CARQUET_ERROR_INIT;
+        int64_t n = carquet_column_read_batch_ex(c, rest, 700, NULL, NULL, &re);
+        if (carquet_error_is_set(&re)) {
+            if (re.code != CARQUET_ERROR_INVALID_ENCODING)
+                TEST_FAIL("column_reader_indices", re.message);
+            got += n > 0 ? n : 0;
+            break;
+        }
+        if (n <= 0) TEST_FAIL("column_reader_indices", "the indices ended before the PLAIN page");
+        got += n;
+    }
+    if (got != DICT_ROWS) TEST_FAIL("column_reader_indices", "not stopped at the PLAIN page");
+
+    /* the rest as values, from the PLAIN page */
+    if (carquet_column_reader_materialize(c, &err) != CARQUET_OK)
+        TEST_FAIL("column_reader_indices", "materialize at the PLAIN page");
+    if (carquet_column_read_batch_ex(c, values, PLAIN_ROWS, NULL, NULL, &err) != PLAIN_ROWS ||
+        carquet_column_has_next(c) || values[0] != plain_value(0) ||
+        values[PLAIN_ROWS - 1] != plain_value(PLAIN_ROWS - 1))
+        TEST_FAIL("column_reader_indices", "the PLAIN page's values");
+
+    /* a reset after materialize reads indices again; reset reads values; and back */
+    if (carquet_column_reader_reset_indices(c, 0, &indices, &err) != CARQUET_OK || !indices ||
+        check_indices(c, DICT_ROWS))
+        TEST_FAIL("column_reader_indices", "indices again after materialize");
+    if (carquet_column_reader_reset(c, 0, &err) != CARQUET_OK ||
+        carquet_column_read_batch(c, values, DICT_ROWS + PLAIN_ROWS, NULL, NULL) != DICT_ROWS + PLAIN_ROWS ||
+        values[DICT_ROWS - 1] != dict_value(DICT_ROWS - 1) || values[DICT_ROWS] != plain_value(0))
+        TEST_FAIL("column_reader_indices", "values after reading indices");
+    if (carquet_column_reader_reset_indices(c, 0, &indices, &err) != CARQUET_OK || !indices ||
+        check_indices(c, 100))
+        TEST_FAIL("column_reader_indices", "indices after reading values");
+    carquet_column_reader_free(c);
+
+    /* a PLAIN chunk: no indices, its values read as ever */
+    carquet_reader_t* pr = carquet_reader_open(plain_path, NULL, &err);
+    carquet_column_reader_t* pc = pr ? carquet_reader_get_column(pr, 0, 0, &err) : NULL;
+    if (!pc || carquet_column_reader_reset_indices(pc, 0, &indices, &err) != CARQUET_OK || indices ||
+        carquet_column_read_batch(pc, values, PLAIN_ROWS, NULL, NULL) != PLAIN_ROWS || values[5] != plain_value(5))
+        TEST_FAIL("column_reader_indices", "a PLAIN chunk");
+    carquet_column_reader_free(pc);
+    carquet_reader_close(pr);
+
+    /* BYTE_ARRAY: the layout of carquet_row_batch_column_dictionary() */
+    carquet_reader_t* sr = carquet_reader_open(strings_path, NULL, &err);
+    carquet_column_reader_t* sc = sr ? carquet_reader_get_column(sr, 0, 0, &err) : NULL;
+    static uint32_t sidx[STRING_ROWS];
+    const uint32_t* offsets = NULL;
+    if (!sc || carquet_column_reader_reset_indices(sc, 0, &indices, &err) != CARQUET_OK || !indices ||
+        carquet_column_read_batch(sc, sidx, STRING_ROWS, NULL, NULL) != STRING_ROWS ||
+        carquet_column_reader_dictionary(sc, &dict, &count, &offsets) != CARQUET_OK || count != 5 || !offsets)
+        TEST_FAIL("column_reader_indices", "a BYTE_ARRAY dictionary");
+    for (int i = 0; i < STRING_ROWS; i++) {
+        if (sidx[i] >= (uint32_t)count) TEST_FAIL("column_reader_indices", "a string index");
+        const uint8_t* entry = dict + offsets[sidx[i]];
+        uint32_t len;
+        memcpy(&len, entry, sizeof(len));
+        if (len != strlen(strings[i % 5]) || memcmp(entry + 4, strings[i % 5], len) != 0)
+            TEST_FAIL("column_reader_indices", "a string");
+    }
+    carquet_column_reader_free(sc);
+    carquet_reader_close(sr);
+    TEST_PASS("column_reader_indices");
+    return 0;
+}
+
 int main(void) {
     carquet_init();
-    char dict_path[512], plain_path[512], mixed_path[512];
+    char dict_path[512], plain_path[512], mixed_path[512], strings_path[512];
     carquet_test_temp_path(dict_path, sizeof(dict_path), "test_dictionary_fallback_dict");
     carquet_test_temp_path(plain_path, sizeof(plain_path), "test_dictionary_fallback_plain");
     carquet_test_temp_path(mixed_path, sizeof(mixed_path), "test_dictionary_fallback_mixed");
+    carquet_test_temp_path(strings_path, sizeof(strings_path), "test_dictionary_fallback_strings");
     if (write_file(dict_path, DICT_ROWS, dict_value, true) ||
         write_file(plain_path, PLAIN_ROWS, plain_value, false) ||
-        splice(dict_path, plain_path, mixed_path))
+        splice(dict_path, plain_path, mixed_path) || write_strings(strings_path))
         TEST_FAIL("dictionary_fallback", "cannot write the files");
 
     carquet_error_t err = CARQUET_ERROR_INIT;
@@ -159,6 +300,7 @@ int main(void) {
             TEST_FAIL("dictionary_fallback", "a value of the mixed chunk");
     }
     carquet_column_reader_free(c);
+    if (column_reader_indices(r, plain_path, strings_path)) return 1;
 
     /* preserved dictionaries: the dictionary part's indices, then an error */
     carquet_batch_reader_config_t config;
@@ -202,6 +344,7 @@ int main(void) {
     remove(dict_path);
     remove(plain_path);
     remove(mixed_path);
+    remove(strings_path);
     TEST_PASS("dictionary_fallback");
     printf("\nAll dictionary fallback tests passed.\n");
     return 0;

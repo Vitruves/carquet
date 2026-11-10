@@ -139,6 +139,9 @@ Every public function of `include/carquet/carquet.h` (v0.7.x), grouped by task. 
 | `carquet_column_remaining` | `int64_t` | `const carquet_column_reader_t* reader` | Get the number of remaining values in the column. |
 | `carquet_column_reader_free` | `void` | `carquet_column_reader_t* reader` | Free a column reader. |
 | `carquet_column_reader_reset` | `carquet_status_t` | `carquet_column_reader_t* reader, int32_t row_group_index, carquet_error_t* error` | Move a column reader to another row group, keeping its buffers. |
+| `carquet_column_reader_reset_indices` | `carquet_status_t` | `carquet_column_reader_t* reader, int32_t row_group_index, bool* indices, carquet_error_t* error` | As reset, but reads return uint32 dictionary indices where the chunk is dictionary-encoded (`*indices`); stops at a PLAIN fallback page with `INVALID_ENCODING`. |
+| `carquet_column_reader_materialize` | `carquet_status_t` | `carquet_column_reader_t* reader, carquet_error_t* error` | Switch a reader reading indices to values from its next page (after a PLAIN fallback stop). |
+| `carquet_column_reader_dictionary` | `carquet_status_t` | `const carquet_column_reader_t* reader, const uint8_t** dictionary_data, int32_t* dictionary_count, const uint32_t** dictionary_offsets` | The current row group's dictionary, laid out as by `carquet_row_batch_column_dictionary`; valid after the first read. |
 | `carquet_count_rows` | `int64_t` | `const int16_t* rep_levels, int64_t num_values` | Count logical rows from repetition levels. |
 | `carquet_list_offsets` | `int64_t` | `const int16_t* rep_levels, int64_t num_values, int16_t list_rep_level, int64_t* offsets_out, int64_t max_offsets` | Compute list offsets from repetition levels. |
 
