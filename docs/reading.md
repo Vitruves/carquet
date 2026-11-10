@@ -152,6 +152,8 @@ for (int32_t rg = 0; rg < carquet_reader_num_row_groups(reader); rg++) {
 carquet_column_reader_free(col);
 ```
 
+To keep dictionary-encoded columns as indices, as the batch reader's `preserve_dictionaries` does, move the reader with `carquet_column_reader_reset_indices()` instead (also for its first row group). Where `*indices` comes back true, `carquet_column_read_batch()` returns `uint32_t` indices into the dictionary that `carquet_column_reader_dictionary()` gives after the first read, in the layout of `carquet_row_batch_column_dictionary()`. If the chunk falls back to PLAIN pages part way through, the read stops before the first one with `CARQUET_ERROR_INVALID_ENCODING` (see `carquet_column_read_batch_ex()`), and `carquet_column_reader_materialize()` reads values from there on.
+
 Also available:
 
 - `carquet_column_skip()`

@@ -1185,9 +1185,64 @@ void carquet_column_reader_rebind(
 }
 
 
+static carquet_status_t column_reader_reset(
+    carquet_column_reader_t* reader,
+    int32_t row_group_index,
+    bool indices,
+    carquet_error_t* error);
+
 carquet_status_t carquet_column_reader_reset(
     carquet_column_reader_t* reader,
     int32_t row_group_index,
+    carquet_error_t* error) {
+    /* Public column readers materialize values unless asked for indices. */
+    return column_reader_reset(reader, row_group_index, false, error);
+}
+
+carquet_status_t carquet_column_reader_reset_indices(
+    carquet_column_reader_t* reader,
+    int32_t row_group_index,
+    bool* indices,
+    carquet_error_t* error) {
+    carquet_status_t status = column_reader_reset(reader, row_group_index, true, error);
+    *indices = status == CARQUET_OK && reader->preserve_dictionary;
+    return status;
+}
+
+carquet_status_t carquet_column_reader_materialize(
+    carquet_column_reader_t* reader,
+    carquet_error_t* error) {
+    /* A page decoded as indices and not read to its end would be read on as
+     * values: only between pages (where a rejected PLAIN page leaves it). */
+    if (reader->page_loaded && reader->page_values_read < reader->page_num_values) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_STATE,
+            "Column reader is in the middle of a page");
+        return CARQUET_ERROR_INVALID_STATE;
+    }
+    reader->preserve_dictionary = false;
+    return CARQUET_OK;
+}
+
+carquet_status_t carquet_column_reader_dictionary(
+    const carquet_column_reader_t* reader,
+    const uint8_t** dictionary_data,
+    int32_t* dictionary_count,
+    const uint32_t** dictionary_offsets) {
+    if (!reader->has_dictionary) {
+        return CARQUET_ERROR_DICTIONARY_NOT_FOUND;
+    }
+    *dictionary_data = reader->dictionary_data;
+    *dictionary_count = reader->dictionary_count;
+    if (dictionary_offsets) {
+        *dictionary_offsets = reader->dictionary_offsets;
+    }
+    return CARQUET_OK;
+}
+
+static carquet_status_t column_reader_reset(
+    carquet_column_reader_t* reader,
+    int32_t row_group_index,
+    bool indices,
     carquet_error_t* error) {
 
     carquet_reader_t* file_reader = reader->file_reader;
@@ -1221,9 +1276,8 @@ carquet_status_t carquet_column_reader_reset(
         return CARQUET_ERROR_INVALID_METADATA;
     }
 
-    /* Public column readers always materialize values (preserve = false). */
     carquet_column_reader_rebind(reader, file_reader, row_group_index,
-                                 column_index, false);
+                                 column_index, indices);
     return CARQUET_OK;
 }
 

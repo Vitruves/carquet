@@ -1816,6 +1816,78 @@ carquet_status_t carquet_column_reader_reset(
     int32_t row_group_index,
     carquet_error_t* error);
 
+/**
+ * @brief Move a column reader to another row group, reading dictionary indices.
+ *
+ * As carquet_column_reader_reset(), but where the row group's chunk is
+ * dictionary-encoded (and not repeated), carquet_column_read_batch() then
+ * returns uint32_t indices into the chunk's dictionary
+ * (carquet_column_reader_dictionary()) instead of the values they stand for,
+ * the column reader counterpart of the batch reader's preserve_dictionaries.
+ * @p indices tells whether it does; where it does not, values are read as
+ * after carquet_column_reader_reset(). A later carquet_column_reader_reset()
+ * reads values again.
+ *
+ * A chunk may fall back to PLAIN pages part way through (writers do once the
+ * dictionary is full). A read reaching such a page stops before it with
+ * CARQUET_ERROR_INVALID_ENCODING, after the indices before it (a partial read,
+ * see carquet_column_read_batch_ex()), and the reader stays at that page:
+ * carquet_column_reader_materialize() then reads values from it on.
+ *
+ * @param[in] reader Column reader
+ * @param[in] row_group_index Row group to read next
+ * @param[out] indices Whether reads return indices
+ * @param[out] error Error information (may be NULL)
+ * @return CARQUET_OK on success. On error the reader is left unchanged.
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1, 3)
+carquet_status_t carquet_column_reader_reset_indices(
+    carquet_column_reader_t* reader,
+    int32_t row_group_index,
+    bool* indices,
+    carquet_error_t* error);
+
+/**
+ * @brief Switch a column reader reading indices to reading values.
+ *
+ * From its next page on, carquet_column_read_batch() returns values, until
+ * the reader is reset again. Only between pages, where a read stopped by a
+ * PLAIN page leaves the reader (see carquet_column_reader_reset_indices()).
+ *
+ * @param[in] reader Column reader
+ * @param[out] error Error information (may be NULL)
+ * @return CARQUET_OK on success, CARQUET_ERROR_INVALID_STATE in the middle of
+ *         a page (the reader is then left unchanged)
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1)
+carquet_status_t carquet_column_reader_materialize(
+    carquet_column_reader_t* reader,
+    carquet_error_t* error);
+
+/**
+ * @brief Get the dictionary of a column reader's current row group.
+ *
+ * The same layout as carquet_row_batch_column_dictionary(): fixed-width
+ * entries side by side, or for BYTE_ARRAY length-prefixed entries found
+ * through @p dictionary_offsets. The chunk's dictionary page is read by the
+ * first carquet_column_read_batch() of the row group, so call this after it.
+ * The pointers stay valid until the reader is reset or freed.
+ *
+ * @param[in] reader Column reader
+ * @param[out] dictionary_data Raw dictionary bytes
+ * @param[out] dictionary_count Number of entries in the dictionary
+ * @param[out] dictionary_offsets Offset table for BYTE_ARRAY dictionaries (NULL
+ *             for fixed-width); may be NULL
+ * @return CARQUET_OK on success, CARQUET_ERROR_DICTIONARY_NOT_FOUND if no
+ *         dictionary page has been read in this row group
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1, 2, 3)
+carquet_status_t carquet_column_reader_dictionary(
+    const carquet_column_reader_t* reader,
+    const uint8_t** dictionary_data,
+    int32_t* dictionary_count,
+    const uint32_t** dictionary_offsets);
+
 /* ============================================================================
  * Batch Reader API
  * ============================================================================
