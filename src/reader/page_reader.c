@@ -451,6 +451,21 @@ static inline int bit_width_for_max(int max_val) {
     return width;
 }
 
+/* Levels are decoded at the bit width of max_level and can exceed it. */
+static carquet_status_t validate_levels_range(const int16_t* levels, int32_t n,
+                                              int16_t max_level, const char* what,
+                                              carquet_error_t* error) {
+    for (int32_t i = 0; i < n; i++) {
+        if (levels[i] < 0 || levels[i] > max_level) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
+                "%s level %d out of range [0, %d]",
+                what, (int)levels[i], (int)max_level);
+            return CARQUET_ERROR_DECODE;
+        }
+    }
+    return CARQUET_OK;
+}
+
 #if defined(CARQUET_ARCH_ARM) && defined(CARQUET_ENABLE_NEON) && \
     (defined(__ARM_NEON) || defined(__ARM_NEON__))
 static bool gather_fixed_dictionary_values_neon(const uint8_t* dict_data,
@@ -1429,6 +1444,11 @@ carquet_status_t carquet_read_data_page_v1(
         if (status != CARQUET_OK) {
             return status;
         }
+        status = validate_levels_range(rep_levels, num_values,
+                                       reader->max_rep_level, "Repetition", error);
+        if (status != CARQUET_OK) {
+            return status;
+        }
     } else if (rep_levels) {
         memset(rep_levels, 0, num_values * sizeof(int16_t));
     }
@@ -1449,6 +1469,11 @@ carquet_status_t carquet_read_data_page_v1(
         carquet_status_t status = decode_v1_level_section(
             &ptr, &remaining, header->definition_level_encoding,
             bit_width, num_values, def_levels, error);
+        if (status != CARQUET_OK) {
+            return status;
+        }
+        status = validate_levels_range(def_levels, num_values,
+                                       reader->max_def_level, "Definition", error);
         if (status != CARQUET_OK) {
             return status;
         }
@@ -1762,6 +1787,11 @@ carquet_status_t carquet_read_data_page_v2(
                 CARQUET_SET_ERROR(error, status, "Failed to decode V2 rep levels");
                 return status;
             }
+            status = validate_levels_range(rep_levels, num_values,
+                                           reader->max_rep_level, "Repetition", error);
+            if (status != CARQUET_OK) {
+                return status;
+            }
         } else {
             memset(rep_levels, 0, num_values * sizeof(int16_t));
         }
@@ -1819,6 +1849,11 @@ carquet_status_t carquet_read_data_page_v2(
                 ptr, (size_t)def_bytes, bit_width, num_values, def_levels, &bytes_consumed);
             if (status != CARQUET_OK) {
                 CARQUET_SET_ERROR(error, status, "Failed to decode V2 def levels");
+                return status;
+            }
+            status = validate_levels_range(def_levels, num_values,
+                                           reader->max_def_level, "Definition", error);
+            if (status != CARQUET_OK) {
                 return status;
             }
         } else {
