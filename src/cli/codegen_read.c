@@ -47,6 +47,32 @@ static void sanitize_ident(const char* name, char* out, size_t out_size) {
     }
 }
 
+/* Copy a column name into a C-comment-safe form: column names come straight
+ * from the (untrusted) file footer, and they are emitted inside the generated
+ * source's schema comments. A name containing "*​/" would otherwise close the
+ * comment and have the remainder compiled as C -- arbitrary code injected into
+ * whatever the user builds from `carquet codegen -f <file>`. Break up any
+ * adjacent comment punctuation and drop non-printable bytes. */
+static void sanitize_comment(const char* name, char* out, size_t out_size) {
+    size_t j = 0;
+    if (out_size == 0) return;
+    for (size_t i = 0; name && name[i] && j + 1 < out_size; i++) {
+        unsigned char ch = (unsigned char)name[i];
+        if (ch == '\n' || ch == '\r' || ch == '\t') { out[j++] = ' '; continue; }
+        if (!isprint(ch)) { out[j++] = '?'; continue; }
+        /* Inserting a space between two adjacent slash/star characters stops
+         * them forming a comment opener, a comment terminator, or a line
+         * comment in the generated source. */
+        if ((ch == '/' || ch == '*') && j > 0 &&
+            (out[j - 1] == '/' || out[j - 1] == '*')) {
+            out[j++] = ' ';
+            if (j + 1 >= out_size) break;
+        }
+        out[j++] = (char)ch;
+    }
+    out[j] = '\0';
+}
+
 static const char* c_type_for(carquet_physical_type_t phys) {
     switch (phys) {
         case CARQUET_PHYSICAL_BOOLEAN:    return "uint8_t";
@@ -248,6 +274,10 @@ int cmd_codegen_read(FILE* out, carquet_reader_t* reader,
     detect_build_line(opts, hints->build_line, sizeof(hints->build_line));
     g_line = 1;
 
+    char src_comment[512];
+    sanitize_comment(opts->input_path ? opts->input_path : "<file.parquet>",
+                     src_comment, sizeof(src_comment));
+
     /* ── Header ───────────────────────────────────────────────────── */
     emit(out,
         "/*\n"
@@ -262,7 +292,7 @@ int cmd_codegen_read(FILE* out, carquet_reader_t* reader,
         "#include <stdlib.h>\n"
         "#include <inttypes.h>\n"
         "#include <carquet/carquet.h>\n\n",
-        opts->input_path ? opts->input_path : "<file.parquet>",
+        src_comment,
         total_rows, num_cols, hints->build_line);
 
     /* ── Schema documentation ─────────────────────────────────────── */
@@ -275,8 +305,10 @@ int cmd_codegen_read(FILE* out, carquet_reader_t* reader,
         type_comment(carquet_schema_column_type(schema, c),
                     carquet_schema_node_logical_type(node),
                     carquet_schema_node_repetition(node), desc, sizeof(desc));
-        emit(out, " *   [%d] %-30s %s\n", c,
-             carquet_schema_column_name(schema, c), desc);
+        char name_comment[256];
+        sanitize_comment(carquet_schema_column_name(schema, c),
+                         name_comment, sizeof(name_comment));
+        emit(out, " *   [%d] %-30s %s\n", c, name_comment, desc);
     }
     emit(out, " */\n\n");
 
@@ -502,12 +534,13 @@ int cmd_codegen_read(FILE* out, carquet_reader_t* reader,
         bool nullable = carquet_schema_max_def_level(schema, c) > 0;
         int32_t tl = carquet_schema_node_type_length(node);
         const char* ctype = c_type_for(phys);
-        char ident[128], desc[128];
+        char ident[128], desc[128], name_comment[256];
         sanitize_ident(carquet_schema_column_name(schema, c), ident, sizeof(ident));
+        sanitize_comment(carquet_schema_column_name(schema, c),
+                         name_comment, sizeof(name_comment));
         type_comment(phys, lt, carquet_schema_node_repetition(node), desc, sizeof(desc));
 
-        emit(out, "\n        /* Column %d: %s (%s) */\n", c,
-             carquet_schema_column_name(schema, c), desc);
+        emit(out, "\n        /* Column %d: %s (%s) */\n", c, name_comment, desc);
         if (phys == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY)
             emit(out, "        uint8_t %s_buf[%d * %d];\n", ident, batch_size, tl);
         else

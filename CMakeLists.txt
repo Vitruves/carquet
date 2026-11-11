@@ -959,6 +959,10 @@ if(CARQUET_BUILD_TESTS)
     # CLI value/type formatting (DATE, TIME, TIMESTAMP rendering)
     add_carquet_test(test_cli_format "tests/test_cli_format.c;src/cli/commands.c")
 
+    # Generated readers keep column names inside comments
+    add_carquet_test(test_codegen_comments
+        "tests/test_codegen_comments.c;src/cli/codegen_read.c;src/cli/commands.c")
+
     # Memory-safety regressions: crafted footers / pages, pipelined write
     # error path, Arrow import validation (Oct 2026 security audit)
     add_carquet_test(test_security_hardening tests/test_security_hardening.c)
