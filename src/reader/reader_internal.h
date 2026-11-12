@@ -120,11 +120,14 @@ struct carquet_reader {
 
 /**
  * Node in the BYTE_ARRAY page retention list.
- * Flexible array member holds the actual page bytes.
+ * Either the flexible array member holds a copy of the page bytes, or `owned`
+ * is a page buffer the reader handed over (adopted, no copy), of capacity
+ * `size`. Freed with the node.
  */
 typedef struct carquet_retained_page {
     struct carquet_retained_page* next;
     size_t size;
+    uint8_t* owned;
     uint8_t data[];
 } carquet_retained_page_t;
 
@@ -169,6 +172,9 @@ struct carquet_column_reader {
      * batch is consumed. We accumulate them in a singly linked list that
      * is flushed on row-group reset and column-reader free. */
     struct carquet_retained_page* retained_pages;
+    /* Adopted page buffers released by carquet_column_release_pages(), for
+     * the next pages to decompress into (warm memory, no new allocation). */
+    struct carquet_retained_page* spare_pages;
 
     /* Current page state for partial reads */
     bool page_loaded;           /* Is a page currently loaded? */
@@ -339,9 +345,22 @@ uint8_t* carquet_column_retain_page(
     size_t size);
 
 /**
+ * Put a page buffer the reader owns on its retention list, without a copy.
+ * The caller drops its own pointer to it. Returns false on out-of-memory (the
+ * buffer is then still the caller's).
+ */
+bool carquet_column_adopt_page(
+    carquet_column_reader_t* reader,
+    uint8_t* buffer,
+    size_t capacity);
+
+/**
  * Free and clear the retained page list on the column reader.
  */
 void carquet_column_clear_retained_pages(carquet_column_reader_t* reader);
+
+/** Free the spare page buffers (with the reader). */
+void carquet_column_free_spare_pages(carquet_column_reader_t* reader);
 
 /**
  * Ensure the column's dictionary page (if any) is loaded. Idempotent.

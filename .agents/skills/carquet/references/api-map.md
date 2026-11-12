@@ -135,6 +135,7 @@ Every public function of `include/carquet/carquet.h` (v0.7.x), grouped by task. 
 | `carquet_column_read_batch` | `int64_t` | `carquet_column_reader_t* reader, void* values, int64_t max_values, int16_t* def_levels, int16_t* rep_levels` | Read a batch of values from a column. |
 | `carquet_column_read_batch_ex` | `int64_t` | `carquet_column_reader_t* reader, void* values, int64_t max_values, int16_t* def_levels, int16_t* rep_levels, err` | Like read_batch but reports partial reads and failures through a carquet_error_t. |
 | `carquet_column_skip` | `int64_t` | `carquet_column_reader_t* reader, int64_t num_values` | Skip values in a column without reading them. |
+| `carquet_column_release_pages` | `void` | `carquet_column_reader_t* reader` | Release the pages behind byte-array values already read (all but the page being read), for later pages to reuse. |
 | `carquet_column_has_next` | `bool` | `const carquet_column_reader_t* reader` | Check if there are more values to read. |
 | `carquet_column_remaining` | `int64_t` | `const carquet_column_reader_t* reader` | Get the number of remaining values in the column. |
 | `carquet_column_reader_free` | `void` | `carquet_column_reader_t* reader` | Free a column reader. |
