@@ -1073,6 +1073,7 @@ void carquet_column_reader_free(carquet_column_reader_t* reader) {
 
     carquet_mem_pool_give(reader->page_buffer, reader->page_buffer_capacity);
     carquet_column_clear_retained_pages(reader);
+    carquet_column_free_spare_pages(reader);
     if (reader->dictionary_ownership == CARQUET_DATA_OWNED) {
         carquet_mem_free(reader->dictionary_data);
     }

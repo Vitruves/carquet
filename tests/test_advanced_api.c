@@ -813,6 +813,94 @@ static int test_column_reader_reset(void) {
     return 0;
 }
 
+/* ======================================================================
+ * Test: carquet_column_release_pages()
+ *
+ * PLAIN byte-array pages are kept by handing the decompress (or page) buffer
+ * over, not by a copy, and a release returns the pages already read for the
+ * next ones to reuse. Small pages make batches cross page boundaries. The
+ * values of the page being read when releasing must survive the later loads
+ * that reuse the released buffers. With mmap too: there a compressed page
+ * hands over its decompress buffer, and an uncompressed one is a view of the
+ * mapping that needs no keeping.
+ * ====================================================================== */
+
+#define RELEASE_ROWS 20000
+static int release_str(char* out, size_t cap, int i) {
+    return snprintf(out, cap, "value-%d-%.*s", i, i % 23, "abcdefghijklmnopqrstuvwxyz");
+}
+
+static int check_values(const carquet_byte_array_t* v, int64_t n, int first) {
+    for (int64_t i = 0; i < n; i++) {
+        char want[64];
+        int len = release_str(want, sizeof(want), first + (int)i);
+        if (v[i].length != len || memcmp(v[i].data, want, (size_t)len) != 0) return 1;
+    }
+    return 0;
+}
+
+static int test_release_pages(carquet_compression_t codec, bool use_mmap) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t* schema = carquet_schema_create(NULL);
+    carquet_schema_add_column(schema, "s", CARQUET_PHYSICAL_BYTE_ARRAY, NULL,
+                              CARQUET_REPETITION_REQUIRED, 0, 0);
+    carquet_writer_options_t opts;
+    carquet_writer_options_init(&opts);
+    opts.compression = codec;
+    opts.page_size = 4096;
+    carquet_writer_t* w = carquet_writer_create(TEMP_FILE, schema, &opts, &err);
+    if (!w) TEST_FAIL("release_pages", err.message);
+    static char strs[RELEASE_ROWS][64];
+    static carquet_byte_array_t ss[RELEASE_ROWS];
+    for (int i = 0; i < RELEASE_ROWS; i++) {
+        ss[i].length = release_str(strs[i], sizeof(strs[i]), i);
+        ss[i].data = (uint8_t*)strs[i];
+    }
+    if (carquet_writer_write_batch(w, 0, ss, RELEASE_ROWS, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_close(w) != CARQUET_OK)
+        TEST_FAIL("release_pages", "write failed");
+    carquet_schema_free(schema);
+
+    carquet_reader_options_t ropts;
+    carquet_reader_options_init(&ropts);
+    ropts.use_mmap = use_mmap;
+    carquet_reader_t* r = carquet_reader_open(TEMP_FILE, &ropts, &err);
+    if (!r) TEST_FAIL("release_pages", err.message);
+    carquet_column_reader_t* c = carquet_reader_get_column(r, 0, 0, &err);
+    if (!c) TEST_FAIL("release_pages", err.message);
+
+    static carquet_byte_array_t a[10], b[RELEASE_ROWS];
+    /* twice: the second pass reads after a reset, from spare buffers */
+    for (int pass = 0; pass < 2; pass++) {
+        int got = 0;
+        /* a few values, then a release: their page is the one being read */
+        if (carquet_column_read_batch(c, a, 10, NULL, NULL) != 10 || check_values(a, 10, 0))
+            TEST_FAIL("release_pages", "first values mismatch");
+        got = 10;
+        carquet_column_release_pages(c);
+        /* batches across several pages, releasing between them */
+        for (int step = 0; got < RELEASE_ROWS; step++) {
+            int64_t want = step % 2 ? 1500 : 333;
+            int64_t n = carquet_column_read_batch(c, b, want, NULL, NULL);
+            if (n <= 0 || check_values(b, n, got))
+                TEST_FAIL("release_pages", "batch values mismatch");
+            if (step == 0 && check_values(a, 10, 0))
+                TEST_FAIL("release_pages", "values of the page being read were released");
+            got += (int)n;
+            carquet_column_release_pages(c);
+        }
+        if (carquet_column_reader_reset(c, 0, &err) != CARQUET_OK)
+            TEST_FAIL("release_pages", "reset failed");
+    }
+
+    carquet_column_reader_free(c);
+    carquet_reader_close(r);
+    TEST_PASS(codec == CARQUET_COMPRESSION_SNAPPY
+                  ? (use_mmap ? "release_pages snappy mmap" : "release_pages snappy")
+                  : (use_mmap ? "release_pages uncompressed mmap" : "release_pages uncompressed"));
+    return 0;
+}
+
 int main(void) {
     carquet_init();
     int failures = 0;
@@ -827,6 +915,10 @@ int main(void) {
     failures += test_read_batch_ex();
     failures += test_type_mismatch_rejected();
     failures += test_column_reader_reset();
+    failures += test_release_pages(CARQUET_COMPRESSION_SNAPPY, false);
+    failures += test_release_pages(CARQUET_COMPRESSION_UNCOMPRESSED, false);
+    failures += test_release_pages(CARQUET_COMPRESSION_SNAPPY, true);
+    failures += test_release_pages(CARQUET_COMPRESSION_UNCOMPRESSED, true);
 
     remove(TEMP_FILE);
 

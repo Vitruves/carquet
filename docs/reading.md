@@ -157,6 +157,7 @@ To keep dictionary-encoded columns as indices, as the batch reader's `preserve_d
 Also available:
 
 - `carquet_column_skip()`
+- `carquet_column_release_pages()`: byte-array values point into the pages they were read from, which a column reader keeps until the next reset. A caller done with each batch before reading the next can release them first; their buffers then serve later pages, so a long chunk is read in a few warm buffers.
 - `carquet_column_has_next()`
 - `carquet_column_remaining()`
 
