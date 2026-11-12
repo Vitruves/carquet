@@ -417,6 +417,16 @@ int64_t carquet_resolve_data_start_offset(int64_t data_page_offset,
     return dict_end;
 }
 
+/* A spare buffer into *buffer when it is NULL, so a page load reuses memory. */
+static void take_spare_page(carquet_column_reader_t* reader, uint8_t** buffer, size_t* capacity) {
+    carquet_retained_page_t* s = reader->spare_pages;
+    if (*buffer || !s) return;
+    reader->spare_pages = s->next;
+    *buffer = s->owned;
+    *capacity = s->size;
+    carquet_mem_free(s);
+}
+
 static carquet_status_t ensure_decompress_capacity(
     carquet_column_reader_t* reader,
     size_t needed,
@@ -428,6 +438,7 @@ static carquet_status_t ensure_decompress_capacity(
         return CARQUET_ERROR_INVALID_PAGE;
     }
 
+    take_spare_page(reader, &reader->decompress_buffer, &reader->decompress_capacity);
     if (needed > reader->decompress_capacity) {
         uint8_t* new_buf = carquet_mem_realloc(reader->decompress_buffer, needed);
         if (!new_buf) {
@@ -566,14 +577,72 @@ static bool page_values_viewable_after_def_bits(
 #endif
 }
 
+/* A few adopted buffers are kept for reuse: about the pages in flight. */
+#define CARQUET_MAX_SPARE_PAGES 4
+
+static void spare_or_free_page(carquet_column_reader_t* reader, carquet_retained_page_t* p) {
+    int spares = 0;
+    for (carquet_retained_page_t* s = reader->spare_pages; s; s = s->next) spares++;
+    if (p->owned && spares < CARQUET_MAX_SPARE_PAGES) {
+        p->next = reader->spare_pages;
+        reader->spare_pages = p;
+        return;
+    }
+    carquet_mem_free(p->owned);
+    carquet_mem_free(p);
+}
+
 void carquet_column_clear_retained_pages(carquet_column_reader_t* reader) {
     carquet_retained_page_t* p = reader->retained_pages;
     while (p) {
         carquet_retained_page_t* next = p->next;
-        carquet_mem_free(p);
+        spare_or_free_page(reader, p);
         p = next;
     }
     reader->retained_pages = NULL;
+}
+
+void carquet_column_free_spare_pages(carquet_column_reader_t* reader) {
+    carquet_retained_page_t* p = reader->spare_pages;
+    while (p) {
+        carquet_retained_page_t* next = p->next;
+        carquet_mem_free(p->owned);
+        carquet_mem_free(p);
+        p = next;
+    }
+    reader->spare_pages = NULL;
+}
+
+void carquet_column_release_pages(carquet_column_reader_t* reader) {
+    /* The newest page may hold the current page's values: it stays. */
+    carquet_retained_page_t* head = reader->retained_pages;
+    if (!head) return;
+    carquet_retained_page_t* p = head;
+    if (reader->page_loaded) {
+        p = head->next;
+        head->next = NULL;
+    } else {
+        reader->retained_pages = NULL;
+    }
+    while (p) {
+        carquet_retained_page_t* next = p->next;
+        spare_or_free_page(reader, p);
+        p = next;
+    }
+}
+
+bool carquet_column_adopt_page(
+    carquet_column_reader_t* reader,
+    uint8_t* buffer,
+    size_t capacity) {
+    carquet_retained_page_t* node =
+        (carquet_retained_page_t*)carquet_mem_malloc(sizeof(carquet_retained_page_t));
+    if (!node) return false;
+    node->next = reader->retained_pages;
+    node->size = capacity;
+    node->owned = buffer;
+    reader->retained_pages = node;
+    return true;
 }
 
 uint8_t* carquet_column_retain_page(
@@ -586,6 +655,7 @@ uint8_t* carquet_column_retain_page(
     if (!node) return NULL;
     node->next = reader->retained_pages;
     node->size = size;
+    node->owned = NULL;
     if (size > 0 && src != NULL) {
         memcpy(node->data, src, size);
     }
@@ -2132,6 +2202,30 @@ static int64_t current_page_payload_offset(const carquet_column_reader_t* reader
     return reader->data_start_offset + reader->current_page;
 }
 
+/* Retain the page by handing over the reader's buffer that holds it (no copy,
+ * no pointer fixup): the next page gets a spare or a new one. False when
+ * page_data is in neither buffer, or on out-of-memory. */
+static bool adopt_page_buffer(carquet_column_reader_t* reader, const uint8_t* page_data) {
+    if (page_data && page_data == reader->decompress_buffer) {
+        if (!carquet_column_adopt_page(reader, reader->decompress_buffer, reader->decompress_capacity)) {
+            return false;
+        }
+        reader->decompress_buffer = NULL;
+        reader->decompress_capacity = 0;
+        return true;
+    }
+    if (page_data && page_data == reader->page_buffer) {
+        if (!carquet_column_adopt_page(reader, reader->page_buffer, reader->page_buffer_capacity)) {
+            return false;
+        }
+        reader->page_buffer = NULL;
+        reader->page_buffer_capacity = 0;
+        reader->page_buffer_size = 0;
+        return true;
+    }
+    return false;
+}
+
 static carquet_status_t prepare_data_page_payload(
     carquet_column_reader_t* reader,
     const parquet_column_metadata_t* col_meta,
@@ -2990,7 +3084,8 @@ static carquet_status_t load_next_page_mmap(
      * is consumed (list is flushed on row-group reset / reader close). */
     if (used_decompress_buffer && reader->type == CARQUET_PHYSICAL_BYTE_ARRAY &&
         (page_encoding == CARQUET_ENCODING_PLAIN ||
-         page_encoding == CARQUET_ENCODING_DELTA_LENGTH_BYTE_ARRAY)) {
+         page_encoding == CARQUET_ENCODING_DELTA_LENGTH_BYTE_ARRAY) &&
+        !adopt_page_buffer(reader, page_data)) {
         uint8_t* retained = carquet_column_retain_page(reader, page_data, page_size);
         if (!retained) {
             CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to retain page data");
@@ -3076,6 +3171,7 @@ static carquet_status_t load_next_page_fread(
     }
 
     /* Read compressed page data into a reusable buffer (from prebuffer or file) */
+    take_spare_page(reader, &reader->page_buffer, &reader->page_buffer_capacity);
     if ((size_t)page_header.compressed_page_size > reader->page_buffer_capacity) {
         uint8_t* new_buffer = carquet_mem_realloc(reader->page_buffer, (size_t)page_header.compressed_page_size);
         if (!new_buffer) {
@@ -3208,7 +3304,9 @@ static carquet_status_t load_next_page_fread(
                    (page_encoding == CARQUET_ENCODING_PLAIN ||
                     page_encoding == CARQUET_ENCODING_DELTA_LENGTH_BYTE_ARRAY));
 
-    if (retain) {
+    if (retain && adopt_page_buffer(reader, page_data)) {
+        /* the pointers already point into it */
+    } else if (retain) {
         uint8_t* retained = carquet_column_retain_page(reader, page_data, page_size);
         if (!retained) {
             CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to retain page data");
