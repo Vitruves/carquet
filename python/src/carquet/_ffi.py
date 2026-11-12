@@ -515,6 +515,7 @@ def _declare(lib: ctypes.CDLL) -> None:
     proto("carquet_schema_node_is_leaf", c_bool, vp)
     proto("carquet_schema_node_physical_type", c_int, vp)
     proto("carquet_schema_node_logical_type", POINTER(LogicalTypeStruct), vp)
+    proto("carquet_schema_node_geospatial_crs", c_char_p, vp, optional=True)
     proto("carquet_schema_node_repetition", c_int, vp)
     proto("carquet_schema_node_type_length", c_int32, vp)
 

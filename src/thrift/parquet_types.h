@@ -97,6 +97,14 @@ struct parquet_schema_element {
      * Values mirror carquet_arrow_type_refinement_t. Read-only: never written
      * to the Parquet schema. */
     int32_t arrow_type_refinement;
+
+    /* The whole CRS of a GEOMETRY / GEOGRAPHY logical type. The logical
+     * type's fixed crs array keeps only its first
+     * CARQUET_GEOSPATIAL_CRS_MAX - 1 bytes, and inline PROJJSON is usually
+     * longer. Set when the element is parsed from a file (arena-owned) and
+     * written in preference to the array; NULL otherwise. Read it with
+     * carquet_schema_node_geospatial_crs(). */
+    const char* geospatial_crs;
 };
 
 /* ============================================================================
