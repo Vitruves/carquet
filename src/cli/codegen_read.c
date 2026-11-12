@@ -73,6 +73,35 @@ static void sanitize_comment(const char* name, char* out, size_t out_size) {
     out[j] = '\0';
 }
 
+/* Copy a string into the body of a C string literal ("..."). The input path is
+ * emitted as `#define DEFAULT_FILE "<path>"`, so a path containing '"' would
+ * otherwise end the literal early and have the rest compiled as C. Backslash
+ * and double quote are backslash-escaped, '?' is escaped so a run of question
+ * marks cannot form a trigraph, and control / non-ASCII bytes become 3-digit
+ * octal escapes (a fixed width, so a following digit is never read as part of
+ * the escape).
+ * Worst case each byte takes 4 output bytes; an escape is never split. */
+static void escape_c_string(const char* s, char* out, size_t out_size) {
+    size_t j = 0;
+    if (out_size == 0) return;
+    for (size_t i = 0; s && s[i]; i++) {
+        unsigned char ch = (unsigned char)s[i];
+        char esc[5];
+        size_t n;
+        if (ch == '\\' || ch == '"' || ch == '?') {
+            esc[0] = '\\'; esc[1] = (char)ch; n = 2;
+        } else if (ch < 0x20 || ch >= 0x7f) {
+            snprintf(esc, sizeof(esc), "\\%03o", (unsigned)ch); n = 4;
+        } else {
+            esc[0] = (char)ch; n = 1;
+        }
+        if (j + n >= out_size) break;
+        memcpy(out + j, esc, n);
+        j += n;
+    }
+    out[j] = '\0';
+}
+
 static const char* c_type_for(carquet_physical_type_t phys) {
     switch (phys) {
         case CARQUET_PHYSICAL_BOOLEAN:    return "uint8_t";
@@ -447,8 +476,9 @@ int cmd_codegen_read(FILE* out, carquet_reader_t* reader,
     /* ── main() ───────────────────────────────────────────────────── */
 
     /* DEFAULT_FILE: resolve to absolute, or use placeholder.
-     * Sized for the escaped form of a full PATH_MAX path (each byte may double). */
-    char escaped_path[CODEGEN_PATH_MAX * 2];
+     * Sized for the escaped form of a full PATH_MAX path (each byte may become
+     * a 4-byte octal escape). */
+    char escaped_path[CODEGEN_PATH_MAX * 4];
     if (opts->input_path) {
         /* realpath() requires a buffer of at least PATH_MAX bytes regardless of
          * the actual path length; an undersized buffer trips glibc's
@@ -470,12 +500,7 @@ int cmd_codegen_read(FILE* out, carquet_reader_t* reader,
             snprintf(abs_input, sizeof(abs_input), "%s", opts->input_path);
         }
 #endif
-        size_t j = 0;
-        for (size_t i = 0; abs_input[i] && j < sizeof(escaped_path) - 2; i++) {
-            if (abs_input[i] == '\\') escaped_path[j++] = '\\';
-            escaped_path[j++] = abs_input[i];
-        }
-        escaped_path[j] = '\0';
+        escape_c_string(abs_input, escaped_path, sizeof(escaped_path));
     } else {
         snprintf(escaped_path, sizeof(escaped_path), "/path/to/file.parquet");
     }
