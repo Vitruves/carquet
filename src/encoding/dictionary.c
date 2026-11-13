@@ -229,7 +229,7 @@ static carquet_status_t dict_builder_add(dict_builder_t* builder,
     for (dict_entry_t* entry = builder->buckets[bucket]; entry; entry = entry->next) {
         if (entry->hash == hash &&
             entry->size == value_size &&
-            memcmp(entry->data, value, value_size) == 0) {
+            (value_size == 0 || memcmp(entry->data, value, value_size) == 0)) {
             /* Found existing entry */
             builder->indices[builder->indices_count++] = entry->index;
             return CARQUET_OK;
@@ -253,7 +253,9 @@ static carquet_status_t dict_builder_add(dict_builder_t* builder,
     }
 
     new_entry->data = (uint8_t*)(new_entry + 1);
-    memcpy(new_entry->data, value, value_size);
+    if (value_size > 0) {
+        memcpy(new_entry->data, value, value_size);
+    }
     new_entry->size = value_size;
     new_entry->hash = hash;
     new_entry->index = (uint32_t)builder->count;
@@ -722,7 +724,7 @@ static carquet_status_t build_fixed(carquet_physical_type_t type, size_t size,
         uint8_t tmp[8];
         const uint8_t* v = fixed_value_le(type, values, i, size, tmp);
         size_t b = fixed_hash(v, size) & t.mask;
-        const uint8_t* entries = dict_output->data + base;
+        const uint8_t* entries = dict_output->data ? dict_output->data + base : NULL;
         uint32_t slot;
         while ((slot = t.slots[b]) != 0 &&
                !fixed_equal(entries + (size_t)(slot - 1) * size, v, size)) {

@@ -974,14 +974,16 @@ static carquet_status_t dict_accumulate(
             &writer->dict_def_levels, &writer->dict_def_capacity,
             writer->dict_def_count + num_values);
         if (s != CARQUET_OK) return s;
-        if (def_levels) {
-            memcpy(writer->dict_def_levels + writer->dict_def_count,
-                   def_levels, (size_t)num_values * sizeof(int16_t));
-        } else {
-            carquet_dispatch_fill_def_levels(
-                writer->dict_def_levels + writer->dict_def_count,
-                num_values,
-                writer->max_def_level);
+        if (num_values > 0) {
+            if (def_levels) {
+                memcpy(writer->dict_def_levels + writer->dict_def_count,
+                       def_levels, (size_t)num_values * sizeof(int16_t));
+            } else {
+                carquet_dispatch_fill_def_levels(
+                    writer->dict_def_levels + writer->dict_def_count,
+                    num_values,
+                    writer->max_def_level);
+            }
         }
         writer->dict_def_count += num_values;
     }
@@ -1515,8 +1517,9 @@ static carquet_status_t dict_fallback_to_plain(
     /* Resolve BYTE_ARRAY offsets to real pointers now that storage is final. */
     if (writer->type == CARQUET_PHYSICAL_BYTE_ARRAY) {
         for (int64_t i = 0; i < writer->dict_value_count; i++) {
-            writer->dict_ba[i].data = writer->dict_ba_storage.data +
-                                      (uintptr_t)writer->dict_ba[i].data;
+            writer->dict_ba[i].data = writer->dict_ba_storage.data
+                ? writer->dict_ba_storage.data + (uintptr_t)writer->dict_ba[i].data
+                : NULL;
         }
     }
 
@@ -1725,8 +1728,9 @@ static carquet_status_t finalize_dictionary(
         if (!ba_resolved) return CARQUET_ERROR_OUT_OF_MEMORY;
         for (int64_t i = 0; i < writer->dict_value_count; i++) {
             ba_resolved[i].length = writer->dict_ba[i].length;
-            ba_resolved[i].data = writer->dict_ba_storage.data +
-                                  (uintptr_t)writer->dict_ba[i].data;
+            ba_resolved[i].data = writer->dict_ba_storage.data
+                ? writer->dict_ba_storage.data + (uintptr_t)writer->dict_ba[i].data
+                : NULL;
         }
     }
 
