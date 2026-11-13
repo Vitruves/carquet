@@ -553,6 +553,10 @@ static void parse_column_metadata(thrift_decoder_t* dec, carquet_arena_t* arena,
                 VALIDATE_COUNT(count, CARQUET_MAX_ENCODINGS, dec);
                 meta->num_encodings = count;
                 meta->encodings = carquet_arena_calloc(arena, count, sizeof(carquet_encoding_t));
+                if (count > 0 && !meta->encodings) {
+                    dec->status = CARQUET_ERROR_OUT_OF_MEMORY;
+                    return;
+                }
                 for (int32_t i = 0; i < count; i++) {
                     meta->encodings[i] = (carquet_encoding_t)thrift_read_i32(dec);
                 }
@@ -565,6 +569,10 @@ static void parse_column_metadata(thrift_decoder_t* dec, carquet_arena_t* arena,
                 VALIDATE_COUNT(count, CARQUET_MAX_PATH_ELEMENTS, dec);
                 meta->path_len = count;
                 meta->path_in_schema = carquet_arena_calloc(arena, count, sizeof(char*));
+                if (count > 0 && !meta->path_in_schema) {
+                    dec->status = CARQUET_ERROR_OUT_OF_MEMORY;
+                    return;
+                }
                 for (int32_t i = 0; i < count; i++) {
                     meta->path_in_schema[i] = arena_strdup_thrift(arena, dec);
                 }
@@ -590,6 +598,10 @@ static void parse_column_metadata(thrift_decoder_t* dec, carquet_arena_t* arena,
                 meta->num_key_value = count;
                 meta->key_value_metadata = carquet_arena_calloc(arena, count,
                     sizeof(parquet_key_value_t));
+                if (count > 0 && !meta->key_value_metadata) {
+                    dec->status = CARQUET_ERROR_OUT_OF_MEMORY;
+                    return;
+                }
                 for (int32_t i = 0; i < count; i++) {
                     thrift_read_struct_begin(dec);
                     thrift_type_t ft;
@@ -626,6 +638,10 @@ static void parse_column_metadata(thrift_decoder_t* dec, carquet_arena_t* arena,
                 meta->num_encoding_stats = count;
                 meta->encoding_stats = carquet_arena_calloc(arena, count,
                     sizeof(parquet_page_encoding_stats_t));
+                if (count > 0 && !meta->encoding_stats) {
+                    dec->status = CARQUET_ERROR_OUT_OF_MEMORY;
+                    return;
+                }
                 for (int32_t i = 0; i < count; i++) {
                     thrift_read_struct_begin(dec);
                     thrift_type_t ft;
@@ -818,6 +834,10 @@ static void parse_row_group(thrift_decoder_t* dec, carquet_arena_t* arena,
                 rg->num_columns = count;
                 rg->columns = carquet_arena_calloc(arena, count,
                     sizeof(parquet_column_chunk_t));
+                if (count > 0 && !rg->columns) {
+                    dec->status = CARQUET_ERROR_OUT_OF_MEMORY;
+                    return;
+                }
                 for (int32_t i = 0; i < count; i++) {
                     parse_column_chunk(dec, arena, &rg->columns[i]);
                 }
@@ -837,6 +857,10 @@ static void parse_row_group(thrift_decoder_t* dec, carquet_arena_t* arena,
                 rg->num_sorting_columns = count;
                 rg->sorting_columns = carquet_arena_calloc(arena, count,
                     sizeof(parquet_sorting_column_t));
+                if (count > 0 && !rg->sorting_columns) {
+                    dec->status = CARQUET_ERROR_OUT_OF_MEMORY;
+                    return;
+                }
                 for (int32_t i = 0; i < count; i++) {
                     parquet_sorting_column_t* sc = &rg->sorting_columns[i];
                     thrift_read_struct_begin(dec);
@@ -928,6 +952,11 @@ carquet_status_t parquet_parse_file_metadata(
                 metadata->num_schema_elements = count;
                 metadata->schema = carquet_arena_calloc(arena, count,
                     sizeof(parquet_schema_element_t));
+                if (count > 0 && !metadata->schema) {
+                    CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY,
+                        "Failed to allocate schema elements");
+                    return CARQUET_ERROR_OUT_OF_MEMORY;
+                }
                 for (int32_t i = 0; i < count; i++) {
                     parse_schema_element(&dec, arena, &metadata->schema[i]);
                 }
@@ -944,6 +973,11 @@ carquet_status_t parquet_parse_file_metadata(
                 metadata->num_row_groups = count;
                 metadata->row_groups = carquet_arena_calloc(arena, count,
                     sizeof(parquet_row_group_t));
+                if (count > 0 && !metadata->row_groups) {
+                    CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY,
+                        "Failed to allocate row groups");
+                    return CARQUET_ERROR_OUT_OF_MEMORY;
+                }
                 for (int32_t i = 0; i < count; i++) {
                     parse_row_group(&dec, arena, &metadata->row_groups[i]);
                 }
@@ -957,6 +991,11 @@ carquet_status_t parquet_parse_file_metadata(
                 metadata->num_key_value = count;
                 metadata->key_value_metadata = carquet_arena_calloc(arena, count,
                     sizeof(parquet_key_value_t));
+                if (count > 0 && !metadata->key_value_metadata) {
+                    CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY,
+                        "Failed to allocate key/value metadata");
+                    return CARQUET_ERROR_OUT_OF_MEMORY;
+                }
                 for (int32_t i = 0; i < count; i++) {
                     thrift_read_struct_begin(&dec);
                     thrift_type_t ft;
