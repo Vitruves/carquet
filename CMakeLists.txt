@@ -887,6 +887,9 @@ if(CARQUET_BUILD_TESTS)
     add_carquet_test(test_reader tests/test_reader.c)
     add_carquet_test(test_encodings_extended tests/test_encodings_extended.c)
     add_carquet_test(test_compression tests/test_compression.c)
+
+    # Data pages carrying levels above the column maximum are rejected
+    add_carquet_test(test_level_range tests/test_level_range.c)
     add_carquet_test(test_utils tests/test_utils.c)
     add_carquet_test(test_production tests/test_production.c)
     add_carquet_test(test_maturity tests/test_maturity.c)
