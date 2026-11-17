@@ -155,12 +155,20 @@
   "2026-11-14": {
    "count": 356,
    "uniques": 36
+  },
+  "2026-11-15": {
+   "count": 327,
+   "uniques": 22
+  },
+  "2026-11-16": {
+   "count": 517,
+   "uniques": 31
   }
  },
  "since": "2026-10-07",
- "total_clones": 29520,
- "total_unique_cloners_daily_sum": 2379,
- "updated": "2026-11-16T11:19:54Z",
+ "total_clones": 30364,
+ "total_unique_cloners_daily_sum": 2432,
+ "updated": "2026-11-17T11:52:57Z",
  "views": {
   "2026-10-07": {
    "count": 41,
@@ -317,6 +325,14 @@
   "2026-11-14": {
    "count": 48,
    "uniques": 19
+  },
+  "2026-11-15": {
+   "count": 22,
+   "uniques": 6
+  },
+  "2026-11-16": {
+   "count": 31,
+   "uniques": 13
   }
  }
 }
