@@ -1,7 +1,7 @@
 name: Python wheels
 
 # Builds the `carquet` Python wheels (python/) with cibuildwheel for CPython
-# 3.9-3.13 on Linux x86_64/aarch64, macOS arm64/x86_64 and Windows x64, runs the
+# 3.11-3.15 on Linux x86_64/aarch64, macOS arm64/x86_64 and Windows x64, runs the
 # pytest suite inside every wheel, builds the sdist, and publishes everything
 # to PyPI when a vX.Y.Z tag is pushed. A manual dispatch builds and tests but
 # does not publish.
@@ -44,7 +44,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Build and test wheels
-        uses: pypa/cibuildwheel@v4.3.1
+        uses: pypa/cibuildwheel@v4.3.5
         with:
           package-dir: python
           output-dir: wheelhouse
@@ -52,7 +52,7 @@ jobs:
           # Identifier selection, skips and the test command live in
           # python/pyproject.toml ([tool.cibuildwheel]); these mirror the
           # essentials so the workflow is readable on its own.
-          CIBW_BUILD: "cp39-* cp310-* cp311-* cp312-* cp313-*"
+          CIBW_BUILD: "cp311-* cp312-* cp313-* cp314-* cp315-*"
           CIBW_SKIP: "*-musllinux_* *_i686 *-win32 pp*"
           CIBW_TEST_REQUIRES: pytest pyarrow numpy
           CIBW_TEST_COMMAND: pytest {project}/python/tests
@@ -74,7 +74,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
       - name: Build sdist
         run: |
