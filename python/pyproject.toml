@@ -7,7 +7,7 @@ name = "carquet"
 dynamic = ["version"]
 description = "Fast Apache Parquet reader/writer in pure C for Python: Arrow tables, pandas, filters with pushdown, metadata and statistics"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Johan H. G. Natter" }]
 keywords = ["parquet", "arrow", "columnar", "polars", "pandas", "zstd", "snappy"]
@@ -22,11 +22,11 @@ classifiers = [
     "Programming Language :: C",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Topic :: Database",
     "Topic :: Scientific/Engineering",
     "Topic :: Software Development :: Libraries",
@@ -120,7 +120,7 @@ cmake.define.CMAKE_DISABLE_FIND_PACKAGE_OpenMP = "OFF"
 
 # --- cibuildwheel (see .github/workflows/wheels.yml) ------------------------
 [tool.cibuildwheel]
-build = ["cp39-*", "cp310-*", "cp311-*", "cp312-*", "cp313-*"]
+build = ["cp311-*", "cp312-*", "cp313-*", "cp314-*", "cp315-*"]
 # No pyarrow wheels exist for musl or 32-bit targets, so the test step could
 # not run there; PyPy is untested.
 skip = ["*-musllinux_*", "*_i686", "*-win32", "pp*"]
