@@ -56,6 +56,22 @@ static carquet_status_t ensure_capacity(carquet_buffer_t* buf, size_t needed) {
         new_capacity = CARQUET_BUFFER_DEFAULT_CAPACITY;
     }
 
+    /* A large block the pool already holds (pages touched before) beats a
+     * fresh one; otherwise realloc, which can move a large block without
+     * copying it. */
+    size_t pooled_capacity = 0;
+    uint8_t* pooled = (uint8_t*)carquet_mem_pool_try_take(new_capacity, &pooled_capacity);
+    if (pooled) {
+        if (buf->data) {
+            if (buf->size) memcpy(pooled, buf->data, buf->size);
+            carquet_mem_pool_give(buf->data, buf->capacity);
+        }
+        buf->data = pooled;
+        buf->capacity = pooled_capacity;
+        buf->owns_data = true;
+        return CARQUET_OK;
+    }
+
     uint8_t* new_data = (uint8_t*)carquet_mem_realloc(buf->data, new_capacity);
     if (!new_data) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
@@ -124,7 +140,7 @@ void carquet_buffer_destroy(carquet_buffer_t* buf) {
     assert(buf != NULL);
 
     if (buf->owns_data && buf->data) {
-        carquet_mem_free(buf->data);
+        carquet_mem_pool_give(buf->data, buf->capacity);
     }
 
     buf->data = NULL;

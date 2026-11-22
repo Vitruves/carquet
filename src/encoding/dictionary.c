@@ -859,7 +859,13 @@ static carquet_status_t build_fixed(carquet_physical_type_t type, size_t size,
  * max_dict_bytes, it stops immediately (without scanning the remaining input)
  * and reports *abandoned = true, with no indices, so the caller can fall back
  * to PLAIN. When max_dict_bytes is 0 the cap is disabled. */
-carquet_status_t carquet_dictionary_build_capped(
+/* carquet_dictionary_build_capped with a caller-owned index buffer that
+ * outlives the call: *indices_io (of *indices_cap entries, NULL / 0 at
+ * first) is reused when it holds count entries and replaced otherwise, so a
+ * writer encoding chunk after chunk allocates it once. On success it holds
+ * the count indices; on failure or abandon its content is unspecified. The
+ * caller frees *indices_io with carquet_mem_free. */
+carquet_status_t carquet_dictionary_build_capped_reuse(
     carquet_physical_type_t type,
     int32_t type_length,
     const void* fixed_values,
@@ -867,14 +873,14 @@ carquet_status_t carquet_dictionary_build_capped(
     int64_t count,
     size_t max_dict_bytes,
     carquet_buffer_t* dict_output,
-    uint32_t** indices_out,
+    uint32_t** indices_io,
+    size_t* indices_cap,
     int32_t* num_entries,
     bool* abandoned) {
 
     if (abandoned) *abandoned = false;
-    if (indices_out) *indices_out = NULL;
     if (num_entries) *num_entries = 0;
-    if (count <= 0 || !dict_output || !indices_out || !num_entries ||
+    if (count <= 0 || !dict_output || !indices_io || !indices_cap || !num_entries ||
         (uint64_t)count > (uint64_t)(SIZE_MAX / sizeof(uint32_t))) {
         return CARQUET_ERROR_INVALID_ARGUMENT;
     }
@@ -899,20 +905,22 @@ carquet_status_t carquet_dictionary_build_capped(
     bool dropped = false;
     carquet_status_t status;
     if (type != CARQUET_PHYSICAL_BYTE_ARRAY) {
-        uint32_t* indices = carquet_mem_malloc((size_t)count * sizeof(uint32_t));
-        if (!indices) return CARQUET_ERROR_OUT_OF_MEMORY;
+        if (*indices_cap < (size_t)count) {
+            carquet_mem_free(*indices_io);
+            *indices_io = carquet_mem_malloc((size_t)count * sizeof(uint32_t));
+            *indices_cap = *indices_io ? (size_t)count : 0;
+            if (!*indices_io) return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
         uint32_t n = 0;
         size_t base = dict_output->size;
         status = build_fixed(type, value_size, fixed_values, count, max_dict_bytes,
-                             dict_output, indices, &n, &dropped);
+                             dict_output, *indices_io, &n, &dropped);
         if (status != CARQUET_OK || dropped || n > INT32_MAX) {
-            carquet_mem_free(indices);
             dict_output->size = base;
             if (status == CARQUET_OK && !dropped) status = CARQUET_ERROR_ENCODE;
             if (dropped && abandoned) *abandoned = true;
             return status;
         }
-        *indices_out = indices;
         *num_entries = (int32_t)n;
         return CARQUET_OK;
     }
@@ -940,13 +948,43 @@ carquet_status_t carquet_dictionary_build_capped(
                                        builder.dict_buffer.size);
         if (status == CARQUET_OK) {
             /* Hand the index array over instead of copying it. */
-            *indices_out = builder.indices;
+            carquet_mem_free(*indices_io);
+            *indices_io = builder.indices;
+            *indices_cap = builder.indices_capacity;
             *num_entries = (int32_t)builder.count;
             builder.indices = NULL;
         }
     }
     dict_builder_destroy(&builder);
     return status;
+}
+
+carquet_status_t carquet_dictionary_build_capped(
+    carquet_physical_type_t type,
+    int32_t type_length,
+    const void* fixed_values,
+    const carquet_byte_array_t* ba_values,
+    int64_t count,
+    size_t max_dict_bytes,
+    carquet_buffer_t* dict_output,
+    uint32_t** indices_out,
+    int32_t* num_entries,
+    bool* abandoned) {
+    if (abandoned) *abandoned = false;
+    if (indices_out) *indices_out = NULL;
+    if (num_entries) *num_entries = 0;
+    if (!indices_out) return CARQUET_ERROR_INVALID_ARGUMENT;
+    uint32_t* indices = NULL;
+    size_t cap = 0;
+    carquet_status_t status = carquet_dictionary_build_capped_reuse(
+        type, type_length, fixed_values, ba_values, count, max_dict_bytes,
+        dict_output, &indices, &cap, num_entries, abandoned);
+    if (status != CARQUET_OK || (abandoned && *abandoned)) {
+        carquet_mem_free(indices);
+        return status;
+    }
+    *indices_out = indices;
+    return CARQUET_OK;
 }
 
 /* Bit width of the indices of a dictionary of `count` entries. */

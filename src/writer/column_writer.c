@@ -152,11 +152,11 @@ extern carquet_status_t carquet_dictionary_encode_double(
 extern carquet_status_t carquet_dictionary_encode_byte_array(
     const carquet_byte_array_t* values, int64_t count,
     carquet_buffer_t* dict_output, carquet_buffer_t* indices_output);
-extern carquet_status_t carquet_dictionary_build_capped(
+extern carquet_status_t carquet_dictionary_build_capped_reuse(
     carquet_physical_type_t type, int32_t type_length,
     const void* fixed_values, const carquet_byte_array_t* ba_values,
     int64_t count, size_t max_dict_bytes, carquet_buffer_t* dict_output,
-    uint32_t** indices_out, int32_t* num_entries, bool* abandoned);
+    uint32_t** indices_io, size_t* indices_cap, int32_t* num_entries, bool* abandoned);
 extern int carquet_dictionary_index_bit_width(int32_t count);
 extern carquet_status_t carquet_rle_encode_all(
     const uint32_t* input, int64_t count, int bit_width, carquet_buffer_t* output);
@@ -235,6 +235,11 @@ typedef struct carquet_column_writer_internal {
     uint8_t dict_minmax_scratch[16];  /* FLOAT/DOUBLE dictionary min (0..7) / max (8..15) */
     size_t dictionary_page_size_limit;  /* options.dictionary_page_size */
     carquet_buffer_t dict_values;       /* Accumulated raw non-null values */
+    uint32_t* dict_index_buf;           /* Dictionary indices of the chunk, kept
+                                         * from chunk to chunk (a chunk-sized
+                                         * allocation each time costs its pages
+                                         * a fault each) */
+    size_t dict_index_cap;
     int64_t dict_value_count;           /* Count of accumulated non-null values */
     carquet_byte_array_t* dict_ba;      /* BYTE_ARRAY: array of {data,len} */
     size_t dict_ba_capacity;
@@ -375,6 +380,7 @@ void carquet_column_writer_destroy(carquet_column_writer_internal_t* writer) {
         carquet_mem_free(writer->max_value);
         carquet_buffer_destroy(&writer->column_buffer);
         carquet_buffer_destroy(&writer->dict_values);
+        carquet_mem_free(writer->dict_index_buf);
         carquet_buffer_destroy(&writer->dict_ba_storage);
         carquet_buffer_destroy(&writer->deferred_values);
         carquet_mem_free(writer->deferred_def_levels);
@@ -1772,7 +1778,6 @@ static carquet_status_t finalize_dictionary(
 
     int64_t n = writer->dict_value_count;
     bool dict_abandoned = false;
-    uint32_t* indices = NULL;
     int32_t num_unique = 0;
     const void* fixed_in = (writer->type == CARQUET_PHYSICAL_BYTE_ARRAY)
         ? NULL : (const void*)writer->dict_values.data;
@@ -1782,14 +1787,15 @@ static carquet_status_t finalize_dictionary(
     /* Single pass with an early-abort budget: if the PLAIN dictionary would
      * exceed dictionary_page_size, the build stops immediately instead of
      * scanning the rest of the chunk. */
-    carquet_status_t status = carquet_dictionary_build_capped(
+    carquet_status_t status = carquet_dictionary_build_capped_reuse(
         writer->type, writer->type_length, fixed_in, ba_in, n,
         writer->dictionary_page_size_limit,
-        &dict_out, &indices, &num_unique, &dict_abandoned);
+        &dict_out, &writer->dict_index_buf, &writer->dict_index_cap,
+        &num_unique, &dict_abandoned);
+    const uint32_t* indices = writer->dict_index_buf;
     carquet_mem_free(ba_resolved);
     if (status != CARQUET_OK || dict_abandoned) {
         carquet_buffer_destroy(&dict_out);
-        carquet_mem_free(indices);
         return status != CARQUET_OK ? status : dict_fallback_to_plain(writer);
     }
 
@@ -1805,7 +1811,6 @@ static carquet_status_t finalize_dictionary(
      * case is short-circuited by the early abort above.) */
     if ((int64_t)num_unique >= writer->dict_value_count) {
         carquet_buffer_destroy(&dict_out);
-        carquet_mem_free(indices);
         return dict_fallback_to_plain(writer);
     }
 
@@ -1832,7 +1837,6 @@ static carquet_status_t finalize_dictionary(
         status = emit_dictionary_data_pages(writer, indices, entries, num_unique);
     }
     carquet_mem_free(entries);
-    carquet_mem_free(indices);
     carquet_buffer_destroy(&dict_out);
     return status;
 }
