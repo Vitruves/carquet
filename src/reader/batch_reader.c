@@ -4174,7 +4174,9 @@ static carquet_status_t batch_reader_next_impl(
             size_t vs = batch_reader->projected_value_sizes[i];
             size_t offset = (size_t)slot->rows_consumed * vs;
 
-            col->data = (uint8_t*)slot->col_values[i] + offset;
+            col->data = slot->col_values[i]
+                ? (uint8_t*)slot->col_values[i] + offset
+                : NULL;
             col->num_values = rows_to_read;
             col->type = batch_reader->projected_types[i];
             col->type_length = batch_reader->projected_type_lengths[i];
