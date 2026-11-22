@@ -878,6 +878,9 @@ if(CARQUET_BUILD_TESTS)
     endfunction()
 
     add_carquet_test(test_core tests/test_core.c)
+
+    # Footer parsing under a failing allocator
+    add_carquet_test(test_footer_alloc tests/test_footer_alloc.c)
     add_carquet_test(test_fixes_0_7_2 tests/test_fixes_0_7_2.c)
     add_carquet_test(test_fixes_0_7_4 tests/test_fixes_0_7_4.c)
     add_carquet_test(test_fixes_0_8_0 tests/test_fixes_0_8_0.c)
