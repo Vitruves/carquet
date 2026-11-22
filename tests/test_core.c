@@ -453,6 +453,36 @@ static int test_bitpack_roundtrip(void) {
     return 0;
 }
 
+/* carquet_bitpack8_32 against a bit-at-a-time reference, every width, with
+ * values wider than the width (masked) and a sentinel past the bit_width
+ * output bytes. */
+static int test_bitpack8_reference(void) {
+    uint32_t x = 7;
+    for (int it = 0; it < 2000; it++) {
+        int bw = 1 + it % 32;
+        uint32_t v[8];
+        for (int i = 0; i < 8; i++) { x = x * 1103515245u + 12345u; v[i] = x ^ (x << 13); }
+        uint8_t ref[33] = {0}, out[33];
+        memset(out, 0xA5, sizeof(out));
+        for (int i = 0; i < 8; i++) {
+            for (int b = 0; b < bw; b++) {
+                int bit = i * bw + b;
+                if ((v[i] >> b) & 1) ref[bit >> 3] |= (uint8_t)(1u << (bit & 7));
+            }
+        }
+        carquet_bitpack8_32(v, bw, out);
+        if (memcmp(out, ref, (size_t)bw) != 0) {
+            printf("  width %d\n", bw);
+            TEST_FAIL("bitpack8_reference", "packed bytes differ from the reference");
+        }
+        for (int b = bw; b < 33; b++) {
+            if (out[b] != 0xA5) TEST_FAIL("bitpack8_reference", "wrote past bit_width bytes");
+        }
+    }
+    TEST_PASS("bitpack8_reference");
+    return 0;
+}
+
 static int test_bitpack_16bit(void) {
     uint32_t original[8] = {
         0x0001, 0x0102, 0x1234, 0x4567,
@@ -743,6 +773,7 @@ int main(void) {
     failures += test_bitpack_1bit();
     failures += test_bitpack_4bit();
     failures += test_bitpack_roundtrip();
+    failures += test_bitpack8_reference();
     failures += test_bitpack_16bit();
     failures += test_run_detection();
     failures += test_dispatch_minmax();
