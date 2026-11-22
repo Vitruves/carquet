@@ -58,6 +58,56 @@ static int test_crc32_known_values(void) {
     return 0;
 }
 
+/* carquet_crc32 takes hardware paths (PCLMULQDQ folding on x86-64, the
+ * ARMv8 CRC32 instructions) where the CPU has them: every length, alignment
+ * and chained update must match a plain table-driven IEEE CRC32. */
+static uint32_t crc32_reference(uint32_t crc, const uint8_t* p, size_t n) {
+    static uint32_t table[256];
+    if (!table[1]) {
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            table[i] = c;
+        }
+    }
+    crc = ~crc;
+    for (size_t i = 0; i < n; i++) crc = table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+    return ~crc;
+}
+
+static int test_crc32_matches_reference(void) {
+    enum { MAX = 70000 };
+    uint8_t* buf = malloc(MAX + 16);
+    if (!buf) TEST_FAIL("crc32_matches_reference", "alloc");
+    uint32_t x = 12345;
+    for (size_t i = 0; i < MAX + 16; i++) { x = x * 1103515245u + 12345u; buf[i] = (uint8_t)(x >> 16); }
+    static const size_t lens[] = {0, 1, 7, 8, 15, 16, 17, 31, 32, 63, 64, 65, 79, 80, 127, 128,
+                                  129, 255, 256, 1000, 4095, 4096, 4097, 65536, MAX};
+    for (size_t li = 0; li < sizeof(lens) / sizeof(lens[0]); li++) {
+        for (size_t off = 0; off < 16; off++) {
+            size_t n = lens[li];
+            const uint8_t* p = buf + off;
+            if (carquet_crc32(p, n) != crc32_reference(0, p, n)) {
+                free(buf);
+                printf("  len %zu offset %zu\n", n, off);
+                TEST_FAIL("crc32_matches_reference", "CRC differs from the reference");
+            }
+            /* Chained: split anywhere, with a non-zero running value. */
+            size_t cut = n ? (x = x * 1103515245u + 12345u, (x >> 8) % (n + 1)) : 0;
+            uint32_t a = carquet_crc32_update(0x5A5A5A5Au, p, cut);
+            a = carquet_crc32_update(a, p + cut, n - cut);
+            if (a != crc32_reference(0x5A5A5A5Au, p, n)) {
+                free(buf);
+                printf("  chained len %zu cut %zu offset %zu\n", n, cut, off);
+                TEST_FAIL("crc32_matches_reference", "chained CRC differs from the reference");
+            }
+        }
+    }
+    free(buf);
+    TEST_PASS("crc32_matches_reference");
+    return 0;
+}
+
 static int test_crc32_hello_world(void) {
     const char* test_data = "Hello, World!";
     uint32_t crc = carquet_crc32((const uint8_t*)test_data, strlen(test_data));
@@ -329,6 +379,7 @@ int main(void) {
     printf("--- CRC32 Tests ---\n");
     failures += test_crc32_empty();
     failures += test_crc32_known_values();
+    failures += test_crc32_matches_reference();
     failures += test_crc32_hello_world();
     failures += test_crc32_different_data();
     failures += test_crc32_incremental();
