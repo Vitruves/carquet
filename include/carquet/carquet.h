@@ -1768,6 +1768,21 @@ int64_t carquet_column_skip(
     int64_t num_values);
 
 /**
+ * @brief Release the pages behind byte-array values already read.
+ *
+ * Byte-array values returned by earlier reads are invalidated, except those
+ * of the page being read; values still to be read stay valid. Without this, a
+ * reader keeps every page it read until the next reset, and their memory is
+ * not reused. A caller done with each batch before the next calls it first.
+ *
+ * @param[in] reader Column reader
+ *
+ * @note Thread-safe: No
+ */
+CARQUET_API CARQUET_NONNULL(1)
+void carquet_column_release_pages(carquet_column_reader_t* reader);
+
+/**
  * @brief Check if there are more values to read.
  *
  * @param[in] reader Column reader
