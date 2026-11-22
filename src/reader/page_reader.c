@@ -638,6 +638,38 @@ static void release_decoded_level_buffers(carquet_column_reader_t* reader) {
     reader->decoded_rep_levels = NULL;
 }
 
+/* Most values a page of this chunk can hold (pages are checked against it). */
+static size_t chunk_value_limit(const carquet_column_reader_t* reader) {
+    if (reader->col_meta && reader->col_meta->num_values >= 0 &&
+        (uint64_t)reader->col_meta->num_values < (uint64_t)SIZE_MAX) {
+        return (size_t)reader->col_meta->num_values;
+    }
+    return SIZE_MAX;
+}
+
+/* New capacity, in values, of a page buffer of `current` that must now hold
+ * `needed`: at least double, so a chunk whose pages grow a little at a time
+ * reallocates a few times instead of at every larger page (with glibc every
+ * new size above the mmap threshold maps fresh pages), but never past what
+ * the chunk holds. */
+static size_t grow_page_capacity(const carquet_column_reader_t* reader,
+                                 size_t current, size_t needed) {
+    size_t cap = current > SIZE_MAX / 2 ? SIZE_MAX : current * 2;
+    size_t limit = chunk_value_limit(reader);
+    if (cap > limit) cap = limit;
+    return cap > needed ? cap : needed;
+}
+
+/* Grow the reusable dictionary-index buffer to hold `needed` indices. */
+static bool grow_indices_buffer(carquet_column_reader_t* reader, size_t needed) {
+    size_t capacity = grow_page_capacity(reader, reader->indices_capacity, needed);
+    if (capacity > SIZE_MAX / sizeof(uint32_t)) capacity = needed;
+    carquet_mem_free(reader->indices_buffer);
+    reader->indices_buffer = carquet_mem_malloc(capacity * sizeof(uint32_t));
+    reader->indices_capacity = reader->indices_buffer ? capacity : 0;
+    return reader->indices_buffer != NULL;
+}
+
 /* Size decoded_def_bits for a page of `num_values` levels; leaves it NULL on
  * allocation failure (callers check). */
 static void ensure_def_bits_capacity(carquet_column_reader_t* reader, int32_t num_values) {
@@ -645,6 +677,9 @@ static void ensure_def_bits_capacity(carquet_column_reader_t* reader, int32_t nu
     /* +8: the slack carquet_rle_decode_to_bitmap writes short runs into. */
     size_t bytes = ((size_t)num_values + 7) / 8 + 8;
     if (bytes > reader->def_bits_capacity) {
+        size_t held = reader->def_bits_capacity > 8 ? (reader->def_bits_capacity - 8) * 8 : 0;
+        size_t values = grow_page_capacity(reader, held, (size_t)num_values);
+        bytes = (values + 7) / 8 + 8;
         carquet_mem_free(reader->decoded_def_bits);
         reader->decoded_def_bits = carquet_mem_malloc(bytes);
         reader->def_bits_capacity = reader->decoded_def_bits ? bytes : 0;
@@ -705,6 +740,18 @@ static carquet_status_t ensure_decoded_page_buffers(
      * and the wider decode/copy would overflow it. */
     if ((size_t)num_values > reader->decoded_capacity ||
         value_size != reader->decoded_value_size) {
+        /* The level buffers are sized to the same capacity, so any page that
+         * fits decoded_capacity fits them too. */
+        size_t capacity = (size_t)num_values > reader->decoded_capacity
+            ? grow_page_capacity(reader, reader->decoded_capacity, (size_t)num_values)
+            : reader->decoded_capacity;
+        size_t capacity_bytes = 0, level_bytes = 0;
+        if (!checked_mul_size(value_size, capacity, &capacity_bytes) ||
+            !checked_mul_size(sizeof(int16_t), capacity, &level_bytes)) {
+            capacity = (size_t)num_values;
+            capacity_bytes = values_buffer_size;
+        }
+
         carquet_mem_free(reader->decoded_values);
         reader->decoded_values = NULL;
         release_decoded_level_buffers(reader);
@@ -712,23 +759,24 @@ static carquet_status_t ensure_decoded_page_buffers(
         /* malloc, not calloc: the page decoder writes every value it reports
          * and reads only ever copy decoded values out, so zeroing is a wasted
          * pass over the buffer (and forces every page of it to be touched). */
-        if (values_buffer_size > 0) {
-            reader->decoded_values = carquet_mem_malloc(values_buffer_size);
+        if (capacity_bytes > 0) {
+            reader->decoded_values = carquet_mem_malloc(capacity_bytes);
         }
-        if (need_def_levels && num_values > 0) {
-            reader->decoded_def_levels = carquet_mem_malloc(sizeof(int16_t) * (size_t)num_values);
+        if (need_def_levels && capacity > 0) {
+            reader->decoded_def_levels = carquet_mem_malloc(sizeof(int16_t) * capacity);
         }
-        if (need_rep_levels && num_values > 0) {
-            reader->decoded_rep_levels = carquet_mem_malloc(sizeof(int16_t) * (size_t)num_values);
+        if (need_rep_levels && capacity > 0) {
+            reader->decoded_rep_levels = carquet_mem_malloc(sizeof(int16_t) * capacity);
         }
-        reader->decoded_capacity = (size_t)num_values;
+        reader->decoded_capacity = capacity;
         reader->decoded_value_size = value_size;
     } else {
-        if (need_def_levels && !reader->decoded_def_levels && num_values > 0) {
-            reader->decoded_def_levels = carquet_mem_malloc(sizeof(int16_t) * (size_t)num_values);
+        size_t capacity = reader->decoded_capacity;
+        if (need_def_levels && !reader->decoded_def_levels && capacity > 0) {
+            reader->decoded_def_levels = carquet_mem_malloc(sizeof(int16_t) * capacity);
         }
-        if (need_rep_levels && !reader->decoded_rep_levels && num_values > 0) {
-            reader->decoded_rep_levels = carquet_mem_malloc(sizeof(int16_t) * (size_t)num_values);
+        if (need_rep_levels && !reader->decoded_rep_levels && capacity > 0) {
+            reader->decoded_rep_levels = carquet_mem_malloc(sizeof(int16_t) * capacity);
         }
     }
 
@@ -1604,15 +1652,10 @@ carquet_status_t carquet_read_data_page_v1(
                 if ((size_t)encoded_count <= reader->indices_capacity) {
                     indices = reader->indices_buffer;
                 } else {
-                    /* Need larger buffer - reallocate */
-                    carquet_mem_free(reader->indices_buffer);
-                    reader->indices_buffer = carquet_mem_malloc((size_t)encoded_count * sizeof(uint32_t));
-                    if (!reader->indices_buffer) {
-                        reader->indices_capacity = 0;
+                    if (!grow_indices_buffer(reader, (size_t)encoded_count)) {
                         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate indices");
                         return CARQUET_ERROR_OUT_OF_MEMORY;
                     }
-                    reader->indices_capacity = encoded_count;
                     indices = reader->indices_buffer;
                 }
 
@@ -1996,14 +2039,10 @@ carquet_status_t carquet_read_data_page_v2(
                 if ((size_t)encoded_count <= reader->indices_capacity) {
                     indices = reader->indices_buffer;
                 } else {
-                    carquet_mem_free(reader->indices_buffer);
-                    reader->indices_buffer = carquet_mem_malloc((size_t)encoded_count * sizeof(uint32_t));
-                    if (!reader->indices_buffer) {
-                        reader->indices_capacity = 0;
+                    if (!grow_indices_buffer(reader, (size_t)encoded_count)) {
                         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate indices");
                         return CARQUET_ERROR_OUT_OF_MEMORY;
                     }
-                    reader->indices_capacity = encoded_count;
                     indices = reader->indices_buffer;
                 }
 

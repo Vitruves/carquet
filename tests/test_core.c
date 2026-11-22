@@ -11,6 +11,7 @@
 #include <stdbool.h>
 #include <math.h>
 
+#include <carquet/carquet.h>
 #include "core/arena.h"
 #include "core/buffer.h"
 #include "core/endian.h"
@@ -116,6 +117,50 @@ static int test_arena_large_allocation(void) {
 
     carquet_arena_destroy(&arena);
     TEST_PASS("arena_large_allocation");
+    return 0;
+}
+
+/* A footer with many row groups: each row group's column-chunk array (here
+ * 105 columns x 744 bytes, as in ClickBench's hits.parquet) is larger than a
+ * default block. Blocks grow, so they take a few allocations instead of one
+ * per row group, and every allocation is a whole number of 64 KiB (none a few
+ * bytes over glibc's 128 KiB mmap threshold). */
+static size_t g_arena_mallocs;
+static int g_arena_odd_size;
+static void* arena_count_malloc(size_t size, void* ctx) {
+    (void)ctx;
+    g_arena_mallocs++;
+    if (size % (64 * 1024) != 0) g_arena_odd_size = 1;
+    return malloc(size);
+}
+static void* arena_count_realloc(void* ptr, size_t size, void* ctx) {
+    (void)ctx;
+    return realloc(ptr, size);
+}
+static void arena_count_free(void* ptr, void* ctx) {
+    (void)ctx;
+    free(ptr);
+}
+
+static int test_arena_block_growth(void) {
+    carquet_allocator_t counting = { arena_count_malloc, arena_count_realloc, arena_count_free, NULL };
+    g_arena_mallocs = 0;
+    g_arena_odd_size = 0;
+    carquet_set_allocator(&counting);
+
+    carquet_arena_t arena;
+    int ok = carquet_arena_init(&arena) == CARQUET_OK;
+    for (int rg = 0; ok && rg < 452; rg++) {
+        ok = carquet_arena_calloc(&arena, 105, 744) != NULL &&
+             carquet_arena_alloc(&arena, 300) != NULL;
+    }
+    if (ok) carquet_arena_destroy(&arena);
+    carquet_set_allocator(NULL);
+
+    if (!ok) TEST_FAIL("arena_block_growth", "allocation failed");
+    if (g_arena_mallocs > 24) TEST_FAIL("arena_block_growth", "one block per row group");
+    if (g_arena_odd_size) TEST_FAIL("arena_block_growth", "block allocation not a multiple of 64 KiB");
+    TEST_PASS("arena_block_growth");
     return 0;
 }
 
@@ -679,6 +724,7 @@ int main(void) {
     /* Arena tests */
     failures += test_arena_basic();
     failures += test_arena_large_allocation();
+    failures += test_arena_block_growth();
     failures += test_arena_save_restore();
     failures += test_arena_overflow_rejected();
 

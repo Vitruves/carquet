@@ -31,21 +31,25 @@ static int add_overflows_size(size_t a, size_t b, size_t* out) {
     return 0;
 }
 
-static carquet_arena_block_t* arena_new_block(size_t min_size) {
-    size_t block_size = min_size < CARQUET_ARENA_DEFAULT_BLOCK_SIZE
-                            ? CARQUET_ARENA_DEFAULT_BLOCK_SIZE
-                            : align_up(min_size, CARQUET_ARENA_DEFAULT_BLOCK_SIZE);
-    if (block_size == SIZE_MAX) {
-        return NULL;
-    }
+/* Blocks after the first double in size up to this, so a large footer takes
+ * a few blocks instead of one per row group. */
+#define CARQUET_ARENA_MAX_GROWTH_BLOCK ((size_t)4 * 1024 * 1024)
 
-    /* Allocate the header plus the data block.
+static carquet_arena_block_t* arena_new_block(size_t min_size) {
+    /* The allocation (header included) is a whole number of 64 KiB, so a
+     * block is never a few bytes over an allocator threshold (glibc maps
+     * every allocation from 128 KiB with mmap).
      * Note: offsetof accounts for the union's alignment padding */
     size_t header_size = offsetof(carquet_arena_block_t, u);
     size_t alloc_size;
-    if (add_overflows_size(header_size, block_size, &alloc_size)) {
+    if (add_overflows_size(header_size, min_size, &alloc_size)) {
         return NULL;
     }
+    alloc_size = align_up(alloc_size, CARQUET_ARENA_DEFAULT_BLOCK_SIZE);
+    if (alloc_size == SIZE_MAX) {
+        return NULL;
+    }
+    size_t block_size = alloc_size - header_size;
     carquet_arena_block_t* block = (carquet_arena_block_t*)carquet_mem_malloc(alloc_size);
 
     if (!block) {
@@ -192,6 +196,12 @@ void* carquet_arena_alloc_aligned(carquet_arena_t* arena, size_t size, size_t al
     size_t block_size = needed > arena->default_block_size
                             ? needed
                             : arena->default_block_size;
+    size_t grown = block->size >= CARQUET_ARENA_MAX_GROWTH_BLOCK / 2
+                       ? CARQUET_ARENA_MAX_GROWTH_BLOCK
+                       : block->size * 2;
+    if (grown > block_size) {
+        block_size = grown;
+    }
 
     carquet_arena_block_t* new_block = arena_new_block(block_size);
     if (!new_block) {
