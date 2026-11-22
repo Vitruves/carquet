@@ -15,6 +15,7 @@
 #include "thrift/thrift_encode.h"
 #include "thrift/parquet_types.h"
 #include "page_tasks.h"
+#include "parallel_copy.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -990,10 +991,12 @@ static carquet_status_t dict_accumulate(
     } else {
         size_t stride = physical_type_stride(writer->type,
                                              writer->type_length);
-        carquet_status_t s = carquet_buffer_append(
-            &writer->dict_values, (const uint8_t*)values,
-            (size_t)num_non_null * stride);
-        if (s != CARQUET_OK) return s;
+        size_t bytes = (size_t)num_non_null * stride;
+        if (bytes > 0) {
+            uint8_t* dst = carquet_buffer_advance(&writer->dict_values, bytes);
+            if (!dst) return CARQUET_ERROR_OUT_OF_MEMORY;
+            carquet_parallel_copy(dst, values, bytes);
+        }
     }
     writer->dict_value_count += num_non_null;
 
@@ -1213,10 +1216,13 @@ static carquet_status_t stash_deferred_batch(
     }
 
     size_t stride = physical_type_stride(writer->type, writer->type_length);
-    carquet_status_t s = carquet_buffer_append(
-        &writer->deferred_values, (const uint8_t*)values,
-        (size_t)num_packed * stride);
-    if (s != CARQUET_OK) return s;
+    size_t bytes = (size_t)num_packed * stride;
+    carquet_status_t s = CARQUET_OK;
+    if (bytes > 0) {
+        uint8_t* dst = carquet_buffer_advance(&writer->deferred_values, bytes);
+        if (!dst) return CARQUET_ERROR_OUT_OF_MEMORY;
+        carquet_parallel_copy(dst, values, bytes);
+    }
 
     if (writer->max_def_level > 0) {
         s = dict_levels_reserve(&writer->deferred_def_levels,

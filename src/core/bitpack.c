@@ -318,16 +318,28 @@ void carquet_bitpack8_32(const uint32_t* values, int bit_width, uint8_t* output)
     int acc_bits = 0;
     int out_pos = 0;
 
+    /* Flush 32 bits at a time (the accumulator holds at most 31 carried +
+     * 32 new bits): one store per 32 output bits instead of one per byte. */
     for (int i = 0; i < 8; i++) {
         acc |= (uint64_t)(values[i] & mask) << acc_bits;
         acc_bits += bit_width;
-        while (acc_bits >= 8) {
-            output[out_pos++] = (uint8_t)acc;
-            acc >>= 8;
-            acc_bits -= 8;
+        if (acc_bits >= 32) {
+            uint32_t w = (uint32_t)acc;
+            output[out_pos] = (uint8_t)w;
+            output[out_pos + 1] = (uint8_t)(w >> 8);
+            output[out_pos + 2] = (uint8_t)(w >> 16);
+            output[out_pos + 3] = (uint8_t)(w >> 24);
+            out_pos += 4;
+            acc >>= 32;
+            acc_bits -= 32;
         }
     }
-    /* 8*bit_width is a multiple of 8, so acc_bits == 0 here — nothing left. */
+    /* 8*bit_width is a multiple of 8: whole bytes remain. */
+    while (acc_bits > 0) {
+        output[out_pos++] = (uint8_t)acc;
+        acc >>= 8;
+        acc_bits -= 8;
+    }
 }
 
 size_t carquet_bitpack_32(const uint32_t* values, size_t count,

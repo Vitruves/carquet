@@ -5,6 +5,7 @@
 
 #include <carquet/carquet.h>
 #include "core/allocator.h"
+#include "writer/parallel_copy.h"
 #include <string.h>
 
 #if defined(_MSC_VER)
@@ -276,6 +277,7 @@ carquet_status_t carquet_init(void) {
 }
 
 void carquet_cleanup(void) {
+    carquet_parallel_copy_shutdown();
     carquet_mem_pool_flush();
     carquet_zstd_cleanup();
     carquet_gzip_cleanup();

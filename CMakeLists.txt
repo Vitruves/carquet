@@ -543,6 +543,7 @@ set(CARQUET_READER_SOURCES
 
 set(CARQUET_WRITER_SOURCES
     src/writer/file_writer.c
+    src/writer/parallel_copy.c
     src/writer/row_group_writer.c
     src/writer/column_writer.c
     src/writer/page_writer.c

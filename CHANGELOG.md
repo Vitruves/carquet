@@ -36,6 +36,8 @@ Portability:
 
 ### Performance
 
+- **Large input batches are copied by several threads**: `carquet_writer_write_batch()` copies the caller's values into the writer (the caller may reuse its buffer once the call returns) on the calling thread, which the pipelined encode then waited on. Copies of 4 MB or more are now cut into pieces run by a small helper pool (up to 4 threads, started on first use, stopped by `carquet_cleanup()`) and the calling thread; a writer copying while another one does copies serially. On a Xeon D-1531 the copy of a 10M-row, 3-column write goes from 55 to 41 ms. Bit-packing of dictionary indices also flushes 32 bits at a time instead of byte by byte.
+
 - **AVX2 BYTE_STREAM_SPLIT encode, 32 values per step**: the AVX2 kernels for DOUBLE and FLOAT moved 4 / 8 values per step through `_mm_extract_epi16` / `_mm256_extract_epi32` and 4-byte scalar stores; they now run the decode transpose backwards on 32 values (lane pairing, per-lane byte grouping, unpack transpose, one 32-byte store per stream). 1M doubles on a Xeon D-1531: 4.70 -> 1.76 ms. Test: `tests/test_encodings_extended.c` (`byte_stream_split_dispatch_layout`: every count to 300 and large ones, against the format layout, through whichever kernel the CPU dispatches).
 - **BYTE_STREAM_SPLIT decode reads the streams directly**: the cache-tiled decode (each stream's tile gathered into a buffer, then transposed) used past 32K doubles / 64K floats on x86 and 1M values on ARM was slower at every size: 1M doubles 2.06 -> 1.56 ms, 1M floats 0.73 -> 0.45 ms on that Xeon.
 
