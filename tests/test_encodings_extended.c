@@ -690,6 +690,54 @@ static int test_byte_stream_split_double(void) {
     return 0;
 }
 
+/* The dispatched BYTE_STREAM_SPLIT kernels (SSE / AVX2 / AVX-512 / NEON,
+ * whichever this CPU runs) against the format's layout, byte b of value i at
+ * output[b * count + i], for every count up to 300 (all vector blocks and
+ * tails) and a few large ones. */
+extern void carquet_dispatch_byte_split_encode_double(const double* values, int64_t count, uint8_t* output);
+extern void carquet_dispatch_byte_split_encode_float(const float* values, int64_t count, uint8_t* output);
+extern void carquet_dispatch_byte_split_decode_double(const uint8_t* data, int64_t count, double* values);
+extern void carquet_dispatch_byte_split_decode_float(const uint8_t* data, int64_t count, float* values);
+
+static int test_byte_stream_split_dispatch_layout(void) {
+    enum { MAXN = 70000 };
+    uint8_t* in = malloc((size_t)MAXN * 8);
+    uint8_t* out = malloc((size_t)MAXN * 8);
+    uint8_t* back = malloc((size_t)MAXN * 8);
+    if (!in || !out || !back) { free(in); free(out); free(back); TEST_FAIL("byte_stream_split_dispatch_layout", "alloc"); }
+    uint32_t x = 99;
+    for (size_t i = 0; i < (size_t)MAXN * 8; i++) { x = x * 1103515245u + 12345u; in[i] = (uint8_t)(x >> 16); }
+    int64_t counts[310]; int nc = 0;
+    for (int64_t c = 0; c <= 300; c++) counts[nc++] = c;
+    counts[nc++] = 1023; counts[nc++] = 4096; counts[nc++] = 32769; counts[nc++] = MAXN;
+    for (int k = 0; k < nc; k++) {
+        int64_t n = counts[k];
+        for (int width = 4; width <= 8; width += 4) {
+            if (width == 8) carquet_dispatch_byte_split_encode_double((const double*)in, n, out);
+            else carquet_dispatch_byte_split_encode_float((const float*)in, n, out);
+            for (int64_t i = 0; i < n; i++) {
+                for (int b = 0; b < width; b++) {
+                    if (out[(size_t)b * n + i] != in[(size_t)i * width + b]) {
+                        printf("  width %d count %lld value %lld byte %d\n", width, (long long)n, (long long)i, b);
+                        free(in); free(out); free(back);
+                        TEST_FAIL("byte_stream_split_dispatch_layout", "encoded layout differs");
+                    }
+                }
+            }
+            if (width == 8) carquet_dispatch_byte_split_decode_double(out, n, (double*)back);
+            else carquet_dispatch_byte_split_decode_float(out, n, (float*)back);
+            if (n && memcmp(back, in, (size_t)n * width) != 0) {
+                printf("  width %d count %lld\n", width, (long long)n);
+                free(in); free(out); free(back);
+                TEST_FAIL("byte_stream_split_dispatch_layout", "decode does not invert encode");
+            }
+        }
+    }
+    free(in); free(out); free(back);
+    TEST_PASS("byte_stream_split_dispatch_layout");
+    return 0;
+}
+
 static int test_byte_stream_split_generic(void) {
     /* Test with 16-bit fixed length values */
     uint8_t input[] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
@@ -1184,6 +1232,7 @@ int main(void) {
     printf("\n--- Byte Stream Split Tests ---\n");
     failures += test_byte_stream_split_float();
     failures += test_byte_stream_split_double();
+    failures += test_byte_stream_split_dispatch_layout();
     failures += test_byte_stream_split_generic();
     failures += test_byte_stream_split_generic_32bit();
     failures += test_byte_stream_split_special_floats();

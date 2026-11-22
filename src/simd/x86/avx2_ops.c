@@ -316,6 +316,32 @@ void carquet_avx2_byte_stream_split_encode_float(
         3, 7, 11, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
         3, 7, 11, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
 
+    /* 32 floats (128 bytes) at a time: pair 128-bit lane k with lane k + 4,
+     * group each lane's bytes by plane into 32-bit words, transpose the
+     * 4 x 4 words per lane, then store 32 bytes of each plane. */
+    const __m256i by_plane = _mm256_setr_epi8(
+        0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15,
+        0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+    for (; i + 32 <= count; i += 32) {
+        const uint8_t* p = src + i * 4;
+        __m256i r0 = _mm256_loadu_si256((const __m256i*)(p + 0));
+        __m256i r1 = _mm256_loadu_si256((const __m256i*)(p + 32));
+        __m256i r2 = _mm256_loadu_si256((const __m256i*)(p + 64));
+        __m256i r3 = _mm256_loadu_si256((const __m256i*)(p + 96));
+        __m256i x0 = _mm256_shuffle_epi8(_mm256_permute2x128_si256(r0, r2, 0x20), by_plane);
+        __m256i x1 = _mm256_shuffle_epi8(_mm256_permute2x128_si256(r0, r2, 0x31), by_plane);
+        __m256i x2 = _mm256_shuffle_epi8(_mm256_permute2x128_si256(r1, r3, 0x20), by_plane);
+        __m256i x3 = _mm256_shuffle_epi8(_mm256_permute2x128_si256(r1, r3, 0x31), by_plane);
+        __m256i t0 = _mm256_unpacklo_epi32(x0, x1);
+        __m256i t1 = _mm256_unpackhi_epi32(x0, x1);
+        __m256i t2 = _mm256_unpacklo_epi32(x2, x3);
+        __m256i t3 = _mm256_unpackhi_epi32(x2, x3);
+        _mm256_storeu_si256((__m256i*)(output + 0 * count + i), _mm256_unpacklo_epi64(t0, t2));
+        _mm256_storeu_si256((__m256i*)(output + 1 * count + i), _mm256_unpackhi_epi64(t0, t2));
+        _mm256_storeu_si256((__m256i*)(output + 2 * count + i), _mm256_unpacklo_epi64(t1, t3));
+        _mm256_storeu_si256((__m256i*)(output + 3 * count + i), _mm256_unpackhi_epi64(t1, t3));
+    }
+
     /* Process 8 floats (32 bytes) at a time */
     for (; i + 8 <= count; i += 8) {
         __m256i v = _mm256_loadu_si256((const __m256i*)(src + i * 4));
@@ -458,6 +484,62 @@ void carquet_avx2_byte_stream_split_encode_double(
     const __m256i s7 = _mm256_setr_epi8(
         7, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
         7, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+
+    /* 32 doubles (256 bytes) at a time, the decode cascade run backwards:
+     * pair 128-bit lane k with lane k + 8, group each lane's bytes by plane
+     * into 16-bit words, transpose the 8 x 8 words per lane in three unpack
+     * stages, then store 32 bytes of each plane. */
+    const __m256i by_plane = _mm256_setr_epi8(
+        0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15,
+        0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15);
+    for (; i + 32 <= count; i += 32) {
+        const uint8_t* p = src + i * 8;
+        __m256i r0 = _mm256_loadu_si256((const __m256i*)(p + 0));
+        __m256i r1 = _mm256_loadu_si256((const __m256i*)(p + 32));
+        __m256i r2 = _mm256_loadu_si256((const __m256i*)(p + 64));
+        __m256i r3 = _mm256_loadu_si256((const __m256i*)(p + 96));
+        __m256i r4 = _mm256_loadu_si256((const __m256i*)(p + 128));
+        __m256i r5 = _mm256_loadu_si256((const __m256i*)(p + 160));
+        __m256i r6 = _mm256_loadu_si256((const __m256i*)(p + 192));
+        __m256i r7 = _mm256_loadu_si256((const __m256i*)(p + 224));
+
+        /* x_k = (lane k, lane k + 8): doubles 2k, 2k+1 | 16+2k, 17+2k */
+        __m256i x0 = _mm256_shuffle_epi8(_mm256_permute2x128_si256(r0, r4, 0x20), by_plane);
+        __m256i x1 = _mm256_shuffle_epi8(_mm256_permute2x128_si256(r0, r4, 0x31), by_plane);
+        __m256i x2 = _mm256_shuffle_epi8(_mm256_permute2x128_si256(r1, r5, 0x20), by_plane);
+        __m256i x3 = _mm256_shuffle_epi8(_mm256_permute2x128_si256(r1, r5, 0x31), by_plane);
+        __m256i x4 = _mm256_shuffle_epi8(_mm256_permute2x128_si256(r2, r6, 0x20), by_plane);
+        __m256i x5 = _mm256_shuffle_epi8(_mm256_permute2x128_si256(r2, r6, 0x31), by_plane);
+        __m256i x6 = _mm256_shuffle_epi8(_mm256_permute2x128_si256(r3, r7, 0x20), by_plane);
+        __m256i x7 = _mm256_shuffle_epi8(_mm256_permute2x128_si256(r3, r7, 0x31), by_plane);
+
+        __m256i t0 = _mm256_unpacklo_epi16(x0, x1);
+        __m256i t1 = _mm256_unpackhi_epi16(x0, x1);
+        __m256i t2 = _mm256_unpacklo_epi16(x2, x3);
+        __m256i t3 = _mm256_unpackhi_epi16(x2, x3);
+        __m256i t4 = _mm256_unpacklo_epi16(x4, x5);
+        __m256i t5 = _mm256_unpackhi_epi16(x4, x5);
+        __m256i t6 = _mm256_unpacklo_epi16(x6, x7);
+        __m256i t7 = _mm256_unpackhi_epi16(x6, x7);
+
+        __m256i u0 = _mm256_unpacklo_epi32(t0, t2);
+        __m256i u1 = _mm256_unpackhi_epi32(t0, t2);
+        __m256i u2 = _mm256_unpacklo_epi32(t1, t3);
+        __m256i u3 = _mm256_unpackhi_epi32(t1, t3);
+        __m256i u4 = _mm256_unpacklo_epi32(t4, t6);
+        __m256i u5 = _mm256_unpackhi_epi32(t4, t6);
+        __m256i u6 = _mm256_unpacklo_epi32(t5, t7);
+        __m256i u7 = _mm256_unpackhi_epi32(t5, t7);
+
+        _mm256_storeu_si256((__m256i*)(output + 0 * count + i), _mm256_unpacklo_epi64(u0, u4));
+        _mm256_storeu_si256((__m256i*)(output + 1 * count + i), _mm256_unpackhi_epi64(u0, u4));
+        _mm256_storeu_si256((__m256i*)(output + 2 * count + i), _mm256_unpacklo_epi64(u1, u5));
+        _mm256_storeu_si256((__m256i*)(output + 3 * count + i), _mm256_unpackhi_epi64(u1, u5));
+        _mm256_storeu_si256((__m256i*)(output + 4 * count + i), _mm256_unpacklo_epi64(u2, u6));
+        _mm256_storeu_si256((__m256i*)(output + 5 * count + i), _mm256_unpackhi_epi64(u2, u6));
+        _mm256_storeu_si256((__m256i*)(output + 6 * count + i), _mm256_unpacklo_epi64(u3, u7));
+        _mm256_storeu_si256((__m256i*)(output + 7 * count + i), _mm256_unpackhi_epi64(u3, u7));
+    }
 
     /* Process 4 doubles (32 bytes) at a time */
     for (; i + 4 <= count; i += 4) {
