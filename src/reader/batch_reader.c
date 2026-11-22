@@ -2582,7 +2582,7 @@ static bool coalesced_read_segment(
              * holding whatever the buffer held before. */
             if (actual != uncomp_size) goto bail;
         } else if (encoding == CARQUET_ENCODING_BYTE_STREAM_SPLIT) {
-            /* Decompress to staging, then cache-tiled transpose to output */
+            /* Decompress to staging, then transpose to output */
             if (!stage && !stage_from_pool) {
                 if (scratch_owner) {
                     if (!scratch_acquire(scratch_owner, &stage, &stage_cap)) goto bail;

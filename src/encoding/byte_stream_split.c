@@ -22,10 +22,6 @@ extern void carquet_dispatch_byte_split_decode_float(const uint8_t* data, int64_
 extern void carquet_dispatch_byte_split_encode_double(const double* values, int64_t count, uint8_t* output);
 extern void carquet_dispatch_byte_split_decode_double(const uint8_t* data, int64_t count, double* values);
 
-/* Large pages benefit from a cache-tiled gather before the SIMD transpose. */
-void carquet_bss_decode_float_tiled(const uint8_t* data, int64_t count, float* values);
-void carquet_bss_decode_double_tiled(const uint8_t* data, int64_t count, double* values);
-
 /* ============================================================================
  * Float Encoding (32-bit, 4 bytes)
  * ============================================================================
@@ -72,7 +68,7 @@ carquet_status_t carquet_byte_stream_split_decode_float(
         return CARQUET_ERROR_DECODE;
     }
 
-    carquet_bss_decode_float_tiled(data, count, values);
+    carquet_dispatch_byte_split_decode_float(data, count, values);
 
     return CARQUET_OK;
 }
@@ -123,107 +119,17 @@ carquet_status_t carquet_byte_stream_split_decode_double(
         return CARQUET_ERROR_DECODE;
     }
 
-    carquet_bss_decode_double_tiled(data, count, values);
+    carquet_dispatch_byte_split_decode_double(data, count, values);
 
     return CARQUET_OK;
 }
 
-/* ============================================================================
- * Cache-Tiled BSS Decode
- * ============================================================================
- * The standard BSS decode reads from S interleaved streams, each N values
- * apart. For large pages (N > 64K), the S stream heads are spread beyond
- * L2 cache, causing heavy cache misses.
- *
- * The tiled version gathers a tile of stream data into a contiguous buffer
- * that fits in L2 cache, then transposes from that hot buffer. This trades
- * one sequential memcpy pass for dramatically better cache behavior during
- * the SIMD transpose.
- *
- * Tile size chosen so S streams × tile_bytes ≤ L2 cache (~256KB):
- * - float (S=4):  tile = 64K values = 256KB
- * - double (S=8): tile = 32K values = 256KB
- */
-
-#if defined(__aarch64__) || defined(_M_ARM64)
-/* Apple Silicon / recent ARM cores: the direct NEON transpose outruns the
- * gather-then-transpose tiling at every page size measured (1 MB pages:
- * 19 GB/s direct vs 11 GB/s tiled on an M3; still ahead at 8 MB planes),
- * because the gather is a full extra read+write pass over the page and
- * the large L2 plus stream prefetchers already keep the 4/8 plane heads
- * hot. Keep the tiling only for pages past 1M values. */
-#define BSS_TILE_FLOAT  (1 << 20)
-#define BSS_TILE_DOUBLE (1 << 20)
-#else
-#define BSS_TILE_FLOAT  65536
-#define BSS_TILE_DOUBLE 32768
-#endif
-
-void carquet_bss_decode_float_tiled(const uint8_t* data, int64_t count, float* values) {
-    /* Small counts: direct decode, no tiling overhead */
-    if (count <= BSS_TILE_FLOAT) {
-        carquet_dispatch_byte_split_decode_float(data, count, values);
-        return;
-    }
-
-    /* Heap-allocate the tile (256 KB on x86, 4 MB on ARM64): a buffer that
-     * large on the stack would not fit the 512 KB default stack of macOS
-     * secondary threads (the OpenMP / worker-pool decode paths). On
-     * allocation failure decode directly; the output is identical, only
-     * cache behaviour differs. */
-    uint8_t* tile = (uint8_t*)malloc((size_t)4 * BSS_TILE_FLOAT);
-    if (!tile) {
-        carquet_dispatch_byte_split_decode_float(data, count, values);
-        return;
-    }
-    int64_t offset = 0;
-
-    while (offset < count) {
-        int64_t n = count - offset;
-        if (n > BSS_TILE_FLOAT) n = BSS_TILE_FLOAT;
-
-        /* Gather: copy n bytes from each of 4 streams into contiguous tile */
-        for (int s = 0; s < 4; s++) {
-            memcpy(tile + (size_t)s * n, data + (size_t)s * count + offset, (size_t)n);
-        }
-
-        /* Transpose from L2-hot tile buffer */
-        carquet_dispatch_byte_split_decode_float(tile, n, values + offset);
-        offset += n;
-    }
-    free(tile);
-}
-
-void carquet_bss_decode_double_tiled(const uint8_t* data, int64_t count, double* values) {
-    /* Small counts: direct decode, no tiling overhead */
-    if (count <= BSS_TILE_DOUBLE) {
-        carquet_dispatch_byte_split_decode_double(data, count, values);
-        return;
-    }
-
-    /* Heap-allocated for the same reason as the float tile above. */
-    uint8_t* tile = (uint8_t*)malloc((size_t)8 * BSS_TILE_DOUBLE);
-    if (!tile) {
-        carquet_dispatch_byte_split_decode_double(data, count, values);
-        return;
-    }
-    int64_t offset = 0;
-
-    while (offset < count) {
-        int64_t n = count - offset;
-        if (n > BSS_TILE_DOUBLE) n = BSS_TILE_DOUBLE;
-
-        /* Gather: copy n bytes from each of 8 streams into contiguous tile */
-        for (int s = 0; s < 8; s++) {
-            memcpy(tile + (size_t)s * n, data + (size_t)s * count + offset, (size_t)n);
-        }
-
-        /* Transpose from L2-hot tile buffer */
-        carquet_dispatch_byte_split_decode_double(tile, n, values + offset);
-        offset += n;
-    }
-    free(tile);
-}
+/* Decoding reads the S streams of a page directly. A cache-tiled variant
+ * (gather a tile of every stream into a contiguous buffer, then transpose)
+ * was slower at every page size measured: 1M doubles in 1.56 ms direct vs
+ * 2.06 ms tiled on a Xeon D-1531 (256 KB L2), 1M floats 0.45 vs 0.73 ms, and
+ * 19 vs 11 GB/s on an Apple M3: the hardware prefetchers follow the S
+ * streams, and the gather was one more pass over the page. */
 
 /* ============================================================================
  * Fixed Length Byte Array Encoding (generic)
@@ -300,12 +206,12 @@ carquet_status_t carquet_byte_stream_split_decode(
      * FIXED_LEN_BYTE_ARRAY(4/8) caller passes a raw, possibly-unaligned byte
      * buffer, so gate on alignment and fall through to the generic transpose. */
     if (type_length == 4 && ((uintptr_t)values & 3u) == 0) {
-        carquet_bss_decode_float_tiled(data, count, (float*)values);
+        carquet_dispatch_byte_split_decode_float(data, count, (float*)values);
         return CARQUET_OK;
     }
 
     if (type_length == 8 && ((uintptr_t)values & 7u) == 0) {
-        carquet_bss_decode_double_tiled(data, count, (double*)values);
+        carquet_dispatch_byte_split_decode_double(data, count, (double*)values);
         return CARQUET_OK;
     }
 
