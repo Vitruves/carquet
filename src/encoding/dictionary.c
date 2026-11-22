@@ -599,25 +599,71 @@ static inline size_t word_slot(uint64_t x, size_t size, unsigned bits) {
     return (size_t)((x * 0x9E3779B97F4A7C15ULL) >> (64 - bits));
 }
 
-static inline carquet_status_t build_fixed_word(size_t size, const uint8_t* src,
-                                                int64_t count, size_t max_dict_bytes,
-                                                carquet_buffer_t* dict_output,
-                                                uint32_t* indices, uint32_t* num_entries,
-                                                bool* abandoned) {
+/* Append the n entries (one word each) to dict_output as PLAIN values. */
+static carquet_status_t fixed_word_emit(size_t size, const uint64_t* entries, uint32_t n,
+                                        carquet_buffer_t* dict_output) {
+    if (n == 0) return CARQUET_OK;
+    size_t base = dict_output->size;
+    carquet_status_t status = carquet_buffer_resize(dict_output, base + (size_t)n * size);
+    if (status != CARQUET_OK) return status;
+    uint8_t* out = dict_output->data + base;
+    if (size == 8) {
+        memcpy(out, entries, (size_t)n * 8);
+    } else {
+        for (uint32_t e = 0; e < n; e++) {
+            uint32_t v = (uint32_t)entries[e];
+            memcpy(out + (size_t)e * 4, &v, 4);
+        }
+    }
+    return CARQUET_OK;
+}
+
+/* Room for one more entry. */
+static inline bool fixed_word_entries_grow(uint64_t** entries, size_t* cap, uint32_t n) {
+    if (n < *cap) return true;
+    size_t ncap = *cap ? *cap * 2 : 256;
+    uint64_t* grown = (ncap <= SIZE_MAX / sizeof(uint64_t))
+        ? carquet_mem_realloc(*entries, ncap * sizeof(uint64_t)) : NULL;
+    if (!grown) return false;
+    *entries = grown;
+    *cap = ncap;
+    return true;
+}
+
+/* Load factor at most 1/8 while the table is small (up to 64K slots,
+ * 256 KB), then at most 1/2. */
+static inline bool fixed_word_table_full(uint32_t n, size_t slots) {
+    return (size_t)n * (slots <= ((size_t)1 << 16) ? 8 : 2) > slots;
+}
+
+/* Hash-table dictionary of 4 / 8-byte words, entries numbered by first
+ * occurrence. Resumes at value `start` with the n entries found so far
+ * (`entries`, owned and freed here, NULL when starting from scratch). */
+static carquet_status_t build_fixed_word_from(size_t size, const uint8_t* src,
+                                              int64_t count, int64_t start,
+                                              uint64_t* entries, size_t entries_cap,
+                                              uint32_t n, size_t max_dict_bytes,
+                                              carquet_buffer_t* dict_output,
+                                              uint32_t* indices, uint32_t* num_entries,
+                                              bool* abandoned) {
     unsigned bits = 10;
+    while (bits < 31 && fixed_word_table_full(n, (size_t)1 << bits)) bits++;
     size_t mask = ((size_t)1 << bits) - 1;
     uint32_t* slots = carquet_mem_calloc(mask + 1, sizeof(uint32_t));
-    size_t entries_cap = 256;
-    uint64_t* entries = carquet_mem_malloc(entries_cap * sizeof(uint64_t));
     carquet_status_t status = CARQUET_OK;
-    uint32_t n = 0;
-    if (!slots || !entries) {
+    if (!slots) {
         status = CARQUET_ERROR_OUT_OF_MEMORY;
         count = 0;
+    } else {
+        for (uint32_t e = 0; e < n; e++) {
+            size_t b = word_slot(entries[e], size, bits);
+            while (slots[b]) b = (b + 1) & mask;
+            slots[b] = e + 1;
+        }
     }
     uint64_t prev = 0;
     uint32_t prev_index = UINT32_MAX;   /* none yet */
-    for (int64_t i = 0; i < count; i++) {
+    for (int64_t i = start; i < count; i++) {
         uint64_t x = word_load(src + (size_t)i * size, size);
         if (x == prev && prev_index != UINT32_MAX) {
             indices[i] = prev_index;
@@ -630,13 +676,9 @@ static inline carquet_status_t build_fixed_word(size_t size, const uint8_t* src,
         }
         if (!slot) {
             if (n == UINT32_MAX) { status = CARQUET_ERROR_ENCODE; break; }
-            if (n == entries_cap) {
-                uint64_t* grown = (entries_cap <= SIZE_MAX / (2 * sizeof(uint64_t)))
-                    ? carquet_mem_realloc(entries, entries_cap * 2 * sizeof(uint64_t))
-                    : NULL;
-                if (!grown) { status = CARQUET_ERROR_OUT_OF_MEMORY; break; }
-                entries = grown;
-                entries_cap *= 2;
+            if (!fixed_word_entries_grow(&entries, &entries_cap, n)) {
+                status = CARQUET_ERROR_OUT_OF_MEMORY;
+                break;
             }
             entries[n] = x;
             slots[b] = n + 1;
@@ -646,9 +688,7 @@ static inline carquet_status_t build_fixed_word(size_t size, const uint8_t* src,
                 *abandoned = true;
                 break;
             }
-            /* Load factor at most 1/8 while the table is small (up to 64K
-             * slots, 256 KB), then at most 1/2. */
-            if ((size_t)n * ((mask + 1) <= ((size_t)1 << 16) ? 8 : 2) > mask + 1) {
+            if (fixed_word_table_full(n, mask + 1)) {
                 unsigned nbits = bits + 1;
                 size_t nmask = ((size_t)1 << nbits) - 1;
                 uint32_t* nslots = carquet_mem_calloc(nmask + 1, sizeof(uint32_t));
@@ -667,20 +707,8 @@ static inline carquet_status_t build_fixed_word(size_t size, const uint8_t* src,
         indices[i] = prev_index = slot - 1;
         prev = x;
     }
-    if (status == CARQUET_OK && !*abandoned && n > 0) {
-        size_t base = dict_output->size;
-        status = carquet_buffer_resize(dict_output, base + (size_t)n * size);
-        if (status == CARQUET_OK) {
-            uint8_t* out = dict_output->data + base;
-            if (size == 8) {
-                memcpy(out, entries, (size_t)n * 8);
-            } else {
-                for (uint32_t e = 0; e < n; e++) {
-                    uint32_t v = (uint32_t)entries[e];
-                    memcpy(out + (size_t)e * 4, &v, 4);
-                }
-            }
-        }
+    if (status == CARQUET_OK && !*abandoned) {
+        status = fixed_word_emit(size, entries, n, dict_output);
     }
     carquet_mem_free(slots);
     carquet_mem_free(entries);
@@ -695,89 +723,107 @@ extern void carquet_dispatch_minmax_i32(const int32_t* values, int64_t count,
 extern void carquet_dispatch_minmax_i64(const int64_t* values, int64_t count,
                                         int64_t* min_value, int64_t* max_value);
 
-/* Values of an INT32 / INT64 chunk spread over at most this many integers,
- * or over no more integers than the chunk has values, go through a direct
- * table (one uint32_t per integer, so never larger than the input). */
+/* Values of an INT32 / INT64 chunk spread over fewer than this many
+ * integers, or over fewer integers than the chunk has values, go through a
+ * direct table. */
 #define DIRECT_DICT_MIN_SPAN ((uint64_t)1 << 16)
 #define DIRECT_DICT_PREFIX 4096
+/* Values checked, then looked up, at a time: they stay in L1 in between. */
+#define DIRECT_DICT_BLOCK 2048
 
-/* Span max - min + 1 of the chunk if a direct table may index it, else 0.
- * A prefix decides first, so a chunk of scattered values costs one short
- * pass, not a full one. */
-static uint64_t direct_dict_span(size_t size, const void* values, int64_t count,
-                                 int64_t* min_out) {
-    uint64_t limit = (uint64_t)count > DIRECT_DICT_MIN_SPAN ? (uint64_t)count
-                                                            : DIRECT_DICT_MIN_SPAN;
-    int64_t prefix = count < DIRECT_DICT_PREFIX ? count : DIRECT_DICT_PREFIX;
-    for (int pass = 0; pass < 2; pass++) {
-        int64_t n = pass == 0 ? prefix : count;
-        int64_t lo, hi;
-        if (size == 4) {
-            int32_t a, b;
-            carquet_dispatch_minmax_i32((const int32_t*)values, n, &a, &b);
-            lo = a; hi = b;
-        } else {
-            carquet_dispatch_minmax_i64((const int64_t*)values, n, &lo, &hi);
-        }
-        uint64_t span = (uint64_t)hi - (uint64_t)lo;   /* hi >= lo */
-        if (span >= limit) return 0;
-        if (pass == 1 || n == count) {
-            *min_out = lo;
-            return span + 1;
-        }
+static inline void direct_dict_minmax(size_t size, const uint8_t* src, int64_t n,
+                                      int64_t* lo, int64_t* hi) {
+    if (size == 4) {
+        int32_t a, b;
+        carquet_dispatch_minmax_i32((const int32_t*)(const void*)src, n, &a, &b);
+        *lo = a; *hi = b;
+    } else {
+        carquet_dispatch_minmax_i64((const int64_t*)(const void*)src, n, lo, hi);
     }
-    return 0;
 }
 
-/* Dictionary of an integer chunk whose values lie in [min, min + span): the
- * slot of a value is its offset from min, with no hashing or probing. Same
- * first-occurrence numbering and early-abort rule as build_fixed_word, so
- * the same dictionary and indices. */
-static carquet_status_t build_fixed_direct(size_t size, const uint8_t* src,
-                                           int64_t count, int64_t minv, uint64_t span,
-                                           size_t max_dict_bytes,
-                                           carquet_buffer_t* dict_output,
-                                           uint32_t* indices, uint32_t* num_entries,
-                                           bool* abandoned) {
-    size_t entries_cap = (uint64_t)count < span ? (size_t)count : (size_t)span;
-    uint32_t* map = carquet_mem_calloc((size_t)span, sizeof(uint32_t));
-    uint64_t* entries = carquet_mem_malloc(entries_cap * sizeof(uint64_t));
-    carquet_status_t status = CARQUET_OK;
+/* Dictionary of an integer chunk. While the values seen so far span fewer
+ * integers than the table has slots, the slot of a value is its low bits
+ * (distinct values less than a table apart never share them), with no
+ * hashing or probing. The span is followed block by block, in the same pass
+ * as the lookups: the table grows with it, and a chunk whose values turn out
+ * scattered continues in the hash table with the entries found so far. A
+ * prefix decides first, so scattered values cost no table at all. Same
+ * first-occurrence numbering and early-abort rule as the hash table, so the
+ * same dictionary and indices whichever path a chunk takes. */
+static carquet_status_t build_fixed_int(size_t size, const uint8_t* src,
+                                        int64_t count, size_t max_dict_bytes,
+                                        carquet_buffer_t* dict_output,
+                                        uint32_t* indices, uint32_t* num_entries,
+                                        bool* abandoned) {
+    uint64_t limit = (uint64_t)count > DIRECT_DICT_MIN_SPAN ? (uint64_t)count
+                                                            : DIRECT_DICT_MIN_SPAN;
+    int64_t lo = 0, hi = 0;
+    direct_dict_minmax(size, src, count < DIRECT_DICT_PREFIX ? count : DIRECT_DICT_PREFIX,
+                       &lo, &hi);
+    if ((uint64_t)hi - (uint64_t)lo >= limit) {
+        return build_fixed_word_from(size, src, count, 0, NULL, 0, 0, max_dict_bytes,
+                                     dict_output, indices, num_entries, abandoned);
+    }
+
+    unsigned bits = 12;
+    while (((uint64_t)1 << bits) <= (uint64_t)hi - (uint64_t)lo) bits++;
+    size_t mask = ((size_t)1 << bits) - 1;
+    uint32_t* map = carquet_mem_calloc(mask + 1, sizeof(uint32_t));
+    uint64_t* entries = NULL;
+    size_t entries_cap = 0;
+    carquet_status_t status = map ? CARQUET_OK : CARQUET_ERROR_OUT_OF_MEMORY;
     uint32_t n = 0;
-    if (!map || !entries) {
-        status = CARQUET_ERROR_OUT_OF_MEMORY;
-        count = 0;
-    }
-    for (int64_t i = 0; i < count; i++) {
-        uint64_t x = word_load(src + (size_t)i * size, size);
-        int64_t v = size == 4 ? (int64_t)(int32_t)(uint32_t)x : (int64_t)x;
-        uint64_t key = (uint64_t)v - (uint64_t)minv;
-        uint32_t slot = map[key];
-        if (!slot) {
-            entries[n] = x;
-            slot = ++n;
-            map[key] = slot;
-            if (max_dict_bytes && (size_t)n * size > max_dict_bytes) {
-                *abandoned = true;
-                break;
-            }
+
+    for (int64_t i = 0; status == CARQUET_OK && !*abandoned && i < count; ) {
+        int64_t block = count - i < DIRECT_DICT_BLOCK ? count - i : DIRECT_DICT_BLOCK;
+        const uint8_t* p = src + (size_t)i * size;
+        int64_t blo, bhi;
+        direct_dict_minmax(size, p, block, &blo, &bhi);
+        if (blo < lo) lo = blo;
+        if (bhi > hi) hi = bhi;
+        uint64_t span = (uint64_t)hi - (uint64_t)lo;
+        if (span >= limit) {
+            carquet_mem_free(map);
+            return build_fixed_word_from(size, src, count, i, entries, entries_cap, n,
+                                         max_dict_bytes, dict_output, indices,
+                                         num_entries, abandoned);
         }
-        indices[i] = slot - 1;
-    }
-    if (status == CARQUET_OK && !*abandoned && n > 0) {
-        size_t base = dict_output->size;
-        status = carquet_buffer_resize(dict_output, base + (size_t)n * size);
-        if (status == CARQUET_OK) {
-            uint8_t* out = dict_output->data + base;
-            if (size == 8) {
-                memcpy(out, entries, (size_t)n * 8);
-            } else {
-                for (uint32_t e = 0; e < n; e++) {
-                    uint32_t w = (uint32_t)entries[e];
-                    memcpy(out + (size_t)e * 4, &w, 4);
+        if (span > mask) {
+            unsigned nbits = bits + 1;
+            while (((uint64_t)1 << nbits) <= span) nbits++;
+            size_t nmask = ((size_t)1 << nbits) - 1;
+            uint32_t* nmap = carquet_mem_calloc(nmask + 1, sizeof(uint32_t));
+            if (!nmap) { status = CARQUET_ERROR_OUT_OF_MEMORY; break; }
+            for (uint32_t e = 0; e < n; e++) nmap[entries[e] & nmask] = e + 1;
+            carquet_mem_free(map);
+            map = nmap;
+            bits = nbits;
+            mask = nmask;
+        }
+        for (int64_t j = 0; j < block; j++) {
+            uint64_t x = word_load(p + (size_t)j * size, size);
+            uint32_t slot = map[x & mask];
+            if (!slot) {
+                if (n == UINT32_MAX) { status = CARQUET_ERROR_ENCODE; break; }
+                if (!fixed_word_entries_grow(&entries, &entries_cap, n)) {
+                    status = CARQUET_ERROR_OUT_OF_MEMORY;
+                    break;
+                }
+                entries[n] = x;
+                slot = ++n;
+                map[x & mask] = slot;
+                if (max_dict_bytes && (size_t)n * size > max_dict_bytes) {
+                    *abandoned = true;
+                    break;
                 }
             }
+            indices[i + j] = slot - 1;
         }
+        i += block;
+    }
+    if (status == CARQUET_OK && !*abandoned) {
+        status = fixed_word_emit(size, entries, n, dict_output);
     }
     carquet_mem_free(map);
     carquet_mem_free(entries);
@@ -795,21 +841,13 @@ static carquet_status_t build_fixed(carquet_physical_type_t type, size_t size,
 #if CARQUET_LITTLE_ENDIAN
     if ((type == CARQUET_PHYSICAL_INT32 && size == 4) ||
         (type == CARQUET_PHYSICAL_INT64 && size == 8)) {
-        int64_t minv = 0;
-        uint64_t span = direct_dict_span(size, values, count, &minv);
-        if (span > 0) {
-            return build_fixed_direct(size, (const uint8_t*)values, count, minv, span,
-                                      max_dict_bytes, dict_output, indices,
-                                      num_entries, abandoned);
-        }
+        return build_fixed_int(size, (const uint8_t*)values, count, max_dict_bytes,
+                               dict_output, indices, num_entries, abandoned);
     }
-    if (size == 4) {
-        return build_fixed_word(4, (const uint8_t*)values, count, max_dict_bytes,
-                                dict_output, indices, num_entries, abandoned);
-    }
-    if (size == 8) {
-        return build_fixed_word(8, (const uint8_t*)values, count, max_dict_bytes,
-                                dict_output, indices, num_entries, abandoned);
+    if (size == 4 || size == 8) {
+        return build_fixed_word_from(size, (const uint8_t*)values, count, 0, NULL, 0, 0,
+                                     max_dict_bytes, dict_output, indices,
+                                     num_entries, abandoned);
     }
 #endif
     fixed_table_t t = {NULL, 0};

@@ -527,14 +527,26 @@ static void run_benchmark(const char* dataset_name, int num_rows, int nullable,
         iters = BENCH_ITERATIONS_LARGE;  /* large and xlarge */
     }
 
+    /* CARQUET_BENCH_PHASE=write|read|read_nommap (profiling aid): the other
+     * phases run once, unwarmed, so a profile holds one phase only. Their
+     * figures are then meaningless. */
+    const char* phase = getenv("CARQUET_BENCH_PHASE");
+    int w_iters = iters, r_iters = iters, n_iters = iters;
+    int w_warm = WARMUP_ITERATIONS, r_warm = WARMUP_ITERATIONS, n_warm = WARMUP_ITERATIONS;
+    if (phase && phase[0]) {
+        if (strcmp(phase, "write") != 0) { w_iters = 1; w_warm = 0; }
+        if (strcmp(phase, "read") != 0) { r_iters = 1; r_warm = 0; }
+        if (strcmp(phase, "read_nommap") != 0) { n_iters = 1; n_warm = 0; }
+    }
+
     /* Warmup writes */
-    for (int i = 0; i < WARMUP_ITERATIONS; i++) {
+    for (int i = 0; i < w_warm; i++) {
         benchmark_write(filename, td, codec);
     }
 
     /* Benchmark writes */
     double write_times[MAX_BENCH_ITERATIONS];
-    for (int i = 0; i < iters; i++) {
+    for (int i = 0; i < w_iters; i++) {
         write_times[i] = benchmark_write(filename, td, codec);
     }
 
@@ -547,13 +559,13 @@ static void run_benchmark(const char* dataset_name, int num_rows, int nullable,
     purge_file_cache(filename);
 
     int read_failed = 0;
-    for (int i = 0; i < WARMUP_ITERATIONS; i++) {
+    for (int i = 0; i < r_warm; i++) {
         if (benchmark_read(filename, num_rows, pool, true, expected_nulls) < 0.0) read_failed = 1;
     }
 
     /* Benchmark reads (warm cache — realistic for most workloads) */
     double read_times[MAX_BENCH_ITERATIONS];
-    for (int i = 0; i < iters; i++) {
+    for (int i = 0; i < r_iters; i++) {
         read_times[i] = benchmark_read(filename, num_rows, pool, true, expected_nulls);
         if (read_times[i] < 0.0) read_failed = 1;
     }
@@ -562,12 +574,12 @@ static void run_benchmark(const char* dataset_name, int num_rows, int nullable,
      * warm up, measure. Runs after the mmap pass so that one is unchanged. */
     purge_file_cache(filename);
 
-    for (int i = 0; i < WARMUP_ITERATIONS; i++) {
+    for (int i = 0; i < n_warm; i++) {
         if (benchmark_read(filename, num_rows, pool, false, expected_nulls) < 0.0) read_failed = 1;
     }
 
     double read_nommap_times[MAX_BENCH_ITERATIONS];
-    for (int i = 0; i < iters; i++) {
+    for (int i = 0; i < n_iters; i++) {
         read_nommap_times[i] = benchmark_read(filename, num_rows, pool, false, expected_nulls);
         if (read_nommap_times[i] < 0.0) read_failed = 1;
     }
@@ -580,9 +592,9 @@ static void run_benchmark(const char* dataset_name, int num_rows, int nullable,
         return;
     }
 
-    double write_med = trimmed_median(write_times, iters);
-    double read_med = trimmed_median(read_times, iters);
-    double read_nommap_med = trimmed_median(read_nommap_times, iters);
+    double write_med = trimmed_median(write_times, w_iters);
+    double read_med = trimmed_median(read_times, r_iters);
+    double read_nommap_med = trimmed_median(read_nommap_times, n_iters);
 
     double rows_per_sec_write = (num_rows / write_med) * 1000;
     double rows_per_sec_read = (num_rows / read_med) * 1000;

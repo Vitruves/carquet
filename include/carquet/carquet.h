@@ -2720,8 +2720,10 @@ typedef struct carquet_writer_options {
      * When enabled, a finalized row group is handed to an I/O thread that
      * writes it while the caller's next batches are buffered, encoded and
      * compressed, so file writes overlap with encoding instead of stalling
-     * it. At most one row group is in flight; peak memory grows by about one
-     * encoded (compressed) row group. A failed background write surfaces on
+     * it. With OpenMP, row groups are also encoded while the next ones are
+     * filled: up to 8 stay in flight (being encoded or written) as long as
+     * their raw input fits 128 MB, two whatever their size, and peak memory
+     * grows by that much. A failed background write surfaces on
      * the next row-group flush or on carquet_writer_close(). When the writer
      * wraps a caller-supplied `FILE*`, the caller must not touch that stream
      * between carquet_writer_create_file() and carquet_writer_close().
@@ -2746,6 +2748,13 @@ void carquet_writer_options_init(carquet_writer_options_t* options);
  *
  * Creates a new file and prepares it for writing. The schema defines the
  * structure of the data to be written.
+ *
+ * A file already at @p path is replaced. It stops being a valid Parquet file
+ * as soon as this call returns and holds the new one once
+ * carquet_writer_close() has succeeded; carquet_writer_abort() removes it.
+ * On Linux the old bytes are written over rather than released first (much
+ * faster, notably on ext4), so until the writer is closed the file keeps its
+ * old size, with new data at the front and old data behind it.
  *
  * @param[in] path Output file path
  * @param[in] schema File schema (copied, caller retains ownership)

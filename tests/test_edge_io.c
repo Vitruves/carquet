@@ -451,6 +451,106 @@ static int test_roundtrip_single_row(void) {
     return 0;
 }
 
+/* Write `rows` INT64 rows (value i * 3) uncompressed to `path`. */
+static int write_int64_file(const char* path, int64_t rows) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t* schema = carquet_schema_create(&err);
+    carquet_schema_add_column(schema, "v", CARQUET_PHYSICAL_INT64, NULL,
+                              CARQUET_REPETITION_REQUIRED, 0, 0);
+    carquet_writer_t* writer = carquet_writer_create(path, schema, NULL, &err);
+    if (!writer) {
+        carquet_schema_free(schema);
+        return 1;
+    }
+    int64_t* values = malloc((size_t)rows * sizeof(int64_t));
+    for (int64_t i = 0; i < rows; i++) values[i] = i * 3;
+    carquet_status_t status = carquet_writer_write_batch(writer, 0, values, rows, NULL, NULL);
+    free(values);
+    if (carquet_writer_close(writer) != CARQUET_OK) status = CARQUET_ERROR_FILE_WRITE;
+    carquet_schema_free(schema);
+    return status == CARQUET_OK ? 0 : 1;
+}
+
+static uint8_t* read_whole_file(const char* path, long* size) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    *size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t* data = malloc(*size > 0 ? (size_t)*size : 1);
+    if (fread(data, 1, (size_t)*size, f) != (size_t)*size) {
+        free(data);
+        data = NULL;
+    }
+    fclose(f);
+    return data;
+}
+
+/* A writer created over an existing file replaces it: the result is byte for
+ * byte the file a fresh path gets, whether the old file was larger (large
+ * enough to be written over in place, its tail cut at close) or smaller, and
+ * an aborted writer leaves no file. */
+static int test_overwrite_existing_file(void) {
+    char path[512], fresh[512];
+    snprintf(path, sizeof(path), "%s", get_temp_file("overwrite"));
+    snprintf(fresh, sizeof(fresh), "%s", get_temp_file("overwrite_fresh"));
+    static const int64_t sizes[][2] = {
+        {2000000, 1000},      /* 16 MB file replaced by a small one */
+        {2000000, 1500000},   /* ... by one that ends inside it */
+        {1000, 2000000},      /* small file replaced by a large one */
+        {1000000, 2000000},   /* large file replaced by a larger one */
+    };
+    for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); k++) {
+        cleanup_file(path);
+        cleanup_file(fresh);
+        if (write_int64_file(path, sizes[k][0]) || write_int64_file(path, sizes[k][1]) ||
+            write_int64_file(fresh, sizes[k][1])) {
+            cleanup_file(path);
+            cleanup_file(fresh);
+            TEST_FAIL("overwrite_existing_file", "write failed");
+        }
+        long size_a = 0, size_b = 0;
+        uint8_t* a = read_whole_file(path, &size_a);
+        uint8_t* b = read_whole_file(fresh, &size_b);
+        int same = a && b && size_a == size_b && memcmp(a, b, (size_t)size_a) == 0;
+        free(a);
+        free(b);
+        if (!same) {
+            cleanup_file(path);
+            cleanup_file(fresh);
+            printf("  [DEBUG] case %zu: %ld vs %ld bytes\n", k, size_a, size_b);
+            TEST_FAIL("overwrite_existing_file", "overwritten file differs from a fresh one");
+        }
+        carquet_error_t err = CARQUET_ERROR_INIT;
+        carquet_reader_t* reader = carquet_reader_open(path, NULL, &err);
+        int64_t rows = reader ? carquet_reader_num_rows(reader) : -1;
+        if (reader) carquet_reader_close(reader);
+        if (rows != sizes[k][1]) {
+            cleanup_file(path);
+            cleanup_file(fresh);
+            TEST_FAIL("overwrite_existing_file", "wrong row count after overwrite");
+        }
+    }
+
+    /* Abort over a large existing file: the file is removed, as before. */
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t* schema = carquet_schema_create(&err);
+    carquet_schema_add_column(schema, "v", CARQUET_PHYSICAL_INT64, NULL,
+                              CARQUET_REPETITION_REQUIRED, 0, 0);
+    carquet_writer_t* writer = carquet_writer_create(path, schema, NULL, &err);
+    if (writer) carquet_writer_abort(writer);
+    carquet_schema_free(schema);
+    FILE* gone = fopen(path, "rb");
+    if (gone) fclose(gone);
+    cleanup_file(path);
+    cleanup_file(fresh);
+    if (!writer || gone) {
+        TEST_FAIL("overwrite_existing_file", "aborted writer left the file");
+    }
+    TEST_PASS("overwrite_existing_file");
+    return 0;
+}
+
 /* ============================================================================
  * Options Edge Cases
  * ============================================================================
@@ -515,6 +615,7 @@ int main(void) {
 
     printf("\n--- Roundtrip Edge Cases ---\n");
     failures += test_roundtrip_single_row();
+    failures += test_overwrite_existing_file();
 
     printf("\n--- Options Edge Cases ---\n");
     failures += test_reader_options_defaults();

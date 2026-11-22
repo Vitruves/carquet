@@ -113,6 +113,15 @@ typedef struct carquet_page_writer {
     carquet_buffer_t page_buffer;        /* Final page with header */
     carquet_buffer_t compress_buffer;   /* Reusable compression buffer */
 
+    /* Borrowed values (carquet_page_writer_set_borrow_values): while
+     * values_borrowed, values_buffer is a non-owning view of the caller's
+     * values (one contiguous run, valid until the page is finalized) and the
+     * owned buffer waits in owned_values. PLAIN / BYTE_STREAM_SPLIT pages of
+     * the fixed-width numeric types only. */
+    bool borrow_values;
+    bool values_borrowed;
+    carquet_buffer_t owned_values;
+
     carquet_physical_type_t type;
     carquet_logical_type_t logical_type;
     carquet_encoding_t encoding;
@@ -265,6 +274,7 @@ carquet_page_writer_t* carquet_page_writer_create(
     carquet_buffer_init(&writer->def_levels_buffer);
     carquet_buffer_init(&writer->rep_levels_buffer);
     carquet_buffer_init(&writer->staging_buffer);
+    carquet_buffer_init(&writer->owned_values);
     carquet_buffer_init(&writer->page_buffer);
     carquet_buffer_init(&writer->compress_buffer);
 
@@ -299,8 +309,34 @@ carquet_page_writer_t* carquet_page_writer_create(
     return writer;
 }
 
+/* Put the owned values buffer back in place of a borrowed view. */
+static void values_drop_view(carquet_page_writer_t* writer) {
+    if (writer->values_borrowed) {
+        writer->values_buffer = writer->owned_values;
+        carquet_buffer_init(&writer->owned_values);
+        writer->values_borrowed = false;
+    }
+}
+
+/* Copy a borrowed view into the owned buffer (the page goes on accumulating
+ * there). */
+static carquet_status_t values_materialize(carquet_page_writer_t* writer) {
+    if (!writer->values_borrowed) return CARQUET_OK;
+    carquet_buffer_t view = writer->values_buffer;
+    values_drop_view(writer);
+    carquet_buffer_clear(&writer->values_buffer);
+    return view.size > 0
+        ? carquet_buffer_append(&writer->values_buffer, view.data, view.size)
+        : CARQUET_OK;
+}
+
+void carquet_page_writer_set_borrow_values(carquet_page_writer_t* writer, bool enabled) {
+    if (writer) writer->borrow_values = enabled;
+}
+
 void carquet_page_writer_destroy(carquet_page_writer_t* writer) {
     if (writer) {
+        values_drop_view(writer);
         carquet_buffer_destroy(&writer->values_buffer);
         carquet_buffer_destroy(&writer->def_levels_buffer);
         carquet_buffer_destroy(&writer->rep_levels_buffer);
@@ -316,6 +352,7 @@ void carquet_page_writer_destroy(carquet_page_writer_t* writer) {
 }
 
 void carquet_page_writer_reset(carquet_page_writer_t* writer) {
+    values_drop_view(writer);
     carquet_buffer_clear(&writer->values_buffer);
     writer->deferred_applied = false;
     carquet_buffer_clear(&writer->def_levels_buffer);
@@ -1093,6 +1130,58 @@ carquet_status_t carquet_page_writer_add_values(
      * has num_values entries (one per logical row) indicating which rows are
      * null vs present.
      */
+#if CARQUET_LITTLE_ENDIAN && !defined(CARQUET_STRICT_ALIGN)
+    /* Borrowed values: the page is one contiguous run of the caller's values,
+     * PLAIN bytes as they stand, so reference them instead of copying; only
+     * the statistics read them here. finalize compresses / transposes /
+     * copies straight from the caller's memory. */
+    if (writer->borrow_values &&
+        (writer->encoding == CARQUET_ENCODING_PLAIN ||
+         writer->encoding == CARQUET_ENCODING_BYTE_STREAM_SPLIT) &&
+        (writer->type == CARQUET_PHYSICAL_INT32 || writer->type == CARQUET_PHYSICAL_INT64 ||
+         writer->type == CARQUET_PHYSICAL_FLOAT || writer->type == CARQUET_PHYSICAL_DOUBLE)) {
+        size_t stride = (writer->type == CARQUET_PHYSICAL_INT32 ||
+                         writer->type == CARQUET_PHYSICAL_FLOAT) ? 4 : 8;
+        if (!writer->values_borrowed && writer->values_buffer.size == 0) {
+            writer->owned_values = writer->values_buffer;
+            carquet_buffer_init_wrap(&writer->values_buffer, (uint8_t*)(uintptr_t)values, 0);
+            writer->values_borrowed = true;
+            values_size_before = 0;
+        }
+        if (writer->values_borrowed && writer->values_buffer.size == 0) {
+            writer->values_buffer.data = (uint8_t*)(uintptr_t)values;
+        }
+        if (writer->values_borrowed &&
+            (const uint8_t*)values == writer->values_buffer.data + writer->values_buffer.size) {
+            writer->values_buffer.size += (size_t)num_non_null * stride;
+            writer->values_buffer.capacity = writer->values_buffer.size;
+            if (writer->write_statistics) {
+                switch (writer->type) {
+                    case CARQUET_PHYSICAL_INT32:
+                        update_statistics_i32(writer, (const int32_t*)values, num_non_null);
+                        break;
+                    case CARQUET_PHYSICAL_INT64:
+                        update_statistics_i64(writer, (const int64_t*)values, num_non_null);
+                        break;
+                    case CARQUET_PHYSICAL_FLOAT:
+                        update_statistics_float(writer, (const float*)values, num_non_null);
+                        break;
+                    default:
+                        update_statistics_double(writer, (const double*)values, num_non_null);
+                        break;
+                }
+            }
+            goto values_done;
+        }
+        /* Not a continuation of the run: own the bytes from here on. */
+        status = values_materialize(writer);
+        if (status != CARQUET_OK) {
+            goto fail;
+        }
+        values_size_before = writer->values_buffer.size;
+    }
+#endif
+
     switch (writer->type) {
         case CARQUET_PHYSICAL_BOOLEAN: {
             const uint8_t* bools = (const uint8_t*)values;
@@ -1263,6 +1352,9 @@ carquet_status_t carquet_page_writer_add_values(
         goto fail;
     }
 
+#if CARQUET_LITTLE_ENDIAN && !defined(CARQUET_STRICT_ALIGN)
+values_done:
+#endif
     writer->num_values += num_values;
     /* Logical rows (rep_level == 0): the V2 header's num_rows and the
      * OffsetIndex first_row_index both need rows, not levels. */
@@ -1821,6 +1913,8 @@ static carquet_status_t apply_byte_stream_split(carquet_page_writer_t* writer) {
     }
     writer->staging_buffer.size = size;
 
+    /* A borrowed view is spent: the owned buffer takes its place in the swap. */
+    values_drop_view(writer);
     carquet_buffer_t tmp = writer->values_buffer;
     writer->values_buffer = writer->staging_buffer;
     writer->staging_buffer = tmp;
@@ -1916,6 +2010,7 @@ static carquet_status_t apply_delta_encoding(carquet_page_writer_t* writer) {
         if (status != CARQUET_OK) return status;
     }
 
+    values_drop_view(writer);
     carquet_buffer_t tmp = writer->values_buffer;
     writer->values_buffer = writer->staging_buffer;
     writer->staging_buffer = tmp;
@@ -2207,6 +2302,8 @@ carquet_status_t carquet_page_writer_add_dictionary_indices(
         if (status != CARQUET_OK) return status;
     }
 
+    status = values_materialize(writer);
+    if (status != CARQUET_OK) return status;
     status = carquet_buffer_append(&writer->values_buffer, idx_payload, idx_size);
     if (status != CARQUET_OK) return status;
 
@@ -2350,20 +2447,6 @@ void carquet_page_writer_set_crc(carquet_page_writer_t* writer, bool enabled) {
     }
 }
 
-/* Fold the min/max of `count` INT32 / INT64 values into the page statistics
- * exactly as staging them on a PLAIN page would (signed or unsigned order by
- * logical type), for a page that stages something else than the values
- * themselves (dictionary indices). Other physical types are ignored. */
-void carquet_page_writer_add_int_statistics(carquet_page_writer_t* writer,
-                                            const void* values, int64_t count) {
-    if (!writer || !writer->write_statistics || !values || count <= 0) return;
-    if (writer->type == CARQUET_PHYSICAL_INT32) {
-        update_statistics_i32(writer, (const int32_t*)values, count);
-    } else if (writer->type == CARQUET_PHYSICAL_INT64) {
-        update_statistics_i64(writer, (const int64_t*)values, count);
-    }
-}
-
 bool carquet_page_writer_statistics_enabled(const carquet_page_writer_t* writer) {
     return writer && writer->write_statistics;
 }
@@ -2444,6 +2527,7 @@ carquet_status_t carquet_page_writer_adopt_config(
     dst->write_statistics = src->write_statistics;
     dst->data_page_v2 = src->data_page_v2;
     dst->geo_enabled = false;
+    dst->borrow_values = false;
     carquet_page_writer_reset(dst);
     return CARQUET_OK;
 }

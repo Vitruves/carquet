@@ -27,6 +27,11 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -310,7 +315,7 @@ typedef struct io_job {
  * written) only while the raw bytes of all of them fit this budget: large
  * row groups keep a two-deep pipeline, small ones, whose few pages cannot
  * keep the pool busy on their own, overlap more deeply. */
-#define PIPELINE_BYTES_BUDGET ((int64_t)64 * 1024 * 1024)
+#define PIPELINE_BYTES_BUDGET ((int64_t)128 * 1024 * 1024)
 /* Row groups that stay in flight whatever their size: one being encoded and
  * one being written, so the write of row group n-1 overlaps the input of
  * n+1 even when a single row group exceeds the budget. */
@@ -405,6 +410,17 @@ struct carquet_writer {
     int64_t file_offset;
     int64_t total_rows;
     bool header_written;
+    /* Size of the file being written over in place (see open_for_overwrite),
+     * 0 when there is none: close cuts whatever is left of it past the new
+     * end. */
+    int64_t overwrite_old_size;
+    /* Systems that empty an existing file instead (see open_for_truncate):
+     * the first job of the I/O thread does it, and writes the header, so
+     * that releasing the old contents overlaps the input and encode of the
+     * first row group. Settled by writer_io_drain(); open_status is the
+     * job's. */
+    bool open_pending;
+    carquet_status_t open_status;
 
     /* Arena for metadata allocations */
     carquet_arena_t arena;
@@ -1343,6 +1359,13 @@ static void io_write_task(void* arg) {
  * for reuse. Returns the first write error, which also sticks on the writer.
  * Must precede any direct access to writer->sink. */
 static carquet_status_t writer_io_drain(carquet_writer_t* writer) {
+    if (writer->open_pending && writer->io_pool) {
+        carquet_worker_pool_wait(writer->io_pool);
+        writer->open_pending = false;
+        if (writer->open_status != CARQUET_OK && writer->io_error == CARQUET_OK) {
+            writer->io_error = writer->open_status;
+        }
+    }
     if (!writer->io_pool || writer->io_jobs_in_flight == 0) {
         return writer->io_error;
     }
@@ -1422,6 +1445,57 @@ static bool writer_io_ready(carquet_writer_t* writer) {
     }
     return true;
 }
+
+#if !defined(_WIN32) && !defined(__linux__)
+/* An existing file of at least this size is emptied on the I/O thread. */
+#define DEFERRED_TRUNCATE_MIN_BYTES ((off_t)4 * 1024 * 1024)
+
+/* fopen(path, "wb") that leaves the contents of a large existing regular
+ * file in place for the caller to drop (*truncate_pending): emptying a
+ * 10 MB file takes APFS as long as encoding its replacement. */
+static FILE* open_for_truncate(const char* path, bool* truncate_pending) {
+    *truncate_pending = false;
+    int fd = open(path, O_WRONLY | O_CREAT, 0666);
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        return NULL;
+    }
+    if (S_ISREG(st.st_mode) && st.st_size > 0) {
+        if (st.st_size >= DEFERRED_TRUNCATE_MIN_BYTES) {
+            *truncate_pending = true;
+        } else if (ftruncate(fd, 0) != 0) {
+            close(fd);
+            return NULL;
+        }
+    }
+    FILE* file = fdopen(fd, "wb");
+    if (!file) close(fd);
+    return file;
+}
+
+static void io_open_task(void* arg) {
+    carquet_writer_t* writer = (carquet_writer_t*)arg;
+    writer->open_status = ftruncate(fileno(writer->sink.file), 0) == 0
+        ? write_magic(&writer->sink) : CARQUET_ERROR_FILE_WRITE;
+}
+
+/* Empty the file just opened: on the I/O thread, together with the header,
+ * when there is one; here otherwise. */
+static carquet_status_t writer_start_truncate(carquet_writer_t* writer) {
+    if (writer_io_ready(writer)) {
+        writer->open_status = CARQUET_OK;
+        writer->open_pending = true;
+        writer->file_offset = 4;  /* PAR1 magic */
+        writer->header_written = true;
+        carquet_worker_pool_submit(writer->io_pool, io_open_task, writer);
+        return CARQUET_OK;
+    }
+    return carquet_ftruncate64(writer->sink.file, 0) == 0
+        ? CARQUET_OK : CARQUET_ERROR_FILE_WRITE;
+}
+#endif
 
 /* Queue every column chunk of a finalized row group for the I/O thread. The
  * previous row group's jobs must have been drained (writer_io_drain). Pages
@@ -2706,6 +2780,43 @@ static carquet_status_t build_file_metadata(
  * ============================================================================
  */
 
+#ifdef __linux__
+/* fopen(path, "wb") for a file writer, on Linux. Emptying an existing file
+ * first makes the kernel release every page of it, only to allocate as many
+ * again for the new contents, and ext4 answers a file emptied then rewritten
+ * with a synchronous flush when it is closed (auto_da_alloc): writing a
+ * 190 MB file over itself took 1.6 s that way against 80 ms over the old
+ * bytes, 130 ms against 76 ms on tmpfs. So an existing regular file keeps
+ * its contents and only its trailing magic is zeroed, which makes it an
+ * invalid Parquet file from this point until close, as an emptied one would
+ * be, whatever interrupts the write. *old_size is its size (0: nothing to
+ * write over); close cuts the file there if the new one ends before. Other
+ * systems keep "wb": on APFS writing over a file is the slower of the two. */
+static FILE* open_for_overwrite(const char* path, int64_t* old_size) {
+    *old_size = 0;
+    int fd = open(path, O_WRONLY | O_CREAT, 0666);
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        return NULL;
+    }
+    if (S_ISREG(st.st_mode) && st.st_size > 0) {
+        static const uint8_t no_magic[4] = {0, 0, 0, 0};
+        if (st.st_size >= 8 &&
+            pwrite(fd, no_magic, sizeof(no_magic), st.st_size - 4) == (ssize_t)sizeof(no_magic)) {
+            *old_size = (int64_t)st.st_size;
+        } else if (ftruncate(fd, 0) != 0) {
+            close(fd);
+            return NULL;
+        }
+    }
+    FILE* file = fdopen(fd, "wb");
+    if (!file) close(fd);
+    return file;
+}
+#endif
+
 carquet_writer_t* carquet_writer_create(
     const char* path,
     const carquet_schema_t* schema,
@@ -2726,7 +2837,15 @@ carquet_writer_t* carquet_writer_create(
     }
 
     /* Open file */
+#ifdef __linux__
+    carquet_writer_sink_init(&writer->sink,
+                             open_for_overwrite(path, &writer->overwrite_old_size));
+#elif !defined(_WIN32)
+    bool truncate_pending = false;
+    carquet_writer_sink_init(&writer->sink, open_for_truncate(path, &truncate_pending));
+#else
     carquet_writer_sink_init(&writer->sink, carquet_fopen(path, "wb"));
+#endif
     if (!writer->sink.file) {
         carquet_arena_destroy(&writer->arena);
         carquet_mem_free(writer);
@@ -2793,6 +2912,15 @@ carquet_writer_t* carquet_writer_create(
             return NULL;
         }
     }
+
+#if !defined(_WIN32) && !defined(__linux__)
+    if (truncate_pending && writer_start_truncate(writer) != CARQUET_OK) {
+        carquet_writer_abort(writer);
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_OPEN,
+                          "Failed to truncate file for writing: %s", path);
+        return NULL;
+    }
+#endif
 
     return writer;
 }
@@ -3770,10 +3898,14 @@ carquet_status_t carquet_writer_close(carquet_writer_t* writer) {
     /* An append writes over the old footer without truncating the file. The
      * new footer can be shorter (empty statistics, encoding stats and
      * key-value metadata are not restored byte for byte), which would leave
-     * the old footer length and PAR1 at the end of the file. */
-    if (writer->is_append) {
+     * the old footer length and PAR1 at the end of the file. A file written
+     * over in place (open_for_overwrite) still holds the end of the old one
+     * when the new one is shorter. */
+    if (writer->is_append || writer->overwrite_old_size > 0) {
         int64_t end = carquet_ftell64(writer->sink.file);
-        if (end < 0 || carquet_ftruncate64(writer->sink.file, end) != 0) {
+        if (end < 0 ||
+            ((writer->is_append || end < writer->overwrite_old_size) &&
+             carquet_ftruncate64(writer->sink.file, end) != 0)) {
             status = CARQUET_ERROR_FILE_WRITE;
             goto cleanup;
         }
@@ -3801,6 +3933,12 @@ cleanup:
     }
 
     if (writer->owns_file && writer->sink.file) {
+        if (status != CARQUET_OK && writer->overwrite_old_size > 0) {
+            /* A failed write leaves what it wrote, not the remains of the
+             * file it was writing over (best effort). */
+            int64_t end = carquet_ftell64(writer->sink.file);
+            if (end >= 0) (void)carquet_ftruncate64(writer->sink.file, end);
+        }
         fclose(writer->sink.file);
         writer->sink.file = NULL;
     }

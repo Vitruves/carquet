@@ -72,6 +72,12 @@ typedef void (*build_null_bitmap_fn)(const int16_t* def_levels, int64_t count,
                                       int16_t max_def_level, uint8_t* null_bitmap);
 typedef void (*fill_def_levels_fn)(int16_t* def_levels, int64_t count, int16_t value);
 typedef bool (*levels_to_bits_fn)(const int16_t* levels, int64_t count, uint64_t* bits);
+typedef int64_t (*expand_bits_32_fn)(uint32_t* dst, const uint32_t* src, int64_t ndense,
+                                     const uint8_t* bm, int64_t at, int64_t n,
+                                     int64_t* consumed);
+typedef int64_t (*expand_bits_64_fn)(uint64_t* dst, const uint64_t* src, int64_t ndense,
+                                     const uint8_t* bm, int64_t at, int64_t n,
+                                     int64_t* consumed);
 typedef void (*minmax_i32_fn)(const int32_t* values, int64_t count, int32_t* min_value, int32_t* max_value);
 typedef void (*minmax_i64_fn)(const int64_t* values, int64_t count, int64_t* min_value, int64_t* max_value);
 typedef void (*minmax_float_fn)(const float* values, int64_t count, float* min_value, float* max_value);
@@ -555,6 +561,12 @@ extern void carquet_avx2_prefix_sum_i32(int32_t* values, int64_t count, int32_t 
 extern void carquet_avx2_prefix_sum_i64(int64_t* values, int64_t count, int64_t initial);
 extern void carquet_avx2_gather_i32(const int32_t* dict, const uint32_t* indices,
                                      int64_t count, int32_t* output);
+extern int64_t carquet_avx2_expand_bits_32(uint32_t* dst, const uint32_t* src, int64_t ndense,
+                                           const uint8_t* bm, int64_t at, int64_t n,
+                                           int64_t* consumed);
+extern int64_t carquet_avx2_expand_bits_64(uint64_t* dst, const uint64_t* src, int64_t ndense,
+                                           const uint8_t* bm, int64_t at, int64_t n,
+                                           int64_t* consumed);
 extern void carquet_avx2_gather_i64(const int64_t* dict, const uint32_t* indices,
                                      int64_t count, int64_t* output);
 extern void carquet_avx2_gather_float(const float* dict, const uint32_t* indices,
@@ -847,6 +859,8 @@ typedef struct {
     build_null_bitmap_fn build_null_bitmap;
     fill_def_levels_fn fill_def_levels;
     levels_to_bits_fn levels_to_bits;
+    expand_bits_32_fn expand_bits_32;   /* NULL: no kernel, the caller's loop */
+    expand_bits_64_fn expand_bits_64;
     minmax_i32_fn minmax_i32;
     minmax_i64_fn minmax_i64;
     minmax_float_fn minmax_float;
@@ -1032,6 +1046,8 @@ void carquet_simd_dispatch_init(void) {
         g_dispatch.prefix_sum_i64 = carquet_avx2_prefix_sum_i64;
         g_dispatch.gather_i32 = carquet_avx2_gather_i32;
         g_dispatch.gather_i64 = carquet_avx2_gather_i64;
+        g_dispatch.expand_bits_32 = carquet_avx2_expand_bits_32;
+        g_dispatch.expand_bits_64 = carquet_avx2_expand_bits_64;
         g_dispatch.gather_float = carquet_avx2_gather_float;
         g_dispatch.gather_double = carquet_avx2_gather_double;
         g_dispatch.checked_gather_i32 = carquet_avx2_checked_gather_i32;
@@ -1449,6 +1465,28 @@ void carquet_dispatch_build_null_bitmap(const int16_t* def_levels, int64_t count
 void carquet_dispatch_fill_def_levels(int16_t* def_levels, int64_t count, int16_t value) {
     DISPATCH_ENSURE_INIT();
     g_dispatch.fill_def_levels(def_levels, count, value);
+}
+
+/* Expand a prefix of the rows of a nullable column from its dense values
+ * (row i takes the next value of src when bit at + i of bm is set, else
+ * zero), for 4- and 8-byte values. Returns the rows written, a multiple of
+ * 8 that may be 0 (no kernel for this CPU or width, or too few values left
+ * to load a vector), and stores the dense values consumed. The caller
+ * expands the remaining rows. */
+int64_t carquet_dispatch_expand_bits(void* dst, const void* src, int64_t ndense,
+                                     const uint8_t* bm, int64_t at, int64_t n,
+                                     size_t value_size, int64_t* consumed) {
+    DISPATCH_ENSURE_INIT();
+    *consumed = 0;
+    if (value_size == 4 && g_dispatch.expand_bits_32) {
+        return g_dispatch.expand_bits_32((uint32_t*)dst, (const uint32_t*)src, ndense,
+                                         bm, at, n, consumed);
+    }
+    if (value_size == 8 && g_dispatch.expand_bits_64) {
+        return g_dispatch.expand_bits_64((uint64_t*)dst, (const uint64_t*)src, ndense,
+                                         bm, at, n, consumed);
+    }
+    return 0;
 }
 
 bool carquet_dispatch_levels_to_bits(const int16_t* levels, int64_t count, uint64_t* bits) {

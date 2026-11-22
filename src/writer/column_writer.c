@@ -11,6 +11,7 @@
 #include <carquet/error.h>
 #include "core/buffer.h"
 #include "core/decimal_cmp.h"
+#include "core/endian.h"
 #include "core/float16.h"
 #include "thrift/thrift_encode.h"
 #include "thrift/parquet_types.h"
@@ -125,11 +126,10 @@ extern carquet_status_t carquet_page_writer_add_dictionary_indices(
     carquet_page_writer_t* writer, const uint8_t* idx_payload, size_t idx_size,
     const int16_t* def_levels, const int16_t* rep_levels,
     int64_t num_values_total, int64_t num_nulls);
+extern void carquet_page_writer_set_borrow_values(carquet_page_writer_t* writer, bool enabled);
 extern void carquet_page_writer_set_encoding(carquet_page_writer_t* writer,
                                              carquet_encoding_t encoding);
 extern bool carquet_page_writer_statistics_enabled(const carquet_page_writer_t* writer);
-extern void carquet_page_writer_add_int_statistics(
-    carquet_page_writer_t* writer, const void* values, int64_t count);
 extern carquet_status_t carquet_page_writer_set_min_max(
     carquet_page_writer_t* writer,
     const uint8_t* min_value, size_t min_size,
@@ -1448,6 +1448,32 @@ static void dict_chunk_min_max(carquet_column_writer_internal_t* w,
                                const uint8_t** max_out, size_t* max_len) {
     *min_out = NULL; *max_out = NULL; *min_len = 0; *max_len = 0;
     int32_t mn = -1, mx = -1;
+#if CARQUET_LITTLE_ENDIAN
+    /* Signed integers: the entries are one contiguous run of values. */
+    if ((w->type == CARQUET_PHYSICAL_INT32 || w->type == CARQUET_PHYSICAL_INT64) &&
+        !logical_integer_is_unsigned(&w->logical_type) &&
+        w->logical_type.id != CARQUET_LOGICAL_DECIMAL && n > 0) {
+        size_t stride = w->type == CARQUET_PHYSICAL_INT32 ? 4 : 8;
+        const uint8_t* base = e[0].data;
+        int64_t lo = 0, hi = 0;
+        mn = mx = 0;
+        for (int32_t i = 0; i < n; i++) {
+            int64_t v;
+            if (stride == 4) {
+                int32_t v32;
+                memcpy(&v32, base + (size_t)i * 4, 4);
+                v = v32;
+            } else {
+                memcpy(&v, base + (size_t)i * 8, 8);
+            }
+            if (i == 0) { lo = hi = v; continue; }
+            if (v < lo) { lo = v; mn = i; }
+            if (v > hi) { hi = v; mx = i; }
+        }
+        dict_minmax_output(w, &e[mn], &e[mx], min_out, min_len, max_out, max_len);
+        return;
+    }
+#endif
     for (int32_t i = 0; i < n; i++) {
         if (dict_is_floating(w)) {
             double v = dict_entry_double(w, &e[i]);
@@ -1461,79 +1487,57 @@ static void dict_chunk_min_max(carquet_column_writer_internal_t* w,
     dict_minmax_output(w, &e[mn], &e[mx], min_out, min_len, max_out, max_len);
 }
 
-/* Stable merge sort of entry ids by dict_entry_compare. */
-static void dict_sort_entries(const carquet_column_writer_internal_t* w,
-                              const dict_entry_ref_t* e,
-                              int32_t* ids, int32_t* tmp, int32_t n) {
-    for (int32_t width = 1; width < n; width *= 2) {
-        for (int32_t lo = 0; lo < n; lo += 2 * width) {
-            int32_t mid = lo + width < n ? lo + width : n;
-            int32_t hi = lo + 2 * width < n ? lo + 2 * width : n;
-            int32_t i = lo, j = mid, k = lo;
-            while (i < mid && j < hi) {
-                tmp[k++] = dict_entry_compare(w, &e[ids[j]], &e[ids[i]]) < 0
-                    ? ids[j++] : ids[i++];
-            }
-            while (i < mid) tmp[k++] = ids[i++];
-            while (j < hi) tmp[k++] = ids[j++];
-        }
-        memcpy(ids, tmp, (size_t)n * sizeof(int32_t));
-        if (width > INT32_MAX / 2) break;
-    }
-}
-
-/* rank[i] = position of entry i in statistics order, equal entries sharing
- * a rank; -1 for NaN. Lets each data page find its min/max with one integer
- * pass over its indices. */
-static carquet_status_t dict_entry_ranks(const carquet_column_writer_internal_t* w,
-                                         const dict_entry_ref_t* e, int32_t n,
-                                         int32_t** rank_out) {
-    *rank_out = NULL;
-    int32_t* rank = carquet_mem_malloc((size_t)n * sizeof(int32_t));
-    int32_t* ids = carquet_mem_malloc((size_t)n * sizeof(int32_t));
-    int32_t* tmp = carquet_mem_malloc((size_t)n * sizeof(int32_t));
-    if (!rank || !ids || !tmp) {
-        carquet_mem_free(rank); carquet_mem_free(ids); carquet_mem_free(tmp);
-        return CARQUET_ERROR_OUT_OF_MEMORY;
-    }
-    int32_t m = 0;
-    for (int32_t i = 0; i < n; i++) {
-        if (dict_is_floating(w)) {
-            double v = dict_entry_double(w, &e[i]);
-            if (v != v) { rank[i] = -1; continue; }
-        }
-        ids[m++] = i;
-    }
-    dict_sort_entries(w, e, ids, tmp, m);
-    int32_t r = 0;
-    for (int32_t k = 0; k < m; k++) {
-        if (k > 0 && dict_entry_compare(w, &e[ids[k - 1]], &e[ids[k]]) != 0) r++;
-        rank[ids[k]] = r;
-    }
-    carquet_mem_free(ids);
-    carquet_mem_free(tmp);
-    *rank_out = rank;
-    return CARQUET_OK;
-}
-
-/* Min/max of one data page from its indices and the entry ranks; ties go to
- * the lowest entry index (the one first seen in the chunk). */
+/* Min/max of one data page from its indices; ties go to the lowest entry
+ * index (the one first seen in the chunk), NaN entries are skipped. A page
+ * with few values next to the dictionary compares the entry of each index;
+ * any other marks the entries it uses in `seen` (one bit per entry,
+ * (num_unique + 63) / 64 words) and scans those in index order, so the cost
+ * is one pass over the indices, never over the values. */
 static void dict_page_min_max(carquet_column_writer_internal_t* w,
-                              const dict_entry_ref_t* e, const int32_t* rank,
-                              const uint32_t* idx, int64_t n,
+                              const dict_entry_ref_t* e, int32_t num_unique,
+                              uint64_t* seen, const uint32_t* idx, int64_t n,
                               const uint8_t** min_out, size_t* min_len,
                               const uint8_t** max_out, size_t* max_len) {
     *min_out = NULL; *max_out = NULL; *min_len = 0; *max_len = 0;
-    int32_t rmn = INT32_MAX, rmx = -1;
-    uint32_t mn = 0, mx = 0;
-    for (int64_t i = 0; i < n; i++) {
-        uint32_t v = idx[i];
-        int32_t r = rank[v];
-        if (r < 0) continue;
-        if (r < rmn || (r == rmn && v < mn)) { rmn = r; mn = v; }
-        if (r > rmx || (r == rmx && v < mx)) { rmx = r; mx = v; }
+    bool floating = dict_is_floating(w);
+    int64_t mn = -1, mx = -1;
+    if (n < (int64_t)num_unique / 4) {
+        for (int64_t i = 0; i < n; i++) {
+            int64_t v = idx[i];
+            if (floating) {
+                double d = dict_entry_double(w, &e[v]);
+                if (d != d) continue;
+            }
+            if (mn < 0) { mn = mx = v; continue; }
+            if (v == mn || v == mx) continue;
+            int c = dict_entry_compare(w, &e[v], &e[mn]);
+            if (c < 0 || (c == 0 && v < mn)) mn = v;
+            c = dict_entry_compare(w, &e[v], &e[mx]);
+            if (c > 0 || (c == 0 && v < mx)) mx = v;
+        }
+    } else {
+        size_t words = ((size_t)num_unique + 63) / 64;
+        memset(seen, 0, words * sizeof(uint64_t));
+        for (int64_t i = 0; i < n; i++) {
+            uint32_t v = idx[i];
+            seen[v >> 6] |= (uint64_t)1 << (v & 63);
+        }
+        for (size_t wi = 0; wi < words; wi++) {
+            uint64_t bits = seen[wi];
+            for (int b = 0; bits != 0; b++, bits >>= 1) {
+                if (!(bits & 1)) continue;
+                int64_t v = (int64_t)(wi * 64) + b;
+                if (floating) {
+                    double d = dict_entry_double(w, &e[v]);
+                    if (d != d) continue;
+                }
+                if (mn < 0) { mn = mx = v; continue; }
+                if (dict_entry_compare(w, &e[v], &e[mn]) < 0) mn = v;
+                if (dict_entry_compare(w, &e[v], &e[mx]) > 0) mx = v;
+            }
+        }
     }
-    if (rmx < 0) return;
+    if (mn < 0) return;
     dict_minmax_output(w, &e[mn], &e[mx], min_out, min_len, max_out, max_len);
 }
 
@@ -1671,7 +1675,7 @@ static carquet_status_t emit_dictionary_data_pages(
 
     carquet_buffer_t payload;
     carquet_buffer_init(&payload);
-    int32_t* rank = NULL;
+    uint64_t* seen = NULL;
     carquet_status_t status = CARQUET_OK;
     int64_t off = 0, packed = 0;
     while (status == CARQUET_OK && off < total) {
@@ -1694,26 +1698,21 @@ static carquet_status_t emit_dictionary_data_pages(
         }
 
         /* The page header carries the statistics of the page's own values,
-         * as on a PLAIN page. */
-        if (status == CARQUET_OK && stats && nn > 0 &&
-            (writer->type == CARQUET_PHYSICAL_INT32 ||
-             writer->type == CARQUET_PHYSICAL_INT64)) {
-            /* Integers: one vector pass over the page's accumulated values,
-             * the PLAIN path's own statistics, instead of ranking the
-             * dictionary entries (a sort) and chasing a rank per index. */
-            size_t stride = physical_type_stride(writer->type, writer->type_length);
-            carquet_page_writer_add_int_statistics(
-                writer->page_writer,
-                writer->dict_values.data + (size_t)packed * stride, nn);
-        } else if (status == CARQUET_OK && stats && nn > 0) {
+         * as on a PLAIN page, found from its indices. */
+        if (status == CARQUET_OK && stats && nn > 0) {
             const uint8_t *mn = NULL, *mx = NULL;
             size_t mn_len = 0, mx_len = 0;
             if (off == 0 && rows == total) {
                 dict_chunk_min_max(writer, entries, num_unique, &mn, &mn_len, &mx, &mx_len);
             } else {
-                if (!rank) status = dict_entry_ranks(writer, entries, num_unique, &rank);
+                if (!seen) {
+                    seen = carquet_mem_malloc((((size_t)num_unique + 63) / 64) *
+                                              sizeof(uint64_t));
+                    if (!seen) status = CARQUET_ERROR_OUT_OF_MEMORY;
+                }
                 if (status == CARQUET_OK) {
-                    dict_page_min_max(writer, entries, rank, indices + packed, nn,
+                    dict_page_min_max(writer, entries, num_unique, seen,
+                                      indices + packed, nn,
                                       &mn, &mn_len, &mx, &mx_len);
                 }
             }
@@ -1742,7 +1741,7 @@ static carquet_status_t emit_dictionary_data_pages(
         off += rows;
         packed += nn;
     }
-    carquet_mem_free(rank);
+    carquet_mem_free(seen);
     carquet_buffer_destroy(&payload);
     return status;
 }
@@ -2422,6 +2421,9 @@ void carquet_column_writer_run_page_task(
     }
     task->status = carquet_page_writer_adopt_config(scratch, w->page_writer);
     if (task->status != CARQUET_OK) return;
+    /* A page is one contiguous run of the stash, which outlives the task:
+     * the page writer encodes from it in place. */
+    carquet_page_writer_set_borrow_values(scratch, true);
 
     size_t stride = physical_type_stride(w->type, w->type_length);
     /* An all-null stash holds no value bytes and may never have allocated;

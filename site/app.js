@@ -9,6 +9,7 @@
     { id: "pyarrow", name: "PyArrow", color: "var(--s-pyarrow)" },
     { id: "fastparquet", name: "fastparquet", color: "var(--s-fastparquet)" },
     { id: "polars", name: "polars", color: "var(--s-polars)" },
+    { id: "duckdb", name: "DuckDB", color: "var(--s-duckdb)" },
   ];
   const CODECS = ["none", "snappy", "zstd", "lz4"];
   const $ = (s, el = document) => el.querySelector(s);
@@ -160,7 +161,7 @@
     $("#method").textContent =
       `Trimmed median of ${it.large}–${it.small} runs after ${data.config.warmup_iterations} warm-ups, page cache purged between write and read, ` +
       `measured ${data.timestamp}. Uncompressed reads use carquet's mmap zero-copy path. ` +
-      `Reproduce with python3 benchmark/run_benchmark.py --skip-xlarge --fastparquet --polars.`;
+      `Reproduce with python3 benchmark/run_benchmark.py --skip-xlarge --fastparquet --polars --duckdb.`;
 
     const tip = $("#tip");
     $("#chart").addEventListener("mousemove", (e) => {

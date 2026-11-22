@@ -1162,6 +1162,130 @@ static int test_dictionary_build_direct_reference(void) {
     return 0;
 }
 
+/* INT32 / INT64 chunks whose span is not known from their first values: it
+ * widens block after block (the direct table grows), jumps below the first
+ * minimum, or leaves the direct range part way through (the build continues
+ * in the hash table with the entries found so far). Dictionary and indices
+ * must be the first-occurrence ones whatever the path. */
+static int test_dictionary_build_span_change_reference(void) {
+    enum { N = 20000 };
+    uint8_t* vals = malloc((size_t)N * 8);
+    uint8_t* ref_dict = malloc((size_t)N * 8);
+    uint32_t* ref_idx = malloc((size_t)N * sizeof(uint32_t));
+    if (!vals || !ref_dict || !ref_idx) { free(vals); free(ref_dict); free(ref_idx); TEST_FAIL("dictionary_build_span_change_reference", "alloc"); }
+    int bad = 0;
+    for (int it = 0; it < 48 && !bad; it++) {
+        bool is64 = it & 1;
+        size_t size = is64 ? 8 : 4;
+        int pattern = (it >> 1) % 6;
+        int64_t n = (it % 4 == 3) ? 4096 + rle_rand() % (N - 4096) : N;
+        int64_t turn = 4096 + (int64_t)(rle_rand() % (uint32_t)(n - 4096 + 1));
+        for (int64_t i = 0; i < n; i++) {
+            int64_t v;
+            switch (pattern) {
+            case 0: v = i / 13; break;                            /* widening upward */
+            case 1: v = 500 - i / 13; break;                      /* widening downward */
+            case 2: v = (int64_t)(rle_rand() % 300) +             /* one jump, inside the limit */
+                        (i < turn ? 0 : 60000); break;
+            case 3: v = (int64_t)(rle_rand() % 300) -             /* one jump below the minimum */
+                        (i < turn ? 0 : 50000); break;
+            case 4: v = i < turn ? (int64_t)(rle_rand() % 300)    /* scattered after `turn` */
+                                 : (int64_t)(rle_rand() % 700) * 1000003; break;
+            default: v = (int64_t)(rle_rand() % 300) +            /* exactly at the span limit */
+                         (i == turn ? 65535 + (it & 2 ? 1 : 0) : 0); break;
+            }
+            if (is64) {
+                if (pattern == 4 && i >= turn) v *= 4099;         /* past the int32 range */
+                memcpy(vals + (size_t)i * 8, &v, 8);
+            } else {
+                int32_t v32 = (int32_t)v;
+                memcpy(vals + (size_t)i * 4, &v32, 4);
+            }
+        }
+        int64_t nref = 0;
+        for (int64_t i = 0; i < n; i++) {
+            int64_t e = 0;
+            while (e < nref && memcmp(ref_dict + (size_t)e * size, vals + (size_t)i * size, size) != 0) e++;
+            if (e == nref) { memcpy(ref_dict + (size_t)nref * size, vals + (size_t)i * size, size); nref++; }
+            ref_idx[i] = (uint32_t)e;
+        }
+        size_t cap = (it % 8 == 5) ? (size_t)(rle_rand() % (nref * size + 1)) : 0;
+        carquet_buffer_t dict;
+        carquet_buffer_init(&dict);
+        uint32_t* idx = NULL;
+        int32_t ne = -1;
+        bool ab = false;
+        carquet_status_t st = carquet_dictionary_build_capped(
+            is64 ? CARQUET_PHYSICAL_INT64 : CARQUET_PHYSICAL_INT32, (int32_t)size,
+            vals, NULL, n, cap, &dict, &idx, &ne, &ab);
+        bool want_abandon = cap && (size_t)nref * size > cap;
+        if (st != CARQUET_OK) bad = 1;
+        else if (ab != want_abandon) bad = 2;
+        else if (ab) {
+            if (idx || dict.size != 0) bad = 3;
+        } else if (ne != nref || dict.size != (size_t)nref * size ||
+                   memcmp(dict.data, ref_dict, (size_t)nref * size) != 0 ||
+                   memcmp(idx, ref_idx, (size_t)n * sizeof(uint32_t)) != 0) {
+            bad = 4;
+        }
+        if (bad) printf("  it=%d size=%zu pattern=%d n=%lld turn=%lld cap=%zu code=%d\n", it, size, pattern, (long long)n, (long long)turn, cap, bad);
+        carquet_mem_free(idx);
+        carquet_buffer_destroy(&dict);
+    }
+    free(vals); free(ref_dict); free(ref_idx);
+    if (bad) TEST_FAIL("dictionary_build_span_change_reference", "dictionary or indices differ from reference");
+    TEST_PASS("dictionary_build_span_change_reference");
+    return 0;
+}
+
+extern int64_t carquet_dispatch_expand_bits(void* dst, const void* src, int64_t ndense,
+                                            const uint8_t* bm, int64_t at, int64_t n,
+                                            size_t value_size, int64_t* consumed);
+
+/* The dispatched bitmap expand (a vector kernel on some CPUs, none on
+ * others) against a bit-at-a-time reference: whatever prefix of the rows it
+ * takes must hold the dense values at the set bits and zero elsewhere, and
+ * it must report the dense values it consumed. Bitmaps of every density, bit
+ * offsets that do not start a byte, 4- and 8-byte values. */
+static int test_expand_bits_dispatch(void) {
+    enum { MAXN = 700 };
+    uint8_t bm[MAXN / 8 + 16];
+    uint64_t src[MAXN + 8], out[MAXN + 8];
+    int bad = 0;
+    for (int it = 0; it < 4000 && !bad; it++) {
+        size_t vs = (it & 1) ? 8 : 4;
+        int64_t n = (int64_t)(rle_rand() % MAXN);
+        int64_t at = (int64_t)(rle_rand() % 16);
+        unsigned density = rle_rand() % 5;   /* 0: empty .. 4: full */
+        memset(bm, 0, sizeof(bm));
+        int64_t ndense = 0;
+        for (int64_t i = 0; i < n; i++) {
+            bool set = density == 4 || (density > 0 && (rle_rand() % 4) < density);
+            if (set) { bm[(at + i) >> 3] |= (uint8_t)(1u << ((at + i) & 7)); ndense++; }
+        }
+        for (int64_t i = 0; i < MAXN + 8; i++) src[i] = ((uint64_t)rle_rand() << 32) | (rle_rand() | 1u);
+        memset(out, 0xA5, sizeof(out));
+        int64_t used = -1;
+        int64_t rows = carquet_dispatch_expand_bits(out, src, ndense, bm, at, n, vs, &used);
+        if (rows < 0 || rows > n || rows % 8 != 0) { bad = 1; break; }
+        int64_t k = 0;
+        for (int64_t i = 0; i < rows && !bad; i++) {
+            bool set = (bm[(at + i) >> 3] >> ((at + i) & 7)) & 1;
+            uint64_t got = 0, want = 0;
+            memcpy(&got, (uint8_t*)out + (size_t)i * vs, vs);
+            if (set) { memcpy(&want, (uint8_t*)src + (size_t)k * vs, vs); k++; }
+            if (got != want) bad = 2;
+        }
+        if (!bad && used != k) bad = 3;
+        /* Nothing past the rows it reported. */
+        if (!bad && ((uint8_t*)out)[(size_t)rows * vs] != 0xA5) bad = 4;
+        if (bad) printf("  it=%d vs=%zu n=%lld at=%lld density=%u rows=%lld code=%d\n", it, vs, (long long)n, (long long)at, density, (long long)rows, bad);
+    }
+    if (bad) TEST_FAIL("expand_bits_dispatch", "expanded rows differ from reference");
+    TEST_PASS("expand_bits_dispatch");
+    return 0;
+}
+
 static int test_bool_pack_unpack_dispatch(void) {
     uint8_t packed[] = {0xA5, 0x3C, 0x81};
     uint8_t unpacked[24];
@@ -1243,6 +1367,8 @@ int main(void) {
     failures += test_rle_batch_long_streams();
     failures += test_dictionary_build_capped_reference();
     failures += test_dictionary_build_direct_reference();
+    failures += test_dictionary_build_span_change_reference();
+    failures += test_expand_bits_dispatch();
 
     printf("\n");
     if (failures == 0) {

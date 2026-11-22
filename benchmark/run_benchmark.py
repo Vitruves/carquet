@@ -16,6 +16,7 @@ Usage:
     python3 benchmark/run_benchmark.py --no-arrow-cpp  # skip Arrow C++
     python3 benchmark/run_benchmark.py --fastparquet   # also compare fastparquet (opt-in)
     python3 benchmark/run_benchmark.py --polars        # also compare polars' native Parquet (opt-in)
+    python3 benchmark/run_benchmark.py --duckdb        # also compare DuckDB's native Parquet (opt-in)
     python3 benchmark/run_benchmark.py --nullable      # also run the <size>_nullable configs
     python3 benchmark/run_benchmark.py --quick --nullable-only  # large_nullable only
 
@@ -291,6 +292,17 @@ def run_polars_single(python, script, dataset, compression, rows, timeout_second
 import sys, os
 sys.path.insert(0, os.path.dirname({script!r}))
 from benchmark_polars import run_benchmark
+run_benchmark({dataset!r}, {rows}, {compression!r})
+"""
+    return run_benchmark_process([python, "-c", code], timeout_seconds)
+
+
+def run_duckdb_single(python, script, dataset, compression, rows, timeout_seconds):
+    """Run DuckDB benchmark for a single config by invoking a helper snippet."""
+    code = f"""
+import sys, os
+sys.path.insert(0, os.path.dirname({script!r}))
+from benchmark_duckdb import run_benchmark
 run_benchmark({dataset!r}, {rows}, {compression!r})
 """
     return run_benchmark_process([python, "-c", code], timeout_seconds)
@@ -595,6 +607,7 @@ COMPETITORS = [
     ("pyarrow", "PyArrow"),
     ("fastparquet", "fastparquet"),
     ("polars", "polars"),
+    ("duckdb", "DuckDB"),
 ]
 
 
@@ -623,7 +636,7 @@ def print_final_tables(results, crossread_results=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Carquet benchmark runner with optional Arrow C++, PyArrow, fastparquet and polars comparisons"
+        description="Carquet benchmark runner with optional Arrow C++, PyArrow, fastparquet, polars and DuckDB comparisons"
     )
     parser.add_argument("--quick", action="store_true",
                         help="Run only large configs (10M rows, all codecs)")
@@ -649,6 +662,8 @@ def main():
                         help="Also benchmark fastparquet (needs fastparquet + pandas)")
     parser.add_argument("--polars", action="store_true",
                         help="Also benchmark polars' native (Rust) Parquet reader/writer")
+    parser.add_argument("--duckdb", action="store_true",
+                        help="Also benchmark DuckDB's native Parquet reader/writer (needs duckdb + pyarrow)")
     parser.add_argument("--no-carquet", action="store_true",
                         help="Skip Carquet benchmarks")
     parser.add_argument("--iterations", type=int, default=0,
@@ -750,6 +765,20 @@ def main():
             print(f"{YLW}Warning:{RST} polars not available, skipping")
             has_polars = False
 
+    has_duckdb = args.duckdb
+    duckdb_script = os.path.join(script_dir, "benchmark_duckdb.py")
+    duckdb_version = None
+
+    if has_duckdb:
+        try:
+            duckdb_version = subprocess.check_output(
+                [python, "-c", "import duckdb, pyarrow; print(duckdb.__version__)"],
+                stderr=subprocess.DEVNULL, text=True
+            ).strip()
+        except Exception:
+            print(f"{YLW}Warning:{RST} duckdb (or pyarrow) not available, skipping")
+            has_duckdb = False
+
     benchmark_runners = []
     if not args.no_carquet:
         benchmark_runners.append((
@@ -785,6 +814,13 @@ def main():
             "polars",
             lambda dataset, compression, rows: run_polars_single(
                 python, polars_script, dataset, compression, rows, args.timeout)
+        ))
+    if has_duckdb:
+        benchmark_runners.append((
+            "duckdb",
+            "DuckDB",
+            lambda dataset, compression, rows: run_duckdb_single(
+                python, duckdb_script, dataset, compression, rows, args.timeout)
         ))
 
     if not benchmark_runners:
@@ -832,6 +868,8 @@ def main():
         print(f"  {DIM}vs:{RST}   fastparquet {fastparquet_version}")
     if has_polars:
         print(f"  {DIM}vs:{RST}   polars {polars_version}")
+    if has_duckdb:
+        print(f"  {DIM}vs:{RST}   DuckDB {duckdb_version}")
     zstd_level = get_benchmark_zstd_level()
     iter_desc = f"{args.iterations} iters (override)" if args.iterations > 0 else "11-51 iters by size"
     print(f"  {DIM}cfg:{RST}  {len(configs)} configs, {args.cooldown}s cooldown, "
@@ -1010,6 +1048,8 @@ def main():
         report["fastparquet_version"] = fastparquet_version
     if polars_version:
         report["polars_version"] = polars_version
+    if duckdb_version:
+        report["duckdb_version"] = duckdb_version
 
     for (lib, (ds, comp)), r in sorted(results.items()):
         entry = {

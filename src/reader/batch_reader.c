@@ -2034,6 +2034,10 @@ static const uint8_t SCATTER_OFF[256][8] = {
         }                                                                        \
     } while (0)
 
+extern int64_t carquet_dispatch_expand_bits(void* dst, const void* src, int64_t ndense,
+                                            const uint8_t* bm, int64_t at, int64_t n,
+                                            size_t value_size, int64_t* consumed);
+
 static void scatter_dense_by_bits(uint8_t* dst, const uint8_t* src, int64_t ndense,
                                   const uint8_t* bm, int64_t at, int64_t n,
                                   size_t value_size) {
@@ -2044,6 +2048,24 @@ static void scatter_dense_by_bits(uint8_t* dst, const uint8_t* src, int64_t nden
     if (ndense == n) {
         memcpy(dst, src, (size_t)n * value_size);
         return;
+    }
+    if (value_size == 4 || value_size == 8) {
+        /* The vector kernel takes what it can; the loop below the rest. */
+        int64_t used = 0;
+        int64_t rows = carquet_dispatch_expand_bits(dst, src, ndense, bm, at, n,
+                                                    value_size, &used);
+        if (rows > 0) {
+            dst += (size_t)rows * value_size;
+            src += (size_t)used * value_size;
+            ndense -= used;
+            at += rows;
+            n -= rows;
+            if (n <= 0) return;
+            if (ndense <= 0) {
+                memset(dst, 0, (size_t)n * value_size);
+                return;
+            }
+        }
     }
     switch (value_size) {
     case 4: SCATTER_BITS_BODY(uint32_t, 1); return;
@@ -2063,6 +2085,148 @@ static void scatter_dense_by_bits(uint8_t* dst, const uint8_t* src, int64_t nden
     }
 }
 #undef SCATTER_BITS_BODY
+
+/* Dictionary values straight to their rows, in one pass: row i takes
+ * dict[idx[k]] for the next index k when bit (at + i) of bm is set, else
+ * zero. Every row loads an entry, present or not (an absent row loads the
+ * entry of the next present one and masks it off), so there is no branch on
+ * the bits and no dense intermediate; rows past the last present one of a
+ * word, which have no next index, are zeroed apart. The indices are the
+ * page's validated ones. */
+#define GATHER_ROWS_BODY(T)                                                      \
+    do {                                                                         \
+        const T* dv = (const T*)dict;                                            \
+        T* out = (T*)(void*)dst;                                                 \
+        int64_t k = 0;                                                           \
+        for (int64_t i = 0; i < n; i += 64) {                                    \
+            int h = n - i < 64 ? (int)(n - i) : 64;                              \
+            uint64_t w = carquet_bitmap_load_bits(bm, at + i, h);                \
+            T* d = out + i;                                                      \
+            if (w == 0) {                                                        \
+                memset(d, 0, (size_t)h * sizeof(T));                             \
+                continue;                                                        \
+            }                                                                    \
+            if (h == 64 && w == ~(uint64_t)0) {                                  \
+                for (int j = 0; j < 64; j++) d[j] = dv[idx[k + j]];              \
+                k += 64;                                                         \
+                continue;                                                        \
+            }                                                                    \
+            int live = 64 - carquet_clz64(w);                                    \
+            for (int j = 0; j < live; j++) {                                     \
+                T bit = (T)(w & 1);                                              \
+                d[j] = dv[idx[k]] & ((T)0 - bit);                                \
+                k += (int64_t)(w & 1);                                           \
+                w >>= 1;                                                         \
+            }                                                                    \
+            if (live < h) memset(d + live, 0, (size_t)(h - live) * sizeof(T));   \
+        }                                                                        \
+    } while (0)
+
+static void gather_rows_by_bits(uint8_t* dst, const void* dict, const uint32_t* idx,
+                                const uint8_t* bm, int64_t at, int64_t n,
+                                size_t value_size) {
+    if (value_size == 8) {
+        GATHER_ROWS_BODY(uint64_t);
+    } else {
+        GATHER_ROWS_BODY(uint32_t);
+    }
+}
+#undef GATHER_ROWS_BODY
+
+extern void carquet_dispatch_byte_split_decode_float(const uint8_t* data, int64_t count,
+                                                     float* values);
+extern void carquet_dispatch_byte_split_decode_double(const uint8_t* data, int64_t count,
+                                                      double* values);
+
+/* Rows per decode-and-place step of lazy_rows_to_dest: its values (16 KB at
+ * most) stay in L1 between the two. */
+#define LAZY_BLOCK_ROWS 2048
+
+/* Rows [pvr, pvr + take) of a page whose values are still encoded
+ * (cr->dense_indices), decoded block by block and placed at their rows of
+ * dst, nulls zeroed. The first of them is dense value `dense_start`. Returns
+ * false with the detail in cr->last_error when the payload is short or a
+ * dictionary index out of range. */
+static bool lazy_rows_to_dest(carquet_column_reader_t* cr, uint8_t* dst,
+                              const uint8_t* pb, int64_t pvr, int64_t take,
+                              int32_t dense_start, size_t value_size) {
+    uint64_t block[LAZY_BLOCK_ROWS];
+    uint8_t planes[LAZY_BLOCK_ROWS * 8];
+    int64_t total = cr->dense_index_count;
+
+    if (cr->lazy_kind == CARQUET_LAZY_DICT && dense_start != cr->lazy_pos) {
+        /* Not the next index of the stream (rows were skipped): reposition. */
+        if (dense_start < cr->lazy_pos) {
+            carquet_rle_decoder_init(&cr->lazy_rle, cr->lazy_ptr, cr->lazy_size,
+                                     cr->lazy_bit_width);
+            cr->lazy_pos = 0;
+        }
+        int64_t gap = (int64_t)dense_start - cr->lazy_pos;
+        if (carquet_rle_decoder_skip(&cr->lazy_rle, gap) != gap) {
+            CARQUET_SET_ERROR(&cr->last_error, CARQUET_ERROR_DECODE,
+                              "Dictionary indices truncated");
+            return false;
+        }
+    }
+    cr->lazy_pos = dense_start;
+
+    for (int64_t off = 0; off < take; off += LAZY_BLOCK_ROWS) {
+        int64_t rows = take - off < LAZY_BLOCK_ROWS ? take - off : LAZY_BLOCK_ROWS;
+        int64_t np = carquet_bitmap_count_range(pb, pvr + off, rows);
+        uint8_t* d = dst + (size_t)off * value_size;
+        int64_t pos = cr->lazy_pos;
+        switch (cr->lazy_kind) {
+        case CARQUET_LAZY_PLAIN:
+            scatter_dense_by_bits(d, cr->lazy_ptr + (size_t)pos * value_size, np,
+                                  pb, pvr + off, rows, value_size);
+            break;
+        case CARQUET_LAZY_BSS:
+            if (np > 0) {
+                /* The planes of the block, brought side by side. */
+                for (size_t b = 0; b < value_size; b++) {
+                    memcpy(planes + b * (size_t)np,
+                           cr->lazy_ptr + b * (size_t)total + (size_t)pos, (size_t)np);
+                }
+                if (value_size == 8) {
+                    carquet_dispatch_byte_split_decode_double(planes, np, (double*)block);
+                } else {
+                    carquet_dispatch_byte_split_decode_float(planes, np, (float*)block);
+                }
+            }
+            scatter_dense_by_bits(d, (const uint8_t*)block, np, pb, pvr + off, rows,
+                                  value_size);
+            break;
+        case CARQUET_LAZY_DICT: {
+            uint32_t* idx = (uint32_t*)block;
+            if (np > 0 && carquet_rle_decoder_get_batch(&cr->lazy_rle, idx, np) != np) {
+                CARQUET_SET_ERROR(&cr->last_error, CARQUET_ERROR_DECODE,
+                                  "Dictionary indices truncated");
+                return false;
+            }
+            if (cr->lazy_check) {
+                uint32_t max_idx = 0;
+                for (int64_t i = 0; i < np; i++) {
+                    if (idx[i] > max_idx) max_idx = idx[i];
+                }
+                if (np > 0 && max_idx >= (uint32_t)cr->dictionary_count) {
+                    CARQUET_SET_ERROR(&cr->last_error, CARQUET_ERROR_DECODE,
+                                      "Dictionary index out of bounds");
+                    return false;
+                }
+            }
+            gather_rows_by_bits(d, cr->dictionary_data, idx, pb, pvr + off, rows,
+                                value_size);
+            break;
+        }
+        default:
+            CARQUET_SET_ERROR(&cr->last_error, CARQUET_ERROR_INTERNAL,
+                              "Unknown deferred page values");
+            return false;
+        }
+        cr->lazy_pos = (int32_t)(pos + np);
+    }
+    return true;
+}
 
 /* Read `want` rows of a flat column with definition levels straight out of
  * its decoded pages: values land at their rows (nulls zeroed) and validity
@@ -2109,10 +2273,9 @@ static int64_t read_rows_from_pages(carquet_column_reader_t* cr, uint8_t* dest,
             }
         }
         if (carquet_column_def_as_bits(cr) && cr->decoded_def_bits && cr->dense_indices) {
-            /* Dictionary values gathered a block at a time into a small
-             * buffer and spread from there while it is in cache (the page's
-             * whole dense stream, gathered first, would come back from
-             * memory). */
+            /* The page's values are still encoded in its payload: decode
+             * them a block at a time and put each block at its rows while
+             * it is in cache (see lazy_values_begin). */
             const uint8_t* pb = cr->decoded_def_bits;
             int64_t pvr = cr->page_values_read;
             int32_t dense_start;
@@ -2129,24 +2292,8 @@ static int64_t read_rows_from_pages(carquet_column_reader_t* cr, uint8_t* dest,
                                   "Definition levels exceed the page's values");
                 break;
             }
-            enum { GATHER_BLOCK = 2048 };
-            uint64_t block[GATHER_BLOCK];
-            const uint32_t* idx = cr->indices_buffer + dense_start;
-            for (int64_t off = 0; off < take; off += GATHER_BLOCK) {
-                int64_t rows = take - off < GATHER_BLOCK ? take - off : GATHER_BLOCK;
-                int64_t np = carquet_bitmap_count_range(pb, pvr + off, rows);
-                if (np > 0) {
-                    if (value_size == 8) {
-                        carquet_dispatch_gather_i64((const int64_t*)cr->dictionary_data,
-                                                    idx, np, (int64_t*)block);
-                    } else {
-                        carquet_dispatch_gather_i32((const int32_t*)cr->dictionary_data,
-                                                    idx, np, (int32_t*)block);
-                    }
-                }
-                scatter_dense_by_bits(dst + (size_t)off * value_size, (const uint8_t*)block,
-                                      np, pb, pvr + off, rows, value_size);
-                idx += np;
+            if (!lazy_rows_to_dest(cr, dst, pb, pvr, take, dense_start, value_size)) {
+                break;
             }
             carquet_bitmap_copy_range(bits, done, pb, pvr, take);
             cr->dense_cursor_pos = cr->page_values_read + (int32_t)take;

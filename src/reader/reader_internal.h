@@ -12,6 +12,7 @@
 #include <carquet/carquet.h>
 #include "thrift/parquet_types.h"
 #include "core/arena.h"
+#include "encoding/rle.h"
 #include <stdio.h>
 
 #ifdef _WIN32
@@ -132,6 +133,11 @@ typedef struct carquet_retained_page {
     uint8_t data[];
 } carquet_retained_page_t;
 
+/* How a dense_indices page holds its values (lazy_kind). */
+#define CARQUET_LAZY_PLAIN 1    /* little-endian values, as they are */
+#define CARQUET_LAZY_BSS 2      /* BYTE_STREAM_SPLIT planes (FLOAT / DOUBLE) */
+#define CARQUET_LAZY_DICT 3     /* RLE / bit-packed dictionary indices */
+
 struct carquet_column_reader {
     carquet_reader_t* file_reader;
     int32_t row_group_index;
@@ -203,11 +209,22 @@ struct carquet_column_reader {
     bool defer_dict_gather;     /* Set only inside read_rows_from_pages(): a
                                  * flat nullable numeric dictionary page may
                                  * keep its indices ungathered (dense_indices) */
-    bool dense_indices;         /* This page's dense values are not gathered:
-                                 * indices_buffer[0, dense_index_count) holds
-                                 * their (checked) dictionary indices; see
+    bool dense_indices;         /* This page's dense_index_count dense values
+                                 * are not decoded: they are drawn in order,
+                                 * a block at a time, from the page payload
+                                 * (lazy_*), or all at once by
                                  * carquet_column_materialize_dense() */
     int32_t dense_index_count;
+    /* The undecoded values of a dense_indices page. The payload stays valid
+     * until the next page is loaded (as a viewed PLAIN page's does). */
+    uint8_t lazy_kind;          /* CARQUET_LAZY_* */
+    bool lazy_check;            /* dictionary indices may exceed the dictionary */
+    int lazy_bit_width;         /* dictionary index width */
+    const uint8_t* lazy_ptr;    /* PLAIN values / BYTE_STREAM_SPLIT planes /
+                                 * RLE index stream (past its width byte) */
+    size_t lazy_size;
+    int32_t lazy_pos;           /* dense values drawn so far */
+    carquet_rle_decoder_t lazy_rle;   /* positioned at lazy_pos */
     void* direct_target;        /* Set only inside carquet_read_next_page():
                                  * the caller's buffer, for a page that fits it */
     size_t direct_target_values;

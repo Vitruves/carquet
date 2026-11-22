@@ -1,6 +1,6 @@
 {
   "carquet_version": "0.8.0",
-  "timestamp": "2026-11-09",
+  "timestamp": "2026-11-22",
   "system": {
     "cpu": "Apple M3",
     "ram_gb": 16,
@@ -19,483 +19,366 @@
     "statistic": "trimmed_median",
     "cache_purge": true,
     "cooldown_seconds": 3,
-    "subprocess_timeout_seconds": 300,
+    "subprocess_timeout_seconds": 900,
     "read_nommap": "read_nommap_ms: same read protocol with memory mapping off (carquet use_mmap=false, Arrow C++ / PyArrow memory_map=false)",
-    "note": "large configs from a second run the same day (--quick, cooldown 5 s): the first run's first config was disturbed (carquet large/none write 98.6 ms vs 57 ms measured alone)",
     "polars_crossread": "each library reads the file carquet's benchmark writes and the file polars writes (polars picks dictionary encoding for id and category itself); carquet = benchmark_carquet read, same protocol"
   },
   "results": [
     {
       "library": "arrow_cpp",
+      "dataset": "large",
+      "compression": "lz4",
+      "rows": 10000000,
+      "write_ms": 242.17,
+      "read_ms": 17.14,
+      "file_bytes": 129405099,
+      "read_nommap_ms": 18.45
+    },
+    {
+      "library": "arrow_cpp",
+      "dataset": "large",
+      "compression": "none",
+      "rows": 10000000,
+      "write_ms": 108.04,
+      "read_ms": 14.54,
+      "file_bytes": 200095003,
+      "read_nommap_ms": 16.28
+    },
+    {
+      "library": "arrow_cpp",
+      "dataset": "large",
+      "compression": "snappy",
+      "rows": 10000000,
+      "write_ms": 219.92,
+      "read_ms": 21.93,
+      "file_bytes": 131524302,
+      "read_nommap_ms": 23.16
+    },
+    {
+      "library": "arrow_cpp",
+      "dataset": "large",
+      "compression": "zstd",
+      "rows": 10000000,
+      "write_ms": 331.63,
+      "read_ms": 27.53,
+      "file_bytes": 101606090,
+      "read_nommap_ms": 28.48
+    },
+    {
+      "library": "arrow_cpp",
       "dataset": "medium",
       "compression": "lz4",
       "rows": 1000000,
-      "write_ms": 25.72,
-      "read_ms": 2.15,
+      "write_ms": 24.11,
+      "read_ms": 1.82,
       "file_bytes": 12943537,
-      "read_nommap_ms": 2.39
+      "read_nommap_ms": 1.97
     },
     {
       "library": "arrow_cpp",
       "dataset": "medium",
       "compression": "none",
       "rows": 1000000,
-      "write_ms": 12.32,
-      "read_ms": 1.59,
+      "write_ms": 11.63,
+      "read_ms": 1.55,
       "file_bytes": 20012832,
-      "read_nommap_ms": 1.88
+      "read_nommap_ms": 1.7
     },
     {
       "library": "arrow_cpp",
       "dataset": "medium",
       "compression": "snappy",
       "rows": 1000000,
-      "write_ms": 25.85,
-      "read_ms": 2.53,
+      "write_ms": 23.02,
+      "read_ms": 2.43,
       "file_bytes": 13156551,
-      "read_nommap_ms": 2.77
+      "read_nommap_ms": 2.6
     },
     {
       "library": "arrow_cpp",
       "dataset": "medium",
       "compression": "zstd",
       "rows": 1000000,
-      "write_ms": 34.12,
-      "read_ms": 3.17,
+      "write_ms": 33.27,
+      "read_ms": 3.02,
       "file_bytes": 10164352,
-      "read_nommap_ms": 3.28
+      "read_nommap_ms": 3.15
     },
     {
       "library": "arrow_cpp",
       "dataset": "small",
       "compression": "lz4",
       "rows": 100000,
-      "write_ms": 2.63,
-      "read_ms": 0.63,
+      "write_ms": 2.51,
+      "read_ms": 0.58,
       "file_bytes": 1294329,
-      "read_nommap_ms": 0.59
+      "read_nommap_ms": 0.55
     },
     {
       "library": "arrow_cpp",
       "dataset": "small",
       "compression": "none",
       "rows": 100000,
-      "write_ms": 1.65,
-      "read_ms": 0.23,
+      "write_ms": 1.58,
+      "read_ms": 0.22,
       "file_bytes": 2001375,
-      "read_nommap_ms": 0.18
+      "read_nommap_ms": 0.16
     },
     {
       "library": "arrow_cpp",
       "dataset": "small",
       "compression": "snappy",
       "rows": 100000,
-      "write_ms": 2.62,
-      "read_ms": 0.91,
+      "write_ms": 2.47,
+      "read_ms": 0.84,
       "file_bytes": 1315651,
-      "read_nommap_ms": 0.88
+      "read_nommap_ms": 0.81
     },
     {
       "library": "arrow_cpp",
       "dataset": "small",
       "compression": "zstd",
       "rows": 100000,
-      "write_ms": 3.69,
-      "read_ms": 1.32,
+      "write_ms": 3.39,
+      "read_ms": 1.23,
       "file_bytes": 1016334,
+      "read_nommap_ms": 1.2
+    },
+    {
+      "library": "carquet",
+      "dataset": "large",
+      "compression": "lz4",
+      "rows": 10000000,
+      "write_ms": 40.3,
+      "read_ms": 9.12,
+      "file_bytes": 99587597,
+      "read_nommap_ms": 9.41
+    },
+    {
+      "library": "carquet",
+      "dataset": "large",
+      "compression": "none",
+      "rows": 10000000,
+      "write_ms": 46.52,
+      "read_ms": 0.26,
+      "file_bytes": 200013459,
+      "read_nommap_ms": 10.28
+    },
+    {
+      "library": "carquet",
+      "dataset": "large",
+      "compression": "snappy",
+      "rows": 10000000,
+      "write_ms": 30.37,
+      "read_ms": 8.19,
+      "file_bytes": 99497194,
+      "read_nommap_ms": 9.33
+    },
+    {
+      "library": "carquet",
+      "dataset": "large",
+      "compression": "zstd",
+      "rows": 10000000,
+      "write_ms": 31.27,
+      "read_ms": 8.77,
+      "file_bytes": 95635385,
+      "read_nommap_ms": 10.23
+    },
+    {
+      "library": "carquet",
+      "dataset": "medium",
+      "compression": "lz4",
+      "rows": 1000000,
+      "write_ms": 3.85,
+      "read_ms": 0.91,
+      "file_bytes": 11100213,
       "read_nommap_ms": 1.23
     },
     {
       "library": "carquet",
       "dataset": "medium",
-      "compression": "lz4",
-      "rows": 1000000,
-      "write_ms": 7.7,
-      "read_ms": 1.06,
-      "file_bytes": 12877807,
-      "read_nommap_ms": 1.76
-    },
-    {
-      "library": "carquet",
-      "dataset": "medium",
       "compression": "none",
       "rows": 1000000,
-      "write_ms": 5.87,
-      "read_ms": 0.06,
+      "write_ms": 5.6,
+      "read_ms": 0.05,
       "file_bytes": 20004278,
-      "read_nommap_ms": 1.32
+      "read_nommap_ms": 1.23
     },
     {
       "library": "carquet",
       "dataset": "medium",
       "compression": "snappy",
       "rows": 1000000,
-      "write_ms": 7.4,
-      "read_ms": 1.3,
-      "file_bytes": 13135400,
-      "read_nommap_ms": 2.29
+      "write_ms": 3.99,
+      "read_ms": 0.9,
+      "file_bytes": 11129666,
+      "read_nommap_ms": 1.28
     },
     {
       "library": "carquet",
       "dataset": "medium",
       "compression": "zstd",
       "rows": 1000000,
-      "write_ms": 8.32,
-      "read_ms": 2.36,
-      "file_bytes": 10069690,
-      "read_nommap_ms": 2.9
+      "write_ms": 4.23,
+      "read_ms": 1.18,
+      "file_bytes": 10208678,
+      "read_nommap_ms": 1.42
     },
     {
       "library": "carquet",
       "dataset": "small",
       "compression": "lz4",
       "rows": 100000,
-      "write_ms": 1.66,
-      "read_ms": 0.3,
-      "file_bytes": 1287900,
-      "read_nommap_ms": 0.3
+      "write_ms": 1.17,
+      "read_ms": 0.25,
+      "file_bytes": 1109998,
+      "read_nommap_ms": 0.26
     },
     {
       "library": "carquet",
       "dataset": "small",
       "compression": "none",
       "rows": 100000,
-      "write_ms": 0.87,
+      "write_ms": 1.01,
       "read_ms": 0.02,
       "file_bytes": 2000499,
-      "read_nommap_ms": 0.08
+      "read_nommap_ms": 0.07
     },
     {
       "library": "carquet",
       "dataset": "small",
       "compression": "snappy",
       "rows": 100000,
-      "write_ms": 1.52,
-      "read_ms": 0.38,
-      "file_bytes": 1313216,
-      "read_nommap_ms": 0.38
+      "write_ms": 1.2,
+      "read_ms": 0.28,
+      "file_bytes": 1112984,
+      "read_nommap_ms": 0.27
     },
     {
       "library": "carquet",
       "dataset": "small",
       "compression": "zstd",
       "rows": 100000,
-      "write_ms": 1.9,
-      "read_ms": 0.64,
-      "file_bytes": 1006793,
-      "read_nommap_ms": 0.63
+      "write_ms": 1.24,
+      "read_ms": 0.36,
+      "file_bytes": 1020801,
+      "read_nommap_ms": 0.36
     },
     {
-      "library": "fastparquet",
+      "library": "duckdb",
+      "dataset": "large",
+      "compression": "lz4",
+      "rows": 10000000,
+      "write_ms": 118.62,
+      "read_ms": 26.66,
+      "file_bytes": 109996713
+    },
+    {
+      "library": "duckdb",
+      "dataset": "large",
+      "compression": "none",
+      "rows": 10000000,
+      "write_ms": 115.68,
+      "read_ms": 24.54,
+      "file_bytes": 110865478
+    },
+    {
+      "library": "duckdb",
+      "dataset": "large",
+      "compression": "snappy",
+      "rows": 10000000,
+      "write_ms": 118.84,
+      "read_ms": 31.46,
+      "file_bytes": 109607538
+    },
+    {
+      "library": "duckdb",
+      "dataset": "large",
+      "compression": "zstd",
+      "rows": 10000000,
+      "write_ms": 132.78,
+      "read_ms": 37.51,
+      "file_bytes": 103939170
+    },
+    {
+      "library": "duckdb",
       "dataset": "medium",
       "compression": "lz4",
       "rows": 1000000,
-      "write_ms": 22.45,
-      "read_ms": 5.37,
-      "file_bytes": 13876160
+      "write_ms": 10.59,
+      "read_ms": 3.04,
+      "file_bytes": 12922967
     },
     {
-      "library": "fastparquet",
+      "library": "duckdb",
       "dataset": "medium",
       "compression": "none",
       "rows": 1000000,
-      "write_ms": 8.01,
-      "read_ms": 3.08,
-      "file_bytes": 20003951
+      "write_ms": 10.18,
+      "read_ms": 3.05,
+      "file_bytes": 16888574
     },
     {
-      "library": "fastparquet",
+      "library": "duckdb",
       "dataset": "medium",
       "compression": "snappy",
       "rows": 1000000,
-      "write_ms": 22.79,
-      "read_ms": 10.21,
-      "file_bytes": 14064235
+      "write_ms": 10.41,
+      "read_ms": 3.7,
+      "file_bytes": 12936405
     },
     {
-      "library": "fastparquet",
+      "library": "duckdb",
       "dataset": "medium",
       "compression": "zstd",
       "rows": 1000000,
-      "write_ms": 33.5,
-      "read_ms": 17.96,
-      "file_bytes": 10754026
+      "write_ms": 11.35,
+      "read_ms": 5.16,
+      "file_bytes": 10404552
     },
     {
-      "library": "fastparquet",
+      "library": "duckdb",
       "dataset": "small",
       "compression": "lz4",
       "rows": 100000,
-      "write_ms": 2.31,
-      "read_ms": 0.73,
-      "file_bytes": 1388551
+      "write_ms": 2.75,
+      "read_ms": 0.72,
+      "file_bytes": 1292612
     },
     {
-      "library": "fastparquet",
+      "library": "duckdb",
       "dataset": "small",
       "compression": "none",
       "rows": 100000,
-      "write_ms": 1.08,
-      "read_ms": 0.58,
-      "file_bytes": 2001053
+      "write_ms": 1.79,
+      "read_ms": 0.54,
+      "file_bytes": 1689041
     },
     {
-      "library": "fastparquet",
+      "library": "duckdb",
       "dataset": "small",
       "compression": "snappy",
       "rows": 100000,
       "write_ms": 2.43,
-      "read_ms": 1.2,
-      "file_bytes": 1406830
+      "read_ms": 0.93,
+      "file_bytes": 1293530
     },
     {
-      "library": "fastparquet",
+      "library": "duckdb",
       "dataset": "small",
       "compression": "zstd",
       "rows": 100000,
-      "write_ms": 3.47,
-      "read_ms": 2.06,
-      "file_bytes": 1075763
-    },
-    {
-      "library": "polars",
-      "dataset": "medium",
-      "compression": "lz4",
-      "rows": 1000000,
-      "write_ms": 4.77,
-      "read_ms": 3.26,
-      "file_bytes": 12054002
-    },
-    {
-      "library": "polars",
-      "dataset": "medium",
-      "compression": "none",
-      "rows": 1000000,
-      "write_ms": 4.53,
-      "read_ms": 3.14,
-      "file_bytes": 13259445
-    },
-    {
-      "library": "polars",
-      "dataset": "medium",
-      "compression": "snappy",
-      "rows": 1000000,
-      "write_ms": 4.82,
-      "read_ms": 3.25,
-      "file_bytes": 12011695
-    },
-    {
-      "library": "polars",
-      "dataset": "medium",
-      "compression": "zstd",
-      "rows": 1000000,
-      "write_ms": 5.83,
-      "read_ms": 4.12,
-      "file_bytes": 10581928
-    },
-    {
-      "library": "polars",
-      "dataset": "small",
-      "compression": "lz4",
-      "rows": 100000,
-      "write_ms": 0.96,
-      "read_ms": 0.44,
-      "file_bytes": 1205840
-    },
-    {
-      "library": "polars",
-      "dataset": "small",
-      "compression": "none",
-      "rows": 100000,
-      "write_ms": 0.72,
-      "read_ms": 0.33,
-      "file_bytes": 1326394
-    },
-    {
-      "library": "polars",
-      "dataset": "small",
-      "compression": "snappy",
-      "rows": 100000,
-      "write_ms": 0.91,
-      "read_ms": 0.46,
-      "file_bytes": 1201603
-    },
-    {
-      "library": "polars",
-      "dataset": "small",
-      "compression": "zstd",
-      "rows": 100000,
-      "write_ms": 1.05,
-      "read_ms": 1.08,
-      "file_bytes": 1058440
-    },
-    {
-      "library": "pyarrow",
-      "dataset": "medium",
-      "compression": "lz4",
-      "rows": 1000000,
-      "write_ms": 30.54,
-      "read_ms": 3.22,
-      "file_bytes": 12966161,
-      "read_nommap_ms": 4.75
-    },
-    {
-      "library": "pyarrow",
-      "dataset": "medium",
-      "compression": "none",
-      "rows": 1000000,
-      "write_ms": 17.47,
-      "read_ms": 2.79,
-      "file_bytes": 20014899,
-      "read_nommap_ms": 5.0
-    },
-    {
-      "library": "pyarrow",
-      "dataset": "medium",
-      "compression": "snappy",
-      "rows": 1000000,
-      "write_ms": 28.89,
-      "read_ms": 3.61,
-      "file_bytes": 13146090,
-      "read_nommap_ms": 5.13
-    },
-    {
-      "library": "pyarrow",
-      "dataset": "medium",
-      "compression": "zstd",
-      "rows": 1000000,
-      "write_ms": 39.42,
-      "read_ms": 4.0,
-      "file_bytes": 10167660,
-      "read_nommap_ms": 5.2
-    },
-    {
-      "library": "pyarrow",
-      "dataset": "small",
-      "compression": "lz4",
-      "rows": 100000,
-      "write_ms": 3.04,
-      "read_ms": 0.44,
-      "file_bytes": 1296659,
-      "read_nommap_ms": 0.44
-    },
-    {
-      "library": "pyarrow",
-      "dataset": "small",
-      "compression": "none",
-      "rows": 100000,
-      "write_ms": 2.1,
-      "read_ms": 0.26,
-      "file_bytes": 2001590,
-      "read_nommap_ms": 0.27
-    },
-    {
-      "library": "pyarrow",
-      "dataset": "small",
-      "compression": "snappy",
-      "rows": 100000,
-      "write_ms": 3.0,
-      "read_ms": 0.67,
-      "file_bytes": 1314643,
-      "read_nommap_ms": 0.68
-    },
-    {
-      "library": "pyarrow",
-      "dataset": "small",
-      "compression": "zstd",
-      "rows": 100000,
-      "write_ms": 4.13,
-      "read_ms": 0.73,
-      "file_bytes": 1016697,
-      "read_nommap_ms": 0.73
-    },
-    {
-      "library": "arrow_cpp",
-      "dataset": "large",
-      "compression": "lz4",
-      "rows": 10000000,
-      "write_ms": 244.44,
-      "read_ms": 18.18,
-      "file_bytes": 129405099,
-      "read_nommap_ms": 19.38
-    },
-    {
-      "library": "arrow_cpp",
-      "dataset": "large",
-      "compression": "none",
-      "rows": 10000000,
-      "write_ms": 117.48,
-      "read_ms": 14.55,
-      "file_bytes": 200095003,
-      "read_nommap_ms": 17.13
-    },
-    {
-      "library": "arrow_cpp",
-      "dataset": "large",
-      "compression": "snappy",
-      "rows": 10000000,
-      "write_ms": 235.12,
-      "read_ms": 22.73,
-      "file_bytes": 131524302,
-      "read_nommap_ms": 23.66
-    },
-    {
-      "library": "arrow_cpp",
-      "dataset": "large",
-      "compression": "zstd",
-      "rows": 10000000,
-      "write_ms": 339.32,
-      "read_ms": 28.81,
-      "file_bytes": 101606090,
-      "read_nommap_ms": 30.97
-    },
-    {
-      "library": "carquet",
-      "dataset": "large",
-      "compression": "lz4",
-      "rows": 10000000,
-      "write_ms": 52.91,
-      "read_ms": 9.83,
-      "file_bytes": 128682195,
-      "read_nommap_ms": 13.39
-    },
-    {
-      "library": "carquet",
-      "dataset": "large",
-      "compression": "none",
-      "rows": 10000000,
-      "write_ms": 57.69,
-      "read_ms": 0.28,
-      "file_bytes": 200013459,
-      "read_nommap_ms": 10.61
-    },
-    {
-      "library": "carquet",
-      "dataset": "large",
-      "compression": "snappy",
-      "rows": 10000000,
-      "write_ms": 49.27,
-      "read_ms": 13.96,
-      "file_bytes": 131163987,
-      "read_nommap_ms": 17.78
-    },
-    {
-      "library": "carquet",
-      "dataset": "large",
-      "compression": "zstd",
-      "rows": 10000000,
-      "write_ms": 61.02,
-      "read_ms": 20.65,
-      "file_bytes": 99907282,
-      "read_nommap_ms": 24.45
+      "write_ms": 3.4,
+      "read_ms": 1.59,
+      "file_bytes": 1040444
     },
     {
       "library": "fastparquet",
       "dataset": "large",
       "compression": "lz4",
       "rows": 10000000,
-      "write_ms": 243.79,
-      "read_ms": 55.41,
+      "write_ms": 232.91,
+      "read_ms": 53.65,
       "file_bytes": 138612356
     },
     {
@@ -503,8 +386,8 @@
       "dataset": "large",
       "compression": "none",
       "rows": 10000000,
-      "write_ms": 64.64,
-      "read_ms": 55.67,
+      "write_ms": 56.22,
+      "read_ms": 48.99,
       "file_bytes": 200004094
     },
     {
@@ -512,8 +395,8 @@
       "dataset": "large",
       "compression": "snappy",
       "rows": 10000000,
-      "write_ms": 207.93,
-      "read_ms": 103.37,
+      "write_ms": 194.44,
+      "read_ms": 100.73,
       "file_bytes": 140576700
     },
     {
@@ -521,17 +404,89 @@
       "dataset": "large",
       "compression": "zstd",
       "rows": 10000000,
-      "write_ms": 325.12,
-      "read_ms": 184.91,
+      "write_ms": 321.76,
+      "read_ms": 182.55,
       "file_bytes": 107512731
+    },
+    {
+      "library": "fastparquet",
+      "dataset": "medium",
+      "compression": "lz4",
+      "rows": 1000000,
+      "write_ms": 20.85,
+      "read_ms": 5.01,
+      "file_bytes": 13876160
+    },
+    {
+      "library": "fastparquet",
+      "dataset": "medium",
+      "compression": "none",
+      "rows": 1000000,
+      "write_ms": 7.38,
+      "read_ms": 2.9,
+      "file_bytes": 20003951
+    },
+    {
+      "library": "fastparquet",
+      "dataset": "medium",
+      "compression": "snappy",
+      "rows": 1000000,
+      "write_ms": 21.27,
+      "read_ms": 9.94,
+      "file_bytes": 14064235
+    },
+    {
+      "library": "fastparquet",
+      "dataset": "medium",
+      "compression": "zstd",
+      "rows": 1000000,
+      "write_ms": 32.38,
+      "read_ms": 17.71,
+      "file_bytes": 10754026
+    },
+    {
+      "library": "fastparquet",
+      "dataset": "small",
+      "compression": "lz4",
+      "rows": 100000,
+      "write_ms": 2.15,
+      "read_ms": 0.67,
+      "file_bytes": 1388551
+    },
+    {
+      "library": "fastparquet",
+      "dataset": "small",
+      "compression": "none",
+      "rows": 100000,
+      "write_ms": 1.0,
+      "read_ms": 0.49,
+      "file_bytes": 2001053
+    },
+    {
+      "library": "fastparquet",
+      "dataset": "small",
+      "compression": "snappy",
+      "rows": 100000,
+      "write_ms": 2.26,
+      "read_ms": 1.11,
+      "file_bytes": 1406830
+    },
+    {
+      "library": "fastparquet",
+      "dataset": "small",
+      "compression": "zstd",
+      "rows": 100000,
+      "write_ms": 3.21,
+      "read_ms": 1.98,
+      "file_bytes": 1075763
     },
     {
       "library": "polars",
       "dataset": "large",
       "compression": "lz4",
       "rows": 10000000,
-      "write_ms": 40.0,
-      "read_ms": 29.4,
+      "write_ms": 38.88,
+      "read_ms": 27.39,
       "file_bytes": 109264762
     },
     {
@@ -539,8 +494,8 @@
       "dataset": "large",
       "compression": "none",
       "rows": 10000000,
-      "write_ms": 37.54,
-      "read_ms": 28.67,
+      "write_ms": 37.5,
+      "read_ms": 27.6,
       "file_bytes": 110153033
     },
     {
@@ -548,8 +503,8 @@
       "dataset": "large",
       "compression": "snappy",
       "rows": 10000000,
-      "write_ms": 38.09,
-      "read_ms": 28.3,
+      "write_ms": 37.83,
+      "read_ms": 27.45,
       "file_bytes": 108848940
     },
     {
@@ -557,287 +512,440 @@
       "dataset": "large",
       "compression": "zstd",
       "rows": 10000000,
-      "write_ms": 48.65,
-      "read_ms": 42.13,
+      "write_ms": 45.85,
+      "read_ms": 38.56,
       "file_bytes": 102902770
+    },
+    {
+      "library": "polars",
+      "dataset": "medium",
+      "compression": "lz4",
+      "rows": 1000000,
+      "write_ms": 4.41,
+      "read_ms": 2.77,
+      "file_bytes": 12054002
+    },
+    {
+      "library": "polars",
+      "dataset": "medium",
+      "compression": "none",
+      "rows": 1000000,
+      "write_ms": 4.16,
+      "read_ms": 2.67,
+      "file_bytes": 13259445
+    },
+    {
+      "library": "polars",
+      "dataset": "medium",
+      "compression": "snappy",
+      "rows": 1000000,
+      "write_ms": 4.44,
+      "read_ms": 2.87,
+      "file_bytes": 12011695
+    },
+    {
+      "library": "polars",
+      "dataset": "medium",
+      "compression": "zstd",
+      "rows": 1000000,
+      "write_ms": 5.32,
+      "read_ms": 3.82,
+      "file_bytes": 10581928
+    },
+    {
+      "library": "polars",
+      "dataset": "small",
+      "compression": "lz4",
+      "rows": 100000,
+      "write_ms": 0.93,
+      "read_ms": 0.42,
+      "file_bytes": 1205840
+    },
+    {
+      "library": "polars",
+      "dataset": "small",
+      "compression": "none",
+      "rows": 100000,
+      "write_ms": 0.68,
+      "read_ms": 0.32,
+      "file_bytes": 1326394
+    },
+    {
+      "library": "polars",
+      "dataset": "small",
+      "compression": "snappy",
+      "rows": 100000,
+      "write_ms": 0.9,
+      "read_ms": 0.43,
+      "file_bytes": 1201603
+    },
+    {
+      "library": "polars",
+      "dataset": "small",
+      "compression": "zstd",
+      "rows": 100000,
+      "write_ms": 1.04,
+      "read_ms": 1.01,
+      "file_bytes": 1058440
     },
     {
       "library": "pyarrow",
       "dataset": "large",
       "compression": "lz4",
       "rows": 10000000,
-      "write_ms": 287.2,
-      "read_ms": 29.04,
+      "write_ms": 282.64,
+      "read_ms": 28.13,
       "file_bytes": 129632610,
-      "read_nommap_ms": 41.71
+      "read_nommap_ms": 39.26
     },
     {
       "library": "pyarrow",
       "dataset": "large",
       "compression": "none",
       "rows": 10000000,
-      "write_ms": 165.46,
-      "read_ms": 26.07,
+      "write_ms": 155.95,
+      "read_ms": 25.19,
       "file_bytes": 200119734,
-      "read_nommap_ms": 38.65
+      "read_nommap_ms": 36.67
     },
     {
       "library": "pyarrow",
       "dataset": "large",
       "compression": "snappy",
       "rows": 10000000,
-      "write_ms": 276.12,
-      "read_ms": 39.3,
+      "write_ms": 258.72,
+      "read_ms": 38.24,
       "file_bytes": 131427090,
-      "read_nommap_ms": 47.41
+      "read_nommap_ms": 47.35
     },
     {
       "library": "pyarrow",
       "dataset": "large",
       "compression": "zstd",
       "rows": 10000000,
-      "write_ms": 387.13,
-      "read_ms": 41.28,
+      "write_ms": 382.89,
+      "read_ms": 40.75,
       "file_bytes": 101643796,
-      "read_nommap_ms": 58.94
+      "read_nommap_ms": 52.45
+    },
+    {
+      "library": "pyarrow",
+      "dataset": "medium",
+      "compression": "lz4",
+      "rows": 1000000,
+      "write_ms": 27.78,
+      "read_ms": 2.9,
+      "file_bytes": 12966161,
+      "read_nommap_ms": 4.11
+    },
+    {
+      "library": "pyarrow",
+      "dataset": "medium",
+      "compression": "none",
+      "rows": 1000000,
+      "write_ms": 16.81,
+      "read_ms": 2.68,
+      "file_bytes": 20014899,
+      "read_nommap_ms": 4.79
+    },
+    {
+      "library": "pyarrow",
+      "dataset": "medium",
+      "compression": "snappy",
+      "rows": 1000000,
+      "write_ms": 26.82,
+      "read_ms": 3.68,
+      "file_bytes": 13146090,
+      "read_nommap_ms": 5.46
+    },
+    {
+      "library": "pyarrow",
+      "dataset": "medium",
+      "compression": "zstd",
+      "rows": 1000000,
+      "write_ms": 38.44,
+      "read_ms": 3.78,
+      "file_bytes": 10167660,
+      "read_nommap_ms": 4.75
+    },
+    {
+      "library": "pyarrow",
+      "dataset": "small",
+      "compression": "lz4",
+      "rows": 100000,
+      "write_ms": 2.89,
+      "read_ms": 0.42,
+      "file_bytes": 1296659,
+      "read_nommap_ms": 0.42
+    },
+    {
+      "library": "pyarrow",
+      "dataset": "small",
+      "compression": "none",
+      "rows": 100000,
+      "write_ms": 1.95,
+      "read_ms": 0.25,
+      "file_bytes": 2001590,
+      "read_nommap_ms": 0.26
+    },
+    {
+      "library": "pyarrow",
+      "dataset": "small",
+      "compression": "snappy",
+      "rows": 100000,
+      "write_ms": 2.8,
+      "read_ms": 0.63,
+      "file_bytes": 1314643,
+      "read_nommap_ms": 0.64
+    },
+    {
+      "library": "pyarrow",
+      "dataset": "small",
+      "compression": "zstd",
+      "rows": 100000,
+      "write_ms": 3.8,
+      "read_ms": 0.69,
+      "file_bytes": 1016697,
+      "read_nommap_ms": 0.7
     }
   ],
   "arrow_cpp_version": "26.0.1",
   "pyarrow_version": "26.0.1",
   "fastparquet_version": "2026.9.0",
   "polars_version": "2.1.0",
+  "duckdb_version": "2.0.0",
   "crossread_results": [
+    {
+      "writer": "arrow_file",
+      "dataset": "large",
+      "compression": "lz4",
+      "carquet_read_ms": 9.62,
+      "arrow_read_ms": 17.08
+    },
+    {
+      "writer": "arrow_file",
+      "dataset": "large",
+      "compression": "none",
+      "carquet_read_ms": 0.91,
+      "arrow_read_ms": 13.96
+    },
+    {
+      "writer": "arrow_file",
+      "dataset": "large",
+      "compression": "snappy",
+      "carquet_read_ms": 12.43,
+      "arrow_read_ms": 23.36
+    },
+    {
+      "writer": "arrow_file",
+      "dataset": "large",
+      "compression": "zstd",
+      "carquet_read_ms": 20.33,
+      "arrow_read_ms": 29.81
+    },
     {
       "writer": "arrow_file",
       "dataset": "medium",
       "compression": "lz4",
-      "carquet_read_ms": 1.38,
-      "arrow_read_ms": 2.15
+      "carquet_read_ms": 1.13,
+      "arrow_read_ms": 1.83
     },
     {
       "writer": "arrow_file",
       "dataset": "medium",
       "compression": "none",
-      "carquet_read_ms": 0.12,
-      "arrow_read_ms": 1.77
+      "carquet_read_ms": 0.17,
+      "arrow_read_ms": 1.56
     },
     {
       "writer": "arrow_file",
       "dataset": "medium",
       "compression": "snappy",
-      "carquet_read_ms": 1.46,
-      "arrow_read_ms": 2.47
+      "carquet_read_ms": 1.47,
+      "arrow_read_ms": 2.34
     },
     {
       "writer": "arrow_file",
       "dataset": "medium",
       "compression": "zstd",
-      "carquet_read_ms": 2.31,
-      "arrow_read_ms": 3.31
+      "carquet_read_ms": 2.23,
+      "arrow_read_ms": 3.01
     },
     {
       "writer": "arrow_file",
       "dataset": "small",
       "compression": "lz4",
-      "carquet_read_ms": 0.39,
-      "arrow_read_ms": 0.64
+      "carquet_read_ms": 0.49,
+      "arrow_read_ms": 0.65
     },
     {
       "writer": "arrow_file",
       "dataset": "small",
       "compression": "none",
       "carquet_read_ms": 0.06,
-      "arrow_read_ms": 0.31
+      "arrow_read_ms": 0.27
     },
     {
       "writer": "arrow_file",
       "dataset": "small",
       "compression": "snappy",
-      "carquet_read_ms": 0.59,
-      "arrow_read_ms": 0.92
+      "carquet_read_ms": 0.53,
+      "arrow_read_ms": 0.9
     },
     {
       "writer": "arrow_file",
       "dataset": "small",
       "compression": "zstd",
-      "carquet_read_ms": 0.83,
-      "arrow_read_ms": 1.26
+      "carquet_read_ms": 0.85,
+      "arrow_read_ms": 1.19
+    },
+    {
+      "writer": "carquet_file",
+      "dataset": "large",
+      "compression": "lz4",
+      "carquet_read_ms": 9.17,
+      "arrow_read_ms": 18.45
+    },
+    {
+      "writer": "carquet_file",
+      "dataset": "large",
+      "compression": "none",
+      "carquet_read_ms": 0.28,
+      "arrow_read_ms": 16.35
+    },
+    {
+      "writer": "carquet_file",
+      "dataset": "large",
+      "compression": "snappy",
+      "carquet_read_ms": 8.08,
+      "arrow_read_ms": 17.14
+    },
+    {
+      "writer": "carquet_file",
+      "dataset": "large",
+      "compression": "zstd",
+      "carquet_read_ms": 9.4,
+      "arrow_read_ms": 18.32
     },
     {
       "writer": "carquet_file",
       "dataset": "medium",
       "compression": "lz4",
-      "carquet_read_ms": 1.16,
-      "arrow_read_ms": 2.14
+      "carquet_read_ms": 0.84,
+      "arrow_read_ms": 2.0
     },
     {
       "writer": "carquet_file",
       "dataset": "medium",
       "compression": "none",
       "carquet_read_ms": 0.05,
-      "arrow_read_ms": 1.91
+      "arrow_read_ms": 1.6
     },
     {
       "writer": "carquet_file",
       "dataset": "medium",
       "compression": "snappy",
-      "carquet_read_ms": 1.34,
-      "arrow_read_ms": 2.69
+      "carquet_read_ms": 0.95,
+      "arrow_read_ms": 2.15
     },
     {
       "writer": "carquet_file",
       "dataset": "medium",
       "compression": "zstd",
-      "carquet_read_ms": 2.29,
-      "arrow_read_ms": 3.41
+      "carquet_read_ms": 1.16,
+      "arrow_read_ms": 2.3
     },
     {
       "writer": "carquet_file",
       "dataset": "small",
       "compression": "lz4",
-      "carquet_read_ms": 0.3,
-      "arrow_read_ms": 0.66
+      "carquet_read_ms": 0.27,
+      "arrow_read_ms": 0.68
     },
     {
       "writer": "carquet_file",
       "dataset": "small",
       "compression": "none",
-      "carquet_read_ms": 0.03,
-      "arrow_read_ms": 0.3
+      "carquet_read_ms": 0.02,
+      "arrow_read_ms": 0.33
     },
     {
       "writer": "carquet_file",
       "dataset": "small",
       "compression": "snappy",
-      "carquet_read_ms": 0.37,
-      "arrow_read_ms": 0.99
+      "carquet_read_ms": 0.27,
+      "arrow_read_ms": 0.72
     },
     {
       "writer": "carquet_file",
       "dataset": "small",
       "compression": "zstd",
-      "carquet_read_ms": 0.65,
-      "arrow_read_ms": 1.41
-    },
-    {
-      "writer": "arrow_file",
-      "dataset": "large",
-      "compression": "lz4",
-      "carquet_read_ms": 8.9,
-      "arrow_read_ms": 17.81
-    },
-    {
-      "writer": "arrow_file",
-      "dataset": "large",
-      "compression": "none",
-      "carquet_read_ms": 0.94,
-      "arrow_read_ms": 17.35
-    },
-    {
-      "writer": "arrow_file",
-      "dataset": "large",
-      "compression": "snappy",
-      "carquet_read_ms": 11.49,
-      "arrow_read_ms": 24.43
-    },
-    {
-      "writer": "arrow_file",
-      "dataset": "large",
-      "compression": "zstd",
-      "carquet_read_ms": 19.84,
-      "arrow_read_ms": 30.69
-    },
-    {
-      "writer": "carquet_file",
-      "dataset": "large",
-      "compression": "lz4",
-      "carquet_read_ms": 9.96,
-      "arrow_read_ms": 19.22
-    },
-    {
-      "writer": "carquet_file",
-      "dataset": "large",
-      "compression": "none",
-      "carquet_read_ms": 0.3,
-      "arrow_read_ms": 17.05
-    },
-    {
-      "writer": "carquet_file",
-      "dataset": "large",
-      "compression": "snappy",
-      "carquet_read_ms": 12.68,
-      "arrow_read_ms": 23.26
-    },
-    {
-      "writer": "carquet_file",
-      "dataset": "large",
-      "compression": "zstd",
-      "carquet_read_ms": 20.23,
-      "arrow_read_ms": 30.31
+      "carquet_read_ms": 0.36,
+      "arrow_read_ms": 0.88
     }
   ],
   "polars_crossread_results": [
     {
       "writer": "carquet",
       "compression": "none",
-      "carquet_read_ms": 0.28,
-      "polars_read_ms": 36.41,
+      "carquet_read_ms": 0.29,
+      "polars_read_ms": 30.03,
       "file_bytes": 200013459,
       "dataset": "large"
     },
     {
       "writer": "polars",
       "compression": "none",
-      "carquet_read_ms": 10.26,
-      "polars_read_ms": 27.77,
+      "carquet_read_ms": 9.53,
+      "polars_read_ms": 23.33,
       "file_bytes": 110153033,
       "dataset": "large"
     },
     {
       "writer": "carquet",
       "compression": "snappy",
-      "carquet_read_ms": 13.19,
-      "polars_read_ms": 53.89,
-      "file_bytes": 131163987,
+      "carquet_read_ms": 8.34,
+      "polars_read_ms": 31.58,
+      "file_bytes": 99497194,
       "dataset": "large"
     },
     {
       "writer": "polars",
       "compression": "snappy",
-      "carquet_read_ms": 12.45,
-      "polars_read_ms": 30.47,
+      "carquet_read_ms": 11.02,
+      "polars_read_ms": 24.7,
       "file_bytes": 108848940,
       "dataset": "large"
     },
     {
       "writer": "carquet",
       "compression": "zstd",
-      "carquet_read_ms": 21.7,
-      "polars_read_ms": 51.84,
-      "file_bytes": 99907282,
+      "carquet_read_ms": 8.89,
+      "polars_read_ms": 32.84,
+      "file_bytes": 95635385,
       "dataset": "large"
     },
     {
       "writer": "polars",
       "compression": "zstd",
-      "carquet_read_ms": 17.42,
-      "polars_read_ms": 34.67,
+      "carquet_read_ms": 16.97,
+      "polars_read_ms": 33.99,
       "file_bytes": 102902770,
       "dataset": "large"
     },
     {
       "writer": "carquet",
       "compression": "lz4",
-      "carquet_read_ms": 10.72,
-      "polars_read_ms": 37.71,
-      "file_bytes": 128682195,
+      "carquet_read_ms": 8.53,
+      "polars_read_ms": 32.2,
+      "file_bytes": 99587597,
       "dataset": "large"
     },
     {
       "writer": "polars",
       "compression": "lz4",
-      "carquet_read_ms": 11.53,
-      "polars_read_ms": 26.67,
+      "carquet_read_ms": 11.23,
+      "polars_read_ms": 24.38,
       "file_bytes": 109264762,
       "dataset": "large"
     }

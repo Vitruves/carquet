@@ -69,6 +69,8 @@ With OpenMP, a row group with more than one column is encoded and compressed in 
 
 With `async_io` (on by default) the finished row group is written by a background thread while the next one is encoded. The kernel copy into the page cache is often the single largest cost of an uncompressed write, so overlapping it matters even without a codec. Keep row groups a few MB or larger: the overlap and the page-level split both need more than one page per column to pay off.
 
+Writing over an existing file: on Linux `carquet_writer_create()` writes over the old bytes instead of emptying the file first, which spares the kernel releasing and reallocating its pages and, on ext4, the synchronous flush an emptied-then-rewritten file gets when it is closed (a 190 MB file rewritten in 80 ms instead of 1.6 s). The file is invalid from the open until `carquet_writer_close()` and keeps its old size in between; it is cut at the new end on close.
+
 ## Write Files for Future Reads
 
 Writer settings change how much pruning future readers can do:
