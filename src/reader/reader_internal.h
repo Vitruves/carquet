@@ -200,6 +200,14 @@ struct carquet_column_reader {
                                  * for the next page decoded into it */
     size_t decoded_capacity;    /* Capacity of owned_values, in values */
     size_t levels_capacity;     /* Capacity of the def / rep level buffers */
+    bool defer_dict_gather;     /* Set only inside read_rows_from_pages(): a
+                                 * flat nullable numeric dictionary page may
+                                 * keep its indices ungathered (dense_indices) */
+    bool dense_indices;         /* This page's dense values are not gathered:
+                                 * indices_buffer[0, dense_index_count) holds
+                                 * their (checked) dictionary indices; see
+                                 * carquet_column_materialize_dense() */
+    int32_t dense_index_count;
     void* direct_target;        /* Set only inside carquet_read_next_page():
                                  * the caller's buffer, for a page that fits it */
     size_t direct_target_values;
@@ -242,6 +250,12 @@ struct carquet_column_reader {
  * whose only levels are 0/1 definition levels (max_def == 1, max_rep == 0),
  * i.e. top-level nullable columns.
  */
+/* Gather the dense values of a page loaded with dense_indices into
+ * decoded_values (no-op otherwise), for readers other than
+ * read_rows_from_pages. */
+carquet_status_t carquet_column_materialize_dense(carquet_column_reader_t* reader,
+                                                  carquet_error_t* error);
+
 static inline bool carquet_column_def_as_bits(const carquet_column_reader_t* reader) {
     return reader->max_def_level == 1 && reader->max_rep_level == 0;
 }

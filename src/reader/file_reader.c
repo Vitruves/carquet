@@ -1169,6 +1169,7 @@ void carquet_column_reader_rebind(
     /* Drop a view or target pointer; the owned buffer is kept for reuse. */
     col_reader->decoded_values = col_reader->owned_values;
     col_reader->decoded_ownership = CARQUET_DATA_OWNED;
+    col_reader->dense_indices = false;
 
     /* Free BYTE_ARRAY page data retention list */
     carquet_column_clear_retained_pages(col_reader);

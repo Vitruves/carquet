@@ -642,6 +642,7 @@ static void release_decoded_level_buffers(carquet_column_reader_t* reader) {
 /* Values of this page are read in place (from the mapping or the page
  * payload). The owned buffer is kept for the next decoded page. */
 static void point_values_at_view(carquet_column_reader_t* reader, const uint8_t* data) {
+    reader->dense_indices = false;
     reader->decoded_values = (uint8_t*)data;
     reader->decoded_ownership = CARQUET_DATA_VIEW;
 }
@@ -724,6 +725,8 @@ static carquet_status_t ensure_decoded_page_buffers(
             num_values, (long long)reader->col_meta->num_values);
         return CARQUET_ERROR_INVALID_PAGE;
     }
+
+    reader->dense_indices = false;
 
     /* Values: into the caller's buffer when the read that loads this page
      * takes all of it (no copy afterwards), else into the owned buffer. */
@@ -886,6 +889,45 @@ static bool dictionary_indices_in_range(const uint32_t* idx, int64_t n, int32_t 
         if (idx[i] > max_idx) max_idx = idx[i];
     }
     return n == 0 || max_idx < (uint32_t)count;
+}
+
+/* A flat nullable numeric dictionary page loaded for read_rows_from_pages
+ * (which asks through defer_dict_gather): keep its validated indices
+ * instead of gathering the dense values, so the reader gathers them a block
+ * at a time right before spreading them to their rows, in cache. Returns
+ * whether the gather was deferred; *status is the range check's verdict. */
+static bool defer_dictionary_gather(carquet_column_reader_t* reader, int bit_width,
+                                    const uint32_t* indices, int32_t count,
+                                    carquet_status_t* status) {
+    if (!reader->defer_dict_gather || !carquet_column_def_as_bits(reader) ||
+        indices != reader->indices_buffer) {
+        return false;
+    }
+    int32_t dict_count = reader->dictionary_count;
+    bool in_bounds = bit_width >= 0 && bit_width < 31 &&
+                     ((int32_t)1 << bit_width) <= dict_count;
+    if (!in_bounds && !dictionary_indices_in_range(indices, count, dict_count)) {
+        *status = CARQUET_ERROR_DECODE;
+        return true;
+    }
+    reader->dense_indices = true;
+    reader->dense_index_count = count;
+    *status = CARQUET_OK;
+    return true;
+}
+
+carquet_status_t carquet_column_materialize_dense(carquet_column_reader_t* reader,
+                                                  carquet_error_t* error) {
+    if (!reader->dense_indices) return CARQUET_OK;
+    reader->dense_indices = false;
+    /* Indices were range-checked when the page was loaded. */
+    if (!gather_numeric_dictionary_values(reader, 0, reader->indices_buffer,
+                                          reader->dense_index_count,
+                                          reader->decoded_values)) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Dictionary index out of bounds");
+        return CARQUET_ERROR_DECODE;
+    }
+    return CARQUET_OK;
 }
 
 static carquet_status_t decode_levels_rle(
@@ -1753,6 +1795,15 @@ carquet_status_t carquet_read_data_page_v1(
                         case CARQUET_PHYSICAL_INT64:
                         case CARQUET_PHYSICAL_FLOAT:
                         case CARQUET_PHYSICAL_DOUBLE:
+                            if (defer_dictionary_gather(reader, bit_width, indices,
+                                                        encoded_count, &status)) {
+                                if (status != CARQUET_OK) {
+                                    CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
+                                                      "Dictionary index out of bounds");
+                                    return CARQUET_ERROR_DECODE;
+                                }
+                                break;
+                            }
                             if (!gather_numeric_dictionary_values(
                                     reader, bit_width, indices,
                                     encoded_count, values)) {
@@ -2133,6 +2184,15 @@ carquet_status_t carquet_read_data_page_v2(
                         case CARQUET_PHYSICAL_INT64:
                         case CARQUET_PHYSICAL_FLOAT:
                         case CARQUET_PHYSICAL_DOUBLE:
+                            if (defer_dictionary_gather(reader, bit_width, indices,
+                                                        encoded_count, &status)) {
+                                if (status != CARQUET_OK) {
+                                    CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
+                                                      "Dictionary index out of bounds");
+                                    return CARQUET_ERROR_DECODE;
+                                }
+                                break;
+                            }
                             if (!gather_numeric_dictionary_values(
                                     reader, bit_width, indices,
                                     encoded_count, values)) {
@@ -3521,6 +3581,7 @@ carquet_status_t carquet_column_reader_seek_to_data_page(
     /* Drop a view or target pointer; the owned buffer is kept for reuse. */
     reader->decoded_values = reader->owned_values;
     reader->decoded_ownership = CARQUET_DATA_OWNED;
+    reader->dense_indices = false;
 
     /* Always walk from the chunk start so accumulated_values counts every
      * value in pages before target_offset. Walking only from the current
@@ -3633,6 +3694,11 @@ carquet_status_t carquet_read_next_page(
         if (status != CARQUET_OK) {
             return status;
         }
+    }
+
+    if (reader->dense_indices) {
+        carquet_status_t status = carquet_column_materialize_dense(reader, error);
+        if (status != CARQUET_OK) return status;
     }
 
     if (max_values == 0) {

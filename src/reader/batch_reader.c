@@ -89,6 +89,11 @@ typedef struct br_share {
     uint8_t* bitmap;
 } br_share_t;
 
+extern void carquet_dispatch_gather_i32(const int32_t* dict, const uint32_t* indices,
+                                        int64_t count, int32_t* output);
+extern void carquet_dispatch_gather_i64(const int64_t* dict, const uint32_t* indices,
+                                        int64_t count, int64_t* output);
+
 static void br_share_free(br_share_t* sh) {
     carquet_mem_pool_give(sh->values, sh->values_size);
     carquet_mem_free(sh->bitmap);
@@ -2078,7 +2083,10 @@ static int64_t read_rows_from_pages(carquet_column_reader_t* cr, uint8_t* dest,
          * re-read with a larger window without mmap), which must not read
          * as an error. */
         carquet_error_t load_error = CARQUET_ERROR_INIT;
-        if (carquet_column_ensure_page_loaded(cr, &load_error) != CARQUET_OK) {
+        cr->defer_dict_gather = true;
+        carquet_status_t load_status = carquet_column_ensure_page_loaded(cr, &load_error);
+        cr->defer_dict_gather = false;
+        if (load_status != CARQUET_OK) {
             cr->last_error = load_error;
             if (cr->last_error.code == CARQUET_OK) {
                 CARQUET_SET_ERROR(&cr->last_error, CARQUET_ERROR_DECODE,
@@ -2090,7 +2098,60 @@ static int64_t read_rows_from_pages(carquet_column_reader_t* cr, uint8_t* dest,
         if (take > want - done) take = want - done;
         if (take <= 0) break;
         uint8_t* dst = dest + (size_t)done * value_size;
-        if (carquet_column_def_as_bits(cr) && cr->decoded_def_bits) {
+        if (cr->dense_indices &&
+            !(carquet_column_def_as_bits(cr) && cr->decoded_def_bits &&
+              (value_size == 4 || value_size == 8))) {
+            /* Only the bitmap spread below gathers deferred values. */
+            carquet_error_t merr = CARQUET_ERROR_INIT;
+            if (carquet_column_materialize_dense(cr, &merr) != CARQUET_OK) {
+                cr->last_error = merr;
+                break;
+            }
+        }
+        if (carquet_column_def_as_bits(cr) && cr->decoded_def_bits && cr->dense_indices) {
+            /* Dictionary values gathered a block at a time into a small
+             * buffer and spread from there while it is in cache (the page's
+             * whole dense stream, gathered first, would come back from
+             * memory). */
+            const uint8_t* pb = cr->decoded_def_bits;
+            int64_t pvr = cr->page_values_read;
+            int32_t dense_start;
+            if (pvr == 0) {
+                dense_start = 0;
+            } else if (cr->dense_cursor_pos == cr->page_values_read) {
+                dense_start = cr->dense_cursor_val;
+            } else {
+                dense_start = (int32_t)carquet_bitmap_count_range(pb, 0, pvr);
+            }
+            int64_t present = carquet_bitmap_count_range(pb, pvr, take);
+            if ((int64_t)dense_start + present > cr->dense_index_count) {
+                CARQUET_SET_ERROR(&cr->last_error, CARQUET_ERROR_DECODE,
+                                  "Definition levels exceed the page's values");
+                break;
+            }
+            enum { GATHER_BLOCK = 2048 };
+            uint64_t block[GATHER_BLOCK];
+            const uint32_t* idx = cr->indices_buffer + dense_start;
+            for (int64_t off = 0; off < take; off += GATHER_BLOCK) {
+                int64_t rows = take - off < GATHER_BLOCK ? take - off : GATHER_BLOCK;
+                int64_t np = carquet_bitmap_count_range(pb, pvr + off, rows);
+                if (np > 0) {
+                    if (value_size == 8) {
+                        carquet_dispatch_gather_i64((const int64_t*)cr->dictionary_data,
+                                                    idx, np, (int64_t*)block);
+                    } else {
+                        carquet_dispatch_gather_i32((const int32_t*)cr->dictionary_data,
+                                                    idx, np, (int32_t*)block);
+                    }
+                }
+                scatter_dense_by_bits(dst + (size_t)off * value_size, (const uint8_t*)block,
+                                      np, pb, pvr + off, rows, value_size);
+                idx += np;
+            }
+            carquet_bitmap_copy_range(bits, done, pb, pvr, take);
+            cr->dense_cursor_pos = cr->page_values_read + (int32_t)take;
+            cr->dense_cursor_val = dense_start + (int32_t)present;
+        } else if (carquet_column_def_as_bits(cr) && cr->decoded_def_bits) {
             /* Levels decoded as a validity bitmap: counts are popcounts, the
              * spread is driven by the bits and they are copied as they are. */
             const uint8_t* pb = cr->decoded_def_bits;
