@@ -7,7 +7,7 @@ pip install carquet
 pip install "carquet[pandas]"   # with pandas + NumPy for read_pandas() / to_pandas() / DataFrame input
 ```
 
-Requires Python 3.9+.
+Requires Python 3.11+.
 
 Reads return a `carquet.Table`: its columns stay in the Arrow buffers the C library decoded into, and it implements the [Arrow PyCapsule interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html), so polars, DuckDB, PyArrow, nanoarrow... take it without a copy, and it converts to Python values, NumPy and pandas on its own.
 

@@ -28,4 +28,4 @@ The sdist root is `python/`, so the C tree one level up cannot be referenced as 
 
 ### Release wheels
 
-`.github/workflows/wheels.yml` builds wheels with [cibuildwheel](https://cibuildwheel.pypa.io/) for CPython 3.9 - 3.13 on Linux (x86_64, aarch64; manylinux_2_28), macOS (arm64, x86_64) and Windows (AMD64), runs this test suite against each wheel, builds the sdist and publishes everything to PyPI via trusted publishing when a `v*` tag is pushed.
+`.github/workflows/wheels.yml` builds wheels with [cibuildwheel](https://cibuildwheel.pypa.io/) for CPython 3.11 - 3.15 on Linux (x86_64, aarch64; manylinux_2_28), macOS (arm64, x86_64) and Windows (AMD64), runs this test suite against each wheel, builds the sdist and publishes everything to PyPI via trusted publishing when a `v*` tag is pushed.
