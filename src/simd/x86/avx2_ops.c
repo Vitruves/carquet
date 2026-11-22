@@ -1641,7 +1641,8 @@ void carquet_avx2_copy_minmax_double(const double* values, int64_t count, double
  *
  * Both kernels process whole bytes of rows while 8 dense values can still be
  * loaded, return the rows done and store the dense values consumed: the
- * caller finishes the tail.
+ * caller finishes the tail. The dense values may be page bytes, at any
+ * address; the rows are value-aligned.
  */
 
 /* EXPAND_RANK[b][j]: set bits of b below bit j. */
@@ -1683,14 +1684,14 @@ static inline unsigned expand_bitmap_byte(const uint8_t* bm, int64_t pos) {
     return sh ? (((unsigned)p[0] | ((unsigned)p[1] << 8)) >> sh) & 0xFFu : p[0];
 }
 
-int64_t carquet_avx2_expand_bits_32(uint32_t* dst, const uint32_t* src, int64_t ndense,
+int64_t carquet_avx2_expand_bits_32(uint32_t* dst, const uint8_t* src, int64_t ndense,
                                     const uint8_t* bm, int64_t at, int64_t n,
                                     int64_t* consumed) {
     const __m256i bitsel = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
     int64_t i = 0, k = 0;
     for (; i + 8 <= n && k + 8 <= ndense; i += 8) {
         unsigned bb = expand_bitmap_byte(bm, at + i);
-        __m256i v = _mm256_loadu_si256((const __m256i*)(const void*)(src + k));
+        __m256i v = _mm256_loadu_si256((const __m256i*)(const void*)(src + (size_t)k * 4));
         __m256i idx = _mm256_cvtepu8_epi32(
             _mm_loadl_epi64((const __m128i*)(const void*)EXPAND_RANK[bb]));
         __m256i m = _mm256_cmpeq_epi32(
@@ -1703,7 +1704,7 @@ int64_t carquet_avx2_expand_bits_32(uint32_t* dst, const uint32_t* src, int64_t 
     return i;
 }
 
-int64_t carquet_avx2_expand_bits_64(uint64_t* dst, const uint64_t* src, int64_t ndense,
+int64_t carquet_avx2_expand_bits_64(uint64_t* dst, const uint8_t* src, int64_t ndense,
                                     const uint8_t* bm, int64_t at, int64_t n,
                                     int64_t* consumed) {
     const __m256i bitsel = _mm256_setr_epi64x(1, 2, 4, 8);
@@ -1711,14 +1712,14 @@ int64_t carquet_avx2_expand_bits_64(uint64_t* dst, const uint64_t* src, int64_t 
     for (; i + 8 <= n && k + 8 <= ndense; i += 8) {
         unsigned bb = expand_bitmap_byte(bm, at + i);
         unsigned lo = bb & 15u, hi = bb >> 4;
-        __m256i v = _mm256_loadu_si256((const __m256i*)(const void*)(src + k));
+        __m256i v = _mm256_loadu_si256((const __m256i*)(const void*)(src + (size_t)k * 8));
         __m256i idx = _mm256_loadu_si256((const __m256i*)(const void*)EXPAND_QWORD[lo]);
         __m256i m = _mm256_cmpeq_epi64(
             _mm256_and_si256(_mm256_set1_epi64x((long long)lo), bitsel), bitsel);
         _mm256_storeu_si256((__m256i*)(void*)(dst + i),
                             _mm256_and_si256(_mm256_permutevar8x32_epi32(v, idx), m));
         k += _mm_popcnt_u32(lo);
-        v = _mm256_loadu_si256((const __m256i*)(const void*)(src + k));
+        v = _mm256_loadu_si256((const __m256i*)(const void*)(src + (size_t)k * 8));
         idx = _mm256_loadu_si256((const __m256i*)(const void*)EXPAND_QWORD[hi]);
         m = _mm256_cmpeq_epi64(
             _mm256_and_si256(_mm256_set1_epi64x((long long)hi), bitsel), bitsel);

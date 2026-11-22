@@ -10,6 +10,7 @@ The README shows two of them: --name bench_10m_m3 (macOS report) and --name benc
 import argparse
 import json
 import os
+import re
 
 import matplotlib
 matplotlib.use("Agg")
@@ -50,7 +51,9 @@ def render(data, version, theme, out):
 
     plt.rcParams["font.family"] = "DejaVu Sans"
     fig = plt.figure(figsize=(10.5, 4.7), dpi=200, facecolor=t["bg"])
-    fig.text(0.06, 0.925, f"Parquet at 10 million rows (INT64 + DOUBLE + INT32), {data['system']['cpu']}, {data['timestamp']}",
+    # "Intel(R) Xeon(R) CPU D-1531 @ 2.20GHz" -> "Intel Xeon D-1531"
+    cpu = re.sub(r"\s+", " ", re.sub(r"\(R\)|\(TM\)|\bCPU\b|@.*$", "", data["system"]["cpu"])).strip()
+    fig.text(0.06, 0.925, f"Parquet at 10 million rows (INT64 + DOUBLE + INT32), {cpu}, {data['timestamp']}",
              fontsize=12, fontweight="bold", color=t["text"], va="baseline")
     fig.text(0.06, 0.87, f"Trimmed median of {iters} runs, page cache purged between write and read. "
              "Uncompressed reads use carquet's mmap zero-copy path.", fontsize=8.5, color=t["muted"], va="baseline")
@@ -81,7 +84,7 @@ def render(data, version, theme, out):
             ax.yaxis.set_minor_locator(NullLocator())
         else:
             ax.set_ylim(0, top * (1.12 if len(libs) < 6 else 1.16))
-            ax.yaxis.set_major_locator(MultipleLocator(100))
+            ax.yaxis.set_major_locator(MultipleLocator(100 if top <= 600 else 200))
         ax.set_xlim(-0.55, len(CODECS) - 0.45)
         ax.set_xticks(range(len(CODECS)), CODECS)
         ax.grid(axis="y", color=t["grid"], linewidth=1, zorder=0)

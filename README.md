@@ -106,7 +106,7 @@ Speed-up of carquet over Arrow C++ at 10M rows (higher = carquet faster):
 
 </div>
 
-<sub>\* mmap zero-copy path. Apple M3: carquet `main` after 0.8.0 vs Arrow C++ 26.0.1 (2026-11-22). Linux: the same carquet vs Arrow C++ 23.0.1 (2026-11-22, files on tmpfs). Windows: carquet 0.7.3 vs Arrow C++ 24.0.0 (2026-11-02), not re-measured since. With a codec carquet dictionary-encodes the two integer columns on its own, which Arrow C++ is asked not to do here (see the methodology).</sub>
+<sub>\* mmap zero-copy path. Apple M3: carquet 0.9.0 vs Arrow C++ 26.0.1 (2026-11-22). Linux: the same carquet vs Arrow C++ 23.0.1 (2026-11-22, files on tmpfs). Windows: carquet 0.7.3 vs Arrow C++ 24.0.0 (2026-11-02), not re-measured since. With a codec carquet dictionary-encodes the two integer columns on its own, which Arrow C++ is asked not to do here (see the methodology).</sub>
 
 Compressed reads decode every value, and on Linux and macOS both libraries link the same system lz4 / zstd, so codec speed is identical. The fairest comparison is the **same-file cross-read** (both libraries read the exact same file): carquet is **1.5–2.1x faster** than Arrow C++ on M3 (2.0–3.8x faster than polars), 1.7–2.7x on Linux (1.7–3.9x faster than polars) and 1.04–1.30x on the Windows VM, whose cold reads are bound by the virtual disk.
 
@@ -132,7 +132,7 @@ The **same-file cross-read** benchmark is the fairest comparison: both libraries
 
 <br/>
 
-*Carquet `main` after 0.8.0, Xeon D-1531 (6 cores / 12 threads @ 2.2GHz, AVX2), 32GB RAM, Ubuntu 24.04, GCC 13.3, Arrow C++ 23.0.1, PyArrow 23.0.0, fastparquet 2026.5.0, polars 2.1.0, DuckDB 1.5.0, ZSTD level 1, files on tmpfs, measured on 2026-11-22.*
+*Carquet 0.9.0, Xeon D-1531 (6 cores / 12 threads @ 2.2GHz, AVX2), 32GB RAM, Ubuntu 24.04, GCC 13.3, Arrow C++ 23.0.1, PyArrow 23.0.0, fastparquet 2026.5.0, polars 2.1.0, DuckDB 1.5.0, ZSTD level 1, files on tmpfs, measured on 2026-11-22.*
 
 ##### 10M rows vs Arrow C++
 
@@ -410,7 +410,7 @@ polars uses its own Rust Parquet reader and writer (`use_pyarrow=False`, its def
 
 <br/>
 
-*Carquet `main` after 0.8.0, MacBook Air M3, 16GB RAM, macOS 26.5, Arrow C++ 26.0.1, PyArrow 26.0.1, fastparquet 2026.9.0, polars 2.1.0, DuckDB 2.0.0, ZSTD level 1, measured on 2026-11-22. Raw report: [`site/bench.json`](site/bench.json).*
+*Carquet 0.9.0, MacBook Air M3, 16GB RAM, macOS 26.5, Arrow C++ 26.0.1, PyArrow 26.0.1, fastparquet 2026.9.0, polars 2.1.0, DuckDB 2.0.0, ZSTD level 1, measured on 2026-11-22. Raw report: [`site/bench.json`](site/bench.json).*
 
 ##### 10M rows vs Arrow C++
 
@@ -657,6 +657,25 @@ Both libraries read the **same** Parquet file, the fairest apples-to-apples comp
 </div>
 
 <br/>
+
+##### Same-file cross-read vs polars (10M rows)
+
+Each library reads the file carquet's benchmark writes and the file polars writes with its own settings.
+
+<div align="center">
+
+| Codec | Writer | Carquet Read | polars Read | Ratio | File |
+|-------|--------|-------------|-------------|-------|------|
+| none | Carquet | **0.29ms** | 30.0ms | **103.6x**\* | 190.7MB |
+| none | polars | **9.53ms** | 23.3ms | **2.45x** | 105.1MB |
+| snappy | Carquet | **8.34ms** | 31.6ms | **3.79x** | 94.9MB |
+| snappy | polars | **11.0ms** | 24.7ms | **2.24x** | 103.8MB |
+| zstd | Carquet | **8.89ms** | 32.8ms | **3.69x** | 91.2MB |
+| zstd | polars | **17.0ms** | 34.0ms | **2.00x** | 98.1MB |
+| lz4 | Carquet | **8.53ms** | 32.2ms | **3.77x** | 95.0MB |
+| lz4 | polars | **11.2ms** | 24.4ms | **2.17x** | 104.2MB |
+
+</div>
 
 \* Zero-copy mmap path. fastparquet reads through pandas and cannot write BYTE_STREAM_SPLIT or page checksums, so its rows are less directly comparable.
 

@@ -542,9 +542,14 @@ static int write_read_arrow(struct ArrowSchema* sc, struct ArrowArray* top,
     if (!w) return -1;
     carquet_status_t rc = carquet_writer_write_arrow(w, top, sc2, err);
     free(top); free(sc2);
-    if (rc != CARQUET_OK) return -1;
-    if (carquet_writer_close(w) != CARQUET_OK) return -1;
-    if (carquet_writer_get_buffer(w, buf, sz) != CARQUET_OK) return -1;
+    /* A buffer writer outlives a failed write or close: abort releases it
+     * (get_buffer does on success). */
+    if (rc != CARQUET_OK || carquet_writer_close(w) != CARQUET_OK ||
+        carquet_writer_get_buffer(w, buf, sz) != CARQUET_OK) {
+        carquet_writer_abort(w);
+        carquet_schema_free(cs);
+        return -1;
+    }
     carquet_schema_free(cs);
     return 0;
 }

@@ -199,13 +199,13 @@ extern "C" {
 #define CARQUET_VERSION_MAJOR 0
 
 /** @brief Minor version number */
-#define CARQUET_VERSION_MINOR 8
+#define CARQUET_VERSION_MINOR 9
 
 /** @brief Patch version number */
 #define CARQUET_VERSION_PATCH 0
 
 /** @brief Version string in "MAJOR.MINOR.PATCH" format */
-#define CARQUET_VERSION_STRING "0.8.0"
+#define CARQUET_VERSION_STRING "0.9.0"
 
 /** @brief Numeric version for compile-time comparisons: (MAJOR * 10000 + MINOR * 100 + PATCH) */
 #define CARQUET_VERSION_NUMBER (CARQUET_VERSION_MAJOR * 10000 + CARQUET_VERSION_MINOR * 100 + CARQUET_VERSION_PATCH)

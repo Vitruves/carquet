@@ -2095,7 +2095,8 @@ static void scatter_dense_by_bits(uint8_t* dst, const uint8_t* src, int64_t nden
  * page's validated ones. */
 #define GATHER_ROWS_BODY(T)                                                      \
     do {                                                                         \
-        const T* dv = (const T*)dict;                                            \
+        /* The dictionary is page bytes: no alignment to count on. */            \
+        const uint8_t* dv = (const uint8_t*)dict;                                \
         T* out = (T*)(void*)dst;                                                 \
         int64_t k = 0;                                                           \
         for (int64_t i = 0; i < n; i += 64) {                                    \
@@ -2107,14 +2108,17 @@ static void scatter_dense_by_bits(uint8_t* dst, const uint8_t* src, int64_t nden
                 continue;                                                        \
             }                                                                    \
             if (h == 64 && w == ~(uint64_t)0) {                                  \
-                for (int j = 0; j < 64; j++) d[j] = dv[idx[k + j]];              \
+                for (int j = 0; j < 64; j++) {                                   \
+                    memcpy(&d[j], dv + (size_t)idx[k + j] * sizeof(T), sizeof(T));\
+                }                                                                \
                 k += 64;                                                         \
                 continue;                                                        \
             }                                                                    \
             int live = 64 - carquet_clz64(w);                                    \
             for (int j = 0; j < live; j++) {                                     \
-                T bit = (T)(w & 1);                                              \
-                d[j] = dv[idx[k]] & ((T)0 - bit);                                \
+                T bit = (T)(w & 1), v;                                           \
+                memcpy(&v, dv + (size_t)idx[k] * sizeof(T), sizeof(T));          \
+                d[j] = v & ((T)0 - bit);                                         \
                 k += (int64_t)(w & 1);                                           \
                 w >>= 1;                                                         \
             }                                                                    \

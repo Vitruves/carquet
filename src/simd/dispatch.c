@@ -72,10 +72,10 @@ typedef void (*build_null_bitmap_fn)(const int16_t* def_levels, int64_t count,
                                       int16_t max_def_level, uint8_t* null_bitmap);
 typedef void (*fill_def_levels_fn)(int16_t* def_levels, int64_t count, int16_t value);
 typedef bool (*levels_to_bits_fn)(const int16_t* levels, int64_t count, uint64_t* bits);
-typedef int64_t (*expand_bits_32_fn)(uint32_t* dst, const uint32_t* src, int64_t ndense,
+typedef int64_t (*expand_bits_32_fn)(uint32_t* dst, const uint8_t* src, int64_t ndense,
                                      const uint8_t* bm, int64_t at, int64_t n,
                                      int64_t* consumed);
-typedef int64_t (*expand_bits_64_fn)(uint64_t* dst, const uint64_t* src, int64_t ndense,
+typedef int64_t (*expand_bits_64_fn)(uint64_t* dst, const uint8_t* src, int64_t ndense,
                                      const uint8_t* bm, int64_t at, int64_t n,
                                      int64_t* consumed);
 typedef void (*minmax_i32_fn)(const int32_t* values, int64_t count, int32_t* min_value, int32_t* max_value);
@@ -561,10 +561,10 @@ extern void carquet_avx2_prefix_sum_i32(int32_t* values, int64_t count, int32_t 
 extern void carquet_avx2_prefix_sum_i64(int64_t* values, int64_t count, int64_t initial);
 extern void carquet_avx2_gather_i32(const int32_t* dict, const uint32_t* indices,
                                      int64_t count, int32_t* output);
-extern int64_t carquet_avx2_expand_bits_32(uint32_t* dst, const uint32_t* src, int64_t ndense,
+extern int64_t carquet_avx2_expand_bits_32(uint32_t* dst, const uint8_t* src, int64_t ndense,
                                            const uint8_t* bm, int64_t at, int64_t n,
                                            int64_t* consumed);
-extern int64_t carquet_avx2_expand_bits_64(uint64_t* dst, const uint64_t* src, int64_t ndense,
+extern int64_t carquet_avx2_expand_bits_64(uint64_t* dst, const uint8_t* src, int64_t ndense,
                                            const uint8_t* bm, int64_t at, int64_t n,
                                            int64_t* consumed);
 extern void carquet_avx2_gather_i64(const int64_t* dict, const uint32_t* indices,
@@ -1479,11 +1479,11 @@ int64_t carquet_dispatch_expand_bits(void* dst, const void* src, int64_t ndense,
     DISPATCH_ENSURE_INIT();
     *consumed = 0;
     if (value_size == 4 && g_dispatch.expand_bits_32) {
-        return g_dispatch.expand_bits_32((uint32_t*)dst, (const uint32_t*)src, ndense,
+        return g_dispatch.expand_bits_32((uint32_t*)dst, (const uint8_t*)src, ndense,
                                          bm, at, n, consumed);
     }
     if (value_size == 8 && g_dispatch.expand_bits_64) {
-        return g_dispatch.expand_bits_64((uint64_t*)dst, (const uint64_t*)src, ndense,
+        return g_dispatch.expand_bits_64((uint64_t*)dst, (const uint8_t*)src, ndense,
                                          bm, at, n, consumed);
     }
     return 0;

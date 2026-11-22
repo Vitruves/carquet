@@ -1,8 +1,12 @@
 # Changelog
 
-## Unreleased
+## v0.9.0
+
+**In short:** reads and writes stop making passes over memory they do not need. Flat nullable columns and numeric dictionary pages are decoded a block at a time straight to their rows, integer dictionaries are built in one pass, page tasks encode from the writer's copy of the input, and on Linux an existing file is written over in place instead of being emptied first. On a 12-thread Xeon D-1531, 10M rows x 3 columns are written in 75–95 ms (122–135 before) and nullable ones read in 32–45 ms (42–64 before), ahead of polars and DuckDB on every configuration measured there; DuckDB joins the benchmark. Also in this release: column readers can read dictionary indices, a GEOMETRY / GEOGRAPHY CRS is returned whole, four memory-safety fixes for crafted or invalid input, and Python 3.11 becomes the minimum. ABI: additions only (new functions). Default output bytes change for INT32 / INT64 columns written with a codec, which are now dictionary-encoded chunk by chunk when a sample says it pays (set the column's encoding to keep PLAIN); other columns are written as before. On Linux, `carquet_writer_create()` replaces an existing file differently (below).
 
 ### Breaking changes
+
+- **An existing file is written over in place on Linux**: `carquet_writer_create()` no longer empties a file that already exists at the path. The file stops being a valid Parquet file as soon as the call returns (its trailing magic is zeroed), keeps its old size while the new one is written, and is cut at the new end by `carquet_writer_close()`; `carquet_writer_abort()` removes it, as before. A program that watched the file's size during a write, or read the old file while it was being replaced, sees old bytes behind the new ones instead of a short file. See Performance for why.
 
 - **Python 3.11+** ([#56](https://github.com/Vitruves/carquet/pull/56) by @aebrahim): wheels are built for CPython 3.11 - 3.15 (cibuildwheel 4.3.5) and `requires-python` is `>=3.11`; 3.9 and 3.10 have reached end of life and are no longer built.
 

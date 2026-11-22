@@ -65,14 +65,15 @@ git tag vX.Y.Z && git push origin main --tags
 
 ```bash
 make benchmark                                                   # Release build (a Debug build/ fakes a slowdown)
-python3 benchmark/run_benchmark.py --skip-xlarge --fastparquet   # writes benchmark/bench_<ver>_<os>_<arch>_<date>.json
+python3 benchmark/run_benchmark.py --skip-xlarge --fastparquet --polars --duckdb   # writes benchmark/bench_<ver>_<os>_<arch>_<date>.json
 python3 benchmark/plot_readme_chart.py benchmark/bench_<...>.json   # res/img/bench_10m_m3_{light,dark}.png
+python3 benchmark/plot_readme_chart.py benchmark/bench_<linux report>.json --name bench_10m_linux   # the Linux figure (run on tmpfs: --temp-dir /dev/shm)
 cp benchmark/bench_<...>.json site/bench.json                    # the website charts read this file
 python3 -m http.server -d site 8765                              # preview http://localhost:8765
 ```
 
 - [ ] **Benchmark report committed** (`benchmark/bench_*.json`) from a quiet machine, Release build.
-- [ ] **README charts regenerated** (light + dark) and the numbers that come from the report updated by hand: Highlights row, speed-up table, "Full ARM results" fold, version / date footnotes.
+- [ ] **README charts regenerated** (light + dark) and the numbers that come from the report updated by hand: Highlights row, speed-up table, "Full ARM results" and "Full x86 results" folds, version / date footnotes.
 - [ ] **`site/bench.json` replaced** with the same report; site text checked against the release (function count in the API section, feature claims, `GIT_TAG` pin — `bump_version.py --check` covers the pin).
 - [ ] **Translations synced**: the six `README.<lang>.md` follow `README.md` (same sections, tables, numbers, badges, links; internal anchors resolve).
 - [ ] **Site deployed**: `.github/workflows/pages.yml` runs on any push to `main` touching `site/`; open https://vitruves.github.io/carquet/ after the push.
