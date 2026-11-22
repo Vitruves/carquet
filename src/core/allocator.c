@@ -215,6 +215,14 @@ void carquet_mem_pool_give(void* ptr, size_t capacity) {
     carquet_mem_free(ptr);
 }
 
+void* carquet_mem_pool_alloc(size_t size, size_t* capacity) {
+    void* p = carquet_mem_pool_try_take(size, capacity);
+    if (p) return p;
+    p = carquet_mem_malloc(size);
+    *capacity = p ? size : 0;
+    return p;
+}
+
 void carquet_mem_pool_flush(void) {
 #ifdef POOL_HAVE_LOCK
     void* blocks[CARQUET_MEM_POOL_SLOTS];

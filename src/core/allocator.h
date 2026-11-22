@@ -54,6 +54,10 @@ void* carquet_mem_pool_try_take(size_t size, size_t* capacity);
  * realloc / the pool: pooled when it fits, freed otherwise. */
 void carquet_mem_pool_give(void* ptr, size_t capacity);
 
+/* A block of at least `size` bytes: pooled if the pool has one, else from
+ * carquet_mem_malloc (*capacity = size). NULL on out-of-memory. */
+void* carquet_mem_pool_alloc(size_t size, size_t* capacity);
+
 /* Free every pooled block. */
 void carquet_mem_pool_flush(void);
 

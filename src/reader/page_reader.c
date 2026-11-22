@@ -429,13 +429,13 @@ static carquet_status_t ensure_decompress_capacity(
     }
 
     if (needed > reader->decompress_capacity) {
-        uint8_t* new_buf = carquet_mem_realloc(reader->decompress_buffer, needed);
-        if (!new_buf) {
+        /* The old contents are not needed: the page is decompressed anew. */
+        carquet_mem_pool_give(reader->decompress_buffer, reader->decompress_capacity);
+        reader->decompress_buffer = carquet_mem_pool_alloc(needed, &reader->decompress_capacity);
+        if (!reader->decompress_buffer) {
             CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "%s", message);
             return CARQUET_ERROR_OUT_OF_MEMORY;
         }
-        reader->decompress_buffer = new_buf;
-        reader->decompress_capacity = needed;
     }
 
     return CARQUET_OK;
@@ -672,9 +672,10 @@ static size_t grow_page_capacity(const carquet_column_reader_t* reader,
 static bool grow_indices_buffer(carquet_column_reader_t* reader, size_t needed) {
     size_t capacity = grow_page_capacity(reader, reader->indices_capacity, needed);
     if (capacity > SIZE_MAX / sizeof(uint32_t)) capacity = needed;
-    carquet_mem_free(reader->indices_buffer);
-    reader->indices_buffer = carquet_mem_malloc(capacity * sizeof(uint32_t));
-    reader->indices_capacity = reader->indices_buffer ? capacity : 0;
+    carquet_mem_pool_give(reader->indices_buffer, reader->indices_capacity * sizeof(uint32_t));
+    size_t bytes = 0;
+    reader->indices_buffer = carquet_mem_pool_alloc(capacity * sizeof(uint32_t), &bytes);
+    reader->indices_capacity = bytes / sizeof(uint32_t);
     return reader->indices_buffer != NULL;
 }
 
@@ -751,12 +752,15 @@ static carquet_status_t ensure_decoded_page_buffers(
                 capacity = (size_t)num_values;
                 capacity_bytes = values_buffer_size;
             }
-            carquet_mem_free(reader->owned_values);
+            carquet_mem_pool_give(reader->owned_values,
+                                  reader->decoded_capacity * reader->decoded_value_size);
             /* malloc, not calloc: the page decoder writes every value it
              * reports and reads only ever copy decoded values out, so zeroing
              * is a wasted pass over the buffer (and forces every page of it
              * to be touched). */
-            reader->owned_values = capacity_bytes > 0 ? carquet_mem_malloc(capacity_bytes) : NULL;
+            size_t got = 0;
+            reader->owned_values = capacity_bytes > 0
+                ? carquet_mem_pool_alloc(capacity_bytes, &got) : NULL;
             reader->decoded_capacity = reader->owned_values ? capacity : 0;
             reader->decoded_value_size = value_size;
         }
@@ -3206,13 +3210,14 @@ static carquet_status_t load_next_page_fread(
 
     /* Read compressed page data into a reusable buffer (from prebuffer or file) */
     if ((size_t)page_header.compressed_page_size > reader->page_buffer_capacity) {
-        uint8_t* new_buffer = carquet_mem_realloc(reader->page_buffer, (size_t)page_header.compressed_page_size);
-        if (!new_buffer) {
+        /* The old contents are not needed: the page is read anew. */
+        carquet_mem_pool_give(reader->page_buffer, reader->page_buffer_capacity);
+        reader->page_buffer = carquet_mem_pool_alloc((size_t)page_header.compressed_page_size,
+                                                     &reader->page_buffer_capacity);
+        if (!reader->page_buffer) {
             CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate page buffer");
             return CARQUET_ERROR_OUT_OF_MEMORY;
         }
-        reader->page_buffer = new_buffer;
-        reader->page_buffer_capacity = (size_t)page_header.compressed_page_size;
     }
     reader->page_buffer_size = (size_t)page_header.compressed_page_size;
     uint8_t* compressed = reader->page_buffer;

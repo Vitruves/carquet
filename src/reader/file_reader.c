@@ -1071,7 +1071,7 @@ carquet_column_reader_t* carquet_reader_get_column(
 void carquet_column_reader_free(carquet_column_reader_t* reader) {
     if (!reader) return;
 
-    carquet_mem_free(reader->page_buffer);
+    carquet_mem_pool_give(reader->page_buffer, reader->page_buffer_capacity);
     carquet_column_clear_retained_pages(reader);
     if (reader->dictionary_ownership == CARQUET_DATA_OWNED) {
         carquet_mem_free(reader->dictionary_data);
@@ -1080,14 +1080,15 @@ void carquet_column_reader_free(carquet_column_reader_t* reader) {
 
     /* decoded_values is owned_values, a mapping view or a caller's buffer:
      * only owned_values is ours. */
-    carquet_mem_free(reader->owned_values);
+    carquet_mem_pool_give(reader->owned_values,
+                          reader->decoded_capacity * reader->decoded_value_size);
 
     /* Levels are always owned (decoded from RLE) */
     carquet_mem_free(reader->decoded_def_levels);
     carquet_mem_free(reader->decoded_def_bits);
     carquet_mem_free(reader->decoded_rep_levels);
-    carquet_mem_free(reader->indices_buffer);
-    carquet_mem_free(reader->decompress_buffer);
+    carquet_mem_pool_give(reader->indices_buffer, reader->indices_capacity * sizeof(uint32_t));
+    carquet_mem_pool_give(reader->decompress_buffer, reader->decompress_capacity);
     carquet_mem_free(reader->scratch_def_levels);
     carquet_mem_free(reader);
 }

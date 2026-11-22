@@ -85,11 +85,12 @@ static long br_share_dec(long* p) { return _InterlockedDecrement((volatile long*
 typedef struct br_share {
     long refs;
     void* values;
+    size_t values_size;         /* Bytes behind values (for the block pool) */
     uint8_t* bitmap;
 } br_share_t;
 
 static void br_share_free(br_share_t* sh) {
-    carquet_mem_free(sh->values);
+    carquet_mem_pool_give(sh->values, sh->values_size);
     carquet_mem_free(sh->bitmap);
     carquet_mem_free(sh);
 }
@@ -1715,9 +1716,8 @@ carquet_batch_reader_t* carquet_batch_reader_create(
                                         needed > CARQUET_MAX_PREALLOC_BYTES) {
                                         continue;
                                     }
-                                    slot->col_values[i] = carquet_mem_malloc(needed);
-                                    slot->col_buf_sizes[i] =
-                                        slot->col_values[i] ? needed : 0;
+                                    slot->col_values[i] = carquet_mem_pool_alloc(
+                                        needed, &slot->col_buf_sizes[i]);
                                 }
                             }
                         }
@@ -2771,6 +2771,7 @@ static void slot_share_column(rg_slot_t* slot, int32_t i) {
     if (!sh) return;
     sh->refs = 1;
     sh->values = slot->col_values[i];
+    sh->values_size = slot->col_buf_sizes[i];
     sh->bitmap = slot->col_bitmaps[i];
     slot->col_share[i] = sh;
 #else
@@ -3016,7 +3017,13 @@ static void pipeline_fill(carquet_batch_reader_t* br) {
             }
             size_t needed = (size_t)slot_rows * vsz;
             if (needed > slot->col_buf_sizes[i]) {
-                void* new_buf = carquet_mem_realloc(slot->col_values[i], needed);
+                /* The slot's old values are not needed: this row group
+                 * overwrites them. */
+                carquet_mem_pool_give(slot->col_values[i], slot->col_buf_sizes[i]);
+                slot->col_values[i] = NULL;
+                slot->col_buf_sizes[i] = 0;
+                size_t got = 0;
+                void* new_buf = carquet_mem_pool_alloc(needed, &got);
                 if (!new_buf) {
                     /* %llu, not %zu: the MinGW/msvcrt printf has no z length modifier. */
                     PIPELINE_FAIL(br, CARQUET_ERROR_OUT_OF_MEMORY,
@@ -3025,7 +3032,7 @@ static void pipeline_fill(carquet_batch_reader_t* br) {
                     return;
                 }
                 slot->col_values[i] = new_buf;
-                slot->col_buf_sizes[i] = needed;
+                slot->col_buf_sizes[i] = got;
             }
 
             /* Validity bitmap for a column with definition levels. */
@@ -4589,7 +4596,7 @@ void carquet_batch_reader_free(carquet_batch_reader_t* batch_reader) {
             carquet_mem_free(slot->col_share);
             if (slot->col_values) {
                 for (int32_t i = 0; i < batch_reader->num_projected; i++) {
-                    carquet_mem_free(slot->col_values[i]);
+                    carquet_mem_pool_give(slot->col_values[i], slot->col_buf_sizes[i]);
                 }
                 carquet_mem_free(slot->col_values);
             }
