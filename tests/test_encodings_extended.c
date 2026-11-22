@@ -1038,6 +1038,82 @@ static int test_dictionary_build_capped_reference(void) {
     return 0;
 }
 
+/* INT32 / INT64 chunks over a small range take the direct-table builder:
+ * the same dictionary, indices and abandon decision as the reference, for
+ * negative bases, the type's extremes, spans either side of the direct
+ * limit (65536 integers, or the chunk's value count) and runs. */
+static int test_dictionary_build_direct_reference(void) {
+    enum { N = 9000 };
+    uint8_t* vals = malloc((size_t)N * 8);
+    uint8_t* ref_dict = malloc((size_t)N * 8);
+    uint32_t* ref_idx = malloc((size_t)N * sizeof(uint32_t));
+    if (!vals || !ref_dict || !ref_idx) { free(vals); free(ref_dict); free(ref_idx); TEST_FAIL("dictionary_build_direct_reference", "alloc"); }
+    const int64_t bases64[] = {0, -5, 1000000, INT64_MIN, INT64_MAX - 70000, -40000};
+    const int32_t bases32[] = {0, -5, 1000000, INT32_MIN, INT32_MAX - 70000, -40000};
+    const int64_t spans[] = {1, 2, 100, 65535, 65536, 65537, 9000, 70000};
+    int bad = 0;
+    for (int it = 0; it < 192 && !bad; it++) {
+        bool is64 = it & 1;
+        size_t size = is64 ? 8 : 4;
+        int64_t span = spans[(it >> 1) % 8];
+        int b = (it >> 4) % 6;
+        int64_t n = (it % 3 == 0) ? N : 1 + rle_rand() % N;
+        uint32_t card = 1 + rle_rand() % 2000;
+        for (int64_t i = 0; i < n; i++) {
+            /* card distinct offsets spread over [0, span); the first value is
+             * the lowest and one is the highest, so the span is exact. */
+            uint64_t c = rle_rand() % card;
+            uint64_t off = card > 1 ? (uint64_t)((double)c / (card - 1) * (double)(span - 1)) : 0;
+            if (i == 0) off = 0;
+            if (i == 1) off = (uint64_t)(span - 1);
+            if (is64) {
+                int64_t v = (int64_t)((uint64_t)bases64[b] + off);
+                memcpy(vals + (size_t)i * 8, &v, 8);
+            } else {
+                int32_t v = (int32_t)(uint32_t)((uint32_t)bases32[b] + (uint32_t)off);
+                memcpy(vals + (size_t)i * 4, &v, 4);
+            }
+        }
+        if (it % 5 == 0 && n > 3) {
+            for (int64_t i = 2; i < n; i++) if (rle_rand() % 4) memcpy(vals + i * size, vals + (i - 1) * size, size);
+        }
+        int64_t nref = 0;
+        for (int64_t i = 0; i < n; i++) {
+            int64_t e = 0;
+            while (e < nref && memcmp(ref_dict + (size_t)e * size, vals + (size_t)i * size, size) != 0) e++;
+            if (e == nref) { memcpy(ref_dict + (size_t)nref * size, vals + (size_t)i * size, size); nref++; }
+            ref_idx[i] = (uint32_t)e;
+        }
+        size_t cap = (it % 4 == 3) ? (size_t)(rle_rand() % (nref * size + 1)) : 0;
+        carquet_buffer_t dict;
+        carquet_buffer_init(&dict);
+        carquet_buffer_append_byte(&dict, 0xEE);
+        uint32_t* idx = NULL;
+        int32_t ne = -1;
+        bool ab = false;
+        carquet_status_t st = carquet_dictionary_build_capped(
+            is64 ? CARQUET_PHYSICAL_INT64 : CARQUET_PHYSICAL_INT32, (int32_t)size,
+            vals, NULL, n, cap, &dict, &idx, &ne, &ab);
+        bool want_abandon = cap && (size_t)nref * size > cap;
+        if (st != CARQUET_OK) bad = 1;
+        else if (ab != want_abandon) bad = 2;
+        else if (ab) {
+            if (idx || dict.size != 1) bad = 3;
+        } else if (ne != nref || dict.size != 1 + (size_t)nref * size ||
+                   memcmp(dict.data + 1, ref_dict, (size_t)nref * size) != 0 ||
+                   memcmp(idx, ref_idx, (size_t)n * sizeof(uint32_t)) != 0) {
+            bad = 4;
+        }
+        if (bad) printf("  it=%d size=%zu n=%lld span=%lld base=%d cap=%zu code=%d\n", it, size, (long long)n, (long long)span, b, cap, bad);
+        carquet_mem_free(idx);
+        carquet_buffer_destroy(&dict);
+    }
+    free(vals); free(ref_dict); free(ref_idx);
+    if (bad) TEST_FAIL("dictionary_build_direct_reference", "dictionary or indices differ from reference");
+    TEST_PASS("dictionary_build_direct_reference");
+    return 0;
+}
+
 static int test_bool_pack_unpack_dispatch(void) {
     uint8_t packed[] = {0xA5, 0x3C, 0x81};
     uint8_t unpacked[24];
@@ -1117,6 +1193,7 @@ int main(void) {
     failures += test_rle_batch_vs_put();
     failures += test_rle_batch_long_streams();
     failures += test_dictionary_build_capped_reference();
+    failures += test_dictionary_build_direct_reference();
 
     printf("\n");
     if (failures == 0) {

@@ -689,6 +689,103 @@ static inline carquet_status_t build_fixed_word(size_t size, const uint8_t* src,
 }
 #endif
 
+#if CARQUET_LITTLE_ENDIAN
+extern void carquet_dispatch_minmax_i32(const int32_t* values, int64_t count,
+                                        int32_t* min_value, int32_t* max_value);
+extern void carquet_dispatch_minmax_i64(const int64_t* values, int64_t count,
+                                        int64_t* min_value, int64_t* max_value);
+
+/* Values of an INT32 / INT64 chunk spread over at most this many integers,
+ * or over no more integers than the chunk has values, go through a direct
+ * table (one uint32_t per integer, so never larger than the input). */
+#define DIRECT_DICT_MIN_SPAN ((uint64_t)1 << 16)
+#define DIRECT_DICT_PREFIX 4096
+
+/* Span max - min + 1 of the chunk if a direct table may index it, else 0.
+ * A prefix decides first, so a chunk of scattered values costs one short
+ * pass, not a full one. */
+static uint64_t direct_dict_span(size_t size, const void* values, int64_t count,
+                                 int64_t* min_out) {
+    uint64_t limit = (uint64_t)count > DIRECT_DICT_MIN_SPAN ? (uint64_t)count
+                                                            : DIRECT_DICT_MIN_SPAN;
+    int64_t prefix = count < DIRECT_DICT_PREFIX ? count : DIRECT_DICT_PREFIX;
+    for (int pass = 0; pass < 2; pass++) {
+        int64_t n = pass == 0 ? prefix : count;
+        int64_t lo, hi;
+        if (size == 4) {
+            int32_t a, b;
+            carquet_dispatch_minmax_i32((const int32_t*)values, n, &a, &b);
+            lo = a; hi = b;
+        } else {
+            carquet_dispatch_minmax_i64((const int64_t*)values, n, &lo, &hi);
+        }
+        uint64_t span = (uint64_t)hi - (uint64_t)lo;   /* hi >= lo */
+        if (span >= limit) return 0;
+        if (pass == 1 || n == count) {
+            *min_out = lo;
+            return span + 1;
+        }
+    }
+    return 0;
+}
+
+/* Dictionary of an integer chunk whose values lie in [min, min + span): the
+ * slot of a value is its offset from min, with no hashing or probing. Same
+ * first-occurrence numbering and early-abort rule as build_fixed_word, so
+ * the same dictionary and indices. */
+static carquet_status_t build_fixed_direct(size_t size, const uint8_t* src,
+                                           int64_t count, int64_t minv, uint64_t span,
+                                           size_t max_dict_bytes,
+                                           carquet_buffer_t* dict_output,
+                                           uint32_t* indices, uint32_t* num_entries,
+                                           bool* abandoned) {
+    size_t entries_cap = (uint64_t)count < span ? (size_t)count : (size_t)span;
+    uint32_t* map = carquet_mem_calloc((size_t)span, sizeof(uint32_t));
+    uint64_t* entries = carquet_mem_malloc(entries_cap * sizeof(uint64_t));
+    carquet_status_t status = CARQUET_OK;
+    uint32_t n = 0;
+    if (!map || !entries) {
+        status = CARQUET_ERROR_OUT_OF_MEMORY;
+        count = 0;
+    }
+    for (int64_t i = 0; i < count; i++) {
+        uint64_t x = word_load(src + (size_t)i * size, size);
+        int64_t v = size == 4 ? (int64_t)(int32_t)(uint32_t)x : (int64_t)x;
+        uint64_t key = (uint64_t)v - (uint64_t)minv;
+        uint32_t slot = map[key];
+        if (!slot) {
+            entries[n] = x;
+            slot = ++n;
+            map[key] = slot;
+            if (max_dict_bytes && (size_t)n * size > max_dict_bytes) {
+                *abandoned = true;
+                break;
+            }
+        }
+        indices[i] = slot - 1;
+    }
+    if (status == CARQUET_OK && !*abandoned && n > 0) {
+        size_t base = dict_output->size;
+        status = carquet_buffer_resize(dict_output, base + (size_t)n * size);
+        if (status == CARQUET_OK) {
+            uint8_t* out = dict_output->data + base;
+            if (size == 8) {
+                memcpy(out, entries, (size_t)n * 8);
+            } else {
+                for (uint32_t e = 0; e < n; e++) {
+                    uint32_t w = (uint32_t)entries[e];
+                    memcpy(out + (size_t)e * 4, &w, 4);
+                }
+            }
+        }
+    }
+    carquet_mem_free(map);
+    carquet_mem_free(entries);
+    *num_entries = n;
+    return status;
+}
+#endif
+
 static carquet_status_t build_fixed(carquet_physical_type_t type, size_t size,
                                     const void* values, int64_t count,
                                     size_t max_dict_bytes,
@@ -696,6 +793,16 @@ static carquet_status_t build_fixed(carquet_physical_type_t type, size_t size,
                                     uint32_t* indices, uint32_t* num_entries,
                                     bool* abandoned) {
 #if CARQUET_LITTLE_ENDIAN
+    if ((type == CARQUET_PHYSICAL_INT32 && size == 4) ||
+        (type == CARQUET_PHYSICAL_INT64 && size == 8)) {
+        int64_t minv = 0;
+        uint64_t span = direct_dict_span(size, values, count, &minv);
+        if (span > 0) {
+            return build_fixed_direct(size, (const uint8_t*)values, count, minv, span,
+                                      max_dict_bytes, dict_output, indices,
+                                      num_entries, abandoned);
+        }
+    }
     if (size == 4) {
         return build_fixed_word(4, (const uint8_t*)values, count, max_dict_bytes,
                                 dict_output, indices, num_entries, abandoned);

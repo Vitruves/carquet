@@ -36,6 +36,8 @@ Portability:
 
 ### Performance
 
+- **Integer dictionaries over a small range use a direct table**: an INT32 / INT64 chunk whose values span no more integers than the chunk has values (or 65 536) is dictionary-encoded through a table indexed by `value - min`, with no hashing or probing (a prefix of the chunk decides first, so scattered values cost one short min / max pass). Same dictionary and indices as before. 10M rows x 3 columns written on Linux (Xeon D-1531): snappy 183 -> 128 ms, zstd 195 -> 149 ms, lz4 178 -> 135 ms; the dictionary build was 32% of the write's CPU there. Test: `tests/test_encodings_extended.c` (`dictionary_build_direct_reference`).
+
 - **Column reads decode into the caller's buffer**: a page that a `carquet_read_next_page()` call loads and takes whole (the case of the batch reader's pipeline, whose slots take whole pages) is decoded straight into the destination instead of into the reader's buffer and then copied, and a reader keeps its own values buffer while pages are read in place from the mapping instead of freeing it (the next decoded page reallocated it). 10M rows x 3 columns, snappy, Linux (Xeon D-1531): 82 -> 57 ms with mmap, 89 -> 60 ms without; Apple M3: 12.4 -> 8.9 ms and 15.0 -> 10.0 ms; 81 MB fewer large allocations per scan.
 - **Batch reader pipeline: fewer slots**: its memory budget goes from 256 to 96 MB. Each slot holds a row group's output and its own column readers' page buffers, all memory touched for the first time; past the slots that keep the worker pool busy, more only cost page faults. 1M-row row groups now get 4 slots instead of 10: the scan above takes 50 ms (mmap) / 57 ms on Linux, with 23k page faults instead of 55k; small row groups keep up to two slots per thread as before.
 
