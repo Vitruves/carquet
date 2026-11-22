@@ -1233,8 +1233,12 @@ static void read_nested_list_column(
  * validity bitmap, plus for BYTE_ARRAY the page bytes its values point into
  * (retained pages or the dictionary, bounded by the chunk's uncompressed
  * size). Wide or string-heavy row groups therefore get fewer slots; the
- * segment split (see max_splits) keeps the pool busy with fewer slots. */
-#define CARQUET_PIPELINE_MEMORY_BUDGET (256LL * 1024 * 1024)
+ * segment split (see max_splits) keeps the pool busy with fewer slots.
+ * Every slot also holds its own column readers' page buffers, and memory
+ * touched for the first time costs a page fault per page: more slots than
+ * keep the pool busy only make a scan slower (10M rows x 3 columns in 1M-row
+ * row groups read in 50 ms with 4 slots, 62 ms with 10, on Linux / glibc). */
+#define CARQUET_PIPELINE_MEMORY_BUDGET (96LL * 1024 * 1024)
 
 /* Most pipeline slots that fit CARQUET_PIPELINE_MEMORY_BUDGET for the
  * largest selected row group (at least 2). Metadata sizes are untrusted:
