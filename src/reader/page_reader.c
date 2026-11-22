@@ -636,6 +636,14 @@ static void release_decoded_level_buffers(carquet_column_reader_t* reader) {
     carquet_mem_free(reader->decoded_rep_levels);
     reader->decoded_def_levels = NULL;
     reader->decoded_rep_levels = NULL;
+    reader->levels_capacity = 0;
+}
+
+/* Values of this page are read in place (from the mapping or the page
+ * payload). The owned buffer is kept for the next decoded page. */
+static void point_values_at_view(carquet_column_reader_t* reader, const uint8_t* data) {
+    reader->decoded_values = (uint8_t*)data;
+    reader->decoded_ownership = CARQUET_DATA_VIEW;
 }
 
 /* Most values a page of this chunk can hold (pages are checked against it). */
@@ -716,12 +724,47 @@ static carquet_status_t ensure_decoded_page_buffers(
         return CARQUET_ERROR_INVALID_PAGE;
     }
 
-    if (reader->decoded_ownership == CARQUET_DATA_VIEW) {
-        reader->decoded_values = NULL;
-        reader->decoded_capacity = 0;
+    /* Values: into the caller's buffer when the read that loads this page
+     * takes all of it (no copy afterwards), else into the owned buffer. */
+    bool use_target = reader->direct_target &&
+                      value_size == reader->direct_value_size &&
+                      (size_t)num_values <= reader->direct_target_values;
+    if (use_target) {
+        reader->decoded_values = (uint8_t*)reader->direct_target;
+        reader->decoded_ownership = CARQUET_DATA_TARGET;
+    } else {
+        /* Realloc when the value COUNT grows, or when the per-value byte
+         * width changed. The width can change for the same count when a
+         * column reader's preserve_dictionary flips on (values decoded as
+         * 2/8-byte physical values vs. 4-byte uint32 dictionary indices):
+         * has_dictionary, and therefore preserve mode, only becomes known
+         * after the first page loads. Without the width check, the
+         * count-keyed capacity would reuse a too-small buffer and the wider
+         * decode/copy would overflow it. */
+        if ((size_t)num_values > reader->decoded_capacity ||
+            value_size != reader->decoded_value_size) {
+            size_t capacity = (size_t)num_values > reader->decoded_capacity
+                ? grow_page_capacity(reader, reader->decoded_capacity, (size_t)num_values)
+                : reader->decoded_capacity;
+            size_t capacity_bytes = 0;
+            if (!checked_mul_size(value_size, capacity, &capacity_bytes)) {
+                capacity = (size_t)num_values;
+                capacity_bytes = values_buffer_size;
+            }
+            carquet_mem_free(reader->owned_values);
+            /* malloc, not calloc: the page decoder writes every value it
+             * reports and reads only ever copy decoded values out, so zeroing
+             * is a wasted pass over the buffer (and forces every page of it
+             * to be touched). */
+            reader->owned_values = capacity_bytes > 0 ? carquet_mem_malloc(capacity_bytes) : NULL;
+            reader->decoded_capacity = reader->owned_values ? capacity : 0;
+            reader->decoded_value_size = value_size;
+        }
+        reader->decoded_values = reader->owned_values;
+        reader->decoded_ownership = CARQUET_DATA_OWNED;
     }
-    reader->decoded_ownership = CARQUET_DATA_OWNED;
 
+    /* Level buffers, both sized levels_capacity. */
     if (!need_def_levels && reader->decoded_def_levels) {
         carquet_mem_free(reader->decoded_def_levels);
         reader->decoded_def_levels = NULL;
@@ -730,53 +773,21 @@ static carquet_status_t ensure_decoded_page_buffers(
         carquet_mem_free(reader->decoded_rep_levels);
         reader->decoded_rep_levels = NULL;
     }
-
-    /* Realloc when the value COUNT grows, or when the per-value byte width
-     * changed. The width can change for the same count when a column reader's
-     * preserve_dictionary flips on (values decoded as 2/8-byte physical values
-     * vs. 4-byte uint32 dictionary indices) — has_dictionary, and therefore
-     * preserve mode, only becomes known after the first page loads. Without
-     * the width check, the count-keyed capacity would reuse a too-small buffer
-     * and the wider decode/copy would overflow it. */
-    if ((size_t)num_values > reader->decoded_capacity ||
-        value_size != reader->decoded_value_size) {
-        /* The level buffers are sized to the same capacity, so any page that
-         * fits decoded_capacity fits them too. */
-        size_t capacity = (size_t)num_values > reader->decoded_capacity
-            ? grow_page_capacity(reader, reader->decoded_capacity, (size_t)num_values)
-            : reader->decoded_capacity;
-        size_t capacity_bytes = 0, level_bytes = 0;
-        if (!checked_mul_size(value_size, capacity, &capacity_bytes) ||
-            !checked_mul_size(sizeof(int16_t), capacity, &level_bytes)) {
-            capacity = (size_t)num_values;
-            capacity_bytes = values_buffer_size;
+    if ((need_def_levels || need_rep_levels) && num_values > 0) {
+        if ((size_t)num_values > reader->levels_capacity) {
+            size_t capacity = grow_page_capacity(reader, reader->levels_capacity, (size_t)num_values);
+            size_t level_bytes = 0;
+            if (!checked_mul_size(sizeof(int16_t), capacity, &level_bytes)) {
+                capacity = (size_t)num_values;
+            }
+            release_decoded_level_buffers(reader);
+            reader->levels_capacity = capacity;
         }
-
-        carquet_mem_free(reader->decoded_values);
-        reader->decoded_values = NULL;
-        release_decoded_level_buffers(reader);
-
-        /* malloc, not calloc: the page decoder writes every value it reports
-         * and reads only ever copy decoded values out, so zeroing is a wasted
-         * pass over the buffer (and forces every page of it to be touched). */
-        if (capacity_bytes > 0) {
-            reader->decoded_values = carquet_mem_malloc(capacity_bytes);
+        if (need_def_levels && !reader->decoded_def_levels) {
+            reader->decoded_def_levels = carquet_mem_malloc(sizeof(int16_t) * reader->levels_capacity);
         }
-        if (need_def_levels && capacity > 0) {
-            reader->decoded_def_levels = carquet_mem_malloc(sizeof(int16_t) * capacity);
-        }
-        if (need_rep_levels && capacity > 0) {
-            reader->decoded_rep_levels = carquet_mem_malloc(sizeof(int16_t) * capacity);
-        }
-        reader->decoded_capacity = capacity;
-        reader->decoded_value_size = value_size;
-    } else {
-        size_t capacity = reader->decoded_capacity;
-        if (need_def_levels && !reader->decoded_def_levels && capacity > 0) {
-            reader->decoded_def_levels = carquet_mem_malloc(sizeof(int16_t) * capacity);
-        }
-        if (need_rep_levels && !reader->decoded_rep_levels && capacity > 0) {
-            reader->decoded_rep_levels = carquet_mem_malloc(sizeof(int16_t) * capacity);
+        if (need_rep_levels && !reader->decoded_rep_levels) {
+            reader->decoded_rep_levels = carquet_mem_malloc(sizeof(int16_t) * reader->levels_capacity);
         }
     }
 
@@ -788,8 +799,10 @@ static carquet_status_t ensure_decoded_page_buffers(
         (need_def_bits && num_values > 0 && !reader->decoded_def_bits) ||
         (need_def_levels && num_values > 0 && !reader->decoded_def_levels) ||
         (need_rep_levels && num_values > 0 && !reader->decoded_rep_levels)) {
-        carquet_mem_free(reader->decoded_values);
+        carquet_mem_free(reader->owned_values);
+        reader->owned_values = NULL;
         reader->decoded_values = NULL;
+        reader->decoded_ownership = CARQUET_DATA_OWNED;
         release_decoded_level_buffers(reader);
         reader->decoded_capacity = 0;
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate decode buffers");
@@ -2896,12 +2909,7 @@ static carquet_status_t load_plain_page_view_def_bits(
         return CARQUET_ERROR_DECODE;
     }
 
-    if (reader->decoded_ownership == CARQUET_DATA_OWNED) {
-        carquet_mem_free(reader->decoded_values);
-    }
-    reader->decoded_values = (uint8_t*)ptr;
-    reader->decoded_ownership = CARQUET_DATA_VIEW;
-    reader->decoded_capacity = 0;
+    point_values_at_view(reader, ptr);
     release_decoded_level_buffers(reader);
 
     reader->page_loaded = true;
@@ -3029,27 +3037,13 @@ static carquet_status_t load_next_page_mmap(
             return CARQUET_ERROR_DECODE;
         }
 
-        /* Free previous owned buffer if any */
-        if (reader->decoded_ownership == CARQUET_DATA_OWNED) {
-            carquet_mem_free(reader->decoded_values);
-        }
-
         /* Point directly to mmap data - no copy! */
-        reader->decoded_values = (uint8_t*)page_data_ptr;
-        reader->decoded_ownership = CARQUET_DATA_VIEW;
+        point_values_at_view(reader, page_data_ptr);
 
         /* Zero-copy path only triggers when max_def/rep == 0 (REQUIRED columns).
          * Level buffers are unused by callers for REQUIRED columns, so set to NULL
          * to avoid unnecessary allocation and memset overhead. */
-        if (reader->decoded_def_levels) {
-            carquet_mem_free(reader->decoded_def_levels);
-            reader->decoded_def_levels = NULL;
-        }
-        if (reader->decoded_rep_levels) {
-            carquet_mem_free(reader->decoded_rep_levels);
-            reader->decoded_rep_levels = NULL;
-        }
-        reader->decoded_capacity = 0;
+        release_decoded_level_buffers(reader);
 
         reader->page_loaded = true;
         reader->page_num_values = num_values;
@@ -3101,12 +3095,7 @@ static carquet_status_t load_next_page_mmap(
             return CARQUET_ERROR_DECODE;
         }
 
-        if (reader->decoded_ownership == CARQUET_DATA_OWNED) {
-            carquet_mem_free(reader->decoded_values);
-        }
-        reader->decoded_values = (uint8_t*)page_data;
-        reader->decoded_ownership = CARQUET_DATA_VIEW;
-        reader->decoded_capacity = 0;
+        point_values_at_view(reader, page_data);
         release_decoded_level_buffers(reader);
 
         reader->page_loaded = true;
@@ -3298,12 +3287,7 @@ static carquet_status_t load_next_page_fread(
             return CARQUET_ERROR_DECODE;
         }
 
-        if (reader->decoded_ownership == CARQUET_DATA_OWNED) {
-            carquet_mem_free(reader->decoded_values);
-        }
-        reader->decoded_values = (uint8_t*)page_data;
-        reader->decoded_ownership = CARQUET_DATA_VIEW;
-        reader->decoded_capacity = 0;
+        point_values_at_view(reader, page_data);
         release_decoded_level_buffers(reader);
 
         reader->page_loaded = true;
@@ -3529,13 +3513,9 @@ carquet_status_t carquet_column_reader_seek_to_data_page(
      * before seeking. Flush retained BYTE_ARRAY page buffers. */
     carquet_column_clear_retained_pages(reader);
 
-    /* If a VIEW-owned decoded buffer is held (mmap), release the
-     * reference; owned buffers are kept for reuse. */
-    if (reader->decoded_ownership == CARQUET_DATA_VIEW) {
-        reader->decoded_values = NULL;
-        reader->decoded_capacity = 0;
-        reader->decoded_ownership = CARQUET_DATA_OWNED;
-    }
+    /* Drop a view or target pointer; the owned buffer is kept for reuse. */
+    reader->decoded_values = reader->owned_values;
+    reader->decoded_ownership = CARQUET_DATA_OWNED;
 
     /* Always walk from the chunk start so accumulated_values counts every
      * value in pages before target_offset. Walking only from the current
@@ -3629,8 +3609,22 @@ carquet_status_t carquet_read_next_page(
         return CARQUET_ERROR_INVALID_ARGUMENT;
     }
 
+    /* Copy values from decoded buffers. Optional columns store a dense stream
+     * of present values; definition levels preserve the logical row shape. */
+    size_t value_size = reader->preserve_dictionary
+        ? sizeof(uint32_t)
+        : get_value_size(reader->type, reader->type_length);
+
     {
+        /* A page this call loads and takes whole (it fits max_values) is
+         * decoded straight into `values`, leaving nothing to copy. */
+        if (max_values > 0) {
+            reader->direct_target = values;
+            reader->direct_target_values = (size_t)max_values;
+            reader->direct_value_size = value_size;
+        }
         carquet_status_t status = carquet_column_ensure_page_loaded(reader, error);
+        reader->direct_target = NULL;
         if (status != CARQUET_OK) {
             return status;
         }
@@ -3652,11 +3646,6 @@ carquet_status_t carquet_read_next_page(
         return CARQUET_OK;
     }
 
-    /* Copy values from decoded buffers. Optional columns store a dense stream
-     * of present values; definition levels preserve the logical row shape. */
-    size_t value_size = reader->preserve_dictionary
-        ? sizeof(uint32_t)
-        : get_value_size(reader->type, reader->type_length);
     size_t offset = (size_t)reader->page_values_read * value_size;
     int32_t values_to_copy = to_copy;
 
@@ -3703,8 +3692,17 @@ carquet_status_t carquet_read_next_page(
         reader->dense_cursor_val = dense_start + values_to_copy;
     }
 
-    memcpy(values, (uint8_t*)reader->decoded_values + offset,
-           (size_t)values_to_copy * value_size);
+    if (reader->decoded_ownership == CARQUET_DATA_TARGET) {
+        /* Decoded in place by the load above, which only targets a page
+         * this call takes whole, from its first value. */
+        if (reader->decoded_values != (uint8_t*)values || offset != 0) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_INTERNAL, "Stale decode target");
+            return CARQUET_ERROR_INTERNAL;
+        }
+    } else {
+        memcpy(values, (uint8_t*)reader->decoded_values + offset,
+               (size_t)values_to_copy * value_size);
+    }
 
     if (def_levels) {
         if (def_bits) {

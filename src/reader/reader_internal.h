@@ -33,6 +33,10 @@ extern "C" {
 typedef enum carquet_data_ownership {
     CARQUET_DATA_OWNED = 0,    /* Data is malloc'd, caller must free */
     CARQUET_DATA_VIEW = 1,     /* Data is view into mmap, do NOT free */
+    CARQUET_DATA_TARGET = 2,   /* Page values decoded straight into the buffer
+                                * of the carquet_read_next_page() call that
+                                * loaded the page (which consumes all of it):
+                                * not ours, valid only during that call */
 } carquet_data_ownership_t;
 
 /**
@@ -191,7 +195,15 @@ struct carquet_column_reader {
                                   * them (carquet_read_next_page). */
     size_t def_bits_capacity;    /* Bytes behind decoded_def_bits */
     int16_t* decoded_rep_levels; /* Buffer for decoded repetition levels */
-    size_t decoded_capacity;    /* Capacity of decoded buffers, in values */
+    uint8_t* owned_values;      /* The values buffer this reader owns; kept
+                                 * while decoded_values is a view or a target,
+                                 * for the next page decoded into it */
+    size_t decoded_capacity;    /* Capacity of owned_values, in values */
+    size_t levels_capacity;     /* Capacity of the def / rep level buffers */
+    void* direct_target;        /* Set only inside carquet_read_next_page():
+                                 * the caller's buffer, for a page that fits it */
+    size_t direct_target_values;
+    size_t direct_value_size;
     size_t decoded_value_size;  /* Per-value byte width the values buffer was
                                  * allocated with; realloc when it changes (e.g.
                                  * preserve_dictionary flips index/value width) */

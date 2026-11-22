@@ -1078,10 +1078,9 @@ void carquet_column_reader_free(carquet_column_reader_t* reader) {
     }
     carquet_mem_free(reader->dictionary_offsets);
 
-    /* Only free decoded_values if we own the memory (not a mmap view) */
-    if (reader->decoded_ownership == CARQUET_DATA_OWNED) {
-        carquet_mem_free(reader->decoded_values);
-    }
+    /* decoded_values is owned_values, a mapping view or a caller's buffer:
+     * only owned_values is ours. */
+    carquet_mem_free(reader->owned_values);
 
     /* Levels are always owned (decoded from RLE) */
     carquet_mem_free(reader->decoded_def_levels);
@@ -1166,11 +1165,8 @@ void carquet_column_reader_rebind(
         col_reader->has_dictionary = false;
     }
 
-    /* If decoded_values is a VIEW (mmap pointer), don't free - just clear */
-    if (col_reader->decoded_ownership == CARQUET_DATA_VIEW) {
-        col_reader->decoded_values = NULL;
-        col_reader->decoded_capacity = 0;
-    }
+    /* Drop a view or target pointer; the owned buffer is kept for reuse. */
+    col_reader->decoded_values = col_reader->owned_values;
     col_reader->decoded_ownership = CARQUET_DATA_OWNED;
 
     /* Free BYTE_ARRAY page data retention list */
