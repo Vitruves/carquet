@@ -362,6 +362,11 @@ typedef struct {
     carquet_error_t* error;
 } rctx_t;
 
+extern void carquet_dispatch_pack_bools(const uint8_t* input, uint8_t* output, int64_t count);
+
+/* build_validity() hands a bool array to the byte kernel. */
+typedef char carquet_bool_is_one_byte[sizeof(bool) == 1 ? 1 : -1];
+
 static struct ArrowArray* new_array(void) {
     struct ArrowArray* a = (struct ArrowArray*)calloc(1, sizeof(struct ArrowArray));
     if (a) a->release = release_array;
@@ -378,7 +383,9 @@ static uint8_t* build_validity(const bool* present, int64_t n, int64_t* null_cou
     size_t bytes = (size_t)((n + 7) / 8); if (bytes == 0) bytes = 1;
     uint8_t* v = (uint8_t*)calloc(bytes, 1);
     if (!v) return NULL;
-    for (int64_t i = 0; i < n; i++) if (present[i]) v[i >> 3] |= (uint8_t)(1u << (i & 7));
+    /* `present` holds C bools (0 / 1 bytes); the kernel writes (n + 7) / 8
+     * bytes with zero padding bits. */
+    carquet_dispatch_pack_bools((const uint8_t*)present, v, n);
     return v;
 }
 
@@ -403,6 +410,7 @@ static carquet_status_t build_leaf(rctx_t* ctx, int32_t leaf_col, int16_t exist_
 
     int64_t null_count = 0;
     uint8_t* validity = build_validity(present, len, &null_count);
+    bool all_present = (null_count == 0);   /* dense values are row-aligned */
     /* A REQUIRED leaf is a non-nullable Arrow field: under a null ancestor
      * struct its slots hold a zero / empty value, not a null (a field declared
      * non-nullable that contains nulls is refused by Arrow consumers, e.g.
@@ -445,9 +453,15 @@ static carquet_status_t build_leaf(rctx_t* ctx, int32_t leaf_col, int16_t exist_
         const void** bufs = (const void**)malloc(2 * sizeof(void*));
         if (!data || !bufs) { free(data); free(bufs); rc = CARQUET_ERROR_OUT_OF_MEMORY; goto fail; }
         const uint8_t* src = (const uint8_t*)L->values;
-        int64_t vc = 0;
-        for (int64_t i = 0; i < len; i++) {
-            if (present[i]) { if (src[vc++]) data[i >> 3] |= (uint8_t)(1u << (i & 7)); }
+        if (all_present) {
+            /* Every slot holds a value: the dense values are row-aligned.
+             * Decoded BOOLEAN bytes are 0 or 1. */
+            if (len > 0) carquet_dispatch_pack_bools(src, data, len);
+        } else {
+            int64_t vc = 0;
+            for (int64_t i = 0; i < len; i++) {
+                if (present[i]) { if (src[vc++]) data[i >> 3] |= (uint8_t)(1u << (i & 7)); }
+            }
         }
         bufs[0] = validity; bufs[1] = data;
         a->n_buffers = 2; a->buffers = bufs;

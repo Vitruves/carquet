@@ -2350,6 +2350,20 @@ void carquet_page_writer_set_crc(carquet_page_writer_t* writer, bool enabled) {
     }
 }
 
+/* Fold the min/max of `count` INT32 / INT64 values into the page statistics
+ * exactly as staging them on a PLAIN page would (signed or unsigned order by
+ * logical type), for a page that stages something else than the values
+ * themselves (dictionary indices). Other physical types are ignored. */
+void carquet_page_writer_add_int_statistics(carquet_page_writer_t* writer,
+                                            const void* values, int64_t count) {
+    if (!writer || !writer->write_statistics || !values || count <= 0) return;
+    if (writer->type == CARQUET_PHYSICAL_INT32) {
+        update_statistics_i32(writer, (const int32_t*)values, count);
+    } else if (writer->type == CARQUET_PHYSICAL_INT64) {
+        update_statistics_i64(writer, (const int64_t*)values, count);
+    }
+}
+
 bool carquet_page_writer_statistics_enabled(const carquet_page_writer_t* writer) {
     return writer && writer->write_statistics;
 }

@@ -954,6 +954,10 @@ carquet_status_t carquet_snappy_compress(
     if (!dst || !dst_size)
         return CARQUET_ERROR_INVALID_ARGUMENT;
 
+    /* The stream header stores the uncompressed length as a 32-bit varint. */
+    if (src_size > UINT32_MAX)
+        return CARQUET_ERROR_COMPRESSION;
+
     size_t max_output = carquet_snappy_compress_bound(src_size);
     if (dst_capacity < max_output)
         return CARQUET_ERROR_COMPRESSION;

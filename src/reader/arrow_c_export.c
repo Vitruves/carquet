@@ -98,6 +98,7 @@ static void arrow_array_release(struct ArrowArray* array) {
 /* Implemented in batch_reader.c: a reference on the storage behind a batch
  * column the batch reader's pipeline served (NULL when it must be copied),
  * and its release. */
+extern void carquet_dispatch_pack_bools(const uint8_t* input, uint8_t* output, int64_t count);
 extern void* carquet_row_batch_column_share(const carquet_row_batch_t* batch,
                                             int32_t column_index, bool* bitmap_shared);
 extern void carquet_row_batch_share_release(void* share);
@@ -426,10 +427,10 @@ static carquet_status_t export_child_array(
         size_t bytes = (size_t)((n + 7) / 8);
         out_data = (uint8_t*)calloc(bytes > 0 ? bytes : 1, 1);
         if (!out_data) { free(val); return CARQUET_ERROR_OUT_OF_MEMORY; }
-        const uint8_t* src = (const uint8_t*)data;
-        for (int64_t i = 0; i < n; i++) {
-            if (src[i]) out_data[i >> 3] |= (uint8_t)(1u << (i & 7));
-        }
+        /* The batch holds what the page decoders produced, always 0 or 1
+         * (the kernels do not agree on other non-zero bytes). The kernel
+         * writes exactly (n + 7) / 8 bytes, padding bits zero. */
+        if (n > 0 && data) carquet_dispatch_pack_bools((const uint8_t*)data, out_data, n);
     } else {
         if (plan->src_width == 0 || plan->dst_width == 0) {
             free(val);

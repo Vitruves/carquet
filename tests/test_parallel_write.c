@@ -146,9 +146,14 @@ static int chunk_matches(const char* multi, const char* single, int col, const c
                    (long long)mm.total_compressed_size, (long long)mm.num_values,
                    (long long)ms.total_compressed_size, (long long)ms.num_values);
         } else {
-            uint8_t* a = read_range(multi, mm.data_page_offset, mm.total_compressed_size);
-            uint8_t* b = read_range(single, ms.data_page_offset, ms.total_compressed_size);
-            ok = a && b && memcmp(a, b, (size_t)mm.total_compressed_size) == 0;
+            /* A chunk starts at its dictionary page when it has one (the
+             * integer columns may get a dictionary by default). */
+            int64_t om = mm.has_dictionary_page ? mm.dictionary_page_offset : mm.data_page_offset;
+            int64_t os = ms.has_dictionary_page ? ms.dictionary_page_offset : ms.data_page_offset;
+            uint8_t* a = read_range(multi, om, mm.total_compressed_size);
+            uint8_t* b = read_range(single, os, ms.total_compressed_size);
+            ok = a && b && mm.has_dictionary_page == ms.has_dictionary_page &&
+                 memcmp(a, b, (size_t)mm.total_compressed_size) == 0;
             if (!ok) printf("  [%s] col %d chunk bytes differ\n", tag, col);
             free(a); free(b);
         }
@@ -257,9 +262,9 @@ static int test_async_io_identical(carquet_compression_t codec, int64_t rg_rows,
     return 0;
 }
 
-/* Several row groups through the buffer writer: the I/O thread writes into
- * the temp stream while later groups are encoded, and get_buffer must see
- * the complete file. */
+/* Several row groups through the buffer writer: the I/O thread appends to
+ * the writer's memory sink while later groups are encoded, and get_buffer
+ * must see the complete file. */
 static int test_async_buffer_writer(void) {
     data_t d; data_init(&d);
     carquet_error_t err = CARQUET_ERROR_INIT;
@@ -297,6 +302,126 @@ static int test_async_buffer_writer(void) {
     data_free(&d);
     if (!ok) TEST_FAIL("async_buffer_writer", "multi-row-group buffer write failed");
     TEST_PASS("async_buffer_writer");
+    return 0;
+}
+
+/* The first `rows` rows of the three columns, to `path` or, when it is NULL,
+ * through the buffer writer into *buf / *size (carquet_free). */
+static int write_sink(const char* path, const data_t* d, int64_t rows, const cfg_t* c,
+                      bool bloom, bool page_index, void** buf, size_t* size) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t* s = carquet_schema_create(&err);
+    if (!s) return 0;
+    static const char* names[3] = {"id", "value", "cat"};
+    static const carquet_physical_type_t types[3] = {
+        CARQUET_PHYSICAL_INT64, CARQUET_PHYSICAL_DOUBLE, CARQUET_PHYSICAL_INT32};
+    for (int i = 0; i < 3; i++) {
+        if (carquet_schema_add_column(s, names[i], types[i], NULL,
+                CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK) {
+            carquet_schema_free(s); return 0;
+        }
+    }
+    carquet_writer_options_t o; apply_cfg(&o, c);
+    o.write_bloom_filters = bloom;
+    o.write_page_index = page_index;
+    carquet_writer_t* w = path ? carquet_writer_create(path, s, &o, &err)
+                               : carquet_writer_create_buffer(s, &o, &err);
+    carquet_schema_free(s);
+    if (!w) return 0;
+    int ok = 1;
+    int64_t step = c->rg_rows > 0 ? c->rg_rows : ROWS;
+    for (int64_t off = 0; off < rows && ok; off += step) {
+        int64_t n = rows - off < step ? rows - off : step;
+        const void* cols[3] = {d->ids + off, d->values + off, d->cats + off};
+        for (int i = 0; i < 3 && ok; i++) {
+            if (carquet_writer_write_batch(w, i, cols[i], n, NULL, NULL) != CARQUET_OK) ok = 0;
+        }
+        if (ok && off + n < rows && carquet_writer_new_row_group(w) != CARQUET_OK) ok = 0;
+    }
+    if (!ok) { carquet_writer_abort(w); return 0; }
+    if (carquet_writer_close(w) != CARQUET_OK) {
+        /* A buffer writer outlives a failed close. */
+        if (!path) carquet_writer_abort(w);
+        return 0;
+    }
+    if (!path && carquet_writer_get_buffer(w, buf, size) != CARQUET_OK) {
+        carquet_writer_abort(w);
+        return 0;
+    }
+    return 1;
+}
+
+/* The buffer writer assembles the file in memory instead of going through a
+ * stream: for the same input it must produce the bytes the file writer does,
+ * row groups, bloom filters, page indexes and footer included. */
+static int test_buffer_matches_file(const cfg_t* c, bool bloom, bool page_index,
+                                    int64_t rows, const char* tag) {
+    data_t d; data_init(&d);
+    char path[512];
+    carquet_test_temp_path(path, sizeof(path), "buf_vs_file");
+    void* buf = NULL; size_t size = 0;
+    int ok = write_sink(path, &d, rows, c, bloom, page_index, NULL, NULL) &&
+             write_sink(NULL, &d, rows, c, bloom, page_index, &buf, &size);
+    if (ok) {
+        long fl = file_size(path);
+        ok = fl > 0 && (size_t)fl == size && buf != NULL;
+        if (ok) {
+            uint8_t* pf = read_range(path, 0, fl);
+            ok = pf && memcmp(pf, buf, size) == 0;
+            free(pf);
+        }
+        if (!ok) printf("  [%s] buffer differs from file (%llu vs %ld bytes)\n", tag,
+                        (unsigned long long)size, fl);
+    }
+    if (ok && size >= 8) {
+        ok = memcmp(buf, "PAR1", 4) == 0 &&
+             memcmp((const uint8_t*)buf + size - 4, "PAR1", 4) == 0;
+    }
+    if (ok && rows == ROWS) ok = values_match(path, &d, 3, tag);
+    if (ok) {
+        /* The buffer is a readable file of `rows` rows on its own. */
+        carquet_error_t err = CARQUET_ERROR_INIT;
+        carquet_reader_t* r = carquet_reader_open_buffer(buf, size, NULL, &err);
+        ok = r != NULL && carquet_reader_num_rows(r) == rows;
+        if (r) carquet_reader_close(r);
+    }
+    carquet_free(buf);
+    carquet_test_cleanup(path);
+    data_free(&d);
+    if (!ok) TEST_FAIL(tag, "buffer writer output differs from the file writer's");
+    TEST_PASS(tag);
+    return 0;
+}
+
+/* Buffer writers that never hand their buffer out: aborted with row groups
+ * written and pending, and closed then aborted (close -> abort is the way to
+ * drop the result). Nothing may leak or be freed twice (sanitizer builds). */
+static int test_buffer_writer_abandoned(void) {
+    data_t d; data_init(&d);
+    int ok = 1;
+    for (int async = 0; async < 2 && ok; async++) {
+        for (int closed = 0; closed < 2 && ok; closed++) {
+            carquet_error_t err = CARQUET_ERROR_INIT;
+            carquet_schema_t* s = carquet_schema_create(&err);
+            ok = s && carquet_schema_add_column(s, "id", CARQUET_PHYSICAL_INT64, NULL,
+                          CARQUET_REPETITION_REQUIRED, 0, 0) == CARQUET_OK;
+            cfg_t c = {CARQUET_COMPRESSION_SNAPPY, 0, 0, 1, async != 0, 0};
+            carquet_writer_options_t o; apply_cfg(&o, &c);
+            carquet_writer_t* w = ok ? carquet_writer_create_buffer(s, &o, &err) : NULL;
+            if (s) carquet_schema_free(s);
+            if (!w) { ok = 0; break; }
+            for (int g = 0; ok && g < 3; g++) {
+                ok = carquet_writer_write_batch(w, 0, d.ids + g * 50000, 50000,
+                                                NULL, NULL) == CARQUET_OK;
+                if (ok && g < 2) ok = carquet_writer_new_row_group(w) == CARQUET_OK;
+            }
+            if (ok && closed) ok = carquet_writer_close(w) == CARQUET_OK;
+            carquet_writer_abort(w);
+        }
+    }
+    data_free(&d);
+    if (!ok) TEST_FAIL("buffer_writer_abandoned", "buffer writer failed");
+    TEST_PASS("buffer_writer_abandoned");
     return 0;
 }
 
@@ -854,6 +979,268 @@ static int test_row_groups_all_null_batches(void) {
     return 0;
 }
 
+/* ----------------------------------------------------------------------------
+ * Automatic dictionary: with a codec, an INT32 / INT64 column gets a
+ * dictionary chunk by chunk, when a sample of the chunk shows repeated values.
+ * ------------------------------------------------------------------------- */
+
+#define AD_COLS 4   /* low-cardinality i64, distinct i64, mid-cardinality i32, low-cardinality double */
+
+typedef struct {
+    int64_t* low;     /* 300 distinct values */
+    int64_t* uniq;    /* all distinct */
+    int32_t* mid;     /* 20000 distinct values */
+    double* dbl;      /* 50 distinct values */
+} adata_t;
+
+static void adata_init(adata_t* d) {
+    d->low = malloc(ROWS * sizeof(int64_t));
+    d->uniq = malloc(ROWS * sizeof(int64_t));
+    d->mid = malloc(ROWS * sizeof(int32_t));
+    d->dbl = malloc(ROWS * sizeof(double));
+    lcg_state = 23;
+    for (int i = 0; i < ROWS; i++) {
+        d->low[i] = (int64_t)(lcg() % 300) * 1000003;
+        d->uniq[i] = (int64_t)i * 7919 + 13;
+        d->mid[i] = (int32_t)(lcg() % 20000) - 5000;
+        d->dbl[i] = (double)(lcg() % 50) * 0.25;
+    }
+}
+
+static void adata_free(adata_t* d) {
+    free(d->low); free(d->uniq); free(d->mid); free(d->dbl);
+}
+
+/* The four columns in one row group; `plain` pins the integer columns to
+ * PLAIN. */
+static int write_auto(const char* path, const adata_t* d, carquet_compression_t codec,
+                      bool plain) {
+    static const carquet_physical_type_t types[AD_COLS] = {
+        CARQUET_PHYSICAL_INT64, CARQUET_PHYSICAL_INT64,
+        CARQUET_PHYSICAL_INT32, CARQUET_PHYSICAL_DOUBLE};
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t* s = carquet_schema_create(&err);
+    if (!s) return 0;
+    int ok = 1;
+    for (int i = 0; ok && i < AD_COLS; i++) {
+        char name[8]; snprintf(name, sizeof(name), "c%d", i);
+        ok = carquet_schema_add_column(s, name, types[i], NULL,
+                CARQUET_REPETITION_REQUIRED, 0, 0) == CARQUET_OK;
+    }
+    carquet_writer_options_t o; carquet_writer_options_init(&o);
+    o.compression = codec;
+    carquet_writer_t* w = ok ? carquet_writer_create(path, s, &o, &err) : NULL;
+    if (!w) { carquet_schema_free(s); return 0; }
+    for (int i = 0; ok && plain && i < 3; i++) {
+        ok = carquet_writer_set_column_encoding(w, i, CARQUET_ENCODING_PLAIN) == CARQUET_OK;
+    }
+    const void* cols[AD_COLS] = {d->low, d->uniq, d->mid, d->dbl};
+    for (int i = 0; ok && i < AD_COLS; i++) {
+        ok = carquet_writer_write_batch(w, i, cols[i], ROWS, NULL, NULL) == CARQUET_OK;
+    }
+    if (carquet_writer_close(w) != CARQUET_OK) ok = 0;
+    carquet_schema_free(s);
+    return ok;
+}
+
+/* has_dictionary_page of the first row group's chunks against `want`, and
+ * the values read back. */
+static int auto_file_ok(const char* path, const adata_t* d, const bool want[AD_COLS],
+                        const char* tag) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_reader_t* r = carquet_reader_open(path, NULL, &err);
+    if (!r) { printf("  [%s] open failed\n", tag); return 0; }
+    const void* cols[AD_COLS] = {d->low, d->uniq, d->mid, d->dbl};
+    static const size_t widths[AD_COLS] = {8, 8, 4, 8};
+    void* got = malloc(ROWS * 8);
+    int ok = got != NULL;
+    for (int c = 0; ok && c < AD_COLS; c++) {
+        carquet_column_chunk_metadata_t m;
+        ok = carquet_reader_column_chunk_metadata(r, 0, c, &m) == CARQUET_OK;
+        if (ok && m.has_dictionary_page != want[c]) {
+            printf("  [%s] col %d: dictionary page %s\n", tag, c,
+                   m.has_dictionary_page ? "present" : "missing");
+            ok = 0;
+        }
+        /* The chunk lists RLE_DICTIONARY exactly when it has a dictionary. */
+        bool listed = false;
+        for (int32_t e = 0; ok && e < m.num_encodings; e++) {
+            if (m.encodings[e] == CARQUET_ENCODING_RLE_DICTIONARY) listed = true;
+        }
+        if (ok && listed != want[c]) {
+            printf("  [%s] col %d: encodings list disagrees\n", tag, c);
+            ok = 0;
+        }
+        carquet_column_reader_t* cr = ok ? carquet_reader_get_column(r, 0, c, &err) : NULL;
+        if (ok) ok = cr && carquet_column_read_batch(cr, got, ROWS, NULL, NULL) == ROWS &&
+                     memcmp(got, cols[c], ROWS * widths[c]) == 0;
+        if (cr) carquet_column_reader_free(cr);
+        if (!ok) printf("  [%s] col %d failed\n", tag, c);
+    }
+    free(got);
+    carquet_reader_close(r);
+    return ok;
+}
+
+static int test_auto_dictionary_choice(void) {
+    adata_t d; adata_init(&d);
+    char pa[512], pp[512], pu[512];
+    carquet_test_temp_path(pa, sizeof(pa), "ad_auto");
+    carquet_test_temp_path(pp, sizeof(pp), "ad_plain");
+    carquet_test_temp_path(pu, sizeof(pu), "ad_unc");
+
+    /* With a codec: the repeated integer columns get a dictionary, the
+     * distinct one and the DOUBLE do not. */
+    static const bool want_auto[AD_COLS] = {true, false, true, false};
+    static const bool want_none[AD_COLS] = {false, false, false, false};
+    int ok = write_auto(pa, &d, CARQUET_COMPRESSION_SNAPPY, false) &&
+             auto_file_ok(pa, &d, want_auto, "auto_dictionary/codec");
+    /* An explicit encoding is never overridden. */
+    ok = ok && write_auto(pp, &d, CARQUET_COMPRESSION_SNAPPY, true) &&
+         auto_file_ok(pp, &d, want_none, "auto_dictionary/explicit_plain");
+    /* Uncompressed columns stay PLAIN (zero-copy reads). */
+    ok = ok && write_auto(pu, &d, CARQUET_COMPRESSION_UNCOMPRESSED, false) &&
+         auto_file_ok(pu, &d, want_none, "auto_dictionary/uncompressed");
+
+    /* A chunk whose sample rejects the dictionary is the PLAIN chunk, byte
+     * for byte (and is encoded page-parallel like one). */
+    if (ok) {
+        carquet_error_t err = CARQUET_ERROR_INIT;
+        carquet_reader_t* ra = carquet_reader_open(pa, NULL, &err);
+        carquet_reader_t* rp = carquet_reader_open(pp, NULL, &err);
+        carquet_column_chunk_metadata_t ma, mp;
+        ok = ra && rp &&
+             carquet_reader_column_chunk_metadata(ra, 0, 1, &ma) == CARQUET_OK &&
+             carquet_reader_column_chunk_metadata(rp, 0, 1, &mp) == CARQUET_OK &&
+             ma.total_compressed_size == mp.total_compressed_size;
+        if (ok) {
+            uint8_t* a = read_range(pa, ma.data_page_offset, ma.total_compressed_size);
+            uint8_t* b = read_range(pp, mp.data_page_offset, mp.total_compressed_size);
+            ok = a && b && memcmp(a, b, (size_t)ma.total_compressed_size) == 0;
+            free(a); free(b);
+        }
+        if (!ok) printf("  [auto_dictionary] rejected chunk differs from the PLAIN chunk\n");
+        if (ra) carquet_reader_close(ra);
+        if (rp) carquet_reader_close(rp);
+    }
+
+    carquet_test_cleanup(pa); carquet_test_cleanup(pp); carquet_test_cleanup(pu);
+    adata_free(&d);
+    if (!ok) TEST_FAIL("auto_dictionary_choice", "wrong encoding choice or values");
+    TEST_PASS("auto_dictionary_choice");
+    return 0;
+}
+
+/* The choice is made per chunk: one column (REQUIRED, and OPTIONAL with
+ * ~10% nulls) alternates between repeated and distinct row groups, more row
+ * groups than the pipeline has slots. */
+static int test_auto_dictionary_per_chunk(void) {
+    enum { RG = 20000, NRG = ROWS / RG };
+    int64_t* vals = malloc(ROWS * sizeof(int64_t));
+    int64_t* packed = malloc(ROWS * sizeof(int64_t));
+    int16_t* defs = malloc(ROWS * sizeof(int16_t));
+    lcg_state = 31;
+    for (int i = 0; i < ROWS; i++) {
+        bool repeated = ((i / RG) % 2) == 0;
+        vals[i] = repeated ? (int64_t)(lcg() % 64) - 20 : (int64_t)i * 104729 - 7;
+        defs[i] = (lcg() % 10) != 0;
+    }
+    char path[512];
+    carquet_test_temp_path(path, sizeof(path), "ad_chunks");
+
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t* s = carquet_schema_create(&err);
+    int ok = s &&
+        carquet_schema_add_column(s, "req", CARQUET_PHYSICAL_INT64, NULL,
+            CARQUET_REPETITION_REQUIRED, 0, 0) == CARQUET_OK &&
+        carquet_schema_add_column(s, "opt", CARQUET_PHYSICAL_INT64, NULL,
+            CARQUET_REPETITION_OPTIONAL, 0, 0) == CARQUET_OK;
+    carquet_writer_options_t o; carquet_writer_options_init(&o);
+    o.compression = CARQUET_COMPRESSION_ZSTD;
+    o.compression_level = 1;
+    carquet_writer_t* w = ok ? carquet_writer_create(path, s, &o, &err) : NULL;
+    ok = w != NULL;
+    for (int64_t off = 0; ok && off < ROWS; off += RG) {
+        int64_t k = 0;
+        for (int64_t i = off; i < off + RG; i++) {
+            if (defs[i]) packed[k++] = vals[i];
+        }
+        ok = carquet_writer_write_batch(w, 0, vals + off, RG, NULL, NULL) == CARQUET_OK &&
+             carquet_writer_write_batch(w, 1, packed, RG, defs + off, NULL) == CARQUET_OK;
+        if (ok && off + RG < ROWS) ok = carquet_writer_new_row_group(w) == CARQUET_OK;
+    }
+    if (w && carquet_writer_close(w) != CARQUET_OK) ok = 0;
+    if (s) carquet_schema_free(s);
+
+    carquet_reader_t* r = ok ? carquet_reader_open(path, NULL, &err) : NULL;
+    ok = r && carquet_reader_num_row_groups(r) == NRG;
+    int64_t* got = malloc(RG * sizeof(int64_t));
+    int16_t* gdef = malloc(RG * sizeof(int16_t));
+    for (int32_t rg = 0; ok && rg < NRG; rg++) {
+        int64_t off = (int64_t)rg * RG;
+        for (int c = 0; ok && c < 2; c++) {
+            carquet_column_chunk_metadata_t m;
+            ok = carquet_reader_column_chunk_metadata(r, rg, c, &m) == CARQUET_OK &&
+                 m.has_dictionary_page == ((rg % 2) == 0);
+            if (!ok) { printf("  [auto_dictionary_per_chunk] rg %d col %d: dictionary\n", rg, c); break; }
+            carquet_column_reader_t* cr = carquet_reader_get_column(r, rg, c, &err);
+            ok = cr && carquet_column_read_batch(cr, got, RG, c ? gdef : NULL, NULL) == RG;
+            if (ok && c == 0) ok = memcmp(got, vals + off, RG * sizeof(int64_t)) == 0;
+            if (ok && c == 1) {
+                int64_t k = 0;
+                for (int64_t i = off; ok && i < off + RG; i++) {
+                    if (gdef[i - off] != defs[i]) ok = 0;
+                    else if (defs[i] && got[k++] != vals[i]) ok = 0;
+                }
+            }
+            if (cr) carquet_column_reader_free(cr);
+            if (!ok) printf("  [auto_dictionary_per_chunk] rg %d col %d: values\n", rg, c);
+        }
+    }
+    free(got); free(gdef);
+    if (r) carquet_reader_close(r);
+    carquet_test_cleanup(path);
+    free(vals); free(packed); free(defs);
+    if (!ok) TEST_FAIL("auto_dictionary_per_chunk", "per-chunk dictionary choice or values");
+    TEST_PASS("auto_dictionary_per_chunk");
+    return 0;
+}
+
+/* Abort with row groups still in the pipeline: the queued writes are
+ * dropped, nothing is left behind and nothing is freed twice. */
+static int test_abort_in_flight(void) {
+    data_t d; data_init(&d);
+    char path[512];
+    carquet_test_temp_path(path, sizeof(path), "ppw_abort");
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t* s = carquet_schema_create(&err);
+    int ok = s &&
+        carquet_schema_add_column(s, "id", CARQUET_PHYSICAL_INT64, NULL,
+            CARQUET_REPETITION_REQUIRED, 0, 0) == CARQUET_OK &&
+        carquet_schema_add_column(s, "value", CARQUET_PHYSICAL_DOUBLE, NULL,
+            CARQUET_REPETITION_REQUIRED, 0, 0) == CARQUET_OK;
+    carquet_writer_options_t o; carquet_writer_options_init(&o);
+    o.compression = CARQUET_COMPRESSION_ZSTD;
+    carquet_writer_t* w = ok ? carquet_writer_create(path, s, &o, &err) : NULL;
+    ok = w != NULL;
+    for (int64_t off = 0; ok && off + 30000 <= ROWS; off += 30000) {
+        ok = carquet_writer_write_batch(w, 0, d.ids + off, 30000, NULL, NULL) == CARQUET_OK &&
+             carquet_writer_write_batch(w, 1, d.values + off, 30000, NULL, NULL) == CARQUET_OK &&
+             carquet_writer_new_row_group(w) == CARQUET_OK;
+    }
+    if (w) carquet_writer_abort(w);
+    if (s) carquet_schema_free(s);
+    if (ok && file_size(path) >= 0) {
+        printf("  [abort_in_flight] the aborted file is still there\n");
+        ok = 0;
+    }
+    carquet_test_cleanup(path);
+    data_free(&d);
+    if (!ok) TEST_FAIL("abort_in_flight", "abort with row groups in the pipeline");
+    TEST_PASS("abort_in_flight");
+    return 0;
+}
+
 int main(void) {
     int failures = 0;
     cfg_t base = {CARQUET_COMPRESSION_LZ4_RAW, 0, 0, 1, true, 0};
@@ -873,6 +1260,35 @@ int main(void) {
     /* 20 small row groups: more than the pipeline's slots stay in flight. */
     failures += test_async_io_identical(CARQUET_COMPRESSION_SNAPPY, 15000, "async_io_identical_snappy_20rg");
     failures += test_async_buffer_writer();
+    {
+        cfg_t b = {CARQUET_COMPRESSION_ZSTD, 0, 0, 1, true, 70000};
+        failures += test_buffer_matches_file(&b, false, false, ROWS, "buffer_matches_file_zstd_async");
+        b.async_io = false;
+        failures += test_buffer_matches_file(&b, false, false, ROWS, "buffer_matches_file_zstd_sync");
+        b.codec = CARQUET_COMPRESSION_UNCOMPRESSED;
+        failures += test_buffer_matches_file(&b, false, false, ROWS, "buffer_matches_file_none_sync");
+        b.async_io = true;
+        failures += test_buffer_matches_file(&b, false, false, ROWS, "buffer_matches_file_none_async");
+        /* One row group, and 20: more than the pipeline keeps in flight. */
+        b.rg_rows = 0;
+        failures += test_buffer_matches_file(&b, false, false, ROWS, "buffer_matches_file_one_rg");
+        b.codec = CARQUET_COMPRESSION_SNAPPY; b.rg_rows = 15000; b.data_page_version = 2;
+        failures += test_buffer_matches_file(&b, false, false, ROWS, "buffer_matches_file_snappy_20rg_v2");
+        /* Bloom filters and page indexes are written between row groups,
+         * from the caller's thread. */
+        b.rg_rows = 70000; b.data_page_version = 1;
+        failures += test_buffer_matches_file(&b, true, true, ROWS, "buffer_matches_file_bloom_index_async");
+        failures += test_buffer_matches_file(&b, true, false, ROWS, "buffer_matches_file_bloom_async");
+        failures += test_buffer_matches_file(&b, false, true, ROWS, "buffer_matches_file_index_async");
+        b.async_io = false;
+        failures += test_buffer_matches_file(&b, true, true, ROWS, "buffer_matches_file_bloom_index_sync");
+        /* No rows at all: header, footer, nothing else. */
+        failures += test_buffer_matches_file(&b, false, false, 0, "buffer_matches_file_empty_sync");
+        failures += test_buffer_matches_file(&b, true, true, 0, "buffer_matches_file_empty_bloom_index");
+        b.async_io = true;
+        failures += test_buffer_matches_file(&b, false, false, 0, "buffer_matches_file_empty_async");
+    }
+    failures += test_buffer_writer_abandoned();
     failures += test_mixed_nullable();
     failures += test_async_write_error();
 
@@ -900,6 +1316,9 @@ int main(void) {
     failures += test_dict_pages(16 * 1024, 0, "dict_pages_by_size");
     failures += test_dict_pages(1024 * 1024, 25000, "dict_pages_max_rows_25k");
     failures += test_row_groups_all_null_batches();
+    failures += test_auto_dictionary_choice();
+    failures += test_auto_dictionary_per_chunk();
+    failures += test_abort_in_flight();
     if (failures) { printf("\n%d test(s) FAILED\n", failures); return 1; }
     printf("\nAll parallel-write tests passed\n");
     return 0;

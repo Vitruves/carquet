@@ -22,6 +22,7 @@
 #include "thrift/parquet_types.h"
 #include "writer/arrow_schema.h"
 #include "writer/page_tasks.h"
+#include "writer/writer_sink.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -111,6 +112,8 @@ extern void carquet_row_group_writer_set_column_write_batch_size(
 extern void carquet_row_group_writer_set_column_page_size(
     carquet_row_group_writer_t* writer,
     int column_index, int64_t bytes);
+extern void carquet_row_group_writer_set_column_dictionary_probe(
+    carquet_row_group_writer_t* writer, int column_index, bool enabled);
 extern void carquet_row_group_writer_set_column_data_page_v2(
     carquet_row_group_writer_t* writer,
     int column_index, bool enabled);
@@ -145,6 +148,8 @@ extern void carquet_row_group_writer_run_whole_column(
 extern carquet_status_t carquet_row_group_writer_complete_page_tasks(
     carquet_row_group_writer_t* writer, int64_t file_offset, int64_t num_rows,
     size_t* total_size);
+extern carquet_status_t carquet_row_group_writer_write_completed(
+    const carquet_row_group_writer_t* writer, carquet_writer_sink_t* sink);
 extern const carquet_buffer_t* carquet_row_group_writer_column_pages(
     const carquet_row_group_writer_t* writer, int column_index, int32_t* count);
 extern void carquet_row_group_writer_detach_column(
@@ -152,9 +157,9 @@ extern void carquet_row_group_writer_detach_column(
     int column_index,
     carquet_buffer_t* out,
     carquet_buffer_t* spare);
-extern carquet_status_t carquet_row_group_writer_write_to_file(
+extern carquet_status_t carquet_row_group_writer_write_to_sink(
     carquet_row_group_writer_t* writer,
-    FILE* file,
+    carquet_writer_sink_t* sink,
     size_t* total_size,
     int64_t num_rows);
 
@@ -295,17 +300,21 @@ typedef struct io_job {
     io_page_t* pages;
     int32_t num_pages;
     int32_t page_capacity;
-    FILE* file;
+    carquet_writer_sink_t* sink;
     carquet_status_t status;
 } io_job_t;
 
 /* Pipelined encode (see "Pipelined encode" below). */
 #define PIPELINE_MAX_SLOTS 8
-/* Older row groups stay in flight behind the newest one only while the raw
- * bytes of everything in flight fit this budget: large row groups keep the
- * one-behind pipeline (peak memory + one row group), small ones, whose few
- * pages cannot keep the pool busy on their own, overlap more deeply. */
+/* More than PIPELINE_MIN_DEPTH row groups stay in flight (being encoded or
+ * written) only while the raw bytes of all of them fit this budget: large
+ * row groups keep a two-deep pipeline, small ones, whose few pages cannot
+ * keep the pool busy on their own, overlap more deeply. */
 #define PIPELINE_BYTES_BUDGET ((int64_t)64 * 1024 * 1024)
+/* Row groups that stay in flight whatever their size: one being encoded and
+ * one being written, so the write of row group n-1 overlaps the input of
+ * n+1 even when a single row group exceeds the budget. */
+#define PIPELINE_MIN_DEPTH 2
 #ifdef _WIN32
 typedef struct pipeline_sync {
     CRITICAL_SECTION mutex;
@@ -328,13 +337,19 @@ typedef struct encode_task_ctx {
     int32_t item;
 } encode_task_ctx_t;
 
-/* A row group whose pages are being encoded on the encode pool, or have
- * been and await their turn to be written. */
+/* A row group in the pipeline: its pages are being encoded on the encode
+ * pool, then the I/O thread assembles and writes it (pipeline_io_task), then
+ * the main thread records its metadata and takes its writer back. */
 typedef struct pipeline_rg {
+    struct carquet_writer* writer;
     carquet_row_group_writer_t* rg;   /* NULL: slot free */
     int64_t rows;
     int64_t bytes;                    /* estimated raw bytes of the row group */
-    int32_t remaining;                /* tasks still running; under pipe_sync */
+    int32_t remaining;                /* encode tasks still running; under pipe_sync */
+    bool written;                     /* the I/O task is through; under pipe_sync */
+    carquet_status_t status;          /* its outcome; valid once written */
+    int64_t file_offset;              /* where the row group went; valid once written */
+    size_t size;                      /* its bytes; valid once written */
     encode_task_ctx_t* ctx;
     int32_t ctx_capacity;
 } pipeline_rg_t;
@@ -345,7 +360,10 @@ typedef struct pipeline_rg {
  */
 
 struct carquet_writer {
-    FILE* file;
+    /* Output: sink.file for a path / FILE* / append writer, sink.mem for a
+     * buffer writer (sink.file NULL). All bytes go through
+     * carquet_writer_sink_write(); direct ones only after writer_io_drain(). */
+    carquet_writer_sink_t sink;
     bool owns_file;
     /* True when this writer was opened over an existing file via
      * carquet_writer_open_append(). Such files must never be deleted on abort:
@@ -456,6 +474,13 @@ struct carquet_writer {
     int pipe_head;                /* slot of the row group to complete next */
     int pipe_count;               /* row groups in the pipeline */
     int64_t pipe_bytes;           /* sum of their estimated raw bytes */
+    /* The I/O thread's side of the pipeline: where the next pipelined row
+     * group starts in the file (set from file_offset by the main thread when
+     * the pipeline is empty, advanced by the I/O thread after each row
+     * group), and the first failure, after which it writes nothing more
+     * (under pipe_sync; abort sets it to stop the writes still queued). */
+    int64_t pipe_io_offset;
+    carquet_status_t pipe_io_status;
     pipeline_sync_t pipe_sync;
     bool pipe_sync_ready;
     carquet_page_writer_t** scratch_stack;  /* idle per-thread page writers; under pipe_sync */
@@ -502,11 +527,8 @@ void carquet_writer_options_init(carquet_writer_options_t* options) {
  * ============================================================================
  */
 
-static carquet_status_t write_magic(FILE* file) {
-    if (fwrite(PARQUET_MAGIC, 1, 4, file) != 4) {
-        return CARQUET_ERROR_FILE_WRITE;
-    }
-    return CARQUET_OK;
+static carquet_status_t write_magic(carquet_writer_sink_t* sink) {
+    return carquet_writer_sink_write(sink, PARQUET_MAGIC, 4);
 }
 
 /* Byte counts only grow: adding nothing (a batch whose values are all null,
@@ -630,7 +652,7 @@ static carquet_status_t ensure_header_written(carquet_writer_t* writer) {
         return CARQUET_OK;
     }
 
-    carquet_status_t status = write_magic(writer->file);
+    carquet_status_t status = write_magic(&writer->sink);
     if (status != CARQUET_OK) {
         return status;
     }
@@ -1000,18 +1022,40 @@ static carquet_encoding_t effective_column_encoding(
         writer->column_encoding_override_set[column_index]) {
         return writer->column_encoding_overrides[column_index];
     }
-    /* Default encoding policy (matches v0.4.4): PLAIN, with automatic
-     * BYTE_STREAM_SPLIT for FLOAT/DOUBLE when a compression codec is set
-     * (BSS makes the float byte planes far more compressible). Dictionary
-     * encoding is a deliberate opt-in via carquet_writer_set_column_encoding()
-     * — making it the default regressed read throughput badly (notably a
-     * ~270x slowdown on the zero-copy uncompressed read path) for a size win
-     * that is zero under zstd. The full dictionary writer remains available. */
-    if (compression != CARQUET_COMPRESSION_UNCOMPRESSED &&
-        (type == CARQUET_PHYSICAL_FLOAT || type == CARQUET_PHYSICAL_DOUBLE)) {
-        return CARQUET_ENCODING_BYTE_STREAM_SPLIT;
+    /* Default encoding policy. Uncompressed columns are PLAIN: that is what
+     * the zero-copy read path needs (a dictionary there made reads ~270x
+     * slower). With a compression codec, FLOAT/DOUBLE take BYTE_STREAM_SPLIT
+     * (the float byte planes compress far better) and INT32/INT64 take a
+     * dictionary, chunk by chunk, when a sample of the chunk shows enough
+     * repeated values (column_dictionary_is_automatic; a chunk that does not
+     * stays PLAIN and page-parallel): fewer bytes go through the codec and
+     * the disk. Other types are PLAIN; a dictionary on them is an opt-in via
+     * carquet_writer_set_column_encoding(). */
+    if (compression != CARQUET_COMPRESSION_UNCOMPRESSED) {
+        if (type == CARQUET_PHYSICAL_FLOAT || type == CARQUET_PHYSICAL_DOUBLE) {
+            return CARQUET_ENCODING_BYTE_STREAM_SPLIT;
+        }
+        if (type == CARQUET_PHYSICAL_INT32 || type == CARQUET_PHYSICAL_INT64) {
+            return CARQUET_ENCODING_RLE_DICTIONARY;
+        }
     }
     return CARQUET_ENCODING_PLAIN;
+}
+
+/* True when the column's dictionary encoding is the default policy above and
+ * not the user's choice: such a dictionary is only attempted on chunks whose
+ * sample calls for it. */
+static bool column_dictionary_is_automatic(
+    const carquet_writer_t* writer,
+    int32_t column_index,
+    carquet_physical_type_t type,
+    carquet_compression_t compression) {
+    if (writer->column_overrides_allocated &&
+        writer->column_encoding_override_set[column_index]) {
+        return false;
+    }
+    return effective_column_encoding(writer, column_index, type, compression) ==
+           CARQUET_ENCODING_RLE_DICTIONARY;
 }
 
 /* Recompute the per-column ColumnMetaData.encodings cache. Must run after
@@ -1184,6 +1228,10 @@ static carquet_status_t create_row_group_writer(
             return status;
         }
 
+        if (column_dictionary_is_automatic(writer, i, col->physical_type, col_comp)) {
+            carquet_row_group_writer_set_column_dictionary_probe(rg, i, true);
+        }
+
         /* Apply the global max_rows_per_page knob (no-op when 0). */
         if (writer->options.max_rows_per_page > 0) {
             carquet_row_group_writer_set_column_max_rows_per_page(
@@ -1284,24 +1332,16 @@ static carquet_status_t ensure_row_group(carquet_writer_t* writer) {
 
 static void io_write_task(void* arg) {
     io_job_t* job = (io_job_t*)arg;
-    job->status = CARQUET_OK;
-    if (job->buf.size > 0 &&
-        fwrite(job->buf.data, 1, job->buf.size, job->file) != job->buf.size) {
-        job->status = CARQUET_ERROR_FILE_WRITE;
-        return;
-    }
-    for (int32_t k = 0; k < job->num_pages; k++) {
+    job->status = carquet_writer_sink_write(job->sink, job->buf.data, job->buf.size);
+    for (int32_t k = 0; job->status == CARQUET_OK && k < job->num_pages; k++) {
         const io_page_t* p = &job->pages[k];
-        if (p->size > 0 && fwrite(p->data, 1, p->size, job->file) != p->size) {
-            job->status = CARQUET_ERROR_FILE_WRITE;
-            return;
-        }
+        job->status = carquet_writer_sink_write(job->sink, p->data, p->size);
     }
 }
 
 /* Wait for every queued background write and take the chunk buffers back
  * for reuse. Returns the first write error, which also sticks on the writer.
- * Must precede any direct access to writer->file. */
+ * Must precede any direct access to writer->sink. */
 static carquet_status_t writer_io_drain(carquet_writer_t* writer) {
     if (!writer->io_pool || writer->io_jobs_in_flight == 0) {
         return writer->io_error;
@@ -1419,7 +1459,7 @@ static carquet_status_t submit_row_group_io(carquet_writer_t* writer,
             job->pages[k].size = pages[k].size;
         }
         job->num_pages = num_pages;
-        job->file = writer->file;
+        job->sink = &writer->sink;
         job->status = CARQUET_OK;
         writer->io_jobs_in_flight = i + 1;
         carquet_worker_pool_submit(writer->io_pool, io_write_task, job);
@@ -1683,15 +1723,17 @@ static carquet_status_t record_row_group(carquet_writer_t* writer,
             chunk->bloom_filter_length = (int32_t)(bf_header.size + bf_size);
 
             /* Write header + data */
-            if (fwrite(bf_header.data, 1, bf_header.size, writer->file) != bf_header.size) {
+            status = carquet_writer_sink_write(&writer->sink, bf_header.data, bf_header.size);
+            if (status != CARQUET_OK) {
                 carquet_buffer_destroy(&bf_header);
-                return CARQUET_ERROR_FILE_WRITE;
+                return status;
             }
             writer->file_offset += (int64_t)bf_header.size;
             carquet_buffer_destroy(&bf_header);
 
-            if (fwrite(bf_data, 1, bf_size, writer->file) != bf_size) {
-                return CARQUET_ERROR_FILE_WRITE;
+            status = carquet_writer_sink_write(&writer->sink, bf_data, bf_size);
+            if (status != CARQUET_OK) {
+                return status;
             }
             writer->file_offset += (int64_t)bf_size;
         }
@@ -1718,9 +1760,10 @@ static carquet_status_t record_row_group(carquet_writer_t* writer,
                     chunk->column_index_offset = writer->file_offset;
                     chunk->has_column_index_length = true;
                     chunk->column_index_length = (int32_t)ci_buf.size;
-                    if (fwrite(ci_buf.data, 1, ci_buf.size, writer->file) != ci_buf.size) {
+                    status = carquet_writer_sink_write(&writer->sink, ci_buf.data, ci_buf.size);
+                    if (status != CARQUET_OK) {
                         carquet_buffer_destroy(&ci_buf);
-                        return CARQUET_ERROR_FILE_WRITE;
+                        return status;
                     }
                     writer->file_offset += (int64_t)ci_buf.size;
                 }
@@ -1739,9 +1782,10 @@ static carquet_status_t record_row_group(carquet_writer_t* writer,
                     chunk->offset_index_offset = writer->file_offset;
                     chunk->has_offset_index_length = true;
                     chunk->offset_index_length = (int32_t)oi_buf.size;
-                    if (fwrite(oi_buf.data, 1, oi_buf.size, writer->file) != oi_buf.size) {
+                    status = carquet_writer_sink_write(&writer->sink, oi_buf.data, oi_buf.size);
+                    if (status != CARQUET_OK) {
                         carquet_buffer_destroy(&oi_buf);
-                        return CARQUET_ERROR_FILE_WRITE;
+                        return status;
                     }
                     writer->file_offset += (int64_t)oi_buf.size;
                 }
@@ -1767,10 +1811,18 @@ static carquet_status_t record_row_group(carquet_writer_t* writer,
  * of n+1. Columns that are not page-parallel (dictionary, BYTE_ARRAY, ...) go
  * to the pool as one work item each, finalized whole by one thread exactly
  * as the serial path would, so they overlap the rest too instead of sending
- * the row group back to the fork/join. The row group is completed (pages
- * accounted, chunk infos filled, metadata recorded, I/O queued) one flush
- * later, or at close. Output is the same bytes in the same order; only
- * which thread encodes which page or column changes.
+ * the row group back to the fork/join.
+ *
+ * The I/O thread takes it from there without the main thread: a job queued
+ * with the row group (pipeline_io_task) waits for its last encode task,
+ * accounts the pages, fills the chunk infos and writes the row group straight
+ * from its writer's buffers, behind the previous one. So the write starts the
+ * moment the encode ends, and the user's thread never waits for a write to
+ * hand over the next row group; it only waits when too much is in flight
+ * (PIPELINE_BYTES_BUDGET). It records the metadata of written row groups and
+ * takes their writers back at the next flush, or at close. Output is the same
+ * bytes in the same order; only which thread encodes which page or column
+ * changes.
  */
 
 #ifdef _OPENMP
@@ -1867,17 +1919,47 @@ static void encode_task_fn(void* arg) {
     PIPELINE_UNLOCK(writer);
 }
 
-/* Block until every task of the slot has run. */
-static void pipeline_wait(carquet_writer_t* writer, pipeline_rg_t* slot) {
+/* I/O thread: write one pipelined row group once its encode tasks are done.
+ * Jobs run in row-group order (one thread, FIFO), so the file offset of each
+ * follows from the previous one. After a failure nothing more is written:
+ * the bytes that follow would land at offsets the footer cannot describe. */
+static void pipeline_io_task(void* arg) {
+    pipeline_rg_t* slot = (pipeline_rg_t*)arg;
+    carquet_writer_t* writer = slot->writer;
     PIPELINE_LOCK(writer);
     while (slot->remaining > 0) {
         PIPELINE_WAIT(writer);
     }
+    carquet_status_t status = writer->pipe_io_status;
+    PIPELINE_UNLOCK(writer);
+
+    size_t size = 0;
+    int64_t offset = writer->pipe_io_offset;
+    if (status == CARQUET_OK) {
+        status = carquet_row_group_writer_complete_page_tasks(
+            slot->rg, offset, slot->rows, &size);
+    }
+    if (status == CARQUET_OK) {
+        status = carquet_row_group_writer_write_completed(slot->rg, &writer->sink);
+    }
+    if (status == CARQUET_OK) {
+        writer->pipe_io_offset = offset + (int64_t)size;
+    }
+
+    PIPELINE_LOCK(writer);
+    if (status != CARQUET_OK && writer->pipe_io_status == CARQUET_OK) {
+        writer->pipe_io_status = status;
+    }
+    slot->status = status;
+    slot->file_offset = offset;
+    slot->size = size;
+    slot->written = true;
+    PIPELINE_BROADCAST(writer);
     PIPELINE_UNLOCK(writer);
 }
 
-/* Set the pipeline up on first use. Needs the background I/O thread (the
- * completed row group is handed to it) and a machine worth threading. A
+/* Set the pipeline up on first use. Needs the background I/O thread (it
+ * writes the row groups) and a machine worth threading. A
  * failure here just leaves the fork/join path in charge. */
 static bool pipeline_ready(carquet_writer_t* writer) {
     if (writer->pipeline_off || writer->num_columns <= 1 ||
@@ -1957,15 +2039,24 @@ static carquet_status_t pipeline_begin(carquet_writer_t* writer, bool* started,
             writer->current_row_group, k);
         slot->ctx[k].item = k;
     }
+    slot->writer = writer;
     slot->rg = writer->current_row_group;
     slot->rows = writer->current_row_group_rows;
     slot->bytes = writer->current_row_group_estimated_bytes;
     PIPELINE_LOCK(writer);
     slot->remaining = n;
+    slot->written = false;
+    if (writer->pipe_count == 0) {
+        /* Nothing pipelined is queued: the I/O thread's offset restarts
+         * from the row groups recorded so far. */
+        writer->pipe_io_offset = writer->file_offset;
+        writer->pipe_io_status = CARQUET_OK;
+    }
     PIPELINE_UNLOCK(writer);
     for (int32_t k = 0; k < n; k++) {
         carquet_worker_pool_submit(writer->encode_pool, encode_task_fn, &slot->ctx[k]);
     }
+    carquet_worker_pool_submit(writer->io_pool, pipeline_io_task, slot);
     *started = true;
     *slot_index = free_slot;
     return CARQUET_OK;
@@ -1981,10 +2072,9 @@ static void pipeline_push_spare(carquet_writer_t* writer,
     }
 }
 
-/* Finish the oldest row group in the pipeline, if any: wait for its pages,
- * queue them for the I/O thread behind the previous row group, record its
- * metadata and return its writer to spare duty. On failure the writer keeps
- * the slot (its buffers may still be referenced) and the error sticks. */
+/* Finish the oldest row group in the pipeline, if any: wait until the I/O
+ * thread has written it, record its metadata and return its writer to spare
+ * duty. On failure the writer keeps the slot and the error sticks. */
 static carquet_status_t pipeline_complete_pending(carquet_writer_t* writer) {
     if (writer->pipe_count <= 0) return CARQUET_OK;
     pipeline_rg_t* slot = &writer->pipe_slots[writer->pipe_head];
@@ -1993,19 +2083,18 @@ static carquet_status_t pipeline_complete_pending(carquet_writer_t* writer) {
         writer->pipe_count--;
         return CARQUET_OK;
     }
-    pipeline_wait(writer, slot);
+    PIPELINE_LOCK(writer);
+    while (!slot->written) {
+        PIPELINE_WAIT(writer);
+    }
+    PIPELINE_UNLOCK(writer);
 
-    size_t size = 0;
-    carquet_status_t status = writer_io_drain(writer);
-    if (status == CARQUET_OK) {
-        status = carquet_row_group_writer_complete_page_tasks(
-            slot->rg, writer->file_offset, slot->rows, &size);
+    carquet_status_t status = slot->status;
+    if (status == CARQUET_OK && slot->file_offset != writer->file_offset) {
+        status = CARQUET_ERROR_INTERNAL;
     }
     if (status == CARQUET_OK) {
-        status = submit_row_group_io(writer, slot->rg);
-    }
-    if (status == CARQUET_OK) {
-        status = record_row_group(writer, slot->rg, slot->rows, size);
+        status = record_row_group(writer, slot->rg, slot->rows, slot->size);
     }
     if (status != CARQUET_OK) {
         if (writer->io_error == CARQUET_OK) writer->io_error = status;
@@ -2029,14 +2118,26 @@ static carquet_status_t pipeline_complete_all(carquet_writer_t* writer) {
     return CARQUET_OK;
 }
 
-/* True when every task of the oldest row group has run. */
+/* True when the oldest row group has been written (or failed to be). */
 static bool pipeline_head_done(carquet_writer_t* writer) {
     if (writer->pipe_count <= 0) return false;
     pipeline_rg_t* slot = &writer->pipe_slots[writer->pipe_head];
+    if (!slot->rg) return true;
     PIPELINE_LOCK(writer);
-    bool done = slot->remaining <= 0;
+    bool done = slot->written;
     PIPELINE_UNLOCK(writer);
     return done;
+}
+
+/* Tell the I/O thread to drop the pipelined row groups it has not written
+ * yet (abort: the file is going away). */
+static void pipeline_cancel_io(carquet_writer_t* writer) {
+    if (!writer->pipe_sync_ready) return;
+    PIPELINE_LOCK(writer);
+    if (writer->pipe_io_status == CARQUET_OK) {
+        writer->pipe_io_status = CARQUET_ERROR_FILE_WRITE;
+    }
+    PIPELINE_UNLOCK(writer);
 }
 
 /* Take an idle row-group writer, or NULL when none is left. */
@@ -2045,8 +2146,9 @@ static carquet_row_group_writer_t* pipeline_pop_spare(carquet_writer_t* writer) 
 }
 
 /* Stop the encode pool: every queued task runs to the end first, so no
- * thread touches a row-group writer after this. The I/O thread may still be
- * reading page buffers; pipeline_free comes after writer_io_shutdown. */
+ * encode thread touches a row-group writer after this, and the I/O jobs
+ * waiting for them can proceed. The I/O thread may still be assembling and
+ * writing row groups; pipeline_free comes after writer_io_shutdown. */
 static void pipeline_quiesce(carquet_writer_t* writer) {
     if (writer->encode_pool) {
         carquet_worker_pool_destroy(writer->encode_pool);
@@ -2103,12 +2205,19 @@ static bool pipeline_head_done(carquet_writer_t* writer) {
 static carquet_row_group_writer_t* pipeline_pop_spare(carquet_writer_t* writer) {
     (void)writer; return NULL;
 }
+static void pipeline_cancel_io(carquet_writer_t* writer) { (void)writer; }
 static void pipeline_quiesce(carquet_writer_t* writer) { (void)writer; }
 static void pipeline_free(carquet_writer_t* writer) { (void)writer; }
 
 #endif
 
-static carquet_status_t flush_row_group(carquet_writer_t* writer) {
+/* Finalize the current row group and get it on its way to the file. `last`
+ * tells no row group follows (close): with nothing to overlap, a writer
+ * that has not started its encode pool or its I/O thread does not start
+ * them for this one row group; it is finalized by the fork/join path and
+ * written from this thread, the same bytes without the threads' setup and
+ * teardown, which outweigh a small file's encode. */
+static carquet_status_t flush_row_group(carquet_writer_t* writer, bool last) {
     /* Sticky error first: after a failed pipelined flush current_row_group
      * is NULL, and close() must still report the failure. */
     if (writer->io_error != CARQUET_OK) {
@@ -2119,9 +2228,9 @@ static carquet_status_t flush_row_group(carquet_writer_t* writer) {
     }
 
     carquet_status_t status;
-    if (pipeline_ready(writer)) {
-        /* Start this row group's pages first, then settle the oldest row
-         * groups: their last pages finish while these begin. */
+    if (!(last && !writer->encode_pool) && pipeline_ready(writer)) {
+        /* Start this row group's pages (and queue its write behind them)
+         * first, then settle the oldest row groups. */
         bool started = false;
         int slot = -1;
         if (writer->pipe_count >= PIPELINE_MAX_SLOTS) {
@@ -2138,16 +2247,16 @@ static carquet_status_t flush_row_group(carquet_writer_t* writer) {
             writer->pipe_count++;
             writer->pipe_bytes += writer->pipe_slots[slot].bytes;
         }
-        /* Keep the newest row group in flight and settle older ones, oldest
-         * first, while the pipeline holds too many bytes or slots, or when
-         * they are already encoded (their I/O can start now). With a budget
-         * for one row group this is the n-1 completion of a two-deep
-         * pipeline. A row group that did not start goes the ordinary way
-         * below, after everything in flight. */
+        /* Settle older row groups, oldest first: those already written (no
+         * wait), and, waiting for the I/O thread, as many as it takes to
+         * bring the pipeline back under its slot and byte limits. A row
+         * group that did not start goes the ordinary way below, after
+         * everything in flight. */
         while (writer->pipe_count > (started ? 1 : 0) &&
                (!started ||
                 writer->pipe_count >= PIPELINE_MAX_SLOTS ||
-                writer->pipe_bytes > PIPELINE_BYTES_BUDGET ||
+                (writer->pipe_count > PIPELINE_MIN_DEPTH &&
+                 writer->pipe_bytes > PIPELINE_BYTES_BUDGET) ||
                 pipeline_head_done(writer))) {
             status = pipeline_complete_pending(writer);
             if (status != CARQUET_OK) {
@@ -2185,12 +2294,12 @@ static carquet_status_t flush_row_group(carquet_writer_t* writer) {
     /* Finalize and write each column directly to file, avoiding
      * an intermediate copy of the entire row group into one buffer */
     size_t size;
-    if (writer_io_ready(writer)) {
+    if (!(last && !writer->io_pool) && writer_io_ready(writer)) {
         status = write_row_group_async(writer, &size);
     } else {
         carquet_row_group_writer_set_page_io(writer->current_row_group, false);
-        status = carquet_row_group_writer_write_to_file(
-            writer->current_row_group, writer->file, &size,
+        status = carquet_row_group_writer_write_to_sink(
+            writer->current_row_group, &writer->sink, &size,
             writer->current_row_group_rows);
     }
     if (status != CARQUET_OK) {
@@ -2617,8 +2726,8 @@ carquet_writer_t* carquet_writer_create(
     }
 
     /* Open file */
-    writer->file = carquet_fopen(path, "wb");
-    if (!writer->file) {
+    carquet_writer_sink_init(&writer->sink, carquet_fopen(path, "wb"));
+    if (!writer->sink.file) {
         carquet_arena_destroy(&writer->arena);
         carquet_mem_free(writer);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_OPEN, "Failed to open file for writing: %s", path);
@@ -2628,12 +2737,90 @@ carquet_writer_t* carquet_writer_create(
 
     writer->path = carquet_heap_strdup(path);
     if (!writer->path) {
-        fclose(writer->file);
+        fclose(writer->sink.file);
         carquet_arena_destroy(&writer->arena);
         carquet_mem_free(writer);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate path");
         return NULL;
     }
+
+    /* Copy options */
+    if (options) {
+        writer->options = *options;
+    } else {
+        carquet_writer_options_init(&writer->options);
+    }
+    writer->max_statistics_size = 32;  /* Parquet spec recommendation; matches Arrow */
+
+    /* Store full schema elements for metadata serialization */
+    {
+        carquet_status_t status = store_schema_elements(writer, schema);
+        if (status != CARQUET_OK) {
+            carquet_writer_abort(writer);
+            CARQUET_SET_ERROR(error, status, "Failed to store schema elements");
+            return NULL;
+        }
+
+        status = build_column_metadata_cache(writer, schema);
+        if (status != CARQUET_OK) {
+            carquet_writer_abort(writer);
+            CARQUET_SET_ERROR(error, status, "Failed to build writer metadata cache");
+            return NULL;
+        }
+    }
+
+    /* Add leaf columns from schema (schema is nonnull per API contract) */
+    for (int32_t i = 0; i < schema->num_leaves; i++) {
+        int32_t elem_idx = schema->leaf_indices[i];
+        parquet_schema_element_t* elem = &schema->elements[elem_idx];
+
+        carquet_logical_type_t* lt = elem->has_logical_type ? &elem->logical_type : NULL;
+
+        carquet_status_t status = add_column_internal(
+            writer,
+            elem->name,
+            elem->type,
+            lt,
+            elem->repetition_type,
+            elem->type_length,
+            schema->max_def_levels[i],
+            schema->max_rep_levels[i],
+            leaf_statistics_sort_order_defined(schema, elem_idx));
+
+        if (status != CARQUET_OK) {
+            carquet_writer_abort(writer);
+            CARQUET_SET_ERROR(error, status, "Failed to add column from schema");
+            return NULL;
+        }
+    }
+
+    return writer;
+}
+
+/* A writer over `file` (not owned), or, for carquet_writer_create_buffer(),
+ * with no stream: the caller then turns the sink into a memory one. */
+static carquet_writer_t* writer_create_on_sink(
+    FILE* file,
+    const carquet_schema_t* schema,
+    const carquet_writer_options_t* options,
+    carquet_error_t* error) {
+
+    /* schema is nonnull per API contract */
+    carquet_writer_t* writer = carquet_mem_calloc(1, sizeof(carquet_writer_t));
+    if (!writer) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate writer");
+        return NULL;
+    }
+
+    /* Initialize arena */
+    if (carquet_arena_init_size(&writer->arena, 4096) != CARQUET_OK) {
+        carquet_mem_free(writer);
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate arena");
+        return NULL;
+    }
+
+    carquet_writer_sink_init(&writer->sink, file);
+    writer->owns_file = false;
 
     /* Copy options */
     if (options) {
@@ -2695,73 +2882,7 @@ carquet_writer_t* carquet_writer_create_file(
     carquet_error_t* error) {
 
     /* file and schema are nonnull per API contract */
-    carquet_writer_t* writer = carquet_mem_calloc(1, sizeof(carquet_writer_t));
-    if (!writer) {
-        CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate writer");
-        return NULL;
-    }
-
-    /* Initialize arena */
-    if (carquet_arena_init_size(&writer->arena, 4096) != CARQUET_OK) {
-        carquet_mem_free(writer);
-        CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate arena");
-        return NULL;
-    }
-
-    writer->file = file;
-    writer->owns_file = false;
-
-    /* Copy options */
-    if (options) {
-        writer->options = *options;
-    } else {
-        carquet_writer_options_init(&writer->options);
-    }
-    writer->max_statistics_size = 32;  /* Parquet spec recommendation; matches Arrow */
-
-    /* Store full schema elements for metadata serialization */
-    {
-        carquet_status_t status = store_schema_elements(writer, schema);
-        if (status != CARQUET_OK) {
-            carquet_writer_abort(writer);
-            CARQUET_SET_ERROR(error, status, "Failed to store schema elements");
-            return NULL;
-        }
-
-        status = build_column_metadata_cache(writer, schema);
-        if (status != CARQUET_OK) {
-            carquet_writer_abort(writer);
-            CARQUET_SET_ERROR(error, status, "Failed to build writer metadata cache");
-            return NULL;
-        }
-    }
-
-    /* Add leaf columns from schema (schema is nonnull per API contract) */
-    for (int32_t i = 0; i < schema->num_leaves; i++) {
-        int32_t elem_idx = schema->leaf_indices[i];
-        parquet_schema_element_t* elem = &schema->elements[elem_idx];
-
-        carquet_logical_type_t* lt = elem->has_logical_type ? &elem->logical_type : NULL;
-
-        carquet_status_t status = add_column_internal(
-            writer,
-            elem->name,
-            elem->type,
-            lt,
-            elem->repetition_type,
-            elem->type_length,
-            schema->max_def_levels[i],
-            schema->max_rep_levels[i],
-            leaf_statistics_sort_order_defined(schema, elem_idx));
-
-        if (status != CARQUET_OK) {
-            carquet_writer_abort(writer);
-            CARQUET_SET_ERROR(error, status, "Failed to add column from schema");
-            return NULL;
-        }
-    }
-
-    return writer;
+    return writer_create_on_sink(file, schema, options, error);
 }
 
 /* ============================================================================
@@ -3117,8 +3238,8 @@ carquet_writer_t* carquet_writer_open_append(
     }
 
     /* "r+b": read+write, do not truncate, fail if missing. */
-    writer->file = carquet_fopen(path, "r+b");
-    if (!writer->file) {
+    carquet_writer_sink_init(&writer->sink, carquet_fopen(path, "r+b"));
+    if (!writer->sink.file) {
         carquet_arena_destroy(&writer->arena);
         carquet_mem_free(writer);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_OPEN,
@@ -3137,7 +3258,7 @@ carquet_writer_t* carquet_writer_open_append(
     parquet_file_metadata_t parsed;
     int64_t insert_offset = 0;
     carquet_status_t st = append_parse_existing_footer(
-        writer->file, &writer->arena, &parsed, &insert_offset, error);
+        writer->sink.file, &writer->arena, &parsed, &insert_offset, error);
     if (st != CARQUET_OK) { carquet_writer_abort(writer); return NULL; }
 
     st = append_validate_schema_matches(schema, &parsed, error);
@@ -3191,7 +3312,7 @@ carquet_writer_t* carquet_writer_open_append(
 
     /* Position the file at the insertion point and mark the header as already
      * written so the close path does not re-emit PAR1. */
-    if (carquet_fseek64(writer->file, insert_offset, SEEK_SET) != 0) {
+    if (carquet_fseek64(writer->sink.file, insert_offset, SEEK_SET) != 0) {
         carquet_writer_abort(writer);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_SEEK,
             "append: seek to insertion offset");
@@ -3346,7 +3467,7 @@ carquet_status_t carquet_writer_write_batch(
     if (writer_supports_aligned_auto_flush(writer) &&
         writer->current_row_group_estimated_bytes > writer->options.row_group_size &&
         current_row_group_is_aligned(writer)) {
-        status = flush_row_group(writer);
+        status = flush_row_group(writer, false);
         if (status != CARQUET_OK) {
             return status;
         }
@@ -3549,7 +3670,7 @@ carquet_status_t carquet_writer_new_row_group(carquet_writer_t* writer) {
     }
 
     /* Flush current row group if any */
-    return flush_row_group(writer);
+    return flush_row_group(writer, false);
 }
 
 int32_t carquet_writer_num_columns(const carquet_writer_t* writer) {
@@ -3585,7 +3706,7 @@ carquet_status_t carquet_writer_close(carquet_writer_t* writer) {
     }
 
     /* Flush any pending row group */
-    status = flush_row_group(writer);
+    status = flush_row_group(writer, true);
     if (status != CARQUET_OK) {
         goto cleanup;
     }
@@ -3618,9 +3739,9 @@ carquet_status_t carquet_writer_close(carquet_writer_t* writer) {
     }
 
     /* Write metadata */
-    if (fwrite(metadata_buffer.data, 1, metadata_buffer.size, writer->file) != metadata_buffer.size) {
+    status = carquet_writer_sink_write(&writer->sink, metadata_buffer.data, metadata_buffer.size);
+    if (status != CARQUET_OK) {
         carquet_buffer_destroy(&metadata_buffer);
-        status = CARQUET_ERROR_FILE_WRITE;
         goto cleanup;
     }
 
@@ -3632,16 +3753,16 @@ carquet_status_t carquet_writer_close(carquet_writer_t* writer) {
     len_bytes[2] = (uint8_t)((metadata_len >> 16) & 0xFF);
     len_bytes[3] = (uint8_t)((metadata_len >> 24) & 0xFF);
 
-    if (fwrite(len_bytes, 1, 4, writer->file) != 4) {
+    status = carquet_writer_sink_write(&writer->sink, len_bytes, 4);
+    if (status != CARQUET_OK) {
         carquet_buffer_destroy(&metadata_buffer);
-        status = CARQUET_ERROR_FILE_WRITE;
         goto cleanup;
     }
 
     carquet_buffer_destroy(&metadata_buffer);
 
     /* Write footer magic */
-    status = write_magic(writer->file);
+    status = write_magic(&writer->sink);
     if (status != CARQUET_OK) {
         goto cleanup;
     }
@@ -3651,42 +3772,21 @@ carquet_status_t carquet_writer_close(carquet_writer_t* writer) {
      * key-value metadata are not restored byte for byte), which would leave
      * the old footer length and PAR1 at the end of the file. */
     if (writer->is_append) {
-        int64_t end = carquet_ftell64(writer->file);
-        if (end < 0 || carquet_ftruncate64(writer->file, end) != 0) {
+        int64_t end = carquet_ftell64(writer->sink.file);
+        if (end < 0 || carquet_ftruncate64(writer->sink.file, end) != 0) {
             status = CARQUET_ERROR_FILE_WRITE;
             goto cleanup;
         }
     }
 
-    /* For buffer writers, read back the entire file into memory.
-     * Use 64-bit seek/tell to handle files >2 GB on all platforms. */
-    if (writer->is_buffer_writer && writer->file) {
-        fflush(writer->file);
-        int64_t file_size = -1;
-        if (carquet_fseek64(writer->file, 0, SEEK_END) == 0)
-            file_size = carquet_ftell64(writer->file);
-        if (file_size > 0 && (uint64_t)file_size > (uint64_t)SIZE_MAX) {
-            /* 32-bit build: the (size_t) casts below would truncate and
-             * return a silently shortened buffer with CARQUET_OK. */
-            status = CARQUET_ERROR_OUT_OF_MEMORY;
-            goto cleanup;
-        }
-        if (file_size > 0) {
-            writer->output_buffer = carquet_mem_malloc((size_t)file_size);
-            if (!writer->output_buffer) {
-                status = CARQUET_ERROR_OUT_OF_MEMORY;
-                goto cleanup;
-            }
-            rewind(writer->file);
-            size_t nread = fread(writer->output_buffer, 1, (size_t)file_size, writer->file);
-            if (nread != (size_t)file_size) {
-                carquet_mem_free(writer->output_buffer);
-                writer->output_buffer = NULL;
-                status = CARQUET_ERROR_FILE_READ;
-                goto cleanup;
-            }
-            writer->output_buffer_size = (size_t)file_size;
-        }
+    /* A buffer writer's file is complete in the memory sink (the footer
+     * followed the drain above, so the I/O thread is idle): hand the block
+     * over as is. It grew by doubling; give the unused tail back, which is a
+     * no-op when the allocator cannot shrink in place. */
+    if (writer->is_buffer_writer && writer->sink.mem.size > 0) {
+        (void)carquet_buffer_shrink_to_fit(&writer->sink.mem);
+        writer->output_buffer = carquet_buffer_detach(
+            &writer->sink.mem, &writer->output_buffer_size);
     }
 
 cleanup:
@@ -3700,10 +3800,13 @@ cleanup:
         writer->current_row_group = NULL;
     }
 
-    if (writer->owns_file && writer->file) {
-        fclose(writer->file);
-        writer->file = NULL;
+    if (writer->owns_file && writer->sink.file) {
+        fclose(writer->sink.file);
+        writer->sink.file = NULL;
     }
+    /* Whatever a failed buffer writer had produced (empty after the detach
+     * above). The I/O thread, its only other writer, is gone. */
+    carquet_buffer_destroy(&writer->sink.mem);
 
     /* Free column definitions. NULL every freed pointer: a buffer writer is
      * kept alive past close() (see the is_buffer_writer return below) and its
@@ -3772,6 +3875,7 @@ cleanup:
 void carquet_writer_abort(carquet_writer_t* writer) {
     if (!writer) return;
 
+    pipeline_cancel_io(writer);
     pipeline_quiesce(writer);
     writer_io_shutdown(writer);
     pipeline_free(writer);
@@ -3785,14 +3889,15 @@ void carquet_writer_abort(carquet_writer_t* writer) {
     /* Close and delete file. For append writers the file existed before we
      * opened it, so deleting it on abort would destroy the user's data —
      * close it but leave it on disk untouched. */
-    if (writer->owns_file && writer->file) {
-        fclose(writer->file);
-        writer->file = NULL;
+    if (writer->owns_file && writer->sink.file) {
+        fclose(writer->sink.file);
+        writer->sink.file = NULL;
 
         if (writer->path && !writer->is_append) {
             carquet_remove(writer->path);
         }
     }
+    carquet_buffer_destroy(&writer->sink.mem);
 
     /* Free column definitions */
     if (writer->columns) {
@@ -4119,36 +4224,14 @@ carquet_writer_t* carquet_writer_create_buffer(
     const carquet_writer_options_t* options,
     carquet_error_t* error) {
 
-    /* Create a temporary FILE* for writing.
-     * tmpfile() can fail on Windows when the process lacks write access to
-     * the root directory.  Fall back to a named temp file in that case. */
-    FILE* tmp = tmpfile();
-#ifdef _WIN32
-    if (!tmp) {
-        /* _tempnam uses %TMP%, %TEMP%, or the current directory */
-        char* tpath = _tempnam(NULL, "cqt");   /* CRT malloc: free with the CRT free() */
-        if (tpath) {
-            tmp = fopen(tpath, "w+bTD");   /* T=short-lived, D=delete-on-close */
-            free(tpath);   /* never carquet_mem_free(): a custom allocator must not free CRT memory */
-        }
-    }
-#endif
-    if (!tmp) {
-        CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_OPEN,
-            "Failed to create temporary file for buffer writer");
-        return NULL;
-    }
-
-    /* Create a writer using the FILE* handle */
-    carquet_writer_t* writer = carquet_writer_create_file(tmp, schema, options, error);
+    /* No stream: the file is assembled in the writer's memory sink, and
+     * carquet_writer_close() turns that block into the output buffer. */
+    carquet_writer_t* writer = writer_create_on_sink(NULL, schema, options, error);
     if (!writer) {
-        fclose(tmp);
         return NULL;
     }
-
-    /* Mark as buffer writer and take ownership of the tmpfile */
     writer->is_buffer_writer = true;
-    writer->owns_file = true;
+    writer->sink.in_memory = true;
 
     return writer;
 }

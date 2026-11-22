@@ -228,8 +228,9 @@ class ParquetWriter:
     * ``row_group_size``: rows per row group (default 1 048 576).
     * ``data_page_size``: target page size in bytes, or ``{column: bytes}``.
     * ``max_rows_per_page``, ``write_batch_size``, ``dictionary_pagesize_limit``.
-    * ``use_dictionary``: ``True`` / list of columns to dictionary-encode
-      (default: carquet's PLAIN encoding). ``column_encoding``: an encoding for
+    * ``use_dictionary``: ``True`` / list of columns to dictionary-encode,
+      ``False`` for none (default: carquet's choice, a dictionary on the
+      compressed integer columns whose values repeat). ``column_encoding``: an encoding for
       every column or ``{column: encoding}`` -- ``"plain"``, ``"dictionary"``,
       ``"delta_binary_packed"``, ``"delta_length_byte_array"``,
       ``"delta_byte_array"``, ``"byte_stream_split"``, ``"rle"``.
@@ -406,6 +407,12 @@ class ParquetWriter:
             for leaf in dict_cols:
                 if use_dictionary is not True or cols.schema[leaf].physical_type != "BOOLEAN":
                     enc[leaf] = RLE_DICTIONARY
+        if use_dictionary is not None:
+            # False, or a list naming the only dictionary columns: the integer columns the C
+            # writer would otherwise dictionary-encode on its own stay PLAIN.
+            for c in cols.schema:
+                if c.physical_type in ("INT32", "INT64") and c.index not in (dict_cols or ()):
+                    enc[c.index] = encoding_id("plain")
         if use_byte_stream_split:
             if use_byte_stream_split is True:
                 bss = {c.index for c in cols.schema if c.physical_type in ("FLOAT", "DOUBLE")}

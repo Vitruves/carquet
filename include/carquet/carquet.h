@@ -2597,9 +2597,9 @@ typedef struct carquet_writer_options {
     /**
      * @brief Dictionary encoding mode.
      *
-     * Default: CARQUET_ENCODING_RLE_DICTIONARY (the encoding used when a column opts
-     * into dictionary encoding; columns are PLAIN unless carquet_writer_set_column_encoding
-     * selects otherwise)
+     * Default: CARQUET_ENCODING_RLE_DICTIONARY (the encoding used when a column is
+     * dictionary-encoded; which columns are is described at
+     * carquet_writer_set_column_encoding)
      */
     carquet_encoding_t dictionary_encoding;
 
@@ -3687,7 +3687,16 @@ carquet_status_t carquet_reader_geospatial_statistics(
 /**
  * @brief Set encoding for a specific column.
  *
- * Overrides the automatic encoding selection for this column.
+ * Overrides the automatic encoding selection for this column, which is:
+ * - uncompressed columns: PLAIN (what zero-copy reads need);
+ * - compressed FLOAT / DOUBLE columns: BYTE_STREAM_SPLIT;
+ * - compressed INT32 / INT64 columns: RLE_DICTIONARY for the column chunks
+ *   whose values repeat (decided per row group from a sample of the chunk),
+ *   PLAIN for the others. Pass CARQUET_ENCODING_PLAIN to never use a
+ *   dictionary, CARQUET_ENCODING_RLE_DICTIONARY to always try one (a chunk
+ *   still falls back to PLAIN when its dictionary would exceed
+ *   dictionary_page_size or every value is distinct);
+ * - other types: PLAIN.
  *
  * @param[in] writer File writer
  * @param[in] column_index Column index

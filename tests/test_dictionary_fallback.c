@@ -3,14 +3,16 @@
  * @brief preserve_dictionaries over a chunk falling back to PLAIN pages
  *
  * A dictionary-encoded column chunk may fall back to PLAIN pages after its
- * dictionary pages (as writers do once the dictionary is full). Read with
- * preserve_dictionaries, the batch reader returns the dictionary part's
+ * dictionary pages (as writers do once the dictionary is full; V2 writers fall
+ * back to DELTA_BINARY_PACKED or BYTE_STREAM_SPLIT instead, tested too). Read
+ * with preserve_dictionaries, the batch reader returns the dictionary part's
  * indices, then fails at the PLAIN page: never the PLAIN values' bytes as
- * indices. A column reader reading indices (carquet_column_reader_reset_indices)
- * stops there too, and carquet_column_reader_materialize() reads the PLAIN
- * values from there. carquet's writer falls back for whole chunks only, so the
- * mixed chunk is spliced from two files' chunks: a dictionary-encoded one, then
- * a PLAIN one's data pages, under the first's footer, grown to both.
+ * indices, nor its values decoded into the index buffer. A column reader
+ * reading indices (carquet_column_reader_reset_indices) stops there too, and
+ * carquet_column_reader_materialize() reads the fallback page's values from
+ * there. carquet's writer falls back for whole chunks only, so the mixed chunk
+ * is spliced from two files' chunks: a dictionary-encoded one, then a PLAIN
+ * one's data pages, under the first's footer, grown to both.
  */
 
 #include <carquet/carquet.h>
@@ -31,8 +33,9 @@ static int64_t dict_value(int64_t i) { return 100 + i % DICT_VALUES; }
 static int64_t plain_value(int64_t i) { return 1000000 + i; }
 
 /* one INT64 REQUIRED column v, uncompressed, without statistics: rows of
- * value(i), dictionary-encoded or PLAIN */
-static int write_file(const char* path, int64_t rows, int64_t (*value)(int64_t), bool dict) {
+ * value(i), in the given encoding and data page version */
+static int write_file(const char* path, int64_t rows, int64_t (*value)(int64_t), carquet_encoding_t encoding,
+                      int32_t page_version) {
     carquet_error_t err = CARQUET_ERROR_INIT;
     carquet_schema_t* schema = carquet_schema_create(&err);
     if (!schema || carquet_schema_add_column(schema, "v", CARQUET_PHYSICAL_INT64, NULL,
@@ -43,6 +46,7 @@ static int write_file(const char* path, int64_t rows, int64_t (*value)(int64_t),
     carquet_writer_options_init(&opts);
     opts.compression = CARQUET_COMPRESSION_UNCOMPRESSED;
     opts.write_statistics = false;
+    opts.data_page_version = page_version;
     carquet_writer_t* w = carquet_writer_create(path, schema, &opts, &err);
     if (!w) {
         carquet_schema_free(schema);
@@ -50,7 +54,7 @@ static int write_file(const char* path, int64_t rows, int64_t (*value)(int64_t),
     }
     int64_t* vs = malloc(sizeof(int64_t) * (size_t)rows);
     for (int64_t i = 0; i < rows; i++) vs[i] = value(i);
-    int rc = (dict && carquet_writer_set_column_encoding(w, 0, CARQUET_ENCODING_RLE_DICTIONARY) != CARQUET_OK) ||
+    int rc = carquet_writer_set_column_encoding(w, 0, encoding) != CARQUET_OK ||
              carquet_writer_write_batch(w, 0, vs, rows, NULL, NULL) != CARQUET_OK;
     rc |= carquet_writer_close(w) != CARQUET_OK;
     free(vs);
@@ -185,8 +189,9 @@ static int check_indices(carquet_column_reader_t* c, int64_t n) {
     return 0;
 }
 
-/* column readers reading indices: the mixed chunk to its PLAIN page, then values;
- * resets between indices and values; a PLAIN chunk; a BYTE_ARRAY dictionary */
+/* column readers reading indices: the mixed chunk to its fallback page, then
+ * values; resets between indices and values; a chunk without a dictionary; a
+ * BYTE_ARRAY dictionary */
 static int column_reader_indices(carquet_reader_t* r, const char* plain_path, const char* strings_path) {
     carquet_error_t err = CARQUET_ERROR_INIT;
     static int64_t values[DICT_ROWS + PLAIN_ROWS];
@@ -204,7 +209,7 @@ static int column_reader_indices(carquet_reader_t* r, const char* plain_path, co
     if (carquet_column_reader_materialize(c, &e) != CARQUET_ERROR_INVALID_STATE)
         TEST_FAIL("column_reader_indices", "materialize in the middle of a page");
 
-    /* on to the PLAIN page: a partial read of the indices before it, stopped there */
+    /* on to the fallback page: a partial read of the indices before it, stopped there */
     static uint32_t rest[DICT_ROWS];
     int64_t got = 10;
     for (;;) {
@@ -216,18 +221,18 @@ static int column_reader_indices(carquet_reader_t* r, const char* plain_path, co
             got += n > 0 ? n : 0;
             break;
         }
-        if (n <= 0) TEST_FAIL("column_reader_indices", "the indices ended before the PLAIN page");
+        if (n <= 0) TEST_FAIL("column_reader_indices", "the indices ended before the fallback page");
         got += n;
     }
-    if (got != DICT_ROWS) TEST_FAIL("column_reader_indices", "not stopped at the PLAIN page");
+    if (got != DICT_ROWS) TEST_FAIL("column_reader_indices", "not stopped at the fallback page");
 
-    /* the rest as values, from the PLAIN page */
+    /* the rest as values, from the fallback page */
     if (carquet_column_reader_materialize(c, &err) != CARQUET_OK)
-        TEST_FAIL("column_reader_indices", "materialize at the PLAIN page");
+        TEST_FAIL("column_reader_indices", "materialize at the fallback page");
     if (carquet_column_read_batch_ex(c, values, PLAIN_ROWS, NULL, NULL, &err) != PLAIN_ROWS ||
         carquet_column_has_next(c) || values[0] != plain_value(0) ||
         values[PLAIN_ROWS - 1] != plain_value(PLAIN_ROWS - 1))
-        TEST_FAIL("column_reader_indices", "the PLAIN page's values");
+        TEST_FAIL("column_reader_indices", "the fallback page's values");
 
     /* a reset after materialize reads indices again; reset reads values; and back */
     if (carquet_column_reader_reset_indices(c, 0, &indices, &err) != CARQUET_OK || !indices ||
@@ -242,12 +247,12 @@ static int column_reader_indices(carquet_reader_t* r, const char* plain_path, co
         TEST_FAIL("column_reader_indices", "indices after reading values");
     carquet_column_reader_free(c);
 
-    /* a PLAIN chunk: no indices, its values read as ever */
+    /* a chunk without a dictionary: no indices, its values read as ever */
     carquet_reader_t* pr = carquet_reader_open(plain_path, NULL, &err);
     carquet_column_reader_t* pc = pr ? carquet_reader_get_column(pr, 0, 0, &err) : NULL;
     if (!pc || carquet_column_reader_reset_indices(pc, 0, &indices, &err) != CARQUET_OK || indices ||
         carquet_column_read_batch(pc, values, PLAIN_ROWS, NULL, NULL) != PLAIN_ROWS || values[5] != plain_value(5))
-        TEST_FAIL("column_reader_indices", "a PLAIN chunk");
+        TEST_FAIL("column_reader_indices", "a chunk without a dictionary");
     carquet_column_reader_free(pc);
     carquet_reader_close(pr);
 
@@ -274,15 +279,16 @@ static int column_reader_indices(carquet_reader_t* r, const char* plain_path, co
     return 0;
 }
 
-int main(void) {
-    carquet_init();
+/* a dictionary chunk falling back to pages of the given encoding, in V1 or V2
+ * data pages */
+static int fallback_to(carquet_encoding_t fallback, int32_t page_version) {
     char dict_path[512], plain_path[512], mixed_path[512], strings_path[512];
     carquet_test_temp_path(dict_path, sizeof(dict_path), "test_dictionary_fallback_dict");
     carquet_test_temp_path(plain_path, sizeof(plain_path), "test_dictionary_fallback_plain");
     carquet_test_temp_path(mixed_path, sizeof(mixed_path), "test_dictionary_fallback_mixed");
     carquet_test_temp_path(strings_path, sizeof(strings_path), "test_dictionary_fallback_strings");
-    if (write_file(dict_path, DICT_ROWS, dict_value, true) ||
-        write_file(plain_path, PLAIN_ROWS, plain_value, false) ||
+    if (write_file(dict_path, DICT_ROWS, dict_value, CARQUET_ENCODING_RLE_DICTIONARY, page_version) ||
+        write_file(plain_path, PLAIN_ROWS, plain_value, fallback, page_version) ||
         splice(dict_path, plain_path, mixed_path) || write_strings(strings_path))
         TEST_FAIL("dictionary_fallback", "cannot write the files");
 
@@ -336,8 +342,9 @@ int main(void) {
         carquet_row_batch_free(batch);
     }
     if (rows != DICT_ROWS) TEST_FAIL("dictionary_fallback", "not every dictionary-encoded row read");
-    if (status == CARQUET_OK || status == CARQUET_ERROR_END_OF_DATA)
-        TEST_FAIL("dictionary_fallback", "no error at the PLAIN page");
+    if (status == CARQUET_OK || status == CARQUET_ERROR_END_OF_DATA ||
+        carquet_batch_reader_last_error(br)->code != CARQUET_ERROR_INVALID_ENCODING)
+        TEST_FAIL("dictionary_fallback", "no error at the fallback page");
 
     carquet_batch_reader_free(br);
     carquet_reader_close(r);
@@ -345,6 +352,19 @@ int main(void) {
     remove(plain_path);
     remove(mixed_path);
     remove(strings_path);
+    return 0;
+}
+
+int main(void) {
+    carquet_init();
+    /* PLAIN is what V1 writers fall back to; V2 writers to the others, which
+     * used to be decoded as values into the index buffer (heap overflow) */
+    for (int32_t version = 1; version <= 2; version++) {
+        if (fallback_to(CARQUET_ENCODING_PLAIN, version) ||
+            fallback_to(CARQUET_ENCODING_DELTA_BINARY_PACKED, version) ||
+            fallback_to(CARQUET_ENCODING_BYTE_STREAM_SPLIT, version))
+            return 1;
+    }
     TEST_PASS("dictionary_fallback");
     printf("\nAll dictionary fallback tests passed.\n");
     return 0;

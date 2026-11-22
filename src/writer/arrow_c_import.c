@@ -638,6 +638,8 @@ typedef struct {
     carquet_status_t rc;
 } shred_ctx_t;
 
+extern void carquet_dispatch_unpack_bools(const uint8_t* input, uint8_t* output, int64_t count);
+
 static bool arr_is_null(const struct ArrowArray* a, int64_t i) {
     const uint8_t* v = (a->n_buffers >= 1) ? (const uint8_t*)a->buffers[0] : NULL;
     if (!v) return false;
@@ -805,9 +807,113 @@ static void emit_placeholder_range(shred_ctx_t* ctx, int32_t base, int64_t count
     }
 }
 
+/* shred_flat_fast() for a BYTE_ARRAY leaf with 32- or 64-bit offsets: one
+ * pass over the offsets, with the checks emit_value() makes on every present
+ * value (null slots are not looked at, as in visit()). */
+static bool shred_flat_bytes(shred_ctx_t* ctx, leaf_acc_t* acc,
+                             const struct ArrowArray* a, const uint8_t* valid) {
+    if (a->n_buffers < 3 || !a->buffers[1]) return false;   /* emit_value() reports it */
+    int64_t n = a->length;
+    int64_t off = a->offset;
+    const uint8_t* bytes = (const uint8_t*)a->buffers[2];
+    const int32_t* o32 = acc->off64 ? NULL : (const int32_t*)a->buffers[1] + off;
+    const int64_t* o64 = acc->off64 ? (const int64_t*)a->buffers[1] + off : NULL;
+
+    if (!grow_levels(acc, n) || !grow_ba(acc, n)) {
+        ctx->rc = CARQUET_ERROR_OUT_OF_MEMORY; return true;
+    }
+    int16_t* def = acc->def + acc->nlevels;
+    carquet_byte_array_t* out = acc->ba + acc->nba;
+    int64_t nb = 0;
+    bool bad = false;
+
+    /* Parquet BYTE_ARRAY lengths are int32; a non-empty value needs data. */
+#define SHRED_BYTES_ROW(OFFS)                                                  \
+    do {                                                                       \
+        int64_t s_ = (OFFS)[r], e_ = (OFFS)[r + 1];                            \
+        if (s_ < 0 || e_ < s_ || e_ - s_ > INT32_MAX || (!bytes && e_ > s_)) { \
+            bad = true; break;                                                 \
+        }                                                                      \
+        out[nb].data = (uint8_t*)(bytes ? bytes + s_ : NULL);                  \
+        out[nb].length = (uint32_t)(e_ - s_);                                  \
+        nb++;                                                                  \
+    } while (0)
+
+    if (!valid) {
+        if (o32) {
+            for (int64_t r = 0; r < n && !bad; r++) SHRED_BYTES_ROW(o32);
+        } else {
+            for (int64_t r = 0; r < n && !bad; r++) SHRED_BYTES_ROW(o64);
+        }
+        int16_t defp = acc->max_def;                 /* 0 (REQUIRED) or 1 (OPTIONAL) */
+        if (defp != 0) {
+            for (int64_t r = 0; r < n; r++) def[r] = defp;
+        }
+    } else {
+        for (int64_t r = 0; r < n && !bad; r++) {
+            int present = (int)ARROW_VALID(valid, off + r);
+            def[r] = (int16_t)present;
+            if (!present) continue;
+            if (o32) SHRED_BYTES_ROW(o32); else SHRED_BYTES_ROW(o64);
+        }
+    }
+#undef SHRED_BYTES_ROW
+    if (bad) { ctx->rc = CARQUET_ERROR_INVALID_ARGUMENT; return true; }
+    acc->nba += nb;
+    acc->nlevels += n;
+    return true;
+}
+
+/* shred_flat_fast() for a BOOLEAN leaf: Arrow bitmap -> one 0/1 byte per
+ * present value. */
+static bool shred_flat_bools(shred_ctx_t* ctx, leaf_acc_t* acc,
+                             const struct ArrowArray* a, const uint8_t* valid) {
+    const uint8_t* bits = (a->n_buffers >= 2) ? (const uint8_t*)a->buffers[1] : NULL;
+    if (!bits) return false;                         /* emit_value() reports it */
+    int64_t n = a->length;
+    int64_t off = a->offset;
+
+    if (!grow_levels(acc, n) || !grow_fixed(acc, n)) {
+        ctx->rc = CARQUET_ERROR_OUT_OF_MEMORY; return true;
+    }
+    int16_t* def = acc->def + acc->nlevels;
+    uint8_t* dst = acc->fixed + acc->fixed_bytes;
+
+    /* Row-aligned unpack: bit by bit up to the next byte boundary of the
+     * bitmap, then the kernel (reads (count + 7) / 8 bytes, writes `count`
+     * bytes, each 0 or 1). */
+    int64_t head = (8 - (off & 7)) & 7;
+    if (head > n) head = n;
+    for (int64_t r = 0; r < head; r++) dst[r] = (uint8_t)ARROW_VALID(bits, off + r);
+    if (n > head) {
+        carquet_dispatch_unpack_bools(bits + ((off + head) >> 3), dst + head, n - head);
+    }
+
+    if (!valid) {
+        acc->fixed_bytes += n;
+        int16_t defp = acc->max_def;                 /* 0 (REQUIRED) or 1 (OPTIONAL) */
+        if (defp != 0) {
+            for (int64_t r = 0; r < n; r++) def[r] = defp;
+        }
+    } else {
+        /* Compact the present values in place. */
+        int64_t nb = 0;
+        for (int64_t r = 0; r < n; r++) {
+            int present = (int)ARROW_VALID(valid, off + r);
+            def[r] = (int16_t)present;
+            dst[nb] = dst[r];
+            nb += present;
+        }
+        acc->fixed_bytes += nb;
+    }
+    acc->nlevels += n;
+    return true;
+}
+
 /*
  * Fast path for the overwhelmingly common case: a top-level, non-nested,
- * non-dictionary, fixed-width primitive leaf (a flat column of a flat table).
+ * non-dictionary primitive leaf (a flat column of a flat table): fixed-width
+ * values stored as Arrow stores them, BOOLEAN, and BYTE_ARRAY with offsets.
  * Instead of recursing once per row through visit()/emit_value() — a function
  * call plus a capacity check plus a 4/8-byte memcpy per element — bulk-copy the
  * contiguous Arrow values buffer and fill the definition levels in one pass.
@@ -823,8 +929,9 @@ static bool shred_flat_fast(shred_ctx_t* ctx, leaf_acc_t* acc,
     if (classify(s->format) != ANODE_PRIMITIVE) return false;
     if (s->dictionary) return false;                 /* indices need resolving  */
     if (acc->max_rep != 0) return false;             /* top-level (flat) only   */
-    if (acc->is_bool || acc->is_bytearray) return false;  /* fixed-width only   */
-    if (acc->stride == 0) return false;
+    if (acc->is_bytearray && acc->view) return false;     /* views: generic path */
+    bool varlen = acc->is_bool || acc->is_bytearray;
+    if (!varlen && acc->stride == 0) return false;
     if (acc->conv != CONV_NONE) return false;        /* needs conversion, not memcpy */
     if (a->offset < 0) return false;                 /* visit() reports the error */
     const uint8_t* d = (a->n_buffers >= 2) ? (const uint8_t*)a->buffers[1] : NULL;
@@ -836,12 +943,14 @@ static bool shred_flat_fast(shred_ctx_t* ctx, leaf_acc_t* acc,
     /* Sliced array: its buffers start `offset` logical elements before the
      * first element of this slice. */
     int64_t off = a->offset;
-    d += (size_t)off * stride;
     bool nullable = (s->flags & ARROW_FLAG_NULLABLE) != 0;
     /* Nulls under a non-nullable field: the generic path reports them. */
     if (!nullable && a->n_buffers >= 1 && a->buffers[0] && a->null_count != 0) return false;
     const uint8_t* valid = (nullable && a->n_buffers >= 1)
                                ? (const uint8_t*)a->buffers[0] : NULL;
+    if (acc->is_bytearray) return shred_flat_bytes(ctx, acc, a, valid);
+    if (acc->is_bool) return shred_flat_bools(ctx, acc, a, valid);
+    d += (size_t)off * stride;
 
     if (!grow_levels(acc, n)) { ctx->rc = CARQUET_ERROR_OUT_OF_MEMORY; return true; }
     if (!grow_fixed(acc, n * (int64_t)stride)) { ctx->rc = CARQUET_ERROR_OUT_OF_MEMORY; return true; }

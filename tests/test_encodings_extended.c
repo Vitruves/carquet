@@ -1060,6 +1060,21 @@ static int test_bool_pack_unpack_dispatch(void) {
         TEST_FAIL("bool_pack_unpack_dispatch", "pack mismatch");
     }
 
+    /* Any non-zero byte is true, wherever it falls (vector blocks and tail). */
+    static const uint8_t truthy[] = {2, 0x80, 0xFF, 4};
+    for (int i = 0; i < 24; i++) {
+        unpacked[i] = expected[i] ? truthy[i % 4] : 0;
+    }
+    for (int n = 1; n <= 24; n++) {
+        memset(repacked, 0, sizeof(repacked));
+        carquet_dispatch_pack_bools(unpacked, repacked, n);
+        for (int i = 0; i < n; i++) {
+            if (((repacked[i / 8] >> (i % 8)) & 1) != expected[i]) {
+                TEST_FAIL("bool_pack_unpack_dispatch", "non-zero byte not packed as true");
+            }
+        }
+    }
+
     TEST_PASS("bool_pack_unpack_dispatch");
     return 0;
 }

@@ -127,6 +127,8 @@ extern carquet_status_t carquet_page_writer_add_dictionary_indices(
 extern void carquet_page_writer_set_encoding(carquet_page_writer_t* writer,
                                              carquet_encoding_t encoding);
 extern bool carquet_page_writer_statistics_enabled(const carquet_page_writer_t* writer);
+extern void carquet_page_writer_add_int_statistics(
+    carquet_page_writer_t* writer, const void* values, int64_t count);
 extern carquet_status_t carquet_page_writer_set_min_max(
     carquet_page_writer_t* writer,
     const uint8_t* min_value, size_t min_size,
@@ -225,6 +227,11 @@ typedef struct carquet_column_writer_internal {
      * writer can compute dictionary_page_offset / data_page_offset. */
     bool use_dictionary;
     bool dict_configured;   /* use_dictionary as configured (restored by reset) */
+    /* The dictionary was chosen by the writer, not asked for: each chunk is
+     * sampled before it is encoded and keeps its plain encoding when the
+     * sample shows too few repeated values (dict_probe_resolve). */
+    bool dict_probe;
+    bool dict_probe_done;   /* this chunk has been sampled */
     uint8_t dict_minmax_scratch[16];  /* FLOAT/DOUBLE dictionary min (0..7) / max (8..15) */
     size_t dictionary_page_size_limit;  /* options.dictionary_page_size */
     carquet_buffer_t dict_values;       /* Accumulated raw non-null values */
@@ -429,6 +436,19 @@ bool carquet_column_writer_defer_eligible(
     return physical_type_stride(writer->type, writer->type_length) > 0;
 }
 
+/* Make a dictionary column's dictionary conditional on a sample of each
+ * chunk (the writer's default for integer columns, as opposed to a
+ * dictionary the user asked for, which is always attempted). INT32 / INT64
+ * only: their plain encoding is the one the chunk goes back to. */
+void carquet_column_writer_set_dictionary_probe(
+    carquet_column_writer_internal_t* writer, bool enabled) {
+    if (writer) {
+        writer->dict_probe = enabled && writer->dict_configured &&
+            (writer->type == CARQUET_PHYSICAL_INT32 ||
+             writer->type == CARQUET_PHYSICAL_INT64);
+    }
+}
+
 void carquet_column_writer_set_defer_encode(
     carquet_column_writer_internal_t* writer, bool enabled) {
     if (writer) {
@@ -482,7 +502,10 @@ void carquet_column_writer_reset(carquet_column_writer_internal_t* writer) {
     if (writer->dict_configured && !writer->use_dictionary) {
         writer->use_dictionary = true;
         carquet_page_writer_set_encoding(writer->page_writer, writer->encoding);
+        /* A probing column that went plain borrowed the deferred stash. */
+        writer->defer_encode = false;
     }
+    writer->dict_probe_done = false;
     writer->has_distinct_count = false;
     writer->distinct_count = 0;
     writer->chunk_unencoded_ba_bytes = 0;
@@ -1657,7 +1680,17 @@ static carquet_status_t emit_dictionary_data_pages(
 
         /* The page header carries the statistics of the page's own values,
          * as on a PLAIN page. */
-        if (status == CARQUET_OK && stats && nn > 0) {
+        if (status == CARQUET_OK && stats && nn > 0 &&
+            (writer->type == CARQUET_PHYSICAL_INT32 ||
+             writer->type == CARQUET_PHYSICAL_INT64)) {
+            /* Integers: one vector pass over the page's accumulated values,
+             * the PLAIN path's own statistics, instead of ranking the
+             * dictionary entries (a sort) and chasing a rank per index. */
+            size_t stride = physical_type_stride(writer->type, writer->type_length);
+            carquet_page_writer_add_int_statistics(
+                writer->page_writer,
+                writer->dict_values.data + (size_t)packed * stride, nn);
+        } else if (status == CARQUET_OK && stats && nn > 0) {
             const uint8_t *mn = NULL, *mx = NULL;
             size_t mn_len = 0, mx_len = 0;
             if (off == 0 && rows == total) {
@@ -1800,6 +1833,144 @@ static carquet_status_t finalize_dictionary(
     return status;
 }
 
+/* ----------------------------------------------------------------------------
+ * Automatic dictionary: sample the chunk before encoding it
+ * ----------------------------------------------------------------------------
+ * Building a dictionary over a chunk of mostly distinct values is wasted
+ * work, and it takes the column off the page-parallel encode. So a column
+ * whose dictionary is the writer's choice (dict_probe) is sampled first:
+ * DICT_PROBE_BLOCKS runs of consecutive values spread over the chunk, which
+ * see both values repeated across the chunk and runs of equal neighbours.
+ * The number of distinct values of the chunk is estimated from the repeats
+ * in the sample (birthday bound), and the dictionary is attempted only when
+ * it would fit the dictionary page and save at least a quarter of the plain
+ * size. The decision depends on the chunk's values alone, never on which
+ * thread or path encodes it. */
+
+#define DICT_PROBE_BLOCKS 16
+#define DICT_PROBE_BLOCK_VALUES 256
+#define DICT_PROBE_SAMPLE (DICT_PROBE_BLOCKS * DICT_PROBE_BLOCK_VALUES)
+#define DICT_PROBE_SLOTS (DICT_PROBE_SAMPLE * 2)   /* power of two */
+
+static bool dict_probe_worthwhile(const carquet_column_writer_internal_t* w) {
+    int64_t n = w->dict_value_count;
+    size_t stride = physical_type_stride(w->type, w->type_length);
+    if (n <= 0) return false;   /* no value (empty or all null): plain */
+    if ((stride != 4 && stride != 8) || !w->dict_values.data) return true;
+    /* slots[h] = 1 + index of a sampled key, 0 when free. */
+    uint64_t* keys = carquet_mem_malloc(DICT_PROBE_SAMPLE * sizeof(uint64_t));
+    uint16_t* slots = carquet_mem_calloc(DICT_PROBE_SLOTS, sizeof(uint16_t));
+    if (!keys || !slots) {
+        carquet_mem_free(keys);
+        carquet_mem_free(slots);
+        return true;
+    }
+
+    int64_t sampled = 0;
+    int64_t distinct = 0;
+    int64_t blocks = n <= DICT_PROBE_SAMPLE ? 1 : DICT_PROBE_BLOCKS;
+    int64_t block_values = n <= DICT_PROBE_SAMPLE ? n : DICT_PROBE_BLOCK_VALUES;
+    for (int64_t b = 0; b < blocks; b++) {
+        /* Block b starts at b/blocks of the way through, the last one ends
+         * with the chunk. */
+        int64_t start = blocks > 1 ? (n - block_values) * b / (blocks - 1) : 0;
+        const uint8_t* src = w->dict_values.data + (size_t)start * stride;
+        for (int64_t i = 0; i < block_values; i++) {
+            /* Fixed-size loads (a memcpy of `stride` bytes is a call). */
+            uint64_t key;
+            if (stride == 8) {
+                memcpy(&key, src + (size_t)i * 8, 8);
+            } else {
+                uint32_t narrow;
+                memcpy(&narrow, src + (size_t)i * 4, 4);
+                key = narrow;
+            }
+            size_t h = (size_t)((key * UINT64_C(0x9E3779B97F4A7C15)) >> 51) &
+                       (DICT_PROBE_SLOTS - 1);
+            while (slots[h] != 0 && keys[slots[h] - 1] != key) {
+                h = (h + 1) & (DICT_PROBE_SLOTS - 1);
+            }
+            if (slots[h] == 0) {
+                keys[distinct] = key;
+                slots[h] = (uint16_t)(distinct + 1);
+                distinct++;
+            }
+            sampled++;
+        }
+    }
+    carquet_mem_free(keys);
+    carquet_mem_free(slots);
+
+    /* Distinct values of the whole chunk. Exact when all of it was sampled;
+     * otherwise, drawing `sampled` values out of D gives about
+     * sampled^2 / (2 D) repeats. No repeat at all: assume all distinct. */
+    int64_t repeats = sampled - distinct;
+    int64_t estimate = distinct;
+    if (sampled < n) {
+        if (repeats == 0) return false;
+        int64_t birthday = sampled * sampled / (2 * repeats);
+        if (birthday > estimate) estimate = birthday;
+        if (estimate > n) estimate = n;
+    }
+
+    int bit_width = 0;
+    while (bit_width < 32 && ((int64_t)1 << bit_width) < estimate) bit_width++;
+    uint64_t dict_bytes = (uint64_t)estimate * stride;
+    uint64_t plain_bytes = (uint64_t)n * stride;
+    /* A fifth of headroom under the dictionary page limit, past which the
+     * build is abandoned and its work lost. */
+    if (dict_bytes + dict_bytes / 4 > w->dictionary_page_size_limit) return false;
+    uint64_t encoded = dict_bytes + ((uint64_t)n * (uint64_t)bit_width + 7) / 8;
+    return encoded <= plain_bytes - plain_bytes / 4;
+}
+
+/* Settle a probing column's encoding for this chunk, once, before it is
+ * planned or finalized. A chunk that keeps its plain encoding hands its
+ * accumulated values and levels to the deferred stash (same layout), so it
+ * is encoded exactly like a plain column: page tasks when the row group is
+ * finalized in parallel, the serial replay otherwise. */
+static void dict_probe_resolve(carquet_column_writer_internal_t* writer) {
+    if (!writer->dict_probe || !writer->use_dictionary || writer->dict_probe_done) {
+        return;
+    }
+    writer->dict_probe_done = true;
+    if (dict_probe_worthwhile(writer)) return;
+
+    carquet_buffer_t values = writer->deferred_values;
+    writer->deferred_values = writer->dict_values;
+    writer->dict_values = values;
+    carquet_buffer_clear(&writer->dict_values);
+
+    int16_t* levels = writer->deferred_def_levels;
+    size_t capacity = writer->deferred_def_capacity;
+    writer->deferred_def_levels = writer->dict_def_levels;
+    writer->deferred_def_capacity = writer->dict_def_capacity;
+    writer->dict_def_levels = levels;
+    writer->dict_def_capacity = capacity;
+
+    levels = writer->deferred_rep_levels;
+    capacity = writer->deferred_rep_capacity;
+    writer->deferred_rep_levels = writer->dict_rep_levels;
+    writer->deferred_rep_capacity = writer->dict_rep_capacity;
+    writer->dict_rep_levels = levels;
+    writer->dict_rep_capacity = capacity;
+
+    writer->deferred_count = writer->dict_total_rows;
+    writer->deferred_packed = writer->dict_value_count;
+    writer->deferred_def_count = writer->dict_def_count;
+    writer->deferred_rep_count = writer->dict_rep_count;
+    writer->dict_value_count = 0;
+    writer->dict_def_count = 0;
+    writer->dict_rep_count = 0;
+    writer->dict_total_rows = 0;
+    writer->dict_total_nulls = 0;
+    writer->plan_valid = false;
+
+    writer->use_dictionary = false;
+    writer->defer_encode = true;   /* until reset */
+    carquet_page_writer_set_encoding(writer->page_writer, CARQUET_ENCODING_PLAIN);
+}
+
 carquet_status_t carquet_column_writer_finalize(
     carquet_column_writer_internal_t* writer,
     const uint8_t** data,
@@ -1811,6 +1982,8 @@ carquet_status_t carquet_column_writer_finalize(
     if (!writer) {
         return CARQUET_ERROR_INVALID_ARGUMENT;
     }
+
+    dict_probe_resolve(writer);
 
     carquet_status_t status;
     if (writer->use_dictionary) {
@@ -2053,8 +2226,12 @@ static bool parallel_pages_eligible(const carquet_column_writer_internal_t* w) {
     /* Bloom insertion and page-index entries are serial, page-ordered side
      * effects of the eager flush; keep those columns on that path. */
     if (w->bloom_filter || w->column_index || w->offset_index) return false;
-    if (w->encoding != CARQUET_ENCODING_PLAIN &&
-        w->encoding != CARQUET_ENCODING_BYTE_STREAM_SPLIT) {
+    /* A dictionary column that is not using its dictionary for this chunk
+     * (see dict_probe_resolve) is PLAIN. */
+    carquet_encoding_t encoding =
+        w->dict_configured ? CARQUET_ENCODING_PLAIN : w->encoding;
+    if (encoding != CARQUET_ENCODING_PLAIN &&
+        encoding != CARQUET_ENCODING_BYTE_STREAM_SPLIT) {
         return false;
     }
     switch (w->type) {
@@ -2102,7 +2279,9 @@ int32_t carquet_column_writer_plan_page_tasks(
     carquet_page_task_t* tasks,
     int32_t capacity) {
 
-    if (!writer || !parallel_pages_eligible(writer)) return 0;
+    if (!writer) return 0;
+    dict_probe_resolve(writer);
+    if (!parallel_pages_eligible(writer)) return 0;
 
     int64_t max_chunk = eager_chunk_values(writer);
     if (tasks && writer->plan_valid) {
@@ -2373,6 +2552,14 @@ void carquet_page_task_release(carquet_page_task_t* task) {
     task->max_value = NULL;
     task->min_size = task->max_size = 0;
     task->min_capacity = task->max_capacity = 0;
+}
+
+/* The column chunk's bytes as the last finalize left them (the pages of a
+ * page_io column are not in there, see assemble_page_tasks). Valid until the
+ * writer is reset or its buffer detached. */
+const carquet_buffer_t* carquet_column_writer_chunk_buffer(
+    const carquet_column_writer_internal_t* writer) {
+    return writer ? &writer->column_buffer : NULL;
 }
 
 /* Hand the finalized chunk bytes to the caller. The column keeps writing into

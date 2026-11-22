@@ -11,6 +11,7 @@
  */
 
 #include "core/allocator.h"
+#include "core/endian.h"
 #include <carquet/carquet.h>
 #include <carquet/error.h>
 #include <stdint.h>
@@ -35,6 +36,24 @@ static const uint32_t SALT[8] = {
 
 /* xxHash64 function declaration (from xxhash.c) */
 extern uint64_t carquet_xxhash64(const void* data, size_t length, uint64_t seed);
+
+/* Typed values are hashed in their PLAIN encoding, i.e. little-endian. */
+static inline uint64_t bloom_hash_i32(int32_t v) {
+    uint8_t b[4]; carquet_write_i32_le(b, v);
+    return carquet_xxhash64(b, sizeof(b), 0);
+}
+static inline uint64_t bloom_hash_i64(int64_t v) {
+    uint8_t b[8]; carquet_write_i64_le(b, v);
+    return carquet_xxhash64(b, sizeof(b), 0);
+}
+static inline uint64_t bloom_hash_float(float v) {
+    uint8_t b[4]; carquet_write_f32_le(b, v);
+    return carquet_xxhash64(b, sizeof(b), 0);
+}
+static inline uint64_t bloom_hash_double(double v) {
+    uint8_t b[8]; carquet_write_f64_le(b, v);
+    return carquet_xxhash64(b, sizeof(b), 0);
+}
 
 /* ============================================================================
  * Bloom Filter Structure
@@ -65,7 +84,9 @@ static inline size_t bloom_filter_block_index(uint64_t hash, size_t num_blocks) 
  * Set bits in a block using the hash value.
  * Uses the SALT values to generate 8 different bit positions.
  */
-static void bloom_filter_block_insert(uint32_t* block, uint64_t hash) {
+/* Blocks are eight little-endian 32-bit words at any alignment (the filter may
+ * wrap a caller's buffer), so words go through the byte-wise LE accessors. */
+static void bloom_filter_block_insert(uint8_t* block, uint64_t hash) {
     uint32_t key = (uint32_t)hash;
 
     for (int i = 0; i < 8; i++) {
@@ -74,20 +95,21 @@ static void bloom_filter_block_insert(uint32_t* block, uint64_t hash) {
         /* Use top 5 bits as bit position within the word */
         uint32_t bit_pos = mask >> 27;
         /* Set bit in the corresponding word */
-        block[i] |= (1U << bit_pos);
+        uint8_t* word = block + 4 * i;
+        carquet_write_u32_le(word, carquet_read_u32_le(word) | (1U << bit_pos));
     }
 }
 
 /**
  * Check if a value might be in the block.
  */
-static bool bloom_filter_block_check(const uint32_t* block, uint64_t hash) {
+static bool bloom_filter_block_check(const uint8_t* block, uint64_t hash) {
     uint32_t key = (uint32_t)hash;
 
     for (int i = 0; i < 8; i++) {
         uint32_t mask = SALT[i] * key;
         uint32_t bit_pos = mask >> 27;
-        if ((block[i] & (1U << bit_pos)) == 0) {
+        if ((carquet_read_u32_le(block + 4 * i) & (1U << bit_pos)) == 0) {
             return false;  /* Definitely not present */
         }
     }
@@ -199,32 +221,32 @@ void carquet_bloom_filter_insert_hash(carquet_bloom_filter_t* filter,
     }
 
     size_t block_idx = bloom_filter_block_index(hash, filter->num_blocks);
-    uint32_t* block = (uint32_t*)(filter->data + block_idx * BLOOM_FILTER_BLOCK_SIZE);
+    uint8_t* block = filter->data + block_idx * BLOOM_FILTER_BLOCK_SIZE;
 
     bloom_filter_block_insert(block, hash);
 }
 
 void carquet_bloom_filter_insert_i32(carquet_bloom_filter_t* filter,
                                       int32_t value) {
-    uint64_t hash = carquet_xxhash64(&value, sizeof(value), 0);
+    uint64_t hash = bloom_hash_i32(value);
     carquet_bloom_filter_insert_hash(filter, hash);
 }
 
 void carquet_bloom_filter_insert_i64(carquet_bloom_filter_t* filter,
                                       int64_t value) {
-    uint64_t hash = carquet_xxhash64(&value, sizeof(value), 0);
+    uint64_t hash = bloom_hash_i64(value);
     carquet_bloom_filter_insert_hash(filter, hash);
 }
 
 void carquet_bloom_filter_insert_float(carquet_bloom_filter_t* filter,
                                         float value) {
-    uint64_t hash = carquet_xxhash64(&value, sizeof(value), 0);
+    uint64_t hash = bloom_hash_float(value);
     carquet_bloom_filter_insert_hash(filter, hash);
 }
 
 void carquet_bloom_filter_insert_double(carquet_bloom_filter_t* filter,
                                          double value) {
-    uint64_t hash = carquet_xxhash64(&value, sizeof(value), 0);
+    uint64_t hash = bloom_hash_double(value);
     carquet_bloom_filter_insert_hash(filter, hash);
 }
 
@@ -247,32 +269,32 @@ bool carquet_bloom_filter_check_hash(const carquet_bloom_filter_t* filter,
     }
 
     size_t block_idx = bloom_filter_block_index(hash, filter->num_blocks);
-    const uint32_t* block = (const uint32_t*)(filter->data + block_idx * BLOOM_FILTER_BLOCK_SIZE);
+    const uint8_t* block = filter->data + block_idx * BLOOM_FILTER_BLOCK_SIZE;
 
     return bloom_filter_block_check(block, hash);
 }
 
 bool carquet_bloom_filter_check_i32(const carquet_bloom_filter_t* filter,
                                      int32_t value) {
-    uint64_t hash = carquet_xxhash64(&value, sizeof(value), 0);
+    uint64_t hash = bloom_hash_i32(value);
     return carquet_bloom_filter_check_hash(filter, hash);
 }
 
 bool carquet_bloom_filter_check_i64(const carquet_bloom_filter_t* filter,
                                      int64_t value) {
-    uint64_t hash = carquet_xxhash64(&value, sizeof(value), 0);
+    uint64_t hash = bloom_hash_i64(value);
     return carquet_bloom_filter_check_hash(filter, hash);
 }
 
 bool carquet_bloom_filter_check_float(const carquet_bloom_filter_t* filter,
                                        float value) {
-    uint64_t hash = carquet_xxhash64(&value, sizeof(value), 0);
+    uint64_t hash = bloom_hash_float(value);
     return carquet_bloom_filter_check_hash(filter, hash);
 }
 
 bool carquet_bloom_filter_check_double(const carquet_bloom_filter_t* filter,
                                         double value) {
-    uint64_t hash = carquet_xxhash64(&value, sizeof(value), 0);
+    uint64_t hash = bloom_hash_double(value);
     return carquet_bloom_filter_check_hash(filter, hash);
 }
 

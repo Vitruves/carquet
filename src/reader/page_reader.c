@@ -593,6 +593,29 @@ uint8_t* carquet_column_retain_page(
     return node->data;
 }
 
+/* Take back the node carquet_column_retain_page() just returned as `data`
+ * (still the head of the list): a page whose decompression or decode failed
+ * hands out no values, so nothing points into it, and a caller retrying the
+ * read must not grow the list by one page per attempt. */
+static void drop_retained_page(carquet_column_reader_t* reader, const uint8_t* data) {
+    carquet_retained_page_t* head = reader->retained_pages;
+    if (head && data && head->data == data) {
+        reader->retained_pages = head->next;
+        carquet_mem_free(head);
+    }
+}
+
+/* True for the pages whose decoded carquet_byte_array_t values point into the
+ * page payload (PLAIN and DELTA_LENGTH_BYTE_ARRAY): the payload has to outlive
+ * the page, on the retained list, unless it is the mapped file itself. */
+static bool page_values_point_into_payload(
+    const carquet_column_reader_t* reader,
+    carquet_encoding_t encoding) {
+    return reader->type == CARQUET_PHYSICAL_BYTE_ARRAY &&
+           (encoding == CARQUET_ENCODING_PLAIN ||
+            encoding == CARQUET_ENCODING_DELTA_LENGTH_BYTE_ARRAY);
+}
+
 static void release_decoded_level_buffers(carquet_column_reader_t* reader) {
     carquet_mem_free(reader->decoded_def_levels);
     carquet_mem_free(reader->decoded_rep_levels);
@@ -1177,6 +1200,28 @@ carquet_status_t carquet_read_dictionary_page(
     return CARQUET_OK;
 }
 
+/* A reader preserving dictionaries decodes into a buffer sized for uint32_t
+ * indices. A chunk that starts dictionary-encoded may fall back to another
+ * encoding part way through (PLAIN once the dictionary is full; the DELTA
+ * encodings or BYTE_STREAM_SPLIT from V2 writers), and decoding such a page
+ * would write full physical values (8-byte INT64, 16-byte carquet_byte_array_t)
+ * into that narrow buffer, overrunning the heap. Only dictionary-encoded pages
+ * are decoded; the rest are rejected. */
+static carquet_status_t check_preserved_page_encoding(
+    const carquet_column_reader_t* reader,
+    int32_t encoding,
+    carquet_error_t* error) {
+    if (reader->preserve_dictionary &&
+        encoding != CARQUET_ENCODING_RLE_DICTIONARY &&
+        encoding != CARQUET_ENCODING_PLAIN_DICTIONARY) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ENCODING,
+            "Cannot preserve dictionary: column chunk falls back to "
+            "encoding %d mid-chunk (mixed encodings)", (int)encoding);
+        return CARQUET_ERROR_INVALID_ENCODING;
+    }
+    return CARQUET_OK;
+}
+
 /* ============================================================================
  * Phase 3 encoding decode dispatch (DELTA_*, BYTE_STREAM_SPLIT int/FLBA)
  * ============================================================================
@@ -1462,20 +1507,10 @@ carquet_status_t carquet_read_data_page_v1(
     /* Decode values based on encoding */
     carquet_status_t status = CARQUET_OK;
 
+    CARQUET_RETURN_IF_ERROR(check_preserved_page_encoding(reader, header->encoding, error));
+
     switch (header->encoding) {
         case CARQUET_ENCODING_PLAIN:
-            /* In dictionary-preserving mode the destination buffer is sized for
-             * uint32_t indices (sizeof(uint32_t) per value). A column chunk that
-             * starts dictionary-encoded but falls back to a PLAIN data page
-             * mid-chunk would have carquet_decode_plain() write full physical
-             * values (e.g. 16-byte carquet_byte_array_t for BYTE_ARRAY) into that
-             * narrow buffer, overrunning the heap. Reject rather than corrupt. */
-            if (reader->preserve_dictionary) {
-                CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ENCODING,
-                    "Cannot preserve dictionary: column chunk falls back to PLAIN "
-                    "encoding mid-chunk (mixed encodings)");
-                return CARQUET_ERROR_INVALID_ENCODING;
-            }
             {
                 int64_t bytes = carquet_decode_plain(
                     ptr, remaining, reader->type, reader->type_length,
@@ -1855,20 +1890,10 @@ carquet_status_t carquet_read_data_page_v2(
     /* Decode values based on encoding - reuse V1 value decoding logic */
     carquet_status_t status = CARQUET_OK;
 
+    CARQUET_RETURN_IF_ERROR(check_preserved_page_encoding(reader, header->encoding, error));
+
     switch (header->encoding) {
         case CARQUET_ENCODING_PLAIN:
-            /* In dictionary-preserving mode the destination buffer is sized for
-             * uint32_t indices (sizeof(uint32_t) per value). A column chunk that
-             * starts dictionary-encoded but falls back to a PLAIN data page
-             * mid-chunk would have carquet_decode_plain() write full physical
-             * values (e.g. 16-byte carquet_byte_array_t for BYTE_ARRAY) into that
-             * narrow buffer, overrunning the heap. Reject rather than corrupt. */
-            if (reader->preserve_dictionary) {
-                CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ENCODING,
-                    "Cannot preserve dictionary: column chunk falls back to PLAIN "
-                    "encoding mid-chunk (mixed encodings)");
-                return CARQUET_ERROR_INVALID_ENCODING;
-            }
             {
                 int64_t bytes = carquet_decode_plain(
                     ptr, remaining, reader->type, reader->type_length,
@@ -2132,6 +2157,68 @@ static int64_t current_page_payload_offset(const carquet_column_reader_t* reader
     return reader->data_start_offset + reader->current_page;
 }
 
+/* Whether prepare_data_page_payload() will inflate this page (the whole V1
+ * payload, or the data section of a V2 page) rather than hand back the stored
+ * bytes. */
+static bool data_page_is_compressed(
+    const parquet_column_metadata_t* col_meta,
+    const parquet_page_header_t* page_header) {
+
+    if (col_meta->codec == CARQUET_COMPRESSION_UNCOMPRESSED) {
+        return false;
+    }
+    if (page_header->type != CARQUET_PAGE_DATA_V2) {
+        return true;
+    }
+    /* An all-null V2 page can carry a 0-byte data section even when
+     * is_compressed is set (parquet-java): there is nothing to inflate,
+     * and GZIP / BROTLI reject an empty input (Arrow GH-31992). */
+    const parquet_data_page_header_v2_t* v2h = &page_header->data_page_header_v2;
+    int64_t levels_size = (int64_t)v2h->repetition_levels_byte_length +
+                          (int64_t)v2h->definition_levels_byte_length;
+    return v2h->is_compressed &&
+           (int64_t)page_header->compressed_page_size > levels_size;
+}
+
+/* Where a page of `needed` uncompressed bytes gets inflated: the reader's
+ * reusable decompress buffer, or, with `retain`, a new node of the retained
+ * list, exactly `needed` bytes like the copy it replaces (the decompressors
+ * are given the exact size and write nothing past it). */
+static carquet_status_t acquire_decompress_target(
+    carquet_column_reader_t* reader,
+    size_t needed,
+    bool retain,
+    const char* message,
+    uint8_t** target,
+    carquet_error_t* error) {
+
+    if (!retain) {
+        carquet_status_t status = ensure_decompress_capacity(reader, needed, message, error);
+        *target = (status == CARQUET_OK) ? reader->decompress_buffer : NULL;
+        return status;
+    }
+
+    if (needed > CARQUET_MAX_PAGE_PAYLOAD_SIZE) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Page size out of range");
+        return CARQUET_ERROR_INVALID_PAGE;
+    }
+    *target = carquet_column_retain_page(reader, NULL, needed);
+    if (!*target) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "%s", message);
+        return CARQUET_ERROR_OUT_OF_MEMORY;
+    }
+    return CARQUET_OK;
+}
+
+/* Hands back the page payload as the decoders want it (levels + values):
+ * the stored bytes when nothing is compressed, else the inflated page.
+ *
+ * A page whose values will point into its payload (BYTE_ARRAY PLAIN /
+ * DELTA_LENGTH_BYTE_ARRAY) is inflated straight into a node of the retained
+ * list instead of the decompress buffer, which the next page reuses:
+ * *payload_retained is then set, the bytes live until the list is flushed, and
+ * the caller has neither a copy to make nor pointers to rebase. The caller
+ * drops the node (drop_retained_page) if the page then fails to decode. */
 static carquet_status_t prepare_data_page_payload(
     carquet_column_reader_t* reader,
     const parquet_column_metadata_t* col_meta,
@@ -2139,7 +2226,7 @@ static carquet_status_t prepare_data_page_payload(
     const uint8_t* compressed,
     const uint8_t** page_data,
     size_t* page_size,
-    bool* used_decompress_buffer,
+    bool* payload_retained,
     carquet_error_t* error) {
 
     bool is_v2 = (page_header->type == CARQUET_PAGE_DATA_V2);
@@ -2147,83 +2234,78 @@ static carquet_status_t prepare_data_page_payload(
 
     *page_data = NULL;
     *page_size = 0;
-    *used_decompress_buffer = false;
+    *payload_retained = false;
 
     status = validate_page_payload_size(page_header, false, error);
     if (status != CARQUET_OK) {
         return status;
     }
 
+    if (!data_page_is_compressed(col_meta, page_header)) {
+        *page_data = compressed;
+        *page_size = (size_t)page_header->compressed_page_size;
+        return CARQUET_OK;
+    }
+
+    bool retain = page_values_point_into_payload(
+        reader, is_v2 ? page_header->data_page_header_v2.encoding
+                      : page_header->data_page_header.encoding);
+    uint8_t* target = NULL;
+
     if (is_v2) {
         const parquet_data_page_header_v2_t* v2h = &page_header->data_page_header_v2;
         size_t levels_size = (size_t)v2h->repetition_levels_byte_length +
                              (size_t)v2h->definition_levels_byte_length;
         size_t compressed_data_size = (size_t)page_header->compressed_page_size - levels_size;
-        /* An all-null V2 page can carry a 0-byte data section even when
-         * is_compressed is set (parquet-java): there is nothing to inflate,
-         * and GZIP / BROTLI reject an empty input (Arrow GH-31992). */
-        bool data_is_compressed = v2h->is_compressed &&
-                                  col_meta->codec != CARQUET_COMPRESSION_UNCOMPRESSED &&
-                                  compressed_data_size > 0;
+        size_t uncompressed_data_size =
+            (size_t)page_header->uncompressed_page_size - levels_size;
+        size_t total_needed = levels_size + uncompressed_data_size;
 
-        if (data_is_compressed) {
-            size_t uncompressed_data_size =
-                (size_t)page_header->uncompressed_page_size - levels_size;
-            size_t total_needed = levels_size + uncompressed_data_size;
-
-            status = ensure_decompress_capacity(
-                reader, total_needed, "Failed to allocate V2 decompress buffer", error);
-            if (status != CARQUET_OK) {
-                return status;
-            }
-
-            if (levels_size > 0) {
-                memcpy(reader->decompress_buffer, compressed, levels_size);
-            }
-
-            size_t decompressed_data_size = 0;
-            char diag[CARQUET_DECOMPRESS_DIAG_SIZE];
-            status = carquet_decompress_page_diag(col_meta->codec,
-                compressed + levels_size, compressed_data_size,
-                reader->decompress_buffer + levels_size, uncompressed_data_size,
-                &decompressed_data_size, diag, sizeof(diag));
-            if (status != CARQUET_OK) {
-                /* The diagnostic goes first: carquet_error_t messages are
-                 * capped at CARQUET_ERROR_MESSAGE_MAX, so the detail that
-                 * identifies the failure must not be what gets truncated.
-                 * %llu, not %zu — the MinGW/msvcrt printf has no z modifier. */
-                CARQUET_SET_ERROR(error, status,
-                    "Failed to decompress V2 page at file offset %lld%s%s "
-                    "(codec=%d, levels=%llu, compressed=%llu, uncompressed=%llu)",
-                    (long long)current_page_payload_offset(reader),
-                    diag[0] ? ": " : "", diag,
-                    (int)col_meta->codec,
-                    (unsigned long long)levels_size,
-                    (unsigned long long)compressed_data_size,
-                    (unsigned long long)uncompressed_data_size);
-                return status;
-            }
-
-            *page_data = reader->decompress_buffer;
-            *page_size = levels_size + decompressed_data_size;
-            *used_decompress_buffer = true;
-            return CARQUET_OK;
+        status = acquire_decompress_target(
+            reader, total_needed, retain, "Failed to allocate V2 decompress buffer",
+            &target, error);
+        if (status != CARQUET_OK) {
+            return status;
         }
 
-        *page_data = compressed;
-        *page_size = (size_t)page_header->compressed_page_size;
+        /* V2 levels are stored uncompressed ahead of the data section. */
+        if (levels_size > 0) {
+            memcpy(target, compressed, levels_size);
+        }
+
+        size_t decompressed_data_size = 0;
+        char diag[CARQUET_DECOMPRESS_DIAG_SIZE];
+        status = carquet_decompress_page_diag(col_meta->codec,
+            compressed + levels_size, compressed_data_size,
+            target + levels_size, uncompressed_data_size,
+            &decompressed_data_size, diag, sizeof(diag));
+        if (status != CARQUET_OK) {
+            /* The diagnostic goes first: carquet_error_t messages are
+             * capped at CARQUET_ERROR_MESSAGE_MAX, so the detail that
+             * identifies the failure must not be what gets truncated.
+             * %llu, not %zu — the MinGW/msvcrt printf has no z modifier. */
+            CARQUET_SET_ERROR(error, status,
+                "Failed to decompress V2 page at file offset %lld%s%s "
+                "(codec=%d, levels=%llu, compressed=%llu, uncompressed=%llu)",
+                (long long)current_page_payload_offset(reader),
+                diag[0] ? ": " : "", diag,
+                (int)col_meta->codec,
+                (unsigned long long)levels_size,
+                (unsigned long long)compressed_data_size,
+                (unsigned long long)uncompressed_data_size);
+            if (retain) drop_retained_page(reader, target);
+            return status;
+        }
+
+        *page_data = target;
+        *page_size = levels_size + decompressed_data_size;
+        *payload_retained = retain;
         return CARQUET_OK;
     }
 
-    if (col_meta->codec == CARQUET_COMPRESSION_UNCOMPRESSED) {
-        *page_data = compressed;
-        *page_size = (size_t)page_header->compressed_page_size;
-        return CARQUET_OK;
-    }
-
-    status = ensure_decompress_capacity(
-        reader, (size_t)page_header->uncompressed_page_size,
-        "Failed to allocate decompress buffer", error);
+    status = acquire_decompress_target(
+        reader, (size_t)page_header->uncompressed_page_size, retain,
+        "Failed to allocate decompress buffer", &target, error);
     if (status != CARQUET_OK) {
         return status;
     }
@@ -2231,7 +2313,7 @@ static carquet_status_t prepare_data_page_payload(
     char diag[CARQUET_DECOMPRESS_DIAG_SIZE];
     status = carquet_decompress_page_diag(col_meta->codec,
         compressed, (size_t)page_header->compressed_page_size,
-        reader->decompress_buffer, (size_t)page_header->uncompressed_page_size,
+        target, (size_t)page_header->uncompressed_page_size,
         page_size, diag, sizeof(diag));
     if (status != CARQUET_OK) {
         CARQUET_SET_ERROR(error, status,
@@ -2241,11 +2323,13 @@ static carquet_status_t prepare_data_page_payload(
             diag[0] ? ": " : "", diag,
             (int)col_meta->codec,
             page_header->compressed_page_size, page_header->uncompressed_page_size);
+        if (retain) drop_retained_page(reader, target);
+        *page_size = 0;
         return status;
     }
 
-    *page_data = reader->decompress_buffer;
-    *used_decompress_buffer = true;
+    *page_data = target;
+    *payload_retained = retain;
     return CARQUET_OK;
 }
 
@@ -2905,12 +2989,17 @@ static carquet_status_t load_next_page_mmap(
 
     /* ====== STANDARD PATH (with decompression/decoding) ====== */
 
+    /* A compressed page whose BYTE_ARRAY values will point into its payload
+     * comes back already on the retained list (payload_retained): the
+     * decompress buffer is reused across pages and a batch read may span
+     * several, so each such page lives until the list is flushed (row-group
+     * reset / reader close). An uncompressed one is the mapped file. */
     const uint8_t* page_data;
     size_t page_size;
-    bool used_decompress_buffer = false;
+    bool payload_retained = false;
 
     status = prepare_data_page_payload(reader, col_meta, &page_header, page_data_ptr,
-                                       &page_data, &page_size, &used_decompress_buffer,
+                                       &page_data, &page_size, &payload_retained,
                                        error);
     if (status != CARQUET_OK) {
         return status;
@@ -2958,6 +3047,7 @@ static carquet_status_t load_next_page_mmap(
 
     status = ensure_decoded_page_buffers(reader, num_values, value_size, error);
     if (status != CARQUET_OK) {
+        if (payload_retained) drop_retained_page(reader, page_data);
         return status;
     }
 
@@ -2980,32 +3070,8 @@ static carquet_status_t load_next_page_mmap(
     }
 
     if (status != CARQUET_OK) {
+        if (payload_retained) drop_retained_page(reader, page_data);
         return status;
-    }
-
-    /* For BYTE_ARRAY PLAIN columns with compressed data, retain a copy of the
-     * decompressed buffer since carquet_byte_array_t.data pointers reference it.
-     * The decompression buffer is reused across pages, AND a single batch read
-     * may span multiple pages, so every page must be retained until the batch
-     * is consumed (list is flushed on row-group reset / reader close). */
-    if (used_decompress_buffer && reader->type == CARQUET_PHYSICAL_BYTE_ARRAY &&
-        (page_encoding == CARQUET_ENCODING_PLAIN ||
-         page_encoding == CARQUET_ENCODING_DELTA_LENGTH_BYTE_ARRAY)) {
-        uint8_t* retained = carquet_column_retain_page(reader, page_data, page_size);
-        if (!retained) {
-            CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to retain page data");
-            return CARQUET_ERROR_OUT_OF_MEMORY;
-        }
-        /* Fixup BYTE_ARRAY pointers to reference the retained copy */
-        /* Only the dense (present) values were decoded: past them the
-         * buffer holds stale entries, which must not be rebased. */
-        carquet_byte_array_t* ba = (carquet_byte_array_t*)reader->decoded_values;
-        int64_t dense = decoded_page_dense_count(reader, decoded_count);
-        for (int64_t i = 0; i < dense; i++) {
-            if (ba[i].data) {
-                ba[i].data = retained + (ba[i].data - page_data);
-            }
-        }
     }
 
     reader->page_loaded = true;
@@ -3123,12 +3189,14 @@ static carquet_status_t load_next_page_fread(
         : get_value_size(reader->type, reader->type_length);
 
     /* Decompress if needed. V2 pages keep level bytes uncompressed and only
-     * decompress the data tail, so both fread and mmap paths share this helper. */
+     * decompress the data tail, so both fread and mmap paths share this helper.
+     * A compressed page whose BYTE_ARRAY values will point into its payload
+     * comes back already on the retained list (payload_retained). */
     const uint8_t* page_data;
     size_t page_size;
-    bool used_decompress_buffer = false;
+    bool payload_retained = false;
     status = prepare_data_page_payload(reader, col_meta, &page_header, compressed,
-                                       &page_data, &page_size, &used_decompress_buffer,
+                                       &page_data, &page_size, &payload_retained,
                                        error);
     if (status != CARQUET_OK) {
         return status;
@@ -3175,6 +3243,7 @@ static carquet_status_t load_next_page_fread(
 
     status = ensure_decoded_page_buffers(reader, num_values, value_size, error);
     if (status != CARQUET_OK) {
+        if (payload_retained) drop_retained_page(reader, page_data);
         return status;
     }
 
@@ -3197,18 +3266,16 @@ static carquet_status_t load_next_page_fread(
     }
 
     if (status != CARQUET_OK) {
+        if (payload_retained) drop_retained_page(reader, page_data);
         return status;
     }
 
-    /* For BYTE_ARRAY PLAIN columns, the decoded carquet_byte_array_t structs
-     * have .data pointers into the page data buffer. Retain every page buffer
-     * so those pointers stay valid across page boundaries within a batch;
-     * the retention list is flushed on row-group reset / reader close. */
-    bool retain = (reader->type == CARQUET_PHYSICAL_BYTE_ARRAY &&
-                   (page_encoding == CARQUET_ENCODING_PLAIN ||
-                    page_encoding == CARQUET_ENCODING_DELTA_LENGTH_BYTE_ARRAY));
-
-    if (retain) {
+    /* An uncompressed page was read into page_buffer, which the next page
+     * reuses: its BYTE_ARRAY values (pointers into the payload) need a copy
+     * of it that lasts as long as the retained list, and rebasing onto it.
+     * (Reading the page straight into a retained node was measured slower:
+     * the kernel then copies into never-touched memory.) */
+    if (!payload_retained && page_values_point_into_payload(reader, page_encoding)) {
         uint8_t* retained = carquet_column_retain_page(reader, page_data, page_size);
         if (!retained) {
             CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to retain page data");

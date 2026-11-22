@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "page_tasks.h"
+#include "writer_sink.h"
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -95,6 +96,8 @@ extern void carquet_column_writer_set_crc(
     carquet_column_writer_internal_t* writer, bool enabled);
 extern void carquet_column_writer_set_data_page_v2(
     carquet_column_writer_internal_t* writer, bool enabled);
+extern void carquet_column_writer_set_dictionary_probe(
+    carquet_column_writer_internal_t* writer, bool enabled);
 extern void carquet_column_writer_set_defer_encode(
     carquet_column_writer_internal_t* writer, bool enabled);
 extern void carquet_column_writer_reset(
@@ -106,6 +109,8 @@ typedef struct carquet_column_index_builder carquet_column_index_builder_t;
 typedef struct carquet_offset_index_builder carquet_offset_index_builder_t;
 
 extern void carquet_page_writer_destroy(carquet_page_writer_t* writer);
+extern const carquet_buffer_t* carquet_column_writer_chunk_buffer(
+    const carquet_column_writer_internal_t* writer);
 extern void carquet_column_writer_detach_buffer(
     carquet_column_writer_internal_t* writer,
     carquet_buffer_t* out,
@@ -969,13 +974,13 @@ carquet_status_t carquet_row_group_writer_finalize(
     return CARQUET_OK;
 }
 
-carquet_status_t carquet_row_group_writer_write_to_file(
+carquet_status_t carquet_row_group_writer_write_to_sink(
     carquet_row_group_writer_t* writer,
-    FILE* file,
+    carquet_writer_sink_t* sink,
     size_t* total_size,
     int64_t num_rows) {
 
-    if (!writer || !file) {
+    if (!writer || !sink) {
         return CARQUET_ERROR_INVALID_ARGUMENT;
     }
 
@@ -987,9 +992,8 @@ carquet_status_t carquet_row_group_writer_write_to_file(
     carquet_status_t status = finalize_all_columns(writer, num_rows, chunks);
     size_t written = 0;
     for (int i = 0; status == CARQUET_OK && i < writer->num_columns; i++) {
-        if (chunks[i].size > 0 &&
-            fwrite(chunks[i].data, 1, chunks[i].size, file) != chunks[i].size) {
-            status = CARQUET_ERROR_FILE_WRITE;
+        status = carquet_writer_sink_write(sink, chunks[i].data, chunks[i].size);
+        if (status != CARQUET_OK) {
             break;
         }
         written += chunks[i].size;
@@ -1177,6 +1181,30 @@ const carquet_buffer_t* carquet_row_group_writer_column_pages(
     return &writer->task_bufs[writer->bank][writer->col_task_offsets[column_index]];
 }
 
+/* Write a row group completed by carquet_row_group_writer_complete_page_tasks
+ * to the sink in file order: per column, its chunk buffer, then the pages
+ * the finalize left in the bank. Reads the writer's buffers in place, so the
+ * writer must not be reset or refilled until this returns. */
+carquet_status_t carquet_row_group_writer_write_completed(
+    const carquet_row_group_writer_t* writer,
+    carquet_writer_sink_t* sink) {
+
+    if (!writer || !sink) return CARQUET_ERROR_INVALID_ARGUMENT;
+    for (int i = 0; i < writer->num_columns; i++) {
+        const carquet_buffer_t* chunk =
+            carquet_column_writer_chunk_buffer(writer->column_writers[i]);
+        carquet_status_t status = carquet_writer_sink_write(sink, chunk->data, chunk->size);
+        int32_t num_pages = 0;
+        const carquet_buffer_t* pages =
+            carquet_row_group_writer_column_pages(writer, i, &num_pages);
+        for (int32_t k = 0; status == CARQUET_OK && k < num_pages; k++) {
+            status = carquet_writer_sink_write(sink, pages[k].data, pages[k].size);
+        }
+        if (status != CARQUET_OK) return status;
+    }
+    return CARQUET_OK;
+}
+
 void carquet_row_group_writer_detach_column(
     carquet_row_group_writer_t* writer,
     int column_index,
@@ -1281,6 +1309,16 @@ void carquet_row_group_writer_set_column_data_page_v2(
         return;
     }
     carquet_column_writer_set_data_page_v2(
+        writer->column_writers[column_index], enabled);
+}
+
+void carquet_row_group_writer_set_column_dictionary_probe(
+    carquet_row_group_writer_t* writer,
+    int column_index, bool enabled) {
+    if (!writer || column_index < 0 || column_index >= writer->num_columns) {
+        return;
+    }
+    carquet_column_writer_set_dictionary_probe(
         writer->column_writers[column_index], enabled);
 }
 

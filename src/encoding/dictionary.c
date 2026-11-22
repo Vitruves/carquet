@@ -18,6 +18,9 @@
 #include <stdbool.h>
 #include <string.h>
 
+/* xxHash64 (src/util/xxhash.c) */
+extern uint64_t carquet_xxhash64(const void* data, size_t length, uint64_t seed);
+
 /* SIMD-dispatched gather functions for dictionary lookups */
 extern void carquet_dispatch_gather_i32(const int32_t* dict, const uint32_t* indices, int64_t count, int32_t* output);
 extern void carquet_dispatch_gather_i64(const int64_t* dict, const uint32_t* indices, int64_t count, int64_t* output);
@@ -59,17 +62,20 @@ extern bool carquet_dispatch_checked_gather_double(const double* dict, int32_t d
  * ============================================================================
  */
 
-typedef struct dict_entry {
-    uint8_t* data;
-    size_t size;
+/* Open-addressing table over the entries already serialized in dict_buffer:
+ * a slot holds entry index + 1 (0 = empty), an entry records where its bytes
+ * sit in dict_buffer. No allocation per entry, values are stored once. */
+typedef struct {
+    size_t offset;                 /* Of the value bytes in dict_buffer */
+    uint32_t size;
     uint32_t hash;
-    uint32_t index;
-    struct dict_entry* next;
 } dict_entry_t;
 
 typedef struct {
-    dict_entry_t** buckets;
-    size_t num_buckets;
+    uint32_t* slots;
+    size_t num_slots;              /* Power of 2 */
+    dict_entry_t* entries;
+    size_t entries_capacity;
     size_t count;
 
     carquet_buffer_t dict_buffer;  /* Stores dictionary values */
@@ -88,39 +94,29 @@ typedef struct {
     bool abandoned;
 } dict_builder_t;
 
-#define DICT_BUILDER_INITIAL_BUCKETS 1024U  /* Must be power of 2 */
-#define DICT_BUILDER_MAX_LOAD_NUM 3U
-#define DICT_BUILDER_MAX_LOAD_DEN 4U
+#define DICT_BUILDER_INITIAL_SLOTS 1024U  /* Must be power of 2 */
 
-static carquet_status_t dict_builder_rehash(dict_builder_t* builder, size_t new_bucket_count) {
-    dict_entry_t** new_buckets = carquet_mem_calloc(new_bucket_count, sizeof(dict_entry_t*));
-    if (!new_buckets) {
+/* Double the slot table (load factor stays <= 1/2 for linear probing). */
+static carquet_status_t dict_builder_grow_slots(dict_builder_t* builder) {
+    size_t new_count = builder->num_slots * 2;
+    uint32_t* new_slots = carquet_mem_calloc(new_count, sizeof(uint32_t));
+    if (!new_slots) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
-
-    /* Use bitmask instead of modulo (new_bucket_count is always power of 2) */
-    size_t mask = new_bucket_count - 1;
-    for (size_t i = 0; i < builder->num_buckets; i++) {
-        dict_entry_t* entry = builder->buckets[i];
-        while (entry) {
-            dict_entry_t* next = entry->next;
-            size_t bucket = entry->hash & mask;
-            entry->next = new_buckets[bucket];
-            new_buckets[bucket] = entry;
-            entry = next;
-        }
+    size_t mask = new_count - 1;
+    for (size_t i = 0; i < builder->count; i++) {
+        size_t b = builder->entries[i].hash & mask;
+        while (new_slots[b]) b = (b + 1) & mask;
+        new_slots[b] = (uint32_t)i + 1;
     }
-
-    carquet_mem_free(builder->buckets);
-    builder->buckets = new_buckets;
-    builder->num_buckets = new_bucket_count;
+    carquet_mem_free(builder->slots);
+    builder->slots = new_slots;
+    builder->num_slots = new_count;
     return CARQUET_OK;
 }
 
 /**
  * Fast hash for fixed-size values using murmur3-style finalizer.
- * Much faster than FNV-1a for 4/8 byte values because it avoids
- * the per-byte sequential dependency chain.
  */
 static inline uint32_t dict_hash_fixed32(const uint8_t* data) {
     uint32_t h;
@@ -133,16 +129,19 @@ static inline uint32_t dict_hash_fixed32(const uint8_t* data) {
     return h;
 }
 
-static inline uint32_t dict_hash_fixed64(const uint8_t* data) {
-    uint64_t k;
-    memcpy(&k, data, 8);
-    /* murmur3-style 64-to-32 mix */
+static inline uint64_t dict_mix64(uint64_t k) {
     k ^= k >> 33;
     k *= 0xff51afd7ed558ccdULL;
     k ^= k >> 33;
     k *= 0xc4ceb9fe1a85ec53ULL;
     k ^= k >> 33;
-    return (uint32_t)k;
+    return k;
+}
+
+static inline uint32_t dict_hash_fixed64(const uint8_t* data) {
+    uint64_t k;
+    memcpy(&k, data, 8);
+    return (uint32_t)dict_mix64(k);
 }
 
 static uint32_t dict_hash(const uint8_t* data, size_t size) {
@@ -150,13 +149,19 @@ static uint32_t dict_hash(const uint8_t* data, size_t size) {
     if (size == 4) return dict_hash_fixed32(data);
     if (size == 8) return dict_hash_fixed64(data);
 
-    /* FNV-1a for variable-length data */
-    uint32_t h = 0x811c9dc5;
-    for (size_t i = 0; i < size; i++) {
-        h ^= data[i];
-        h *= 0x01000193;
+    /* Short strings: two (overlapping) 8-byte words, no call. */
+    if (size > 8 && size <= 16) {
+        uint64_t a, b;
+        memcpy(&a, data, 8);
+        memcpy(&b, data + size - 8, 8);
+        return (uint32_t)dict_mix64(a ^ dict_mix64(b + size));
     }
-    return h;
+    if (size < 8) {
+        uint64_t a = 0;
+        if (size) memcpy(&a, data, size);
+        return (uint32_t)dict_mix64(a + size);
+    }
+    return (uint32_t)carquet_xxhash64(data, size, 0);
 }
 
 static carquet_status_t dict_builder_init(dict_builder_t* builder,
@@ -165,23 +170,17 @@ static carquet_status_t dict_builder_init(dict_builder_t* builder,
                                            bool is_variable_length) {
     memset(builder, 0, sizeof(*builder));
 
-    builder->num_buckets = DICT_BUILDER_INITIAL_BUCKETS;
-    builder->buckets = carquet_mem_calloc(builder->num_buckets, sizeof(dict_entry_t*));
-    if (!builder->buckets) {
-        return CARQUET_ERROR_OUT_OF_MEMORY;
-    }
-
-    carquet_status_t status = carquet_buffer_init_capacity(&builder->dict_buffer, 4096);
-    if (status != CARQUET_OK) {
-        carquet_mem_free(builder->buckets);
-        return status;
-    }
-
+    builder->num_slots = DICT_BUILDER_INITIAL_SLOTS;
+    builder->slots = carquet_mem_calloc(builder->num_slots, sizeof(uint32_t));
+    builder->entries_capacity = DICT_BUILDER_INITIAL_SLOTS / 2;
+    builder->entries = carquet_mem_malloc(builder->entries_capacity * sizeof(dict_entry_t));
     builder->indices_capacity = expected_count > 0 ? expected_count : 1024;
     builder->indices = carquet_mem_malloc(builder->indices_capacity * sizeof(uint32_t));
-    if (!builder->indices) {
-        carquet_buffer_destroy(&builder->dict_buffer);
-        carquet_mem_free(builder->buckets);
+    if (!builder->slots || !builder->entries || !builder->indices ||
+        carquet_buffer_init_capacity(&builder->dict_buffer, 4096) != CARQUET_OK) {
+        carquet_mem_free(builder->slots);
+        carquet_mem_free(builder->entries);
+        carquet_mem_free(builder->indices);
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
 
@@ -192,17 +191,8 @@ static carquet_status_t dict_builder_init(dict_builder_t* builder,
 }
 
 static void dict_builder_destroy(dict_builder_t* builder) {
-    if (builder->buckets) {
-        for (size_t i = 0; i < builder->num_buckets; i++) {
-            dict_entry_t* entry = builder->buckets[i];
-            while (entry) {
-                dict_entry_t* next = entry->next;
-                carquet_mem_free(entry);
-                entry = next;
-            }
-        }
-        carquet_mem_free(builder->buckets);
-    }
+    carquet_mem_free(builder->slots);
+    carquet_mem_free(builder->entries);
     carquet_buffer_destroy(&builder->dict_buffer);
     carquet_mem_free(builder->indices);
 }
@@ -221,63 +211,64 @@ static carquet_status_t dict_builder_add(dict_builder_t* builder,
         builder->indices_capacity = new_cap;
     }
 
-    /* Look up in hash table (bitmask since num_buckets is power of 2) */
     uint32_t hash = dict_hash(value, value_size);
-    size_t mask = builder->num_buckets - 1;
-    size_t bucket = hash & mask;
-
-    for (dict_entry_t* entry = builder->buckets[bucket]; entry; entry = entry->next) {
-        if (entry->hash == hash &&
-            entry->size == value_size &&
-            memcmp(entry->data, value, value_size) == 0) {
-            /* Found existing entry */
-            builder->indices[builder->indices_count++] = entry->index;
+    size_t mask = builder->num_slots - 1;
+    size_t b = hash & mask;
+    uint32_t slot;
+    while ((slot = builder->slots[b]) != 0) {
+        const dict_entry_t* entry = &builder->entries[slot - 1];
+        if (entry->hash == hash && entry->size == value_size &&
+            (value_size == 0 ||
+             memcmp(builder->dict_buffer.data + entry->offset, value, value_size) == 0)) {
+            builder->indices[builder->indices_count++] = slot - 1;
             return CARQUET_OK;
         }
+        b = (b + 1) & mask;
     }
 
-    if ((builder->count + 1) * DICT_BUILDER_MAX_LOAD_DEN >
-        builder->num_buckets * DICT_BUILDER_MAX_LOAD_NUM) {
-        carquet_status_t status = dict_builder_rehash(builder, builder->num_buckets * 2);
-        if (status != CARQUET_OK) {
-            return status;
+    /* New entry: make room first so nothing below needs undoing. Entry sizes
+     * are uint32 (callers pass int32 BYTE_ARRAY lengths or type lengths). */
+    if (value_size > UINT32_MAX || builder->count >= UINT32_MAX - 1) {
+        return CARQUET_ERROR_ENCODE;
+    }
+    if (builder->count == builder->entries_capacity) {
+        size_t new_cap = builder->entries_capacity * 2;
+        dict_entry_t* grown = carquet_mem_realloc(builder->entries, new_cap * sizeof(dict_entry_t));
+        if (!grown) {
+            return CARQUET_ERROR_OUT_OF_MEMORY;
         }
-        mask = builder->num_buckets - 1;
-        bucket = hash & mask;
+        builder->entries = grown;
+        builder->entries_capacity = new_cap;
+    }
+    if ((builder->count + 1) * 2 > builder->num_slots) {
+        CARQUET_RETURN_IF_ERROR(dict_builder_grow_slots(builder));
+        mask = builder->num_slots - 1;
+        b = hash & mask;
+        while (builder->slots[b]) b = (b + 1) & mask;
     }
 
-    /* Add new entry */
-    dict_entry_t* new_entry = carquet_mem_malloc(sizeof(dict_entry_t) + value_size);
-    if (!new_entry) {
-        return CARQUET_ERROR_OUT_OF_MEMORY;
-    }
-
-    new_entry->data = (uint8_t*)(new_entry + 1);
-    memcpy(new_entry->data, value, value_size);
-    new_entry->size = value_size;
-    new_entry->hash = hash;
-    new_entry->index = (uint32_t)builder->count;
-    new_entry->next = builder->buckets[bucket];
-    builder->buckets[bucket] = new_entry;
-
-    /* Add to dictionary buffer. An append failure must not leave an indexed
-     * entry without its bytes (the indices would reference a missing value). */
+    /* Append to the dictionary buffer. A failed append must not leave an
+     * indexed entry without its bytes, so the entry is recorded only after. */
+    size_t start = builder->dict_buffer.size;
     carquet_status_t append_status = CARQUET_OK;
     if (builder->is_variable_length) {
-        /* Write length prefix */
-        uint32_t len = (uint32_t)value_size;
-        append_status = carquet_buffer_append_u32_le(&builder->dict_buffer, len);
+        append_status = carquet_buffer_append_u32_le(&builder->dict_buffer, (uint32_t)value_size);
     }
+    size_t offset = builder->dict_buffer.size;
     if (append_status == CARQUET_OK) {
         append_status = carquet_buffer_append(&builder->dict_buffer, value, value_size);
     }
     if (append_status != CARQUET_OK) {
-        builder->buckets[bucket] = new_entry->next;
-        carquet_mem_free(new_entry);
+        builder->dict_buffer.size = start;
         return append_status;
     }
 
-    builder->indices[builder->indices_count++] = new_entry->index;
+    dict_entry_t* entry = &builder->entries[builder->count];
+    entry->offset = offset;
+    entry->size = (uint32_t)value_size;
+    entry->hash = hash;
+    builder->slots[b] = (uint32_t)builder->count + 1;
+    builder->indices[builder->indices_count++] = (uint32_t)builder->count;
     builder->count++;
 
     /* Early-abort: the dictionary is no longer worthwhile once its PLAIN

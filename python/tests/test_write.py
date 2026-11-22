@@ -77,6 +77,26 @@ def test_encodings(tmp_path, table):
         carquet.write_table(table, path, column_encoding="bogus")
 
 
+def test_default_dictionary_choice(tmp_path):
+    """With a codec, integer chunks whose values repeat get a dictionary unless told otherwise."""
+    path = str(tmp_path / "auto.parquet")
+    n = 50_000
+    data = {"low": [i % 40 for i in range(n)], "uniq": list(range(n)), "val": [(i % 25) * 0.5 for i in range(n)]}
+
+    def dictionaries(**kwargs):
+        carquet.write_table(data, path, **kwargs)
+        rg = carquet.read_metadata(path).row_group(0)
+        assert carquet.read_table(path).to_pydict() == data
+        return {name: rg.column(name).has_dictionary_page for name in data}
+
+    assert dictionaries(compression="zstd") == {"low": True, "uniq": False, "val": False}
+    assert dictionaries(compression="none") == {"low": False, "uniq": False, "val": False}
+    assert dictionaries(compression="zstd", use_dictionary=False) == {"low": False, "uniq": False, "val": False}
+    assert dictionaries(compression="zstd", use_dictionary=["val"]) == {"low": False, "uniq": False, "val": True}
+    assert dictionaries(compression="zstd", column_encoding={"low": "plain"}) == {
+        "low": False, "uniq": False, "val": False}
+
+
 def test_statistics_options(tmp_path, table):
     path = tmp_path / "st.parquet"
     carquet.write_table(table, path, write_statistics=["id"])

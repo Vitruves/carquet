@@ -1178,6 +1178,362 @@ static int test_export_partial_field_rejected(void) {
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* Top-level string / binary / boolean columns take the bulk shredder of
+ * carquet_writer_write_arrow (shred_flat_fast).                        */
+
+static struct ArrowSchema* flat_schema(const char* fmt, int nullable) {
+    struct ArrowSchema* t = SB("+s", "", 0, 1);
+    t->children[0] = SB(fmt, "c", nullable, 0);
+    return t;
+}
+
+/* Deterministic pseudo-random bit for physical row p. */
+static int flat_rand_bit(int64_t p, uint32_t salt) {
+    uint32_t x = (uint32_t)p * 2654435761u + salt;
+    x ^= x >> 15; x *= 2246822519u; x ^= x >> 13;
+    return (int)(x & 1u);
+}
+static int32_t flat_str_len(int64_t p) { return (p % 4 == 0) ? 0 : (int32_t)((p * 7 + 3) % 13); }
+static uint8_t flat_str_byte(int64_t p, int32_t j) { return (uint8_t)('a' + (p * 3 + j) % 26); }
+
+/* nullmode: 0 no validity buffer, 1 random nulls, 2 all null, 3 validity
+ * buffer with every bit set. Row r of the written table is physical row
+ * coff + toff + r of the child's buffers. */
+static uint8_t* flat_validity(int nullmode, int64_t phys) {
+    if (nullmode == 0) return NULL;
+    uint8_t* v = calloc((size_t)(phys + 7) / 8 + 1, 1);
+    for (int64_t p = 0; p < phys; p++) {
+        int valid = nullmode == 3 || (nullmode == 1 && flat_rand_bit(p, 77u));
+        if (valid) v[p >> 3] |= (uint8_t)(1u << (p & 7));
+    }
+    return v;
+}
+static int flat_is_valid(int nullmode, int64_t p) {
+    return nullmode == 0 || nullmode == 3 || (nullmode == 1 && flat_rand_bit(p, 77u));
+}
+
+static int flat_bytes_case(const char* fmt, int nullable, int nullmode,
+                           int64_t n, int64_t coff, int64_t toff) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    int off64 = (fmt[0] == 'U' || fmt[0] == 'Z');
+    int64_t phys = coff + toff + n + 3;
+    int32_t* o32 = malloc((size_t)(phys + 1) * sizeof(int32_t));
+    int64_t* o64 = malloc((size_t)(phys + 1) * sizeof(int64_t));
+    int64_t pos = 0;
+    for (int64_t p = 0; p < phys; p++) { o32[p] = (int32_t)pos; o64[p] = pos; pos += flat_str_len(p); }
+    o32[phys] = (int32_t)pos; o64[phys] = pos;
+    uint8_t* data = malloc((size_t)pos + 1);
+    for (int64_t p = 0; p < phys; p++)
+        for (int32_t j = 0; j < flat_str_len(p); j++) data[o64[p] + j] = flat_str_byte(p, j);
+
+    struct ArrowArray* top = AB(n, 1, 1);
+    top->offset = toff;
+    struct ArrowArray* c = AB(toff + n + 2, 3, 0);
+    c->offset = coff;
+    c->buffers[0] = flat_validity(nullmode, phys);
+    c->null_count = (nullmode == 0 || nullmode == 3) ? 0 : -1;
+    if (off64) { c->buffers[1] = o64; free(o32); } else { c->buffers[1] = o32; free(o64); }
+    c->buffers[2] = data;
+    top->children[0] = c;
+
+    void* buf = NULL; size_t sz = 0;
+    if (write_read_arrow(flat_schema(fmt, nullable), top, flat_schema(fmt, nullable),
+                         &buf, &sz, &err) != 0) {
+        printf("  write_arrow(%s): %s\n", fmt, err.message);
+        return -1;
+    }
+    carquet_reader_t* r = carquet_reader_open_buffer(buf, sz, NULL, &err);
+    if (!r) { free(buf); return -1; }
+    assert(carquet_reader_num_rows(r) == n);
+    if (n > 0) {
+        carquet_column_reader_t* col = carquet_reader_get_column(r, 0, 0, NULL);
+        assert(col);
+        carquet_byte_array_t* vals = calloc((size_t)n, sizeof(*vals));
+        int16_t* def = calloc((size_t)n, sizeof(int16_t));
+        assert(carquet_column_read_batch(col, vals, n, nullable ? def : NULL, NULL) == n);
+        int64_t k = 0;
+        for (int64_t i = 0; i < n; i++) {
+            int64_t p = coff + toff + i;
+            if (!flat_is_valid(nullmode, p)) { assert(nullable && def[i] == 0); continue; }
+            if (nullable) assert(def[i] == 1);
+            assert((int32_t)vals[k].length == flat_str_len(p));
+            for (int32_t j = 0; j < flat_str_len(p); j++) assert(vals[k].data[j] == flat_str_byte(p, j));
+            k++;
+        }
+        free(vals); free(def);
+        carquet_column_reader_free(col);
+    }
+    carquet_reader_close(r);
+    free(buf);
+    return 0;
+}
+
+static int test_write_arrow_flat_bytes(void) {
+    static const char* fmts[] = {"u", "U", "z", "Z"};
+    static const int64_t lens[] = {0, 1, 7, 8, 9, 63, 64, 65, 1000};
+    static const int64_t offs[][2] = {{0, 0}, {1, 0}, {0, 3}, {5, 7}, {13, 1}};
+    for (size_t f = 0; f < 4; f++) {
+        for (size_t l = 0; l < sizeof(lens) / sizeof(lens[0]); l++) {
+            for (size_t o = 0; o < sizeof(offs) / sizeof(offs[0]); o++) {
+                for (int nullmode = 0; nullmode < 4; nullmode++) {
+                    if (flat_bytes_case(fmts[f], 1, nullmode, lens[l], offs[o][0], offs[o][1]) != 0)
+                        TEST_FAIL("write_arrow_flat_bytes", "nullable case failed");
+                }
+                /* non-nullable field: no validity buffer, or one with no null */
+                if (flat_bytes_case(fmts[f], 0, 0, lens[l], offs[o][0], offs[o][1]) != 0 ||
+                    flat_bytes_case(fmts[f], 0, 3, lens[l], offs[o][0], offs[o][1]) != 0)
+                    TEST_FAIL("write_arrow_flat_bytes", "required case failed");
+            }
+        }
+    }
+    TEST_PASS("write_arrow_flat_bytes");
+    return 0;
+}
+
+/* Offsets / buffers the bulk path must refuse (or accept) exactly as the
+ * per-row path does. Returns the status of write_arrow. */
+static carquet_status_t flat_bytes_raw(const char* fmt, int nullable, int64_t n,
+                                       const uint8_t* validity, int64_t null_count,
+                                       const void* offsets, size_t offsets_size,
+                                       const char* data, int64_t* rows_out) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    struct ArrowArray* top = AB(n, 1, 1);
+    struct ArrowArray* c = AB(n, 3, 0);
+    c->null_count = null_count;
+    c->buffers[0] = validity ? dupmem(validity, (size_t)(n + 7) / 8) : NULL;
+    c->buffers[1] = dupmem(offsets, offsets_size);
+    c->buffers[2] = data ? dupmem(data, strlen(data)) : NULL;
+    top->children[0] = c;
+    void* buf = NULL; size_t sz = 0;
+    if (write_read_arrow(flat_schema(fmt, nullable), top, flat_schema(fmt, nullable),
+                         &buf, &sz, &err) != 0)
+        return err.code != CARQUET_OK ? err.code : CARQUET_ERROR_INTERNAL;
+    carquet_reader_t* r = carquet_reader_open_buffer(buf, sz, NULL, &err);
+    if (!r) { free(buf); return CARQUET_ERROR_INTERNAL; }
+    if (rows_out) *rows_out = carquet_reader_num_rows(r);
+    carquet_reader_close(r);
+    free(buf);
+    return CARQUET_OK;
+}
+
+static int test_write_arrow_flat_bytes_errors(void) {
+    const uint8_t v101 = 0x05;   /* rows 0 and 2 valid, row 1 null */
+    int64_t rows = 0;
+    {   /* decreasing offsets */
+        int32_t o[4] = {0, 3, 2, 4};
+        assert(flat_bytes_raw("u", 0, 3, NULL, 0, o, sizeof(o), "abcd", NULL) == CARQUET_ERROR_INVALID_ARGUMENT);
+        int64_t O[4] = {0, 3, 2, 4};
+        assert(flat_bytes_raw("U", 1, 3, NULL, 0, O, sizeof(O), "abcd", NULL) == CARQUET_ERROR_INVALID_ARGUMENT);
+        int32_t g[4] = {0, 2, -7, 4};  /* row 2 = [-7, 4) */
+        assert(flat_bytes_raw("u", 1, 3, &v101, 1, g, sizeof(g), "abcd", NULL) == CARQUET_ERROR_INVALID_ARGUMENT);
+        /* ... are not looked at under a null slot */
+        int32_t h[4] = {0, 2, 1, 1};   /* row 1 = [2, 1) is null, row 2 = [1, 1) */
+        assert(flat_bytes_raw("u", 1, 3, &v101, 1, h, sizeof(h), "abcd", &rows) == CARQUET_OK && rows == 3);
+    }
+    {   /* negative offset */
+        int32_t o[3] = {-1, 1, 2};
+        assert(flat_bytes_raw("z", 0, 2, NULL, 0, o, sizeof(o), "abcd", NULL) == CARQUET_ERROR_INVALID_ARGUMENT);
+        int64_t O[3] = {-1, 1, 2};
+        assert(flat_bytes_raw("Z", 0, 2, NULL, 0, O, sizeof(O), "abcd", NULL) == CARQUET_ERROR_INVALID_ARGUMENT);
+    }
+    {   /* a value longer than INT32_MAX (refused before its bytes are read) */
+        int64_t O[3] = {0, 1, (int64_t)INT32_MAX + 2};
+        assert(flat_bytes_raw("U", 0, 2, NULL, 0, O, sizeof(O), "abcd", NULL) == CARQUET_ERROR_INVALID_ARGUMENT);
+        const uint8_t v01 = 0x01;      /* the long one is null: fine */
+        assert(flat_bytes_raw("U", 1, 2, &v01, 1, O, sizeof(O), "abcd", &rows) == CARQUET_OK && rows == 2);
+    }
+    {   /* NULL data buffer: only with empty values */
+        int32_t e[4] = {0, 0, 0, 0};
+        assert(flat_bytes_raw("u", 0, 3, NULL, 0, e, sizeof(e), NULL, &rows) == CARQUET_OK && rows == 3);
+        int32_t o[4] = {0, 0, 1, 1};
+        assert(flat_bytes_raw("u", 0, 3, NULL, 0, o, sizeof(o), NULL, NULL) == CARQUET_ERROR_INVALID_ARGUMENT);
+        assert(flat_bytes_raw("u", 1, 3, &v101, 1, o, sizeof(o), NULL, &rows) == CARQUET_OK && rows == 3);
+    }
+    {   /* null in a non-nullable field */
+        int32_t o[4] = {0, 1, 2, 3};
+        assert(flat_bytes_raw("u", 0, 3, &v101, 1, o, sizeof(o), "abcd", NULL) == CARQUET_ERROR_INVALID_ARGUMENT);
+        assert(flat_bytes_raw("u", 0, 3, &v101, -1, o, sizeof(o), "abcd", NULL) == CARQUET_ERROR_INVALID_ARGUMENT);
+    }
+    TEST_PASS("write_arrow_flat_bytes_errors");
+    return 0;
+}
+
+static int flat_bool_case(int nullable, int nullmode, int64_t n, int64_t coff, int64_t toff) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    int64_t phys = coff + toff + n + 3;
+    uint8_t* bits = calloc((size_t)(phys + 7) / 8 + 1, 1);
+    for (int64_t p = 0; p < phys; p++)
+        if (flat_rand_bit(p, 5u)) bits[p >> 3] |= (uint8_t)(1u << (p & 7));
+
+    struct ArrowArray* top = AB(n, 1, 1);
+    top->offset = toff;
+    struct ArrowArray* c = AB(toff + n + 2, 2, 0);
+    c->offset = coff;
+    c->buffers[0] = flat_validity(nullmode, phys);
+    c->null_count = (nullmode == 0 || nullmode == 3) ? 0 : -1;
+    c->buffers[1] = bits;
+    top->children[0] = c;
+
+    void* buf = NULL; size_t sz = 0;
+    if (write_read_arrow(flat_schema("b", nullable), top, flat_schema("b", nullable),
+                         &buf, &sz, &err) != 0) {
+        printf("  write_arrow(b): %s\n", err.message);
+        return -1;
+    }
+    carquet_reader_t* r = carquet_reader_open_buffer(buf, sz, NULL, &err);
+    if (!r) { free(buf); return -1; }
+    assert(carquet_reader_num_rows(r) == n);
+    if (n > 0) {
+        /* Column reader: dense 0/1 bytes + definition levels. */
+        carquet_column_reader_t* col = carquet_reader_get_column(r, 0, 0, NULL);
+        assert(col);
+        uint8_t* vals = calloc((size_t)n, 1);
+        int16_t* def = calloc((size_t)n, sizeof(int16_t));
+        assert(carquet_column_read_batch(col, vals, n, nullable ? def : NULL, NULL) == n);
+        int64_t k = 0;
+        for (int64_t i = 0; i < n; i++) {
+            int64_t p = coff + toff + i;
+            if (!flat_is_valid(nullmode, p)) { assert(nullable && def[i] == 0); continue; }
+            if (nullable) assert(def[i] == 1);
+            assert(vals[k] == (uint8_t)flat_rand_bit(p, 5u));
+            k++;
+        }
+        free(vals); free(def);
+        carquet_column_reader_free(col);
+
+        /* read_arrow: bit-packed values + validity, padding bits zero. */
+        struct ArrowSchema os; struct ArrowArray oa;
+        if (carquet_reader_read_arrow(r, 0, &os, &oa, &err) != CARQUET_OK) {
+            printf("  read_arrow: %s\n", err.message);
+            return -1;
+        }
+        assert(oa.length == n && oa.n_children == 1);
+        const struct ArrowArray* oc = oa.children[0];
+        assert(oc->length == n && oc->offset == 0 && oc->n_buffers == 2);
+        const uint8_t* ov = (const uint8_t*)oc->buffers[0];
+        const uint8_t* ob = (const uint8_t*)oc->buffers[1];
+        int64_t nulls = 0;
+        for (int64_t i = 0; i < n; i++) {
+            int64_t p = coff + toff + i;
+            int valid = flat_is_valid(nullmode, p);
+            if (!valid) nulls++;
+            if (ov) assert(((ov[i >> 3] >> (i & 7)) & 1) == valid); else assert(valid);
+            if (valid) assert(((ob[i >> 3] >> (i & 7)) & 1) == flat_rand_bit(p, 5u));
+        }
+        assert(oc->null_count == nulls);
+        if (n & 7) {
+            uint8_t pad = (uint8_t)(0xFFu << (n & 7));
+            assert((ob[n >> 3] & pad) == 0);
+            if (ov) assert((ov[n >> 3] & pad) == 0);
+        }
+        oa.release(&oa); os.release(&os);
+    }
+    carquet_reader_close(r);
+    free(buf);
+    return 0;
+}
+
+static int test_write_arrow_flat_bools(void) {
+    static const int64_t lens[] = {0, 1, 7, 8, 9, 15, 16, 17, 63, 64, 65, 127, 129, 1000};
+    static const int64_t offs[][2] = {{0, 0}, {1, 0}, {0, 3}, {5, 7}, {8, 0}, {13, 1}, {64, 0}, {7, 65}};
+    for (size_t l = 0; l < sizeof(lens) / sizeof(lens[0]); l++) {
+        for (size_t o = 0; o < sizeof(offs) / sizeof(offs[0]); o++) {
+            for (int nullmode = 0; nullmode < 4; nullmode++) {
+                if (flat_bool_case(1, nullmode, lens[l], offs[o][0], offs[o][1]) != 0)
+                    TEST_FAIL("write_arrow_flat_bools", "nullable case failed");
+            }
+            if (flat_bool_case(0, 0, lens[l], offs[o][0], offs[o][1]) != 0 ||
+                flat_bool_case(0, 3, lens[l], offs[o][0], offs[o][1]) != 0)
+                TEST_FAIL("write_arrow_flat_bools", "required case failed");
+        }
+    }
+
+    /* A missing values buffer and a null in a non-nullable field are still
+     * reported. */
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    for (int variant = 0; variant < 2; variant++) {
+        struct ArrowArray* top = AB(3, 1, 1);
+        struct ArrowArray* c = AB(3, 2, 0);
+        const uint8_t v = 0x05, b = 0x02;
+        if (variant == 0) { c->buffers[0] = NULL; c->buffers[1] = NULL; }
+        else { c->buffers[0] = dupmem(&v, 1); c->buffers[1] = dupmem(&b, 1); c->null_count = 1; }
+        top->children[0] = c;
+        void* buf = NULL; size_t sz = 0;
+        assert(write_read_arrow(flat_schema("b", 0), top, flat_schema("b", 0), &buf, &sz, &err) != 0);
+        assert(err.code == CARQUET_ERROR_INVALID_ARGUMENT);
+    }
+    TEST_PASS("write_arrow_flat_bools");
+    return 0;
+}
+
+/* BOOLEAN through the batch exporter: bit-packed values at lengths around
+ * the kernel's block sizes. */
+static int test_export_bool_lengths(void) {
+    static const int64_t lens[] = {1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 1000};
+    for (size_t l = 0; l < sizeof(lens) / sizeof(lens[0]); l++) {
+        int64_t n = lens[l];
+        carquet_error_t err = CARQUET_ERROR_INIT;
+        carquet_schema_t* s = carquet_schema_create(NULL);
+        carquet_schema_add_column(s, "req", CARQUET_PHYSICAL_BOOLEAN, NULL,
+                                  CARQUET_REPETITION_REQUIRED, 0, 0);
+        carquet_schema_add_column(s, "opt", CARQUET_PHYSICAL_BOOLEAN, NULL,
+                                  CARQUET_REPETITION_OPTIONAL, 0, 0);
+        carquet_writer_t* w = carquet_writer_create_buffer(s, NULL, &err);
+        if (!w) { carquet_schema_free(s); TEST_FAIL("export_bool_lengths", "writer"); }
+        uint8_t* req = malloc((size_t)n);
+        uint8_t* opt = malloc((size_t)n);
+        int16_t* def = malloc((size_t)n * sizeof(int16_t));
+        int64_t k = 0;
+        for (int64_t i = 0; i < n; i++) {
+            req[i] = (uint8_t)flat_rand_bit(i, 11u);
+            def[i] = (int16_t)flat_rand_bit(i, 23u);
+            if (def[i]) opt[k++] = (uint8_t)flat_rand_bit(i, 31u);
+        }
+        if (carquet_writer_write_batch(w, 0, req, n, NULL, NULL) != CARQUET_OK ||
+            carquet_writer_write_batch(w, 1, opt, n, def, NULL) != CARQUET_OK ||
+            carquet_writer_close(w) != CARQUET_OK)
+            { carquet_schema_free(s); TEST_FAIL("export_bool_lengths", "write"); }
+        void* buf = NULL; size_t sz = 0;
+        if (carquet_writer_get_buffer(w, &buf, &sz) != CARQUET_OK) TEST_FAIL("export_bool_lengths", "getbuf");
+        carquet_schema_free(s);
+
+        carquet_reader_t* r = carquet_reader_open_buffer(buf, sz, NULL, &err);
+        if (!r) { free(buf); TEST_FAIL("export_bool_lengths", "open"); }
+        carquet_batch_reader_config_t cfg;
+        carquet_batch_reader_config_init(&cfg);
+        cfg.batch_size = 4096;
+        carquet_batch_reader_t* br = carquet_batch_reader_create(r, &cfg, &err);
+        carquet_row_batch_t* batch = NULL;
+        if (!br || carquet_batch_reader_next(br, &batch) != CARQUET_OK || !batch)
+            { free(buf); TEST_FAIL("export_bool_lengths", "batch"); }
+        struct ArrowSchema os; struct ArrowArray oa;
+        if (carquet_arrow_export_batch(batch, carquet_reader_schema(r), &os, &oa, &err) != CARQUET_OK)
+            { free(buf); TEST_FAIL("export_bool_lengths", err.message); }
+        assert(oa.length == n && oa.n_children == 2);
+        assert(strcmp(os.children[0]->format, "b") == 0);
+        const uint8_t* rb = (const uint8_t*)oa.children[0]->buffers[1];
+        const uint8_t* ov = (const uint8_t*)oa.children[1]->buffers[0];
+        const uint8_t* ob = (const uint8_t*)oa.children[1]->buffers[1];
+        assert(oa.children[0]->null_count == 0);
+        assert(oa.children[1]->null_count == n - k);
+        for (int64_t i = 0; i < n; i++) {
+            assert(((rb[i >> 3] >> (i & 7)) & 1) == flat_rand_bit(i, 11u));
+            int valid = flat_rand_bit(i, 23u);
+            if (ov) assert(((ov[i >> 3] >> (i & 7)) & 1) == valid); else assert(valid);
+            if (valid) assert(((ob[i >> 3] >> (i & 7)) & 1) == flat_rand_bit(i, 31u));
+        }
+        if (n & 7) assert((rb[n >> 3] & (uint8_t)(0xFFu << (n & 7))) == 0);
+        oa.release(&oa); os.release(&os);
+        carquet_row_batch_free(batch);
+        carquet_batch_reader_free(br);
+        carquet_reader_close(r);
+        free(buf); free(req); free(opt); free(def);
+    }
+    TEST_PASS("export_bool_lengths");
+    return 0;
+}
+
 int main(void) {
     int rc = 0;
     rc |= test_export_bytes();
@@ -1199,6 +1555,10 @@ int main(void) {
     rc |= test_export_struct_rejected();
     rc |= test_export_projected();
     rc |= test_export_partial_field_rejected();
+    rc |= test_write_arrow_flat_bytes();
+    rc |= test_write_arrow_flat_bytes_errors();
+    rc |= test_write_arrow_flat_bools();
+    rc |= test_export_bool_lengths();
     if (rc == 0) printf("\nAll Arrow C Data Interface tests passed.\n");
     return rc;
 }

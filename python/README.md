@@ -178,7 +178,7 @@ cq.write_table(data, where, *, row_group_size=None, **options) -> None
 | `row_group_size` | rows per row group (default 1 048 576) |
 | `data_page_size` | target page size in bytes (default 1 MiB), or `{column: bytes}` |
 | `max_rows_per_page` | rows per data page |
-| `use_dictionary` | `True` or a list of columns to dictionary-encode; the writer falls back to PLAIN for a chunk whose dictionary does not pay off. Default: carquet's own choice (PLAIN, BYTE_STREAM_SPLIT for floats) |
+| `use_dictionary` | `True` or a list of columns to dictionary-encode (the writer falls back to PLAIN for a chunk whose dictionary does not pay off), `False` for none. Default: carquet's own choice: with a compression codec, BYTE_STREAM_SPLIT for floats and a dictionary for the integer column chunks whose values repeat; PLAIN otherwise |
 | `column_encoding` | one encoding for every column or `{column: encoding}`: `"plain"`, `"dictionary"`, `"delta_binary_packed"` (`"delta"`), `"delta_length_byte_array"`, `"delta_byte_array"`, `"byte_stream_split"`, `"rle"` |
 | `use_byte_stream_split` | `True` (float columns) or a list of columns |
 | `write_statistics` | `True` (default), `False`, or a list of columns |

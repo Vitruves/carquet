@@ -815,7 +815,8 @@ bool carquet_neon_checked_gather_double(const double* dict, int32_t dict_count,
 
 static inline uint8_t carquet_neon_pack_bool_octet(uint8x8_t bools) {
     static const uint8_t bit_positions[8] = {1, 2, 4, 8, 16, 32, 64, 128};
-    uint8x8_t masked = vand_u8(bools, vdup_n_u8(1));
+    /* Any non-zero byte is true, as in every other pack_bools kernel. */
+    uint8x8_t masked = vmin_u8(bools, vdup_n_u8(1));
     uint8x8_t weighted = vmul_u8(masked, vld1_u8(bit_positions));
     uint16x4_t sum16 = vpaddl_u8(weighted);
     uint32x2_t sum32 = vpaddl_u16(sum16);
